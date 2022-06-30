@@ -21,7 +21,7 @@ logger = logging_setup(log_dir, "jira2github_import")
 
 
 def attachment_url(issue_num: int, filename: str, att_repo: str, att_branch: str) -> str:
-    return f"https://github.com/{att_repo}/blob/{att_branch}/attachments/{jira_issue_id(issue_num)}/{quote(filename)}"
+    return f"https://raw.githubusercontent.com/{att_repo}/{att_branch}/attachments/{jira_issue_id(issue_num)}/{quote(filename)}"
 
 
 #def may_markup(gh_account: str) -> bool:
