@@ -24,8 +24,8 @@ def attachment_url(issue_num: int, filename: str, att_repo: str, att_branch: str
     return f"https://github.com/{att_repo}/blob/{att_branch}/attachments/{jira_issue_id(issue_num)}/{quote(filename)}"
 
 
-def may_markup(gh_account: str) -> bool:
-    return gh_account if gh_account in ["@mocobeta", "@dweiss"] else f"`{gh_account}`"
+#def may_markup(gh_account: str) -> bool:
+#    return gh_account if gh_account in ["@mocobeta", "@dweiss"] else f"`{gh_account}`"
 
 
 def jira_timestamp_to_github_timestamp(ts: str) -> str:
@@ -61,9 +61,9 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         pull_requests =extract_pull_requests(o)
 
         reporter_gh = account_map.get(reporter_name)
-        reporter = f"{reporter_dispname} ({may_markup(reporter_gh)})" if reporter_gh else f"{reporter_dispname}"
+        reporter = f"{reporter_dispname} ({reporter_gh})" if reporter_gh else f"{reporter_dispname}"
         assignee_gh = account_map.get(assignee_name)
-        assignee = f"{assignee_dispname} ({may_markup(assignee_gh)})" if assignee_gh else f"{assignee_dispname}"
+        assignee = f"{assignee_dispname} ({assignee_gh})" if assignee_gh else f"{assignee_dispname}"
 
         # make attachment list
         attachment_list_items = []
@@ -111,7 +111,7 @@ Pull Requests:
 
         def comment_author(author_name, author_dispname):
             author_gh = account_map.get(author_name)
-            return f"{author_dispname} ({may_markup(author_gh)})" if author_gh else author_dispname
+            return f"{author_dispname} ({author_gh})" if author_gh else author_dispname
         
         comments = extract_comments(o)
         comments_data = []
