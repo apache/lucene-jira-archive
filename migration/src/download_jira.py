@@ -94,7 +94,7 @@ if __name__ == "__main__":
         dump_dir.mkdir()
     assert dump_dir.exists()
 
-    att_data_dir = Path(__file__).resolve().parent.parent.joinpath(JIRA_ATTACHMENTS_DIRNAME)
+    att_data_dir = Path(__file__).resolve().parent.parent.parent.joinpath(JIRA_ATTACHMENTS_DIRNAME)
     if not att_data_dir.exists():
         att_data_dir.mkdir()
     assert att_data_dir.exists()
