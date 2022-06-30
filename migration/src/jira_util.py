@@ -169,6 +169,7 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}) -> str:
                 res = f"[{m.group(1)}]({repl})"
         return res
 
+    text = text.replace("\r\n", "\n")
     text = jira2markdown.convert(text)
 
     # markup @ mentions with ``
