@@ -6,7 +6,7 @@ import requests
 
 
 GITHUB_API_BASE = "https://api.github.com"
-INTERVAL = 2
+INTERVAL = 1
 
 
 @dataclass
