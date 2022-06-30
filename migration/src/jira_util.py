@@ -154,6 +154,27 @@ def extract_pull_requests(o: dict) -> list[str]:
     return res
 
 
+JIRA_EMOJI_TO_UNICODE = {
+    "(y)": "\U0001F44D",
+    "(n)": "\U0001F44E",
+    "(i)": "\U0001F6C8",
+    "(/)": "\u2714",
+    "(x)": "\u274C",
+    "(!)": "\u26A0",
+    "(+)": "\u002B",
+    "(-)": "\u2212",
+    "(?)": "\u003F",
+    "(on)": "\U0001F4A1",
+    "(off)": "\U0001F4A1",
+    "(*)": "\u2B50",
+    "(*r)": "\u2B50",
+    "(*g)": "\u2B50",
+    "(*b)": "\u2B50",
+    "(flag)": "\U0001F3F4",
+    "(flagoff)": "\U0001F3F3"
+}
+
+REGEX_CRLF = re.compile(r"\r\n\s*")
 REGEX_JIRA_KEY = re.compile(r"[^/]LUCENE-\d+")
 REGEX_MENTION = re.compile(r"@\w+")
 REGEX_LINK = re.compile(r"\[([^\]]+)\]\(([^\)]+)\)")
@@ -169,7 +190,9 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}) -> str:
                 res = f"[{m.group(1)}]({repl})"
         return res
 
-    text = text.replace("\r\n", "\n")
+    text = re.sub(REGEX_CRLF, "\n", text)
+    for emoji, unicode in JIRA_EMOJI_TO_UNICODE.items():
+        text = text.replace(emoji, unicode)
     text = jira2markdown.convert(text)
 
     # markup @ mentions with ``
