@@ -1,0 +1,457 @@
+### Eclipse Workspace Patch 1.0
+#P lucene_trunk
+Index: src/java/org/apache/lucene/store/SimpleFSDirectory.java
+===================================================================
+--- src/java/org/apache/lucene/store/SimpleFSDirectory.java	(revision 794204)
++++ src/java/org/apache/lucene/store/SimpleFSDirectory.java	(working copy)
+@@ -21,6 +21,8 @@
+ import java.io.IOException;
+ import java.io.RandomAccessFile;
+ 
++import org.apache.lucene.util.Constants;
++
+ /** A straighforward implementation of {@link FSDirectory}
+  *  using java.io.RandomAccessFile.  However, this class has
+  *  poor concurrent performance (multiple threads will
+@@ -61,9 +63,9 @@
+   /** Creates an IndexInput for the file with the given name. */
+   public IndexInput openInput(String name, int bufferSize) throws IOException {
+     ensureOpen();
+-    return new SimpleFSIndexInput(new File(directory, name), bufferSize);
++    return new SimpleFSIndexInput(new File(directory, name), bufferSize, getReadChunkSize());
+   }
+-
++  
+   protected static class SimpleFSIndexInput extends BufferedIndexInput {
+   
+     protected static class Descriptor extends RandomAccessFile {
+@@ -72,11 +74,13 @@
+       protected volatile boolean isOpen;
+       long position;
+       final long length;
++     
+       
+       public Descriptor(File file, String mode) throws IOException {
+         super(file, mode);
+         isOpen=true;
+         length=length();
++        
+       }
+   
+       public void close() throws IOException {
+@@ -89,16 +93,25 @@
+   
+     protected final Descriptor file;
+     boolean isClone;
+-  
++    //  LUCENE-1566 - maximum read length on a 32bit JVM to prevent incorrect OOM 
++    private final int chunkSize;
+     public SimpleFSIndexInput(File path) throws IOException {
+-      this(path, BufferedIndexInput.BUFFER_SIZE);
++      this(path, BufferedIndexInput.BUFFER_SIZE, SimpleFSDirectory.DEFAULT_READ_CHUNK_SIZE);
+     }
+-  
++
+     public SimpleFSIndexInput(File path, int bufferSize) throws IOException {
++      this(path, bufferSize, SimpleFSDirectory.DEFAULT_READ_CHUNK_SIZE);
++    }
++    
++    SimpleFSIndexInput(File path, int bufferSize, int chunkSize) throws IOException {
+       super(bufferSize);
+       file = new Descriptor(path, "r");
++      this.chunkSize = chunkSize;
++      
+     }
+   
++    
++    
+     /** IndexInput methods */
+     protected void readInternal(byte[] b, int offset, int len)
+          throws IOException {
+@@ -109,15 +122,49 @@
+           file.position = position;
+         }
+         int total = 0;
+-        do {
+-          int i = file.read(b, offset+total, len-total);
+-          if (i == -1)
+-            throw new IOException("read past EOF");
+-          file.position += i;
+-          total += i;
+-        } while (total < len);
++        /* 
++         * LUCENE-1566 - a JVM Bug raises an incorrect OOM Error when reading into a large
++         * byte array on 32bit JVM. This workaround deploys a slightly different
++         * readInternal implementation for 32 bit VM.
++         */
++        try {
++          // if 64bit VM or chunksize is gt length use fast path
++          if (Constants.JRE_IS_64BIT || len < chunkSize) { 
++            do {
++              final int i = file.read(b, offset + total, len - total);
++              if (i == -1)
++                throw new IOException("read past EOF");
++              file.position += i;
++              total += i;
++            } while (total < len);
++          } else {
++            // LUCENE-1566 - workaround for 32bit JVMs  
++            int readLength = chunkSize;
++            do {
++              if (len <= (total + readLength)) {
++                readLength = len - total;
++              }
++              // read in chunks to prevent incorrect OOM
++              final int i = file.read(b, offset + total, readLength);
++              if (i == -1)
++                throw new IOException("read past EOF");
++              file.position += i;
++              total += i;
++            } while (total < len);
++          }
++        } catch (OutOfMemoryError e) {
++          // propagate OOM up and add a hint for 32bit VM Users hitting the bug
++          // with a large chunk size in the fast path.
++          final OutOfMemoryError outOfMemoryError = new OutOfMemoryError(
++              "OutOfMemeoryError caugth most likely caused by a VM Bug documented in "
++                  + "LUCENE-1566. Try to set a value smaller than "+chunkSize
++                  + " to FSDirectory#setReadChunkSize.");
++          outOfMemoryError.initCause(e);
++          throw outOfMemoryError;
++        }
+       }
+     }
++    
+   
+     public void close() throws IOException {
+       // only close the file if this is not a clone
+Index: src/java/org/apache/lucene/store/NIOFSDirectory.java
+===================================================================
+--- src/java/org/apache/lucene/store/NIOFSDirectory.java	(revision 794204)
++++ src/java/org/apache/lucene/store/NIOFSDirectory.java	(working copy)
+@@ -22,6 +22,8 @@
+ import java.nio.ByteBuffer;
+ import java.nio.channels.FileChannel;
+ 
++import org.apache.lucene.util.Constants;
++
+ /**
+  * An {@link FSDirectory} implementation that uses
+  * java.nio's FileChannel's positional read, which allows
+@@ -66,7 +68,7 @@
+   /** Creates an IndexInput for the file with the given name. */
+   public IndexInput openInput(String name, int bufferSize) throws IOException {
+     ensureOpen();
+-    return new NIOFSIndexInput(new File(getFile(), name), bufferSize);
++    return new NIOFSIndexInput(new File(getFile(), name), bufferSize, getReadChunkSize());
+   }
+ 
+   /** Creates an IndexOutput for the file with the given name. */
+@@ -75,7 +77,7 @@
+     return new SimpleFSDirectory.SimpleFSIndexOutput(new File(directory, name));
+   }
+ 
+-  private static class NIOFSIndexInput extends SimpleFSDirectory.SimpleFSIndexInput {
++  static class NIOFSIndexInput extends SimpleFSDirectory.SimpleFSIndexInput {
+ 
+     private ByteBuffer byteBuf; // wraps the buffer for NIO
+ 
+@@ -83,10 +85,16 @@
+     private ByteBuffer otherByteBuf;
+ 
+     final FileChannel channel;
+-
++    private final int chunkSize;
++    
+     public NIOFSIndexInput(File path, int bufferSize) throws IOException {
++      this(path, bufferSize, FSDirectory.DEFAULT_READ_CHUNK_SIZE);
++    }
++    
++    NIOFSIndexInput(File path, int bufferSize, int chunkSize) throws IOException {
+       super(path, bufferSize);
+       channel = file.getChannel();
++      this.chunkSize = chunkSize;
+     }
+ 
+     protected void newBuffer(byte[] newBuffer) {
+@@ -133,14 +141,52 @@
+           // Always wrap when offset != 0
+           bb = ByteBuffer.wrap(b, offset, len);
+       }
+-
++      int readLength = bb.limit() - bb.position();
+       long pos = getFilePointer();
+-      while (bb.hasRemaining()) {
+-        int i = channel.read(bb, pos);
+-        if (i == -1)
+-          throw new IOException("read past EOF");
+-        pos += i;
++      /* 
++       * LUCENE-1566 - a JVM Bug raises an incorrect OOM Error when reading into a large
++       * byte array on 32bit JVM. This workaround deploys a slightly different
++       * readInternal implementation for 32 bit VM.
++       */
++      try {
++        // if 64bit VM or chunksize is gt length use fast path
++        if (Constants.JRE_IS_64BIT || chunkSize > readLength) {
++          while (bb.hasRemaining()) {
++            int i = channel.read(bb, pos);
++            if (i == -1)
++              throw new IOException("read past EOF");
++            pos += i;
++          }
++        } else {
++          int readOffset = bb.position();
++          bb.limit(readOffset + chunkSize);
++          while (bb.hasRemaining()) {
++            int i = channel.read(bb, pos);
++            if (i == -1)
++              throw new IOException("read past EOF");
++            pos += i;
++            readOffset += i;
++            readLength -= i;
++            if (readLength > 0) {
++              if (chunkSize < readLength) {
++                bb.limit(readOffset + chunkSize);
++              } else {
++                bb.limit(readOffset + readLength);
++              }
++            }
++          }
++        }
++      } catch (OutOfMemoryError e) {
++        // propagate OOM up and add a hint for 32bit VM Users hitting the bug
++        // with a large chunk size in the fast path.
++        final OutOfMemoryError outOfMemoryError = new OutOfMemoryError(
++            "OutOfMemeoryError caugth most likely caused by a VM Bug documented in "
++                + "LUCENE-1566. Try to set a value smaller than " + chunkSize
++                + " to FSDirectory#setReadChunkSize.");
++        outOfMemoryError.initCause(e);
++        throw outOfMemoryError;
+       }
++      
+     }
+   }
+ }
+Index: src/test/org/apache/lucene/store/TestBufferedIndexInput.java
+===================================================================
+--- src/test/org/apache/lucene/store/TestBufferedIndexInput.java	(revision 794204)
++++ src/test/org/apache/lucene/store/TestBufferedIndexInput.java	(working copy)
+@@ -18,7 +18,9 @@
+  */
+ 
+ import java.io.File;
++import java.io.FileOutputStream;
+ import java.io.IOException;
++import java.io.OutputStream;
+ import java.util.ArrayList;
+ import java.util.Iterator;
+ import java.util.List;
+@@ -33,50 +35,107 @@
+ import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.ScoreDoc;
+ import org.apache.lucene.search.TermQuery;
++import org.apache.lucene.store.NIOFSDirectory.NIOFSIndexInput;
++import org.apache.lucene.store.SimpleFSDirectory.SimpleFSIndexInput;
+ import org.apache.lucene.util.LuceneTestCase;
+ import org.apache.lucene.util._TestUtil;
+ 
+ public class TestBufferedIndexInput extends LuceneTestCase {
++  
++  private static void writeBytes(File aFile, int size) throws IOException{
++    OutputStream stream = null;
++    try{
++    stream = new FileOutputStream(aFile);
++    for (int i = 0; i < size; i++) {
++      stream.write(byten(i));  
++    }
++    stream.flush();
++    }finally{
++      if(stream != null)
++      stream.close();
++    }
++  }
++ 
+ 	// Call readByte() repeatedly, past the buffer boundary, and see that it
+ 	// is working as expected.
+ 	// Our input comes from a dynamically generated/ "file" - see
+ 	// MyBufferedIndexInput below.
+-    public void testReadByte() throws Exception {
+-    	MyBufferedIndexInput input = new MyBufferedIndexInput(); 
+-    	for(int i=0; i<BufferedIndexInput.BUFFER_SIZE*10; i++){
+-     		assertEquals(input.readByte(), byten(i));
+-    	}
++  public void testReadByte() throws Exception {
++    MyBufferedIndexInput input = new MyBufferedIndexInput();
++    for (int i = 0; i < BufferedIndexInput.BUFFER_SIZE * 10; i++) {
++      assertEquals(input.readByte(), byten(i));
+     }
++  }
+  
+ 	// Call readBytes() repeatedly, with various chunk sizes (from 1 byte to
+     // larger than the buffer size), and see that it returns the bytes we expect.
+ 	// Our input comes from a dynamically generated "file" -
+     // see MyBufferedIndexInput below.
+-    public void testReadBytes() throws Exception {
+-    	MyBufferedIndexInput input = new MyBufferedIndexInput();
+-    	int pos=0;
+-    	// gradually increasing size:
+-    	for(int size=1; size<BufferedIndexInput.BUFFER_SIZE*10; size=size+size/200+1){
+-    		checkReadBytes(input, size, pos);
+-    		pos+=size;
+-    	}
+-    	// wildly fluctuating size:
+-    	for(long i=0; i<1000; i++){
+-    		// The following function generates a fluctuating (but repeatable)
+-    		// size, sometimes small (<100) but sometimes large (>10000)
+-    		int size1 = (int)( i%7 + 7*(i%5)+ 7*5*(i%3) + 5*5*3*(i%2));
+-    		int size2 = (int)( i%11 + 11*(i%7)+ 11*7*(i%5) + 11*7*5*(i%3) + 11*7*5*3*(i%2) );
+-    		int size = (i%3==0)?size2*10:size1; 
+-    		checkReadBytes(input, size, pos);
+-    		pos+=size;
+-    	}
+-    	// constant small size (7 bytes):
+-    	for(int i=0; i<BufferedIndexInput.BUFFER_SIZE; i++){
+-    		checkReadBytes(input, 7, pos);
+-    		pos+=7;
+-    	}
++  public void testReadBytes() throws Exception {
++    MyBufferedIndexInput input = new MyBufferedIndexInput();
++    runReadBytes(input, BufferedIndexInput.BUFFER_SIZE);
++
++    // This tests the workaround code for LUCENE-1566 where readBytesInternal
++    // provides a workaround for a JVM Bug that incorrectly raises a OOM Error
++    // when a large byte buffer is passed to a file read.
++    // NOTE: this does only test the chunked reads and NOT if the Bug is triggered.
++    final int tmpFileSize = 1024 * 1024 * 5;
++    final int inputBufferSize = 128;
++    File tmpInputFile = File.createTempFile("IndexInput", "tmpFile");
++    tmpInputFile.deleteOnExit();
++    writeBytes(tmpInputFile, tmpFileSize);
++    // run test with chunk size of 10 bytes
++    runReadBytesAndClose(new SimpleFSIndexInput(tmpInputFile,
++        inputBufferSize, 10), inputBufferSize);
++    // run test with chunk size of 100 MB - default
++    runReadBytesAndClose(new SimpleFSIndexInput(tmpInputFile,
++        inputBufferSize), inputBufferSize);
++    // run test with chunk size of 10 bytes
++    runReadBytesAndClose(new NIOFSIndexInput(tmpInputFile,
++        inputBufferSize, 10), inputBufferSize);
++    // run test with chunk size of 100 MB - default
++    runReadBytesAndClose(new NIOFSIndexInput(tmpInputFile,
++        inputBufferSize), inputBufferSize);
++  }
++
++  private void runReadBytesAndClose(IndexInput input, int bufferSize)
++      throws IOException {
++    try {
++      runReadBytes(input, bufferSize);
++    } finally {
++      input.close();
+     }
+-   private void checkReadBytes(BufferedIndexInput input, int size, int pos) throws IOException{
++  }
++  
++  private void runReadBytes(IndexInput input, int bufferSize)
++      throws IOException {
++
++    int pos = 0;
++    // gradually increasing size:
++    for (int size = 1; size < bufferSize * 10; size = size + size / 200 + 1) {
++      checkReadBytes(input, size, pos);
++      pos += size;
++    }
++    // wildly fluctuating size:
++    for (long i = 0; i < 1000; i++) {
++      // The following function generates a fluctuating (but repeatable)
++      // size, sometimes small (<100) but sometimes large (>10000)
++      int size1 = (int) (i % 7 + 7 * (i % 5) + 7 * 5 * (i % 3) + 5 * 5 * 3 * (i % 2));
++      int size2 = (int) (i % 11 + 11 * (i % 7) + 11 * 7 * (i % 5) + 11 * 7 * 5
++          * (i % 3) + 11 * 7 * 5 * 3 * (i % 2));
++      int size = (i % 3 == 0) ? size2 * 10 : size1;
++      checkReadBytes(input, size, pos);
++      pos += size;
++    }
++    // constant small size (7 bytes):
++    for (int i = 0; i < bufferSize; i++) {
++      checkReadBytes(input, 7, pos);
++      pos += 7;
++    }
++  }
++    
++    
++   private void checkReadBytes(IndexInput input, int size, int pos) throws IOException{
+ 	   // Just to see that "offset" is treated properly in readBytes(), we
+ 	   // add an arbitrary offset at the beginning of the array
+ 	   int offset = size % 10; // arbitrary
+Index: src/java/org/apache/lucene/store/FSDirectory.java
+===================================================================
+--- src/java/org/apache/lucene/store/FSDirectory.java	(revision 794204)
++++ src/java/org/apache/lucene/store/FSDirectory.java	(working copy)
+@@ -729,6 +729,66 @@
+   }
+ 
+ 
++  /**
++   * Default chunk size set to <code>100 * 1024 * 1024</code> based on the
++   * LUCENE-1566 and SUN Bug-Reports where the incorrect OOM error occurs on
++   * very larg byte arrays greater than 100MB.
++   * 
++   * @see #setReadChunkSize(int)
++   */
++  public static int DEFAULT_READ_CHUNK_SIZE = 100 * 1024 * 1024;
++
++  // LUCENE-1566
++  private int chunkSize = DEFAULT_READ_CHUNK_SIZE;
++
++  /**
++   * Sets the maximum size of a single chunk in bytes an {@link IndexInput}
++   * reads into a byte array when reading from an underlying index. The default
++   * value is {@link #DEFAULT_READ_CHUNK_SIZE};
++   * <p>
++   * The chunk size was introduced due to a JVM Bug reported in LUCENE-1566
++   * which raises an incorrect OOM Error when reading a large byte array from a
++   * file. This bug occurs on 32bit JVMs only therefore the chunk size will only
++   * be applied if running on 32bit machines.
++   * </p>
++   * <p>
++   * Note: This value should be as large as possible to prevent a possible
++   * performance impact. By default this value is set to 100MB and should only
++   * be set to a lower value if the application hits an incorrect OutOfMemory
++   * Error. On a 64bit JVM the chunk size will be ignored.
++   * </p>
++   * 
++   * @param chunkSize
++   *          the maximum size of a single chunk an {@link IndexInput} reads
++   *          into a byte array when reading from an underlying index on a 32bit
++   *          JVM.
++   */
++  public final void setReadChunkSize(int chunkSize) {
++    // LUCENE-1566
++    if (chunkSize <= 0)
++      throw new IllegalArgumentException("chunkSize must be positive");
++    this.chunkSize = chunkSize;
++  }
++
++  /**
++   * Returns the maximum size of a single chunk in bytes an {@link IndexInput} reads into
++   * a byte array when reading from an underlying index.
++   * <p>
++   * The chunk size was introduced due to a JVM Bug reported in LUCENE-1566
++   * which raises an incorrect OOM Error when reading a large byte array from a
++   * file. This bug occurs on 32bit JVMs only therefore the chunk size will only
++   * be applied if running on 32bit machines.
++   * </p>
++   * 
++   * @return the maximum size of a single chunk an {@link IndexInput} reads into
++   *         a byte array when reading from an underlying index on a 32bit JVM.
++   */
++  public final int getReadChunkSize() {
++    // LUCENE-1566
++    return chunkSize;
++  }
++
++
+   /** @deprecated Use SimpleFSDirectory.SimpleFSIndexInput instead */
+   protected static class FSIndexInput extends SimpleFSDirectory.SimpleFSIndexInput {
+   

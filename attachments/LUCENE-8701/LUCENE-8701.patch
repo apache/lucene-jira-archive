@@ -1,0 +1,196 @@
+diff --git a/lucene/join/src/java/org/apache/lucene/search/join/ToParentBlockJoinQuery.java b/lucene/join/src/java/org/apache/lucene/search/join/ToParentBlockJoinQuery.java
+index c42cf39134..3c9f1fa177 100644
+--- a/lucene/join/src/java/org/apache/lucene/search/join/ToParentBlockJoinQuery.java
++++ b/lucene/join/src/java/org/apache/lucene/search/join/ToParentBlockJoinQuery.java
+@@ -24,6 +24,7 @@ import java.util.Locale;
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.IndexWriter;
+ import org.apache.lucene.index.LeafReaderContext;
++import org.apache.lucene.search.ConstantScoreQuery;
+ import org.apache.lucene.search.DocIdSetIterator;
+ import org.apache.lucene.search.Explanation;
+ import org.apache.lucene.search.FilterWeight;
+@@ -93,7 +94,18 @@ public class ToParentBlockJoinQuery extends Query {
+ 
+   @Override
+   public Weight createWeight(IndexSearcher searcher, org.apache.lucene.search.ScoreMode weightScoreMode, float boost) throws IOException {
+-    return new BlockJoinWeight(this, childQuery.createWeight(searcher, weightScoreMode, boost), parentsFilter, weightScoreMode.needsScores() ? scoreMode : ScoreMode.None);
++    ScoreMode childScoreMode = weightScoreMode.needsScores() ? scoreMode : ScoreMode.None;
++    final Weight childWeight;
++    if (childScoreMode == ScoreMode.None) {
++      // we don't need to compute a score for the child query so we wrap
++      // it under a constant score query that can early terminate if the
++      // minimum score is greater than 0 and the total hits that match the
++      // query is not requested.
++      childWeight = new ConstantScoreQuery(childQuery).createWeight(searcher, weightScoreMode, 0f);
++    } else {
++      childWeight = childQuery.createWeight(searcher, weightScoreMode, boost);
++    }
++    return new BlockJoinWeight(this, childWeight, parentsFilter, childScoreMode);
+   }
+ 
+   /** Return our child query. */
+@@ -318,9 +330,19 @@ public class ToParentBlockJoinQuery extends Query {
+ 
+     @Override
+     public float getMaxScore(int upTo) throws IOException {
++      if (scoreMode == ScoreMode.None) {
++        return childScorer.getMaxScore(upTo);
++      }
+       return Float.POSITIVE_INFINITY;
+     }
+ 
++    @Override
++    public void setMinCompetitiveScore(float minScore) throws IOException {
++      if (scoreMode == ScoreMode.None) {
++        childScorer.setMinCompetitiveScore(minScore);
++      }
++    }
++
+     private void setScoreAndFreq() throws IOException {
+       if (childApproximation.docID() >= parentApproximation.docID()) {
+         return;
+@@ -329,7 +351,7 @@ public class ToParentBlockJoinQuery extends Query {
+       int freq = 1;
+       while (childApproximation.nextDoc() < parentApproximation.docID()) {
+         if (childTwoPhase == null || childTwoPhase.matches()) {
+-          final float childScore = childScorer.score();
++          final float childScore = scoreMode == ScoreMode.None ? 0 : childScorer.score();
+           freq += 1;
+           switch (scoreMode) {
+             case Total:
+diff --git a/lucene/join/src/test/org/apache/lucene/search/join/TestBlockJoin.java b/lucene/join/src/test/org/apache/lucene/search/join/TestBlockJoin.java
+index a82d33e653..14ab72ac1a 100644
+--- a/lucene/join/src/test/org/apache/lucene/search/join/TestBlockJoin.java
++++ b/lucene/join/src/test/org/apache/lucene/search/join/TestBlockJoin.java
+@@ -813,7 +813,11 @@ public class TestBlockJoin extends LuceneTestCase {
+           if ("sum of:".equals(childWeightExplanation.getDescription())) {
+             childWeightExplanation = childWeightExplanation.getDetails()[0];
+           }
+-          assertTrue("Wrong child weight description", childWeightExplanation.getDescription().startsWith("weight(child"));
++          if (agg == ScoreMode.None) {
++            assertTrue("Wrong child weight description", childWeightExplanation.getDescription().startsWith("ConstantScore("));
++          } else {
++            assertTrue("Wrong child weight description", childWeightExplanation.getDescription().startsWith("weight(child"));
++          }
+         }
+       }
+ 
+diff --git a/lucene/join/src/test/org/apache/lucene/search/join/TestBlockJoinScorer.java b/lucene/join/src/test/org/apache/lucene/search/join/TestBlockJoinScorer.java
+new file mode 100644
+index 0000000000..1d2e286001
+--- /dev/null
++++ b/lucene/join/src/test/org/apache/lucene/search/join/TestBlockJoinScorer.java
+@@ -0,0 +1,111 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.search.join;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.Field;
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.LeafReaderContext;
++import org.apache.lucene.index.RandomIndexWriter;
++import org.apache.lucene.index.Term;
++import org.apache.lucene.search.DocIdSetIterator;
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.MatchAllDocsQuery;
++import org.apache.lucene.search.Query;
++import org.apache.lucene.search.ScoreMode;
++import org.apache.lucene.search.Scorer;
++import org.apache.lucene.search.TermQuery;
++import org.apache.lucene.search.Weight;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.BitSet;
++import org.apache.lucene.util.LuceneTestCase;
++
++public class TestBlockJoinScorer extends LuceneTestCase {
++  public void testScoreNone() throws IOException {
++    Directory dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir,
++        newIndexWriterConfig().setMergePolicy(
++          // retain doc id order
++          newLogMergePolicy(random().nextBoolean())
++        )
++    );
++    List<Document> docs = new ArrayList<>();
++    for (int i = 0; i < 10; i++) {
++      docs.clear();
++      for (int j = 0; j < i; j++) {
++        Document child = new Document();
++        child.add(newStringField("value", Integer.toString(j), Field.Store.YES));
++        docs.add(child);
++      }
++      Document parent = new Document();
++      parent.add(newStringField("docType", "parent", Field.Store.NO));
++      parent.add(newStringField("value", Integer.toString(i), Field.Store.NO));
++      docs.add(parent);
++      w.addDocuments(docs);
++    }
++    w.forceMerge(1);
++
++    IndexReader reader = w.getReader();
++    w.close();
++    IndexSearcher searcher = newSearcher(reader);
++
++    // Create a filter that defines "parent" documents in the index - in this case resumes
++    BitSetProducer parentsFilter = new QueryBitSetProducer(new TermQuery(new Term("docType", "parent")));
++    CheckJoinIndex.check(reader, parentsFilter);
++
++    Query childQuery = new MatchAllDocsQuery();
++    ToParentBlockJoinQuery query = new ToParentBlockJoinQuery(childQuery, parentsFilter,
++        org.apache.lucene.search.join.ScoreMode.None);
++
++    Weight weight = searcher.createWeight(searcher.rewrite(query), ScoreMode.TOP_SCORES, 1);
++    LeafReaderContext context = searcher.getIndexReader().leaves().get(0);
++
++    Scorer scorer = weight.scorer(context);
++    BitSet bits = parentsFilter.getBitSet(reader.leaves().get(0));
++    int parent = 0;
++    for (int i = 0; i < 9; i++) {
++      parent = bits.nextSetBit(parent + 1);
++      assertEquals(parent, scorer.iterator().nextDoc());
++    }
++    assertEquals(DocIdSetIterator.NO_MORE_DOCS, scorer.iterator().nextDoc());
++
++    scorer = weight.scorer(context);
++    scorer.setMinCompetitiveScore(0f);
++    parent = 0;
++    for (int i = 0; i < 9; i++) {
++      parent = bits.nextSetBit(parent + 1);
++      assertEquals(parent, scorer.iterator().nextDoc());
++    }
++    assertEquals(DocIdSetIterator.NO_MORE_DOCS, scorer.iterator().nextDoc());
++
++    scorer = weight.scorer(context);
++    scorer.setMinCompetitiveScore(Math.nextUp(0f));
++    assertEquals(DocIdSetIterator.NO_MORE_DOCS, scorer.iterator().nextDoc());
++
++    scorer = weight.scorer(context);
++    assertEquals(2, scorer.iterator().nextDoc());
++    scorer.setMinCompetitiveScore(Math.nextUp(0f));
++    assertEquals(DocIdSetIterator.NO_MORE_DOCS, scorer.iterator().nextDoc());
++
++    reader.close();
++    dir.close();
++  }
++}
+\ No newline at end of file

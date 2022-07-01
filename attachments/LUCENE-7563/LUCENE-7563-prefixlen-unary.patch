@@ -1,0 +1,396 @@
+diff --git a/lucene/core/src/java/org/apache/lucene/util/bkd/BKDReader.java b/lucene/core/src/java/org/apache/lucene/util/bkd/BKDReader.java
+index 44744c1..7098cc6 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/bkd/BKDReader.java
++++ b/lucene/core/src/java/org/apache/lucene/util/bkd/BKDReader.java
+@@ -24,6 +24,7 @@ import org.apache.lucene.index.PointValues;
+ import org.apache.lucene.store.ByteArrayDataInput;
+ import org.apache.lucene.store.IndexInput;
+ import org.apache.lucene.util.Accountable;
++import org.apache.lucene.util.BitUtil;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.MathUtil;
+ import org.apache.lucene.util.RamUsageEstimator;
+@@ -140,7 +141,7 @@ public final class BKDReader extends PointValues implements Accountable {
+ 
+   long getMinLeafBlockFP() {
+     if (packedIndex != null) {
+-      return new ByteArrayDataInput(packedIndex).readVLong();
++      return readLargeVLong(new ByteArrayDataInput(packedIndex));
+     } else {
+       long minFP = Long.MAX_VALUE;
+       for(long fp : leafBlockFPs) {
+@@ -302,6 +303,20 @@ public final class BKDReader extends PointValues implements Accountable {
+     }
+   }
+ 
++  //read a long written with BKDWriter#writeLargeVLong
++  static long readLargeVLong(ByteArrayDataInput in) {
++    return Byte.toUnsignedLong(in.readByte()) | (in.readVLong() << 8);
++  }
++
++  // read a long written with BKDWriter#writeSmallVLong
++  static long readSmallVLong(ByteArrayDataInput in) {
++    long l = Byte.toUnsignedLong(in.readByte());
++    if (l == 0xffl) {
++      l += in.readVLong();
++    }
++    return l;
++  }
++
+   /** Reads the new packed byte[] index format which can be up to ~63% smaller than the legacy index format on 20M NYC taxis tests.  This
+    *  format takes advantage of the limited access pattern to the BKD tree at search time, i.e. starting at the root node and recursing
+    *  downwards one child at a time. */
+@@ -320,6 +335,8 @@ public final class BKDReader extends PointValues implements Accountable {
+     // 2D array, i.e. to access array[level][dim] you read from negativeDeltas[level*numDims+dim].  this will be true if the last time we
+     // split on this dimension, we next pushed to the left sub-tree:
+     private final boolean[] negativeDeltas;
++    // the last common prefix length, per-dimension
++    private final byte[] prefixLengths;
+     // holds the packed per-level split values; the intersect method uses this to save the cell min/max as it recurses:
+     private final byte[][] splitValuesStack;
+     // scratch value to return from getPackedValue:
+@@ -333,6 +350,7 @@ public final class BKDReader extends PointValues implements Accountable {
+       splitValuesStack = new byte[treeDepth+1][];
+       splitDims = new int[treeDepth+1];
+       negativeDeltas = new boolean[numDims*(treeDepth+1)];
++      prefixLengths = new byte[numDims*(treeDepth+1)];
+ 
+       in = new ByteArrayDataInput(packedIndex);
+       splitValuesStack[0] = new byte[packedBytesLength];
+@@ -352,6 +370,7 @@ public final class BKDReader extends PointValues implements Accountable {
+       index.rightNodePositions[level] = rightNodePositions[level];
+       index.splitValuesStack[index.level] = splitValuesStack[index.level].clone();
+       System.arraycopy(negativeDeltas, level*numDims, index.negativeDeltas, level*numDims, numDims);
++      System.arraycopy(prefixLengths, level*numDims, index.prefixLengths, level*numDims, numDims);
+       index.splitDims[level] = splitDims[level];
+       return index;
+     }
+@@ -363,6 +382,7 @@ public final class BKDReader extends PointValues implements Accountable {
+       System.arraycopy(negativeDeltas, (level-1)*numDims, negativeDeltas, level*numDims, numDims);
+       assert splitDim != -1;
+       negativeDeltas[level*numDims+splitDim] = true;
++      System.arraycopy(prefixLengths, (level-1)*numDims, prefixLengths, level*numDims, numDims);
+       in.setPosition(nodePosition);
+       readNodeData(true);
+     }
+@@ -374,6 +394,7 @@ public final class BKDReader extends PointValues implements Accountable {
+       System.arraycopy(negativeDeltas, (level-1)*numDims, negativeDeltas, level*numDims, numDims);
+       assert splitDim != -1;
+       negativeDeltas[level*numDims+splitDim] = false;
++      System.arraycopy(prefixLengths, (level-1)*numDims, prefixLengths, level*numDims, numDims);
+       in.setPosition(nodePosition);
+       readNodeData(false);
+     }
+@@ -404,19 +425,23 @@ public final class BKDReader extends PointValues implements Accountable {
+ 
+       // read leaf block FP delta
+       if (isLeft == false) {
+-        leafBlockFPStack[level] += in.readVLong();
++        leafBlockFPStack[level] += readLargeVLong(in);
+       }
+ 
+       if (isLeafNode()) {
+         splitDim = -1;
+       } else {
+-
+         // read split dim, prefix, firstDiffByteDelta encoded as int:
+-        int code = in.readVInt();
+-        splitDim = code % numDims;
++        long code = readSmallVLong(in);
++        splitDim = Math.toIntExact(code % numDims);
+         splitDims[level] = splitDim;
+         code /= numDims;
+-        int prefix = code % (1+bytesPerDim);
++        final int ntz = Long.numberOfTrailingZeros(code);
++        code >>>= 1 + ntz;
++        int prefix = prefixLengths[level*numDims+splitDim] - BitUtil.zigZagDecode(ntz);
++        assert prefix >= 0 && prefix <= bytesPerDim;
++        prefixLengths[level*numDims+splitDim] = (byte) prefix;
++
+         int suffix = bytesPerDim - prefix;
+ 
+         if (splitValuesStack[level] == null) {
+@@ -424,7 +449,7 @@ public final class BKDReader extends PointValues implements Accountable {
+         }
+         System.arraycopy(splitValuesStack[level-1], 0, splitValuesStack[level], 0, packedBytesLength);
+         if (suffix > 0) {
+-          int firstDiffByteDelta = code / (1+bytesPerDim);
++          int firstDiffByteDelta = Math.toIntExact(code);
+           if (negativeDeltas[level*numDims + splitDim]) {
+             firstDiffByteDelta = -firstDiffByteDelta;
+           }
+@@ -432,6 +457,7 @@ public final class BKDReader extends PointValues implements Accountable {
+           splitValuesStack[level][splitDim*bytesPerDim+prefix] = (byte) (oldByte + firstDiffByteDelta);
+           in.readBytes(splitValuesStack[level], splitDim*bytesPerDim+prefix+1, suffix-1);
+         } else {
++          assert code == 0 : code;
+           // our split value is == last split value in this dim, which can happen when there are many duplicate values
+         }
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/util/bkd/BKDWriter.java b/lucene/core/src/java/org/apache/lucene/util/bkd/BKDWriter.java
+index c82a0c8..1205d1d 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/bkd/BKDWriter.java
++++ b/lucene/core/src/java/org/apache/lucene/util/bkd/BKDWriter.java
+@@ -27,15 +27,18 @@ import java.util.function.IntFunction;
+ import org.apache.lucene.codecs.CodecUtil;
+ import org.apache.lucene.codecs.MutablePointValues;
+ import org.apache.lucene.index.MergeState;
++import org.apache.lucene.index.PointValues;
+ import org.apache.lucene.index.PointValues.IntersectVisitor;
+ import org.apache.lucene.index.PointValues.Relation;
+ import org.apache.lucene.store.ChecksumIndexInput;
++import org.apache.lucene.store.DataOutput;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.IOContext;
+ import org.apache.lucene.store.IndexOutput;
+ import org.apache.lucene.store.RAMOutputStream;
+ import org.apache.lucene.store.TrackingDirectoryWrapper;
+ import org.apache.lucene.util.ArrayUtil;
++import org.apache.lucene.util.BitUtil;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.BytesRefComparator;
+ import org.apache.lucene.util.FixedBitSet;
+@@ -162,7 +165,7 @@ public class BKDWriter implements Closeable {
+   protected BKDWriter(int maxDoc, Directory tempDir, String tempFileNamePrefix, int numDims, int bytesPerDim,
+                       int maxPointsInLeafNode, double maxMBSortInHeap, long totalPointCount,
+                       boolean singleValuePerDoc, boolean longOrds, long offlineSorterBufferMB, int offlineSorterMaxTempFiles) throws IOException {
+-    verifyParams(numDims, maxPointsInLeafNode, maxMBSortInHeap, totalPointCount);
++    verifyParams(numDims, bytesPerDim, maxPointsInLeafNode, maxMBSortInHeap, totalPointCount);
+     // We use tracking dir to deal with removing files on exception, so each place that
+     // creates temp files doesn't need crazy try/finally/sucess logic:
+     this.tempDir = new TrackingDirectoryWrapper(tempDir);
+@@ -223,12 +226,15 @@ public class BKDWriter implements Closeable {
+     this.maxMBSortInHeap = maxMBSortInHeap;
+   }
+ 
+-  public static void verifyParams(int numDims, int maxPointsInLeafNode, double maxMBSortInHeap, long totalPointCount) {
++  public static void verifyParams(int numDims, int bytesPerDim, int maxPointsInLeafNode, double maxMBSortInHeap, long totalPointCount) {
+     // We encode dim in a single byte in the splitPackedValues, but we only expose 4 bits for it now, in case we want to use
+     // remaining 4 bits for another purpose later
+     if (numDims < 1 || numDims > MAX_DIMS) {
+       throw new IllegalArgumentException("numDims must be 1 .. " + MAX_DIMS + " (got: " + numDims + ")");
+     }
++    if (bytesPerDim < 1 || bytesPerDim > PointValues.MAX_NUM_BYTES) {
++      throw new IllegalArgumentException("bytesPerDim must be 1 .. " + PointValues.MAX_NUM_BYTES + " (got: " + bytesPerDim + ")");
++    }
+     if (maxPointsInLeafNode <= 0) {
+       throw new IllegalArgumentException("maxPointsInLeafNode must be > 0; got " + maxPointsInLeafNode);
+     }
+@@ -1070,7 +1076,7 @@ public class BKDWriter implements Closeable {
+     List<byte[]> blocks = new ArrayList<>();
+     byte[] lastSplitValues = new byte[bytesPerDim * numDims];
+     //System.out.println("\npack index");
+-    int totalSize = recursePackIndex(writeBuffer, leafBlockFPs, splitPackedValues, 0l, blocks, 1, lastSplitValues, new boolean[numDims], false);
++    int totalSize = recursePackIndex(writeBuffer, leafBlockFPs, splitPackedValues, 0l, blocks, 1, lastSplitValues, new boolean[numDims], new byte[numDims], false);
+ 
+     // Compact the byte[] blocks into single byte index:
+     byte[] index = new byte[totalSize];
+@@ -1094,11 +1100,29 @@ public class BKDWriter implements Closeable {
+     return pos;
+   }
+ 
++  // Write a vLong that commonly needs 8 bits or more
++  // this only starts using a continuation bit as of the 15th bit
++  static void writeLargeVLong(DataOutput out, long l) throws IOException {
++    out.writeByte((byte) l);
++    out.writeVLong(l >>> 8);
++  }
++
++  // Write a vLong that is commonly strictly less then 255
++  static void writeSmallVLong(DataOutput out, long l) throws IOException {
++    assert l >= 0;
++    if (l >= 0xffL) {
++      out.writeByte((byte) 0xffL);
++      out.writeVLong(l - 0xffL);
++    } else {
++      out.writeByte((byte) l);
++    }
++  }
++
+   /**
+    * lastSplitValues is per-dimension split value previously seen; we use this to prefix-code the split byte[] on each inner node
+    */
+   private int recursePackIndex(RAMOutputStream writeBuffer, long[] leafBlockFPs, byte[] splitPackedValues, long minBlockFP, List<byte[]> blocks,
+-                               int nodeID, byte[] lastSplitValues, boolean[] negativeDeltas, boolean isLeft) throws IOException {
++                               int nodeID, byte[] lastSplitValues, boolean[] negativeDeltas, byte[] prefixLengths, boolean isLeft) throws IOException {
+     if (nodeID >= leafBlockFPs.length) {
+       int leafID = nodeID - leafBlockFPs.length;
+       //System.out.println("recursePack leaf nodeID=" + nodeID);
+@@ -1111,7 +1135,7 @@ public class BKDWriter implements Closeable {
+           return 0;
+         } else {
+           assert nodeID == 1 || delta > 0: "nodeID=" + nodeID;
+-          writeBuffer.writeVLong(delta);
++          writeLargeVLong(writeBuffer, delta);
+           return appendBlock(writeBuffer, blocks);
+         }
+       } else {
+@@ -1123,7 +1147,7 @@ public class BKDWriter implements Closeable {
+         leftBlockFP = getLeftMostLeafBlockFP(leafBlockFPs, nodeID);
+         long delta = leftBlockFP - minBlockFP;
+         assert nodeID == 1 || delta > 0;
+-        writeBuffer.writeVLong(delta);
++        writeLargeVLong(writeBuffer, delta);
+       } else {
+         // The left tree's left most leaf block FP is always the minimal FP:
+         leftBlockFP = minBlockFP;
+@@ -1157,13 +1181,20 @@ public class BKDWriter implements Closeable {
+         firstDiffByteDelta = 0;
+       }
+ 
+-      // pack the prefix, splitDim and delta first diff byte into a single vInt:
+-      int code = (firstDiffByteDelta * (1+bytesPerDim) + prefix) * numDims + splitDim;
++      // pack the prefix, splitDim and delta first diff byte into a single long
++      // taking advantage of the fact that prefix lengths on consecutive levels
++      // are close to each other
++      int prefixLengthDelta =  prefix - prefixLengths[splitDim];
++      int prefixLengthCode = BitUtil.zigZagEncode(-prefixLengthDelta);
++      assert prefixLengthCode >= 0;
++      long code = (1L << prefixLengthCode);
++      code |= (((long) firstDiffByteDelta) << (1 + prefixLengthCode));
++      code = code * numDims + splitDim;
+ 
+       //System.out.println("  code=" + code);
+       //System.out.println("  splitValue=" + new BytesRef(splitPackedValues, address, bytesPerDim));
+ 
+-      writeBuffer.writeVInt(code);
++      writeSmallVLong(writeBuffer, code);
+ 
+       // write the split value, prefix coded vs. our parent's split value:
+       int suffix = bytesPerDim - prefix;
+@@ -1188,8 +1219,10 @@ public class BKDWriter implements Closeable {
+ 
+       boolean savNegativeDelta = negativeDeltas[splitDim];
+       negativeDeltas[splitDim] = true;
++      byte savPrefixLength = prefixLengths[splitDim];
++      prefixLengths[splitDim] = (byte) prefix;
+ 
+-      int leftNumBytes = recursePackIndex(writeBuffer, leafBlockFPs, splitPackedValues, leftBlockFP, blocks, 2*nodeID, lastSplitValues, negativeDeltas, true);
++      int leftNumBytes = recursePackIndex(writeBuffer, leafBlockFPs, splitPackedValues, leftBlockFP, blocks, 2*nodeID, lastSplitValues, negativeDeltas, prefixLengths, true);
+ 
+       if (nodeID * 2 < leafBlockFPs.length) {
+         writeBuffer.writeVInt(leftNumBytes);
+@@ -1204,9 +1237,11 @@ public class BKDWriter implements Closeable {
+       blocks.set(idxSav, bytes2);
+ 
+       negativeDeltas[splitDim] = false;
+-      int rightNumBytes = recursePackIndex(writeBuffer, leafBlockFPs, splitPackedValues, leftBlockFP, blocks, 2*nodeID+1, lastSplitValues, negativeDeltas, false);
++      prefixLengths[splitDim] = (byte) prefix;
++      int rightNumBytes = recursePackIndex(writeBuffer, leafBlockFPs, splitPackedValues, leftBlockFP, blocks, 2*nodeID+1, lastSplitValues, negativeDeltas, prefixLengths, false);
+ 
+       negativeDeltas[splitDim] = savNegativeDelta;
++      prefixLengths[splitDim] = savPrefixLength;
+ 
+       // restore lastSplitValues to what caller originally passed us:
+       System.arraycopy(savSplitValue, 0, lastSplitValues, splitDim * bytesPerDim + prefix, suffix);
+@@ -1218,7 +1253,6 @@ public class BKDWriter implements Closeable {
+   }
+ 
+   private long getLeftMostLeafBlockFP(long[] leafBlockFPs, int nodeID) {
+-    int nodeIDIn = nodeID;
+     // TODO: can we do this cheaper, e.g. a closed form solution instead of while loop?  Or
+     // change the recursion while packing the index to return this left-most leaf block FP
+     // from each recursion instead?
+diff --git a/lucene/core/src/test/org/apache/lucene/util/bkd/TestBKD.java b/lucene/core/src/test/org/apache/lucene/util/bkd/TestBKD.java
+index 8b9b7a5..23d8041 100644
+--- a/lucene/core/src/test/org/apache/lucene/util/bkd/TestBKD.java
++++ b/lucene/core/src/test/org/apache/lucene/util/bkd/TestBKD.java
+@@ -29,6 +29,8 @@ import org.apache.lucene.index.MergeState;
+ import org.apache.lucene.index.PointValues.IntersectVisitor;
+ import org.apache.lucene.index.PointValues.Relation;
+ import org.apache.lucene.index.PointValues;
++import org.apache.lucene.store.ByteArrayDataInput;
++import org.apache.lucene.store.ByteArrayDataOutput;
+ import org.apache.lucene.store.CorruptingIndexOutput;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.FilterDirectory;
+@@ -259,7 +261,7 @@ public class TestBKD extends LuceneTestCase {
+ 
+     int numDocs = atLeast(1000);
+     try (Directory dir = getDirectory(numDocs)) {
+-      int numBytesPerDim = TestUtil.nextInt(random(), 2, 30);
++      int numBytesPerDim = TestUtil.nextInt(random(), 2, 16);
+       int numDims = TestUtil.nextInt(random(), 1, 5);
+       int maxPointsInLeafNode = TestUtil.nextInt(random(), 50, 100);
+       float maxMB = (float) 3.0 + (3*random().nextFloat());
+@@ -378,7 +380,7 @@ public class TestBKD extends LuceneTestCase {
+   /** Make sure we close open files, delete temp files, etc., on exception */
+   public void testWithExceptions() throws Exception {
+     int numDocs = atLeast(10000);
+-    int numBytesPerDim = TestUtil.nextInt(random(), 2, 30);
++    int numBytesPerDim = TestUtil.nextInt(random(), 2, 16);
+     int numDims = TestUtil.nextInt(random(), 1, 5);
+ 
+     byte[][][] docValues = new byte[numDocs][][];
+@@ -444,7 +446,7 @@ public class TestBKD extends LuceneTestCase {
+ 
+   private void doTestRandomBinary(int count) throws Exception {
+     int numDocs = TestUtil.nextInt(random(), count, count*2);
+-    int numBytesPerDim = TestUtil.nextInt(random(), 2, 30);
++    int numBytesPerDim = TestUtil.nextInt(random(), 2, 16);
+ 
+     int numDims = TestUtil.nextInt(random(), 1, 5);
+ 
+@@ -463,7 +465,7 @@ public class TestBKD extends LuceneTestCase {
+   }
+ 
+   public void testAllEqual() throws Exception {
+-    int numBytesPerDim = TestUtil.nextInt(random(), 2, 30);
++    int numBytesPerDim = TestUtil.nextInt(random(), 2, 16);
+     int numDims = TestUtil.nextInt(random(), 1, 5);
+ 
+     int numDocs = atLeast(1000);
+@@ -486,7 +488,7 @@ public class TestBKD extends LuceneTestCase {
+   }
+ 
+   public void testOneDimEqual() throws Exception {
+-    int numBytesPerDim = TestUtil.nextInt(random(), 2, 30);
++    int numBytesPerDim = TestUtil.nextInt(random(), 2, 16);
+     int numDims = TestUtil.nextInt(random(), 1, 5);
+ 
+     int numDocs = atLeast(1000);
+@@ -510,7 +512,7 @@ public class TestBKD extends LuceneTestCase {
+ 
+   // this should trigger run-length compression with lengths that are greater than 255
+   public void testOneDimTwoValues() throws Exception {
+-    int numBytesPerDim = TestUtil.nextInt(random(), 2, 30);
++    int numBytesPerDim = TestUtil.nextInt(random(), 2, 16);
+     int numDims = TestUtil.nextInt(random(), 1, 5);
+ 
+     int numDocs = atLeast(1000);
+@@ -538,7 +540,7 @@ public class TestBKD extends LuceneTestCase {
+   }
+ 
+   public void testMultiValued() throws Exception {
+-    int numBytesPerDim = TestUtil.nextInt(random(), 2, 30);
++    int numBytesPerDim = TestUtil.nextInt(random(), 2, 16);
+     int numDims = TestUtil.nextInt(random(), 1, 5);
+ 
+     int numDocs = atLeast(1000);
+@@ -1064,4 +1066,26 @@ public class TestBKD extends LuceneTestCase {
+     in.close();
+     dir.close();
+   }
++
++  public void testSmallVLong() throws Exception {
++    for (long l = 0; l < 10000; ++l) {
++      byte[] data = new byte[20];
++      ByteArrayDataOutput out = new ByteArrayDataOutput(data);
++      BKDWriter.writeSmallVLong(out, l);
++      ByteArrayDataInput in = new ByteArrayDataInput(data, 0, out.getPosition());
++      assertEquals(l, BKDReader.readSmallVLong(in));
++      assertEquals(out.getPosition(), in.getPosition());
++    }
++  }
++
++  public void testLargeVLong() throws Exception {
++    for (long l = 0; l < 50000; ++l) {
++      byte[] data = new byte[20];
++      ByteArrayDataOutput out = new ByteArrayDataOutput(data);
++      BKDWriter.writeLargeVLong(out, l);
++      ByteArrayDataInput in = new ByteArrayDataInput(data, 0, out.getPosition());
++      assertEquals(l, BKDReader.readLargeVLong(in));
++      assertEquals(out.getPosition(), in.getPosition());
++    }
++  }
+ }

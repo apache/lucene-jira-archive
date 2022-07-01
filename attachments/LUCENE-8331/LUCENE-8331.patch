@@ -1,0 +1,260 @@
+Index: lucene/core/src/test/org/apache/lucene/index/MergeSimulator.java
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/index/MergeSimulator.java	(date 1527192391000)
++++ lucene/core/src/test/org/apache/lucene/index/MergeSimulator.java	(date 1527192391000)
+@@ -0,0 +1,252 @@
++package org.apache.lucene.index;
++
++import java.io.IOException;
++import java.io.PrintStream;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Random;
++import java.util.stream.LongStream;
++
++import org.apache.lucene.analysis.standard.StandardAnalyzer;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.store.RAMDirectory;
++import org.apache.lucene.util.StringHelper;
++import org.apache.lucene.util.Version;
++
++/**
++ * This is benchmarking / simulator code; it is <em>not</em> a test.
++ */
++public class MergeSimulator {
++	/*
++
++	What we do NOT do: (disclaimers)
++
++	(A) deletes.  Avg total docs vs searchable docs ratio.  Segs with deletes are cheaper to merge too.
++
++	(B) impact of total environment (a real test):
++	 * MergeScheduler
++	 * actual merges tend to produce slightly smaller segments (thus future merges slightly cheaper
++
++	Can we obtain a sequence of flush segment sizes in production?
++
++	 */
++
++  private static final boolean verbose = Boolean.getBoolean("verbose");
++  private static final boolean printAtFlush = false;
++  private static final boolean printAtMerge = false;
++
++  private static final long smallestSegSizeBytes = 10 * 1024;//10KB
++  private static final long largestSegSizeBytes = 10 * 1024 * 1024;//10MB
++  private static final double minFlushesRatio = 0.90;
++
++  private final Directory dir;
++  private final MergePolicy mergePolicy;
++  private final IndexWriter indexWriter;
++
++  private int segIdCounter = 0;
++
++  private MergeSimulator(Directory dir, MergePolicy mergePolicy, IndexWriter indexWriter) {
++    this.dir = dir;
++    this.mergePolicy = mergePolicy;
++    this.indexWriter = indexWriter;
++  }
++
++  // It's usually necessary to edit this during experimentation
++  public static void main(String[] args) throws IOException {
++    if (args.length == 0) {
++      System.err.println("See code for arguments");
++      return;
++    }
++
++    // Configure input affecting the index activity
++    System.out.printf("totalSizeMB=%s avgFlushSizeMB=%s flushStdDevMB=%s %n", args);
++    long totalSizeBytes = (long) (Double.parseDouble(args[0])*1024.0*1024.0);
++    double avgFlushSizeBytes = Double.parseDouble(args[1])*1024.0*1024.0;
++    double flushStdDevSizeBytes = Double.parseDouble(args[2])*1024.0*1024.0;
++    long[] segSizeStream = makeStreamOfFlushSegmentSizes(totalSizeBytes, avgFlushSizeBytes, flushStdDevSizeBytes);
++    System.out.println("seg size stats: " + LongStream.of(segSizeStream).summaryStatistics().toString());
++
++    // Configure the merge policy
++    TieredMergePolicy mergePolicy = makeMergePolicy();
++    System.out.println(mergePolicy.toString().replaceAll("[,:]", System.lineSeparator()));
++    System.out.println();
++
++    System.out.println("floorMB, avgNumSegs, avgWriteAmpFactor");
++    for (double floorMB = 1.0; floorMB <= 4.0; floorMB += 0.2) {
++      mergePolicy = makeMergePolicy();
++      mergePolicy.setFloorSegmentMB(floorMB);
++      Stats stats = run(segSizeStream, mergePolicy);
++      System.out.printf("%5.2f %.2f %.2f%n", floorMB, stats.getAvgNumSegments(), stats.getAvgWriteAmpFactor());
++    }
++
++  }
++
++  // It's usually necessary to edit this during experimentation
++  private static TieredMergePolicy makeMergePolicy() {
++    TieredMergePolicy mergePolicy = new TieredMergePolicy();
++    mergePolicy.setFloorSegmentMB(Double.parseDouble(System.getProperty("floorSegmentMB", "2.0")));
++    Integer mf = Integer.getInteger("mergeFactor");
++    if (mf != null) {
++      mergePolicy.setMaxMergeAtOnce(mf);
++      mergePolicy.setSegmentsPerTier(mf);
++    } else {
++      mergePolicy.setMaxMergeAtOnce(Integer.getInteger("maxMergeAtOnce", mergePolicy.getMaxMergeAtOnce()));
++      mergePolicy.setSegmentsPerTier(Double.parseDouble(System.getProperty("segmentsPerTier", ""+mergePolicy.getSegmentsPerTier())));
++      assert mergePolicy.getSegmentsPerTier() >= mergePolicy.getMaxMergeAtOnce();
++    }
++    return mergePolicy;
++  }
++
++  // -- hopefully you don't have to edit the rest of this file to experiment
++
++  private static long[] makeStreamOfFlushSegmentSizes(long totalSizeBytes, double avgFlushSizeBytes, double flushStdDevSizeBytes) {
++    Random random = new Random(0);
++    LongStream.Builder segSizeStreamBuilder = LongStream.builder();
++    while (totalSizeBytes > 0) {
++      long sz = (long) (avgFlushSizeBytes + random.nextGaussian() * flushStdDevSizeBytes);
++      sz = Math.max(sz, smallestSegSizeBytes);
++      sz = Math.min(sz, largestSegSizeBytes);
++      sz = Math.min(sz, totalSizeBytes);
++      segSizeStreamBuilder.add(sz);
++      totalSizeBytes -= sz;
++    }
++    return segSizeStreamBuilder.build().toArray();
++  }
++
++  private static Stats run(long[] segSizeStream, MergePolicy mergePolicy) throws IOException {
++    IndexWriterConfig conf = new IndexWriterConfig(new StandardAnalyzer());
++    conf.setMergePolicy(mergePolicy);
++    if (verbose) {
++      conf.setInfoStream(System.out);
++    }
++
++    MergeSimulator simulator;
++    try (RAMDirectory dir = new RAMDirectory();
++         IndexWriter indexWriter = new IndexWriter(dir, conf)) {
++      simulator = new MergeSimulator(dir, mergePolicy, indexWriter);
++      int minFlushes = (int) (segSizeStream.length * minFlushesRatio);
++      return simulator.run(LongStream.of(segSizeStream).mapToObj(simulator::makeSegInfoPerCommit).iterator(), minFlushes);
++    }
++  }
++
++  Stats run(Iterator<SegmentCommitInfo> flushSegIterator, int minFlushes) throws IOException {
++
++    List<SegmentCommitInfo> segs = new ArrayList<>(); // current list of segments
++    Stats stats = new Stats();
++
++    while (flushSegIterator.hasNext()) {
++      SegmentCommitInfo flushSeg = flushSegIterator.next();
++      segs.add(flushSeg);
++
++      stats.numFlushes++;
++      stats.flushSegSizeSum += flushSeg.sizeInBytes();
++
++      int segCountAtFlush = segs.size();
++      boolean synchronousMerge = false;
++      MergePolicy.MergeSpecification mergeSpec = mergePolicy.findMerges(MergeTrigger.FULL_FLUSH, makeSegInfos(segs), indexWriter);
++      if (mergeSpec != null) {
++        assert mergeSpec.merges.isEmpty() == false;
++        for (MergePolicy.OneMerge merge : mergeSpec.merges) {
++          stats.numMerges++;
++          // note: merge.totalBytesSize() isn't populated yet so we calculate ourselves
++          long mergedTotalSize = merge.segments.stream().mapToLong(MergeSimulator::sizeInBytes).sum();
++
++          stats.mergeSegSizeSum += mergedTotalSize;
++          int beforeNumSegs = segs.size();
++          segs.removeAll(merge.segments);
++          assert beforeNumSegs - segs.size() == merge.segments.size();
++          segs.add(makeSegInfoPerCommit(mergedTotalSize));
++        }
++      }
++
++      int segCountAfterMerge = segs.size();
++      int searchableSegCount = synchronousMerge ? segCountAfterMerge : segCountAtFlush;
++      stats.segCountSumAtFlush += searchableSegCount;
++      stats.segCount = segCountAfterMerge;
++      stats.writeAmpFactorSum += stats.getWriteAmpFactor();
++
++      if (printAtFlush || (mergeSpec != null && printAtMerge)) {
++        String label = (mergeSpec != null ? "flushAndMerge" : "flush");
++        System.out.printf(label + " %d %.2f %.2f %.2f%n", stats.segCount, stats.getAvgNumSegments(), stats.getWriteAmpFactor(), stats.getAvgWriteAmpFactor());
++      }
++
++    }
++
++    return stats;
++  }
++
++  static class Stats implements Cloneable {
++    int numFlushes = 0;
++    int numMerges = 0;
++    long segCountSumAtFlush = 0;
++    long flushSegSizeSum = 0;
++    long mergeSegSizeSum = 0;
++    int segCount;
++    double writeAmpFactorSum = 0.0;
++
++    @Override
++    public Stats clone() {
++      try {
++        return (Stats) super.clone();
++      } catch (CloneNotSupportedException e) {
++        throw new RuntimeException(e);
++      }
++    }
++
++    void printStats(PrintStream out) {
++      out.println(" Size written (MB): " + (flushSegSizeSum / 1024.0 / 1024.0));
++      out.println(" Flushes: " + numFlushes);
++      out.println(" Merges: " + numMerges);
++      out.println(" Avg flush seg size (MB): " + (flushSegSizeSum / (double) numFlushes / 1024.0 / 1024.0));
++      out.println(" Avg num segments: " + getAvgNumSegments());
++      out.println(" Avg write amplification factor: " + getAvgWriteAmpFactor());
++    }
++
++    double getAvgNumSegments() {
++      return segCountSumAtFlush / (double) numFlushes;
++    }
++
++    double getWriteAmpFactor() {
++      return (flushSegSizeSum + mergeSegSizeSum) / (double) flushSegSizeSum;
++    }
++
++    double getAvgWriteAmpFactor() {
++      return writeAmpFactorSum / (double) numFlushes;
++    }
++  }
++
++  private static long sizeInBytes(SegmentCommitInfo infoPerCommit) {
++    try {
++      return infoPerCommit.sizeInBytes();
++    } catch (IOException e) {
++      throw new RuntimeException(e);
++    }
++  }
++
++  private SegmentInfos makeSegInfos(List<SegmentCommitInfo> segs) {
++    SegmentInfos infos = new SegmentInfos(Version.LATEST.major);
++    for (SegmentCommitInfo seg : segs) {
++      infos.add(seg);
++    }
++    return infos;
++  }
++
++  private SegmentCommitInfo makeSegInfoPerCommit(long sizeInBytes) {
++    String name = "seg" + (segIdCounter++);
++    int docCount = (int) (sizeInBytes / 10000L);
++    SegmentInfo segInfo = new SegmentInfo(
++        dir, Version.LATEST, Version.LATEST, name, docCount, false, null,
++        new HashMap<>(), StringHelper.randomId(), new HashMap<>(), null
++    );
++    return new SegmentCommitInfo(segInfo, 0, 0, 0, 0) {
++      @Override
++      public long sizeInBytes() throws IOException {
++        return sizeInBytes;
++      }
++    };
++  }
++
++
++}

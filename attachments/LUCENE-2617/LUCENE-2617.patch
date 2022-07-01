@@ -1,0 +1,170 @@
+Index: lucene/src/test/org/apache/lucene/search/TestBooleanQuery.java
+===================================================================
+--- lucene/src/test/org/apache/lucene/search/TestBooleanQuery.java	(revision 988314)
++++ lucene/src/test/org/apache/lucene/search/TestBooleanQuery.java	(working copy)
+@@ -66,11 +66,27 @@
+     Document doc = new Document();
+     doc.add(new Field("field", "a b c d", Field.Store.NO, Field.Index.ANALYZED));
+     w.addDocument(doc);
++
+     IndexReader r = w.getReader();
+     IndexSearcher s = new IndexSearcher(r);
+     BooleanQuery q = new BooleanQuery();
+     q.add(new TermQuery(new Term("field", "a")), BooleanClause.Occur.SHOULD);
+ 
++    // LUCENE-2617: make sure that a term not in the index still contributes to the score via coord factor
++    float score = s.search(q, 10).getMaxScore();
++    Query subQuery = new TermQuery(new Term("field", "not_in_index"));
++    subQuery.setBoost(0);
++    q.add(subQuery, BooleanClause.Occur.SHOULD);
++    float score2 = s.search(q, 10).getMaxScore();
++    assertEquals(score*.5, score2, 1e-6);
++
++    // now test BooleanScorer2
++    subQuery = new TermQuery(new Term("field", "b"));
++    subQuery.setBoost(0);
++    q.add(subQuery, BooleanClause.Occur.MUST);
++    score2 = s.search(q, 10).getMaxScore();
++    assertEquals(score*(2.0/3), score2, 1e-6);
++ 
+     // PhraseQuery w/ no terms added returns a null scorer
+     PhraseQuery pq = new PhraseQuery();
+     q.add(pq, BooleanClause.Occur.SHOULD);
+Index: lucene/src/test/org/apache/lucene/search/TestBooleanScorer.java
+===================================================================
+--- lucene/src/test/org/apache/lucene/search/TestBooleanScorer.java	(revision 988314)
++++ lucene/src/test/org/apache/lucene/search/TestBooleanScorer.java	(working copy)
+@@ -90,7 +90,7 @@
+       }
+       
+     }};
+-    BooleanScorer bs = new BooleanScorer(sim, 1, Arrays.asList(scorers), null);
++    BooleanScorer bs = new BooleanScorer(sim, 1, Arrays.asList(scorers), null, scorers.length);
+     
+     assertEquals("should have received 3000", 3000, bs.nextDoc());
+     assertEquals("should have received NO_MORE_DOCS", DocIdSetIterator.NO_MORE_DOCS, bs.nextDoc());
+Index: lucene/src/java/org/apache/lucene/search/BooleanScorer2.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/search/BooleanScorer2.java	(revision 988314)
++++ lucene/src/java/org/apache/lucene/search/BooleanScorer2.java	(working copy)
+@@ -81,20 +81,17 @@
+    *          the list of optional scorers.
+    */
+   public BooleanScorer2(Similarity similarity, int minNrShouldMatch,
+-      List<Scorer> required, List<Scorer> prohibited, List<Scorer> optional) throws IOException {
++      List<Scorer> required, List<Scorer> prohibited, List<Scorer> optional, int maxCoord) throws IOException {
+     super(similarity);
+     if (minNrShouldMatch < 0) {
+       throw new IllegalArgumentException("Minimum number of optional scorers should not be negative");
+     }
+     coordinator = new Coordinator();
+     this.minNrShouldMatch = minNrShouldMatch;
++    coordinator.maxCoord = maxCoord;
+ 
+     optionalScorers = optional;
+-    coordinator.maxCoord += optional.size();
+-
+-    requiredScorers = required;
+-    coordinator.maxCoord += required.size();
+-    
++    requiredScorers = required;    
+     prohibitedScorers = prohibited;
+     
+     coordinator.init();
+Index: lucene/src/java/org/apache/lucene/search/BooleanQuery.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/search/BooleanQuery.java	(revision 988314)
++++ lucene/src/java/org/apache/lucene/search/BooleanQuery.java	(working copy)
+@@ -179,13 +179,16 @@
+     /** The Similarity implementation. */
+     protected Similarity similarity;
+     protected ArrayList<Weight> weights;
++    protected int maxCoord;  // num optional + num required
+ 
+     public BooleanWeight(Searcher searcher)
+       throws IOException {
+       this.similarity = getSimilarity(searcher);
+       weights = new ArrayList<Weight>(clauses.size());
+       for (int i = 0 ; i < clauses.size(); i++) {
+-        weights.add(clauses.get(i).getQuery().createWeight(searcher));
++        BooleanClause c = clauses.get(i);
++        weights.add(c.getQuery().createWeight(searcher));
++        if (!c.isProhibited()) maxCoord++;
+       }
+     }
+ 
+@@ -229,7 +232,6 @@
+       ComplexExplanation sumExpl = new ComplexExplanation();
+       sumExpl.setDescription("sum of:");
+       int coord = 0;
+-      int maxCoord = 0;
+       float sum = 0.0f;
+       boolean fail = false;
+       int shouldMatchCount = 0;
+@@ -241,7 +243,6 @@
+           continue;
+         }
+         Explanation e = w.explain(reader, doc);
+-        if (!c.isProhibited()) maxCoord++;
+         if (e.isMatch()) {
+           if (!c.isProhibited()) {
+             sumExpl.addDetail(e);
+@@ -319,7 +320,7 @@
+       
+       // Check if we can return a BooleanScorer
+       if (!scoreDocsInOrder && topScorer && required.size() == 0 && prohibited.size() < 32) {
+-        return new BooleanScorer(similarity, minNrShouldMatch, optional, prohibited);
++        return new BooleanScorer(similarity, minNrShouldMatch, optional, prohibited, maxCoord);
+       }
+       
+       if (required.size() == 0 && optional.size() == 0) {
+@@ -333,7 +334,7 @@
+       }
+       
+       // Return a BooleanScorer2
+-      return new BooleanScorer2(similarity, minNrShouldMatch, required, prohibited, optional);
++      return new BooleanScorer2(similarity, minNrShouldMatch, required, prohibited, optional, maxCoord);
+     }
+     
+     @Override
+Index: lucene/src/java/org/apache/lucene/search/BooleanScorer.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/search/BooleanScorer.java	(revision 988314)
++++ lucene/src/java/org/apache/lucene/search/BooleanScorer.java	(working copy)
+@@ -177,7 +177,6 @@
+   
+   private SubScorer scorers = null;
+   private BucketTable bucketTable = new BucketTable();
+-  private int maxCoord = 1;
+   private final float[] coordFactors;
+   private int requiredMask = 0;
+   private int prohibitedMask = 0;
+@@ -188,13 +187,12 @@
+   private int doc = -1;
+ 
+   BooleanScorer(Similarity similarity, int minNrShouldMatch,
+-      List<Scorer> optionalScorers, List<Scorer> prohibitedScorers) throws IOException {
++      List<Scorer> optionalScorers, List<Scorer> prohibitedScorers, int maxCoord) throws IOException {
+     super(similarity);
+     this.minNrShouldMatch = minNrShouldMatch;
+ 
+     if (optionalScorers != null && optionalScorers.size() > 0) {
+       for (Scorer scorer : optionalScorers) {
+-        maxCoord++;
+         if (scorer.nextDoc() != NO_MORE_DOCS) {
+           scorers = new SubScorer(scorer, false, false, bucketTable.newCollector(0), scorers);
+         }
+@@ -212,10 +210,10 @@
+       }
+     }
+ 
+-    coordFactors = new float[maxCoord];
++    coordFactors = new float[optionalScorers.size() + 1];
+     Similarity sim = getSimilarity();
+-    for (int i = 0; i < maxCoord; i++) {
+-      coordFactors[i] = sim.coord(i, maxCoord - 1); 
++    for (int i = 0; i < coordFactors.length; i++) {
++      coordFactors[i] = sim.coord(i, maxCoord); 
+     }
+   }
+ 

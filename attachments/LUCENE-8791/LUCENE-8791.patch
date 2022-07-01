@@ -1,0 +1,592 @@
+diff --git a/lucene/core/src/java/org/apache/lucene/search/CollectorRescorer.java b/lucene/core/src/java/org/apache/lucene/search/CollectorRescorer.java
+new file mode 100644
+index 0000000000..3d4d439ee1
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/search/CollectorRescorer.java
+@@ -0,0 +1,230 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.lucene.search;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Comparator;
++import java.util.List;
++import java.util.concurrent.Callable;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Future;
++
++import org.apache.lucene.index.LeafReaderContext;
++import org.apache.lucene.search.IndexSearcher.LeafSlice;
++import org.apache.lucene.util.IOUtils;
++
++/**
++ * A Rescorer implementation that uses a provided Collector to assign new scores to the first-pass hits.
++ *
++ * @lucene.experimental
++ */
++public class CollectorRescorer<C extends Collector> extends Rescorer {
++
++  private ExecutorService executor;
++  private final CollectorManager<C, TopDocs> manager;
++
++  /**
++   * Sole constructor, passing the 2nd pass query to assign scores to the 1st pass hits.
++   * @param manager  collector manager
++   */
++  public CollectorRescorer(CollectorManager<C, TopDocs> manager) {
++    this.manager = manager;
++  }
++
++  /**
++   * sets the {@link ExecutorService} instance to run rescoring in parallel
++   * {@link RescorerTask} task is created for each leaf slice if it exists, otherwise for each segment
++   * and they run in their own thread
++   * Expert: Running this rescorer with {@link ExecutorService} may not bring any speed up
++   * or even may hurt the performance
++   * it is advised to benchmark this to see if it is bringing any benefit
++   *
++   * @param executor used to perform concurrent rescoring across multiple segments. If null, all
++   *                 segments are scored sequentially in the current thread.
++   *                 For each leaf slice new runnable task is fired
++   */
++  public void setExecutor(ExecutorService executor) {
++    this.executor = executor;
++  }
++
++  /**
++   * Holds multiple per segment rescorers ({@link SegmentRescorer}).
++   * Object of this will be created per {@link LeafSlice} if segments are grouped by slice
++   * otherwise all per segment rescorers are grouped as one RescorerTask
++   */
++  private static class RescorerTask implements Callable<Void> {
++    private final SegmentRescorer[] segmentRescorers;
++    private final Collector collector;
++
++    RescorerTask(SegmentRescorer[] segmentRescorers, Collector collector) {
++      this.segmentRescorers = segmentRescorers;
++      this.collector = collector;
++    }
++
++    @Override
++    public Void call() throws IOException {
++      for (SegmentRescorer segmentRescorer : segmentRescorers) {
++        // This can be null if this query had no hits in this segment:
++        if (segmentRescorer != null) {
++          segmentRescorer.call(collector);
++        }
++      }
++      return null;
++    }
++  }
++
++  /**
++   * Re-scores hits in one segment.
++   */
++  private static class SegmentRescorer {
++    private final LeafReaderContext context;
++    // all docIDs that belong to this segment
++    private final List<Integer> docIDs;
++
++    SegmentRescorer(LeafReaderContext context, List<Integer> docIDs) {
++      this.context = context;
++      this.docIDs = docIDs;
++    }
++
++    public void call(Collector collector) throws IOException {
++      LeafCollector leafCollector = collector.getLeafCollector(context);
++      // second pass rescoring happens on already built topdoc objects,
++      // so scorer object will not be needed
++      leafCollector.setScorer(null);
++
++      for (int docID : docIDs) {
++        leafCollector.collect(docID);
++      }
++    }
++  }
++
++  /**
++   * builds SegmentRescorer for each leaf context reader
++   *
++   * @param searcher IndexSearcher to get leaf readers
++   * @param hits     first pass hits
++   * @return returns array of SegmentRescorer, each per leaf reader and docIDs are already assigned
++   * NOTE, return array may contain nulls if first pass doesn't contain any result from that segment
++   */
++  protected SegmentRescorer[] buildSegmentScorers(IndexSearcher searcher, ScoreDoc[] hits) {
++    SegmentRescorer[] segmentRescorers = new SegmentRescorer[searcher.leafContexts.size()];
++    int contextUpto = 0;
++    int maxDoc = -1;
++    List<Integer> pending = new ArrayList<>();
++    LeafReaderContext currentContext = null;
++    for (ScoreDoc hit : hits) {
++      int docID = hit.doc;
++      while (docID >= maxDoc) {
++        // advancing to next segment
++        if (!pending.isEmpty()) {
++          segmentRescorers[currentContext.ord] = new SegmentRescorer(currentContext, pending);
++          pending = new ArrayList<>();
++        }
++        currentContext = searcher.leafContexts.get(contextUpto++);
++        maxDoc = currentContext.docBase + currentContext.reader().maxDoc();
++      }
++      assert docID >= currentContext.docBase : "docID=" + docID + "shouldn't be part of segment ord=" + currentContext.ord;
++      pending.add(docID - currentContext.docBase);
++    }
++    if (!pending.isEmpty()) {
++      segmentRescorers[currentContext.ord] = new SegmentRescorer(currentContext, pending);
++    }
++    return segmentRescorers;
++  }
++
++  /**
++   * @param searcher         {@link IndexSearcher} used to build per segment docIDs
++   * @param firstPassTopDocs Hits from the first pass
++   *                         search.  It's very important that these hits were
++   *                         produced by the provided searcher; otherwise the doc
++   *                         IDs will not match!
++   * @param topN             this param is ignore, and it is upto collector to decide how many to collect
++   * @return collected and reduced TopDocs object
++   * @throws IOException could be thrown while collecting documents
++   */
++  public TopDocs rescore(IndexSearcher searcher, TopDocs firstPassTopDocs, int topN) throws IOException {
++    ScoreDoc[] hits = firstPassTopDocs.scoreDocs.clone();
++    Arrays.sort(hits, Comparator.comparingInt(a -> a.doc));
++
++    List<C> collectors = new ArrayList<>();
++    List<Future<Void>> futures = new ArrayList<>();
++    // build per segment re-scorer objects
++    SegmentRescorer[] segmentRescorers = buildSegmentScorers(searcher, hits);
++    if (searcher.getSlices() != null && executor != null) {
++      rescoreBySlice(searcher, segmentRescorers, collectors, futures);
++    } else {
++      rescoreBySegment(segmentRescorers, collectors, futures);
++    }
++    // wait for all future computations to finish
++    for (Future<Void> future : futures) {
++      try {
++        future.get();
++      } catch (InterruptedException ie) {
++        throw new RuntimeException(ie);
++      } catch (ExecutionException ee) {
++        IOUtils.rethrowAlways(ee.getCause());
++      }
++    }
++    return manager.reduce(collectors);
++  }
++
++  // used when Searcher's slices not null (ie used with executor)
++  protected void rescoreBySlice(IndexSearcher searcher, SegmentRescorer[] segmentRescorers,
++                                List<C> collectors, List<Future<Void>> futures) throws IOException {
++    assert executor != null && searcher.getSlices() != null;
++    for (LeafSlice slice : searcher.getSlices()) {
++      SegmentRescorer[] perSlice = new SegmentRescorer[slice.leaves.length];
++      int upto = 0;
++      for (LeafReaderContext leaf : slice.leaves) {
++        perSlice[upto++] = segmentRescorers[leaf.ord];
++      }
++      C collector = manager.newCollector();
++      collectors.add(collector);
++      futures.add(executor.submit(new RescorerTask(perSlice, collector)));
++    }
++  }
++
++  // used when Searcher's slices is null
++  protected void rescoreBySegment(SegmentRescorer[] segmentRescorers, List<C> collectors,
++                                  List<Future<Void>> futures) throws IOException {
++    if (executor != null && segmentRescorers.length > 1) {
++      for (SegmentRescorer segmentRescorer : segmentRescorers) {
++        C collector = manager.newCollector();
++        collectors.add(collector);
++        futures.add(executor.submit(new RescorerTask(new SegmentRescorer[]{segmentRescorer}, collector)));
++        }
++      } else {
++      C collector = manager.newCollector();
++      collectors.add(collector);
++      for (SegmentRescorer segmentRescorer : segmentRescorers) {
++        if (segmentRescorer != null) {
++          segmentRescorer.call(collector);
++        }
++      }
++    }
++  }
++
++  /* since re-scoring/re-ranking happens within collectors we have no way to access and get explanation */
++  @Override
++  public Explanation explain(IndexSearcher searcher, Explanation firstPassExplanation, int docID) throws IOException {
++    throw new UnsupportedOperationException("CollectorRescorer doesn't support explain functionality");
++  }
++}
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestCollectorRescorer.java b/lucene/core/src/test/org/apache/lucene/search/TestCollectorRescorer.java
+new file mode 100644
+index 0000000000..d7d3a25d6d
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/search/TestCollectorRescorer.java
+@@ -0,0 +1,350 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.search;
++
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.stream.IntStream;
++
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.Field;
++import org.apache.lucene.document.NumericDocValuesField;
++import org.apache.lucene.document.SortedDocValuesField;
++import org.apache.lucene.index.DirectoryReader;
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.LeafReaderContext;
++import org.apache.lucene.index.NumericDocValues;
++import org.apache.lucene.index.RandomIndexWriter;
++import org.apache.lucene.index.SortedDocValues;
++import org.apache.lucene.index.Term;
++import org.apache.lucene.search.similarities.ClassicSimilarity;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util.NamedThreadFactory;
++import org.apache.lucene.util.PriorityQueue;
++
++public class TestCollectorRescorer extends LuceneTestCase {
++  IndexSearcher searcher;
++  DirectoryReader reader;
++  Directory dir;
++
++  // maintains array of two element to be sorted in descending order
++  private static void update(FieldDoc[] docs, FieldDoc doc) {
++    if (docs[1] == null) {
++      docs[1] = doc;
++    } else if (docs[0] == null) {
++      docs[0] = doc;
++      if (docs[1].score > docs[0].score) {
++        FieldDoc tmp = docs[0];
++        docs[0] = docs[1];
++        docs[1] = tmp;
++      }
++    } else if (docs[1].score < doc.score) {
++      docs[1] = doc;
++      if (docs[1].score > docs[0].score) {
++        FieldDoc tmp = docs[0];
++        docs[0] = docs[1];
++        docs[1] = tmp;
++      }
++    }
++  }
++
++  /**
++   * here we create collector/leaf collector to collect top two document per family
++   */
++  class TopFamilyLeafCollector implements LeafCollector {
++
++    Map<String, FieldDoc[]> seen = new HashMap<>();
++    SortedDocValues familyValues;
++    NumericDocValues score;
++    int docBase;
++
++    TopFamilyLeafCollector(LeafReaderContext readerContext) throws IOException {
++      familyValues = readerContext.reader().getSortedDocValues("family");
++      score = readerContext.reader().getNumericDocValues("popularity");
++      docBase = readerContext.docBase;
++    }
++
++    @Override
++    public void setScorer(Scorable scorer) throws IOException {
++      // no scorer needed
++    }
++
++    @Override
++    public void collect(int doc) throws IOException {
++      if (familyValues.advance(doc) == doc && score.advanceExact(doc)) {
++        BytesRef family = familyValues.binaryValue();
++        int val = (int) score.longValue();
++        FieldDoc[] scoreDocs = seen.computeIfAbsent(family.utf8ToString(), bytesRef -> new FieldDoc[2]);
++        update(scoreDocs, new FieldDoc(doc + docBase, val, new Object[]{score, family.utf8ToString()}));
++      }
++    }
++
++    public ScoreMode scoreMode() {
++      return null;
++    }
++  }
++
++  List<TopFamilyLeafCollector> leafCollectors = new ArrayList<>();
++  final CollectorManager<Collector, TopDocs> manager = new CollectorManager<>() {
++    @Override
++    public Collector newCollector() throws IOException {
++      return new Collector() {
++
++        @Override
++        public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
++          TopFamilyLeafCollector leafCollector = new TopFamilyLeafCollector(context);
++          leafCollectors.add(leafCollector);
++          return leafCollector;
++        }
++
++        @Override
++        public ScoreMode scoreMode() {
++          return null;
++        }
++      };
++    }
++
++    @Override
++    public TopDocs reduce(Collection<Collector> collectors) throws IOException {
++      Map<String, FieldDoc[]> seen = new HashMap<>();
++      // merge results from all leaf collectors into hashmap
++      for (TopFamilyLeafCollector leafCollector : leafCollectors) {
++        for (String family : leafCollector.seen.keySet()) {
++          FieldDoc[] scoreDocs = seen.computeIfAbsent(family, bytesRef -> new FieldDoc[2]);
++          for (int i = 1; i >= 0; i--) {
++            FieldDoc scoreDoc = leafCollector.seen.get(family)[i];
++            if (scoreDoc == null) {
++              continue;
++            }
++            update(scoreDocs, scoreDoc);
++          }
++        }
++      }
++      PriorityQueue<FieldDoc> queue = new PriorityQueue<>(seen.size() * 2) {
++        @Override
++        public boolean lessThan(FieldDoc a, FieldDoc b) {
++          int cmp = Float.compare(b.score, a.score);
++          if (cmp != 0) {
++            return cmp < 0;
++          }
++          return CharSequence.compare(a.fields[1].toString(), b.fields[1].toString()) < 0;
++        }
++      };
++      // now sort them by score and tie braker is family name
++      for (FieldDoc[] value : seen.values()) {
++        queue.add(value[1]);
++        if (value[0] != null) {
++          queue.add(value[0]);
++        }
++      }
++      List<FieldDoc> docs = new ArrayList<>();
++      FieldDoc fieldDoc;
++      while ((fieldDoc = queue.pop()) != null) {
++        docs.add(fieldDoc);
++      }
++      return new TopDocs(new TotalHits(docs.size(), TotalHits.Relation.EQUAL_TO), docs.toArray(ScoreDoc[]::new));
++    }
++  };
++
++
++  @Override
++  public void setUp() throws Exception {
++    super.setUp();
++    dir = newDirectory();
++  }
++
++  private void indexDocs(boolean multipleSegments) throws IOException {
++    RandomIndexWriter iw = new RandomIndexWriter(random(), dir, newIndexWriterConfig().setSimilarity(new ClassicSimilarity()));
++
++    Document doc = new Document();
++    doc.add(newStringField("id", "1", Field.Store.YES));
++    doc.add(newTextField("body", "some contents and more contents", Field.Store.NO));
++    doc.add(new NumericDocValuesField("popularity", 50));
++    doc.add(new SortedDocValuesField("family", new BytesRef("a")));
++    iw.addDocument(doc);
++
++    doc = new Document();
++    doc.add(newStringField("id", "2", Field.Store.YES));
++    doc.add(newTextField("body", "another document with different contents", Field.Store.NO));
++    doc.add(new NumericDocValuesField("popularity", 50));
++    doc.add(new SortedDocValuesField("family", new BytesRef("b")));
++    iw.addDocument(doc);
++    if (multipleSegments) {
++      iw.commit();
++    }
++
++    doc = new Document();
++    doc.add(newStringField("id", "3", Field.Store.YES));
++    doc.add(newTextField("body", "crappy contents", Field.Store.NO));
++    doc.add(new NumericDocValuesField("popularity", 2));
++    doc.add(new SortedDocValuesField("family", new BytesRef("c")));
++    iw.addDocument(doc);
++    if (multipleSegments) {
++      iw.commit();
++    }
++
++    doc = new Document();
++    doc.add(newStringField("id", "4", Field.Store.YES));
++    doc.add(newTextField("body", "so so contents", Field.Store.NO));
++    doc.add(new NumericDocValuesField("popularity", 5));
++    doc.add(new SortedDocValuesField("family", new BytesRef("c")));
++    iw.addDocument(doc);
++    if (multipleSegments) {
++      iw.commit();
++    }
++
++    doc = new Document();
++    doc.add(newStringField("id", "5", Field.Store.YES));
++    doc.add(newTextField("body", "ok contents", Field.Store.NO));
++    doc.add(new NumericDocValuesField("popularity", 8));
++    doc.add(new SortedDocValuesField("family", new BytesRef("c")));
++    iw.addDocument(doc);
++
++    reader = iw.getReader();
++    searcher = new IndexSearcher(reader);
++    iw.close();
++  }
++
++  @Override
++  public void tearDown() throws Exception {
++    if (reader != null) {
++      reader.close();
++    }
++    dir.close();
++    super.tearDown();
++  }
++
++  public void testBasic() throws Exception {
++    indexDocs(false);
++    IndexReader r = searcher.getIndexReader();
++    // create a sort field and sort by it (reverse order)
++    Query query = new TermQuery(new Term("body", "contents"));
++    // Just first pass query
++    TopDocs hits = searcher.search(query, 10);
++    testTopFamilyHits(hits, r, query);
++  }
++
++
++  public void testMultiSegment() throws Exception {
++    indexDocs(true);
++    IndexReader r = searcher.getIndexReader();
++    // create a sort field and sort by it (reverse order)
++    Query query = new TermQuery(new Term("body", "contents"));
++    // Just first pass query
++    TopDocs hits = searcher.search(query, 10);
++    testTopFamilyHits(hits, r, query);
++  }
++
++  private void testTopFamilyHits(TopDocs hits, IndexReader r, Query query) throws IOException {
++    assertEquals(5, hits.totalHits.value);
++
++    // Now, rescore
++    Rescorer rescorer = new CollectorRescorer<>(manager);
++    hits = rescorer.rescore(searcher, hits, 10);
++
++    assertEquals("1", r.document(hits.scoreDocs[0].doc).get("id"));
++    assertEquals(50, (int) hits.scoreDocs[0].score);
++    assertEquals("a", ((FieldDoc) hits.scoreDocs[0]).fields[1]);
++
++    assertEquals("2", r.document(hits.scoreDocs[1].doc).get("id"));
++    assertEquals(50, (int) hits.scoreDocs[1].score);
++    assertEquals("b", ((FieldDoc) hits.scoreDocs[1]).fields[1]);
++
++    assertEquals("5", r.document(hits.scoreDocs[2].doc).get("id"));
++    assertEquals(8, (int) hits.scoreDocs[2].score);
++    assertEquals("c", ((FieldDoc) hits.scoreDocs[2]).fields[1]);
++
++    assertEquals("4", r.document(hits.scoreDocs[3].doc).get("id"));
++    assertEquals(5, (int) hits.scoreDocs[3].score);
++    assertEquals("c", ((FieldDoc) hits.scoreDocs[3]).fields[1]);
++
++    assertEquals(4, hits.totalHits.value);
++
++    leafCollectors.clear();
++  }
++
++  /**
++   * Randomly index bunch of families and for each family index bunch of documents
++   * we keep best popularity for each family in an array so we can validate correctness
++   */
++  public void testRandom() throws Exception {
++    Directory dir = newDirectory();
++    int numberOfFamilies = atLeast(20);
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++    // for each family record best ones, so we can validate down
++    final int[][] valuesPerFamily = new int[numberOfFamilies][];
++    List<Document> documents = new ArrayList<>();
++    for (int i = 0; i < numberOfFamilies; i++) {
++      int[] range = IntStream.rangeClosed(1, atLeast(30)).toArray();
++      // last two numbers are scores best scores, keep it in a separate array for later validation
++      valuesPerFamily[i] = new int[]{range[range.length - 1], range[range.length - 2]};
++      for (int popularity : range) {
++        Document doc = new Document();
++        doc.add(newTextField("body", "searchable", Field.Store.NO));
++        doc.add(new NumericDocValuesField("popularity", popularity));
++        doc.add(new SortedDocValuesField("family", new BytesRef(String.valueOf(i))));
++        documents.add(doc);
++      }
++    }
++    Collections.shuffle(documents, random());
++    for (Document document : documents) {
++      w.addDocument(document);
++      if (rarely()) {
++        // create multiple segments rarely
++        w.commit();
++      }
++    }
++    w.commit();
++    final IndexReader r = w.getReader();
++    w.close();
++
++    IndexSearcher s = newSearcher(r);
++    TopDocs hits = s.search(new TermQuery(new Term("body", "searchable")), documents.size());
++    ExecutorService exec = null;
++    if (rarely()) {
++      exec = Executors.newFixedThreadPool(2, new NamedThreadFactory("TestCollectorRescorer"));
++    }
++    try {
++      CollectorRescorer rescorer = new CollectorRescorer<>(manager);
++      rescorer.setExecutor(exec);
++      hits = rescorer.rescore(s, hits, numberOfFamilies * 2);
++      // upto hols pointer per family array items
++      int[] upto = new int[numberOfFamilies * 2];
++      for (ScoreDoc scoreDoc : hits.scoreDocs) {
++        FieldDoc fieldDoc = (FieldDoc) scoreDoc;
++        int family = Integer.parseInt(fieldDoc.fields[1].toString());
++        assertEquals(valuesPerFamily[family][upto[family]++], (int) fieldDoc.score);
++      }
++    } finally {
++      if (exec != null) {
++        exec.shutdown();
++      }
++      r.close();
++      dir.close();
++    }
++  }
++}

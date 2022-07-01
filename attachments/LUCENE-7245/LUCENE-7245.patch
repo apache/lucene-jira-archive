@@ -1,0 +1,315 @@
+diff --git a/lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java b/lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java
+index 3ac64c8..1dda1c4 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java
++++ b/lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java
+@@ -301,6 +301,24 @@ public class IndexSearcher {
+   }
+ 
+   /**
++   * Warm up the {@link QueryCache} with queries that are returned by the
++   * {@link #getQueryCachingPolicy() caching policy}. This should be called
++   * before the searcher is made available to handle end-user queries.
++   * @lucene.experimental
++   */
++  public void warmUpQueryCache() throws IOException {
++    if (queryCache == null) {
++      return;
++    }
++    for (Query query : queryCachingPolicy.getTopQueries()) {
++      final Weight weight = createNormalizedWeight(query, false);
++      for (LeafReaderContext leaf : leafContexts) {
++        weight.scorer(leaf); // populates the cache through side effects
++      }
++    }
++  }
++
++  /**
+    * Expert: Creates an array of leaf slices each holding a subset of the given leaves.
+    * Each {@link LeafSlice} is executed in a single thread. By default there
+    * will be one {@link LeafSlice} per leaf ({@link org.apache.lucene.index.LeafReaderContext}).
+diff --git a/lucene/core/src/java/org/apache/lucene/search/QueryCachingPolicy.java b/lucene/core/src/java/org/apache/lucene/search/QueryCachingPolicy.java
+index fabd971..a0529d3 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/QueryCachingPolicy.java
++++ b/lucene/core/src/java/org/apache/lucene/search/QueryCachingPolicy.java
+@@ -18,6 +18,8 @@ package org.apache.lucene.search;
+ 
+ 
+ import java.io.IOException;
++import java.util.Collections;
++import java.util.Set;
+ 
+ /**
+  * A policy defining which filters should be cached.
+@@ -28,7 +30,6 @@ import java.io.IOException;
+  * @see LRUQueryCache
+  * @lucene.experimental
+  */
+-// TODO: add APIs for integration with IndexWriter.IndexReaderWarmer
+ public interface QueryCachingPolicy {
+ 
+   /** A simple policy that caches all the provided filters on all segments. */
+@@ -57,4 +58,12 @@ public interface QueryCachingPolicy {
+    *  returned. */
+   boolean shouldCache(Query query) throws IOException;
+ 
++  /** Return queries that are probably worth caching given the history of calls
++   *  to {@link #onUse}. This is used to warm up the query cache on merged
++   *  segments.
++   *  The default implementation returns an empty set. */
++  default Set<Query> getTopQueries() {
++    return Collections.emptySet();
++  }
++
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/search/SearcherFactory.java b/lucene/core/src/java/org/apache/lucene/search/SearcherFactory.java
+index eeb817e..e6e9877 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/SearcherFactory.java
++++ b/lucene/core/src/java/org/apache/lucene/search/SearcherFactory.java
+@@ -41,9 +41,10 @@ import org.apache.lucene.search.similarities.Similarity; // javadocs
+  *   <li>Setting a custom scoring model: {@link IndexSearcher#setSimilarity(Similarity)}
+  *   <li>Parallel per-segment search: {@link IndexSearcher#IndexSearcher(IndexReader, ExecutorService)}
+  *   <li>Return custom subclasses of IndexSearcher (for example that implement distributed scoring)
+- *   <li>Run queries to warm your IndexSearcher before it is used. Note: when using near-realtime search
+- *       you may want to also {@link IndexWriterConfig#setMergedSegmentWarmer(IndexWriter.IndexReaderWarmer)} to warm
+- *       newly merged segments in the background, outside of the reopen path.
++ *   <li>Warm up IndexSearcher before it is used by running queries or calling {@link IndexSearcher#warmUpQueryCache()}.
++ *       Note: when using near-realtime search you may want to also
++ *       {@link IndexWriterConfig#setMergedSegmentWarmer(IndexWriter.IndexReaderWarmer)} to warm newly merged segments
++ *       in the background, outside of the reopen path.
+  * </ul>
+  * @lucene.experimental
+  */
+diff --git a/lucene/core/src/java/org/apache/lucene/search/UsageTrackingQueryCachingPolicy.java b/lucene/core/src/java/org/apache/lucene/search/UsageTrackingQueryCachingPolicy.java
+index ab68eeb..436cc94 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/UsageTrackingQueryCachingPolicy.java
++++ b/lucene/core/src/java/org/apache/lucene/search/UsageTrackingQueryCachingPolicy.java
+@@ -18,16 +18,23 @@ package org.apache.lucene.search;
+ 
+ 
+ import java.io.IOException;
++import java.util.ArrayDeque;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.Deque;
++import java.util.HashSet;
++import java.util.Iterator;
++import java.util.Set;
+ 
+ import org.apache.lucene.util.FrequencyTrackingRingBuffer;
+ 
+ /**
+  * A {@link QueryCachingPolicy} that tracks usage statistics of recently-used
+- * filters in order to decide on which filters are worth caching.
++ * queries in order to decide on which ones are worth caching.
+  *
+  * @lucene.experimental
+  */
+-public final class UsageTrackingQueryCachingPolicy implements QueryCachingPolicy {
++public class UsageTrackingQueryCachingPolicy implements QueryCachingPolicy {
+ 
+   // the hash code that we use as a sentinel in the ring buffer.
+   private static final int SENTINEL = Integer.MIN_VALUE;
+@@ -61,20 +68,24 @@ public final class UsageTrackingQueryCachingPolicy implements QueryCachingPolicy
+     return query instanceof TermQuery;
+   }
+ 
+-  private final FrequencyTrackingRingBuffer recentlyUsedFilters;
++  private final FrequencyTrackingRingBuffer recentlyUsedQueries;
++  private final Deque<Query> topQueries;
++  private final int topHistorySize;
+ 
+-  /**
+-   * Create a new instance.
+-   *
+-   * @param historySize               the number of recently used filters to track
++  /** Expert: Create a new instance.
++   * @param historySize    the number of recently used queries to track
++   * @param topHistorySize the number of top queries to track
+    */
+-  public UsageTrackingQueryCachingPolicy(int historySize) {
+-    this.recentlyUsedFilters = new FrequencyTrackingRingBuffer(historySize, SENTINEL);
++  public UsageTrackingQueryCachingPolicy(int historySize, int topHistorySize) {
++    this.recentlyUsedQueries = new FrequencyTrackingRingBuffer(historySize, SENTINEL);
++    this.topQueries = new ArrayDeque<>(topHistorySize);
++    this.topHistorySize = topHistorySize;
+   }
+ 
+-  /** Create a new instance with an history size of 256. */
++  /** Create a new instance with an global history size of 256, and an history
++   *  size of 8 for top queries. */
+   public UsageTrackingQueryCachingPolicy() {
+-    this(256);
++    this(256, 8);
+   }
+ 
+   /**
+@@ -92,6 +103,16 @@ public final class UsageTrackingQueryCachingPolicy implements QueryCachingPolicy
+     }
+   }
+ 
++  /**
++   * For a given query, return how many times it should appear in the history
++   * before being considered a top query that is worth caching aggressively on
++   * merged segments.
++   * The default implementation return {@code minFrequencyToCache(query) + 2}.
++   */
++  protected int minFrequencyTopQueries(Query query) {
++    return minFrequencyToCache(query) + 2;
++  }
++
+   @Override
+   public void onUse(Query query) {
+     assert query instanceof BoostQuery == false;
+@@ -104,8 +125,18 @@ public final class UsageTrackingQueryCachingPolicy implements QueryCachingPolicy
+     // we only track hash codes to avoid holding references to possible
+     // large queries; this may cause rare false positives, but at worse
+     // this just means we cache a query that was not in fact used enough:
+-    synchronized (this) {
+-      recentlyUsedFilters.add(hashCode);
++    int newFreq;
++    synchronized (recentlyUsedQueries) {
++      newFreq = recentlyUsedQueries.add(hashCode);
++    }
++
++    if (newFreq >= minFrequencyTopQueries(query)) {
++      synchronized (topQueries) {
++        if (topQueries.size() >= topHistorySize) {
++          topQueries.removeFirst();
++        }
++        topQueries.addLast(query);
++      }
+     }
+   }
+ 
+@@ -117,8 +148,8 @@ public final class UsageTrackingQueryCachingPolicy implements QueryCachingPolicy
+     // in case it's somewhat expensive:
+     int hashCode = query.hashCode();
+ 
+-    synchronized (this) {
+-      return recentlyUsedFilters.frequency(hashCode);
++    synchronized (recentlyUsedQueries) {
++      return recentlyUsedQueries.frequency(hashCode);
+     }
+   }
+ 
+@@ -147,4 +178,21 @@ public final class UsageTrackingQueryCachingPolicy implements QueryCachingPolicy
+     return frequency >= minFrequency;
+   }
+ 
++  @Override
++  public Set<Query> getTopQueries() {
++    Query[] topQueriesArray;
++    synchronized (this.topQueries) {
++      topQueriesArray = this.topQueries.toArray(new Query[0]);
++    }
++    Set<Query> topQueries = new HashSet<>(Arrays.asList(topQueriesArray));
++    Iterator<Query> it = topQueries.iterator();
++    while (it.hasNext()) {
++      Query query = it.next();
++      if (frequency(query) < minFrequencyTopQueries(query)) {
++        it.remove();
++      }
++    }
++    return Collections.unmodifiableSet(topQueries);
++  }
++
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/util/FrequencyTrackingRingBuffer.java b/lucene/core/src/java/org/apache/lucene/util/FrequencyTrackingRingBuffer.java
+index 9b0fd49..9f41987 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/FrequencyTrackingRingBuffer.java
++++ b/lucene/core/src/java/org/apache/lucene/util/FrequencyTrackingRingBuffer.java
+@@ -68,21 +68,23 @@ public final class FrequencyTrackingRingBuffer implements Accountable {
+ 
+   /**
+    * Add a new item to this ring buffer, potentially removing the oldest
+-   * entry from this buffer if it is already full.
++   * entry from this buffer if it is already full. Return the new frequency
++   * of the provided integer.
+    */
+-  public void add(int i) {
++  public int add(int i) {
+     // remove the previous value
+     final int removed = buffer[position];
+     final boolean removedFromBag = frequencies.remove(removed);
+     assert removedFromBag;
+     // add the new value
+     buffer[position] = i;
+-    frequencies.add(i);
++    int result = frequencies.add(i);
+     // increment the position
+     position += 1;
+     if (position == maxSize) {
+       position = 0;
+     }
++    return result;
+   }
+ 
+   /**
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestIndexSearcher.java b/lucene/core/src/test/org/apache/lucene/search/TestIndexSearcher.java
+index 8201bf8..d348ca4 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestIndexSearcher.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestIndexSearcher.java
+@@ -19,6 +19,8 @@ package org.apache.lucene.search;
+ 
+ import java.io.IOException;
+ import java.util.Arrays;
++import java.util.Collections;
++import java.util.Set;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.LinkedBlockingQueue;
+ import java.util.concurrent.ThreadPoolExecutor;
+@@ -30,7 +32,6 @@ import org.apache.lucene.document.Field.Store;
+ import org.apache.lucene.document.SortedDocValuesField;
+ import org.apache.lucene.document.StringField;
+ import org.apache.lucene.index.IndexReader;
+-import org.apache.lucene.index.LeafReaderContext;
+ import org.apache.lucene.index.MultiReader;
+ import org.apache.lucene.index.RandomIndexWriter;
+ import org.apache.lucene.index.Term;
+@@ -220,4 +221,32 @@ public class TestIndexSearcher extends LuceneTestCase {
+     searcher = new IndexSearcher(new MultiReader());
+     assertEquals(dummyPolicy, searcher.getQueryCachingPolicy());
+   }
++
++  public void testWarmUpQueryCache() throws Exception {
++    Query query = new TermQuery(new Term("field2", "true"));
++    LRUQueryCache cache = new LRUQueryCache(2, 1000, context -> true);
++    QueryCachingPolicy policy = new QueryCachingPolicy() {
++      @Override
++      public boolean shouldCache(Query query) throws IOException {
++        return true;
++      }
++      @Override
++      public void onUse(Query query) {}
++
++      @Override
++      public Set<Query> getTopQueries() {
++        return Collections.singleton(query);
++      }
++    };
++
++    IndexSearcher searcher = newSearcher(reader);
++    searcher.setQueryCachingPolicy(policy);
++    searcher.setQueryCache(null);
++    searcher.warmUpQueryCache();
++    assertEquals(0, cache.getCacheSize());
++
++    searcher.setQueryCache(cache);
++    searcher.warmUpQueryCache();
++    assertEquals(reader.leaves().size(), cache.getCacheSize());
++  }
+ }
+diff --git a/lucene/core/src/test/org/apache/lucene/util/TestFrequencyTrackingRingBuffer.java b/lucene/core/src/test/org/apache/lucene/util/TestFrequencyTrackingRingBuffer.java
+index 81b7ac5..4311157 100644
+--- a/lucene/core/src/test/org/apache/lucene/util/TestFrequencyTrackingRingBuffer.java
++++ b/lucene/core/src/test/org/apache/lucene/util/TestFrequencyTrackingRingBuffer.java
+@@ -59,7 +59,8 @@ public class TestFrequencyTrackingRingBuffer extends LuceneTestCase {
+       for (int j = 0; j < numitems; ++j) {
+         final Integer item = random().nextInt(maxitem);
+         items.add(item);
+-        buffer.add(item);
++        int newFreq = buffer.add(item);
++        assertEquals(newFreq, buffer.frequency(item));
+       }
+       assertBuffer(buffer, maxSize, sentinel, items);
+     }

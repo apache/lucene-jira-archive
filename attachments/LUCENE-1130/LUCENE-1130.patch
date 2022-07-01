@@ -1,0 +1,359 @@
+Index: src/test/org/apache/lucene/store/MockRAMDirectory.java
+===================================================================
+--- src/test/org/apache/lucene/store/MockRAMDirectory.java	(revision 610858)
++++ src/test/org/apache/lucene/store/MockRAMDirectory.java	(working copy)
+@@ -198,7 +198,7 @@
+    * RAMOutputStream.BUFFER_SIZE (now 1024) bytes.
+    */
+ 
+-  final synchronized long getRecomputedActualSizeInBytes() {
++  public final synchronized long getRecomputedActualSizeInBytes() {
+     long size = 0;
+     Iterator it = fileMap.values().iterator();
+     while (it.hasNext())
+Index: src/test/org/apache/lucene/index/TestIndexWriter.java
+===================================================================
+--- src/test/org/apache/lucene/index/TestIndexWriter.java	(revision 610858)
++++ src/test/org/apache/lucene/index/TestIndexWriter.java	(working copy)
+@@ -2112,4 +2112,115 @@
+     directory.close();
+   }
+ 
++  private class IndexerThread extends Thread {
++
++    boolean diskFull;
++    IOException error;
++    IndexWriter writer;
++
++    public IndexerThread(IndexWriter writer) {
++      this.writer = writer;
++    }
++
++    public void run() {
++
++      final Document doc = new Document();
++      doc.add(new Field("field", "aaa bbb ccc ddd eee fff ggg hhh iii jjj", Field.Store.YES, Field.Index.TOKENIZED, Field.TermVector.WITH_POSITIONS_OFFSETS));
++
++      int idUpto = 0;
++      while(true) {
++        try {
++          writer.updateDocument(new Term("id", ""+(idUpto++)), doc);
++        } catch (IOException ioe) {
++          if (ioe.getMessage().startsWith("fake disk full at"))
++            diskFull = true;
++          else {
++            System.out.println("\nERROR: unexpected IOException:");
++            ioe.printStackTrace(System.out);
++            error = ioe;
++          }
++          break;
++        }
++      }
++    }
++  }
++
++  // LUCENE-1130: make sure disk full during
++  // DW.ThreadState.init() does not lead to hang:
++  public void testDiskFullWithThreads() throws IOException {
++
++    int NUM_THREADS = 3;
++
++    for(int iter=0;iter<100;iter++) {
++      MockRAMDirectory dir = new MockRAMDirectory();
++      IndexWriter writer = new IndexWriter(dir, new WhitespaceAnalyzer());
++      ConcurrentMergeScheduler cms = new ConcurrentMergeScheduler();
++      // We expect disk full exceptions in the merge threads
++      cms.setSuppressExceptions();
++      writer.setMergeScheduler(cms);
++      writer.setMaxBufferedDocs(10);
++      writer.setMergeFactor(4);
++      dir.setMaxSizeInBytes(4*1024+20*iter);
++
++      IndexerThread[] threads = new IndexerThread[NUM_THREADS];
++      boolean diskFull = false;
++
++      for(int i=0;i<NUM_THREADS;i++)
++        threads[i] = new IndexerThread(writer);
++
++      for(int i=0;i<NUM_THREADS;i++)
++        threads[i].start();
++
++      for(int i=0;i<NUM_THREADS;i++) {
++        while(true) {
++          try {
++            // Without fix for LUCENE-1130: one of the
++            // threads will hang
++            threads[i].join(5000);
++            break;
++          } catch (InterruptedException ie) {
++            Thread.currentThread().interrupt();
++          }
++        }
++        if (threads[i].isAlive())
++          fail("thread seems to be hung");
++        else
++          assertTrue("hit unexpected IOException", threads[i].error == null);
++      }
++
++      try {
++        writer.close(false);
++      } catch (IOException ioe) {
++      }
++
++      dir.close();
++    }
++  }
++
++  // LUCENE-1130: make sure disk full during
++  // DW.ThreadState.init() does not lead to hang:
++  public void testImmediateDiskFull() throws IOException {
++    MockRAMDirectory dir = new MockRAMDirectory();
++    IndexWriter writer = new IndexWriter(dir, new WhitespaceAnalyzer());
++    dir.setMaxSizeInBytes(dir.getRecomputedActualSizeInBytes());
++    writer.setMaxBufferedDocs(2);
++    final Document doc = new Document();
++    doc.add(new Field("field", "aaa bbb ccc ddd eee fff ggg hhh iii jjj", Field.Store.YES, Field.Index.TOKENIZED, Field.TermVector.WITH_POSITIONS_OFFSETS));
++    try {
++      writer.addDocument(doc);
++      fail("did not hit disk full");
++    } catch (IOException ioe) {
++    }
++    // Without fix for LUCENE-1130: this call will hang:
++    try {
++      writer.addDocument(doc);
++      fail("did not hit disk full");
++    } catch (IOException ioe) {
++    }
++    try {
++      writer.close();
++      fail("did not hit disk full");
++    } catch (IOException ioe) {
++    }
++  }
+ }
+Index: src/java/org/apache/lucene/index/DocumentsWriter.java
+===================================================================
+--- src/java/org/apache/lucene/index/DocumentsWriter.java	(revision 611145)
++++ src/java/org/apache/lucene/index/DocumentsWriter.java	(working copy)
+@@ -360,10 +360,16 @@
+       // Reset vectors writer
+       if (tvx != null) {
+         tvx.close();
+-        tvf.close();
+-        tvd.close();
+         tvx = null;
+       }
++      if (tvd != null) {
++        tvd.close();
++        tvd = null;
++      }
++      if (tvf != null) {
++        tvf.close();
++        tvf = null;
++      }
+ 
+       // Reset fields writer
+       if (fieldsWriter != null) {
+@@ -574,6 +580,7 @@
+         localFieldsWriter.close();
+         localFieldsWriter = null;
+       }
++      fieldGen = 0;
+       maxPostingsVectors = 0;
+       doFlushAfter = false;
+       postingsPool.reset();
+@@ -642,6 +649,8 @@
+       }
+     }
+ 
++    int fieldGen;
++
+     /** Initializes shared state for this new document */
+     void init(Document doc, int docID) throws IOException {
+ 
+@@ -655,6 +664,7 @@
+ 
+       assert 0 == fdtLocal.length();
+       assert 0 == tvfLocal.length();
++      final int thisFieldGen = fieldGen++;
+ 
+       List docFields = doc.getFields();
+       final int numDocFields = docFields.size();
+@@ -700,36 +710,37 @@
+ 
+           if (numAllFieldData == allFieldDataArray.length) {
+             int newSize = (int) (allFieldDataArray.length*1.5);
++            int newHashSize = fieldDataHash.length*2;
+ 
+             FieldData newArray[] = new FieldData[newSize];
++            FieldData newHashArray[] = new FieldData[newHashSize];
+             System.arraycopy(allFieldDataArray, 0, newArray, 0, numAllFieldData);
+-            allFieldDataArray = newArray;
+ 
+             // Rehash
+-            newSize = fieldDataHash.length*2;
+-            newArray = new FieldData[newSize];
+             fieldDataHashMask = newSize-1;
+             for(int j=0;j<fieldDataHash.length;j++) {
+               FieldData fp0 = fieldDataHash[j];
+               while(fp0 != null) {
+                 hashPos = fp0.fieldInfo.name.hashCode() & fieldDataHashMask;
+                 FieldData nextFP0 = fp0.next;
+-                fp0.next = newArray[hashPos];
+-                newArray[hashPos] = fp0;
++                fp0.next = newHashArray[hashPos];
++                newHashArray[hashPos] = fp0;
+                 fp0 = nextFP0;
+               }
+             }
+-            fieldDataHash = newArray;
++
++            allFieldDataArray = newArray;
++            fieldDataHash = newHashArray;
+           }
+           allFieldDataArray[numAllFieldData++] = fp;
+         } else {
+           assert fp.fieldInfo == fi;
+         }
+ 
+-        if (docID != fp.lastDocID) {
++        if (thisFieldGen != fp.lastGen) {
+ 
+           // First time we're seeing this field for this doc
+-          fp.lastDocID = docID;
++          fp.lastGen = thisFieldGen;
+           fp.fieldCount = 0;
+           fp.doVectors = fp.doVectorPositions = fp.doVectorOffsets = false;
+           fp.doNorms = fi.isIndexed && !fi.omitNorms;
+@@ -776,8 +787,15 @@
+           assert docStoreSegment == null;
+           assert segment != null;
+           docStoreSegment = segment;
++
++          // If we hit an exception while init'ing the
++          // fieldsWriter, we must abort this segment
++          // because those files will be in an unknown
++          // state:
++          abortOnExc = true;
+           fieldsWriter = new FieldsWriter(directory, docStoreSegment, fieldInfos);
+           files = null;
++          abortOnExc = false;
+         }
+         localFieldsWriter = new FieldsWriter(null, fdtLocal, fieldInfos);
+       }
+@@ -787,6 +805,11 @@
+       if (docHasVectors) {
+         if (tvx == null) {
+           assert docStoreSegment != null;
++
++          // If we hit an exception while init'ing the term
++          // vector output files, we must abort this segment
++          // because those files will be in an unknown state:
++          abortOnExc = true;
+           tvx = directory.createOutput(docStoreSegment + "." + IndexFileNames.VECTORS_INDEX_EXTENSION);
+           tvx.writeInt(TermVectorsReader.FORMAT_VERSION);
+           tvd = directory.createOutput(docStoreSegment +  "." + IndexFileNames.VECTORS_DOCUMENTS_EXTENSION);
+@@ -799,6 +822,7 @@
+           // vectors before this one
+           for(int i=0;i<docID;i++)
+             tvx.writeLong(0);
++          abortOnExc = false;
+         }
+ 
+         numVectorFields = 0;
+@@ -929,7 +953,7 @@
+       int upto = 0;
+       for(int i=0;i<numAllFieldData;i++) {
+         FieldData fp = allFieldDataArray[i];
+-        if (fp.lastDocID == -1) {
++        if (fp.lastGen == -1) {
+           // This field was not seen since the previous
+           // flush, so, free up its resources now
+ 
+@@ -953,7 +977,7 @@
+ 
+         } else {
+           // Reset
+-          fp.lastDocID = -1;
++          fp.lastGen = -1;
+           allFieldDataArray[upto++] = fp;
+           
+           if (fp.numPostings > 0 && ((float) fp.numPostings) / fp.postingsHashSize < 0.2) {
+@@ -1215,7 +1239,7 @@
+       int fieldCount;
+       Fieldable[] docFields = new Fieldable[1];
+ 
+-      int lastDocID = -1;
++      int lastGen = -1;
+       FieldData next;
+ 
+       boolean doNorms;
+@@ -2277,7 +2301,7 @@
+ 
+     boolean success = false;
+     try {
+-      state.init(doc, nextDocID++);
++      state.init(doc, nextDocID);
+ 
+       if (delTerm != null) {
+         addDeleteTerm(delTerm, state.docID);
+@@ -2285,16 +2309,21 @@
+           state.doFlushAfter = timeToFlushDeletes();
+       }
+ 
++      // Only increment nextDocID on successful init
++      nextDocID++;
++
+       success = true;
+     } finally {
+       if (!success) {
+         synchronized(this) {
+           state.isIdle = true;
++          notifyAll();
+           if (state.doFlushAfter) {
+             state.doFlushAfter = false;
+             flushPending = false;
+           }
+-          notifyAll();
++          if (state.abortOnExc)
++            abort();
+         }
+       }
+     }
+@@ -2333,6 +2362,7 @@
+       if (!success) {
+         synchronized(this) {
+           state.isIdle = true;
++          notifyAll();
+           if (state.abortOnExc)
+             // Abort all buffered docs since last flush
+             abort();
+@@ -2342,7 +2372,6 @@
+             // keeps indexing as "all or none" (atomic) when
+             // adding a document:
+             addDeleteDocID(state.docID);
+-          notifyAll();
+         }
+       }
+     }
+@@ -2474,6 +2503,7 @@
+     if (nextWriteDocID == state.docID) {
+       // It's my turn, so write everything now:
+       state.isIdle = true;
++      notifyAll();
+       nextWriteDocID++;
+       state.writeDocument();
+ 
+@@ -2497,12 +2527,6 @@
+           numWaiting = upto;
+         }
+       }
+-
+-      // Now notify any incoming calls to addDocument
+-      // (above) that are waiting on our line to
+-      // shrink
+-      notifyAll();
+-
+     } else {
+       // Another thread got a docID before me, but, it
+       // hasn't finished its processing.  So add myself to

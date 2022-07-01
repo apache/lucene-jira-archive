@@ -1,0 +1,882 @@
+From 2fe53238f87f0dbabdd5277995d5d4131d771cbd Mon Sep 17 00:00:00 2001
+From: Huy Le <huyle@atlassian.com>
+Date: Thu, 16 May 2019 17:28:02 +1000
+Subject: [PATCH] LUCENE-8041 All Fields.terms(fld) impls should be O(1) not
+ O(log(N))
+
+---
+ .../lucene/codecs/blockterms/BlockTermsReader.java | 44 ++++++++++---------
+ .../blocktreeords/OrdsBlockTreeTermsReader.java    | 34 ++++++++-------
+ .../lucene/codecs/memory/DirectPostingsFormat.java | 11 +++--
+ .../lucene/codecs/memory/FSTOrdTermsReader.java    | 50 ++++++++++++----------
+ .../lucene/codecs/memory/FSTTermsReader.java       | 26 ++++++-----
+ .../codecs/blocktree/BlockTreeTermsReader.java     | 25 ++++++-----
+ .../codecs/perfield/PerFieldPostingsFormat.java    | 28 ++++++------
+ 7 files changed, 122 insertions(+), 96 deletions(-)
+
+diff --git a/lucene/codecs/src/java/org/apache/lucene/codecs/blockterms/BlockTermsReader.java b/lucene/codecs/src/java/org/apache/lucene/codecs/blockterms/BlockTermsReader.java
+index 964f616..170373b 100644
+--- a/lucene/codecs/src/java/org/apache/lucene/codecs/blockterms/BlockTermsReader.java
++++ b/lucene/codecs/src/java/org/apache/lucene/codecs/blockterms/BlockTermsReader.java
+@@ -22,7 +22,9 @@ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.Iterator;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Map;
+ import java.util.TreeMap;
+ 
+ import org.apache.lucene.codecs.BlockTermState;
+@@ -58,7 +60,7 @@ import org.apache.lucene.util.RamUsageEstimator;
+  *
+  * <p>This class also interacts with an instance of {@link
+  * TermsIndexReaderBase}, to abstract away the specific
+- * implementation of the terms dict index. 
++ * implementation of the terms dict index.
+  * @lucene.experimental */
+ 
+ public class BlockTermsReader extends FieldsProducer {
+@@ -70,11 +72,11 @@ public class BlockTermsReader extends FieldsProducer {
+   // produce DocsEnum on demand
+   private final PostingsReaderBase postingsReader;
+ 
+-  private final TreeMap<String,FieldReader> fields = new TreeMap<>();
++  private final Map<String,FieldReader> fields;
+ 
+   // Reads the terms index
+   private TermsIndexReaderBase indexReader;
+-  
++
+   // Used as key for the terms cache
+   private static class FieldAndTerm implements Cloneable {
+     String field;
+@@ -104,24 +106,24 @@ public class BlockTermsReader extends FieldsProducer {
+       return field.hashCode() * 31 + term.hashCode();
+     }
+   }
+-  
++
+   public BlockTermsReader(TermsIndexReaderBase indexReader, PostingsReaderBase postingsReader, SegmentReadState state) throws IOException {
+-    
++
+     this.postingsReader = postingsReader;
+-    
++
+     String filename = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, BlockTermsWriter.TERMS_EXTENSION);
+     in = state.directory.openInput(filename, state.context);
+ 
+     boolean success = false;
+     try {
+-      CodecUtil.checkIndexHeader(in, BlockTermsWriter.CODEC_NAME, 
++      CodecUtil.checkIndexHeader(in, BlockTermsWriter.CODEC_NAME,
+                                        BlockTermsWriter.VERSION_START,
+                                        BlockTermsWriter.VERSION_CURRENT,
+                                        state.segmentInfo.getId(), state.segmentSuffix);
+ 
+       // Have PostingsReader init itself
+       postingsReader.init(in, state);
+-      
++
+       // NOTE: data file is too costly to verify checksum against all the bytes on open,
+       // but for now we at least verify proper structure of the checksum footer: which looks
+       // for FOOTER_MAGIC + algorithmID. This is cheap and can detect some forms of corruption
+@@ -135,6 +137,7 @@ public class BlockTermsReader extends FieldsProducer {
+       if (numFields < 0) {
+         throw new CorruptIndexException("invalid number of fields: " + numFields, in);
+       }
++      final Map<String,FieldReader> sortedFields = new TreeMap<>();
+       for(int i=0;i<numFields;i++) {
+         final int field = in.readVInt();
+         final long numTerms = in.readVLong();
+@@ -155,11 +158,12 @@ public class BlockTermsReader extends FieldsProducer {
+         if (sumTotalTermFreq < sumDocFreq) { // #positions must be >= #postings
+           throw new CorruptIndexException("invalid sumTotalTermFreq: " + sumTotalTermFreq + " sumDocFreq: " + sumDocFreq, in);
+         }
+-        FieldReader previous = fields.put(fieldInfo.name, new FieldReader(fieldInfo, numTerms, termsStartPointer, sumTotalTermFreq, sumDocFreq, docCount, longsSize));
++        FieldReader previous = sortedFields.put(fieldInfo.name, new FieldReader(fieldInfo, numTerms, termsStartPointer, sumTotalTermFreq, sumDocFreq, docCount, longsSize));
+         if (previous != null) {
+           throw new CorruptIndexException("duplicate fields: " + fieldInfo.name, in);
+         }
+       }
++      fields = new LinkedHashMap<>(sortedFields);
+       success = true;
+     } finally {
+       if (!success) {
+@@ -169,13 +173,13 @@ public class BlockTermsReader extends FieldsProducer {
+ 
+     this.indexReader = indexReader;
+   }
+-  
++
+   private void seekDir(IndexInput input) throws IOException {
+     input.seek(input.length() - CodecUtil.footerLength() - 8);
+     long dirOffset = input.readLong();
+     input.seek(dirOffset);
+   }
+-  
++
+   @Override
+   public void close() throws IOException {
+     try {
+@@ -260,7 +264,7 @@ public class BlockTermsReader extends FieldsProducer {
+     public boolean hasPositions() {
+       return fieldInfo.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0;
+     }
+-    
++
+     @Override
+     public boolean hasPayloads() {
+       return fieldInfo.hasPayloads();
+@@ -358,7 +362,7 @@ public class BlockTermsReader extends FieldsProducer {
+         if (indexEnum == null) {
+           throw new IllegalStateException("terms index was not loaded");
+         }
+-   
++
+         //System.out.println("BTR.seek seg=" + segment + " target=" + fieldInfo.name + ":" + target.utf8ToString() + " " + target + " current=" + term().utf8ToString() + " " + term() + " indexIsCurrent=" + indexIsCurrent + " didIndexNext=" + didIndexNext + " seekPending=" + seekPending + " divisor=" + indexReader.getDivisor() + " this="  + this);
+         if (didIndexNext) {
+           if (nextIndexTerm == null) {
+@@ -473,7 +477,7 @@ public class BlockTermsReader extends FieldsProducer {
+                 termSuffixesReader.readBytes(term.bytes(), termBlockPrefix, suffix);
+               }
+               state.ord++;
+-              
++
+               if (!nextBlock()) {
+                 indexIsCurrent = false;
+                 return SeekStatus.END;
+@@ -504,7 +508,7 @@ public class BlockTermsReader extends FieldsProducer {
+             state.ord++;
+ 
+             final int suffix = termSuffixesReader.readVInt();
+-            
++
+             // We know the prefix matches, so just compare the new suffix:
+             final int termLen = termBlockPrefix + suffix;
+             int bytePos = termSuffixesReader.getPosition();
+@@ -676,7 +680,7 @@ public class BlockTermsReader extends FieldsProducer {
+         indexIsCurrent = false;
+         term.copyBytes(target);
+       }
+-      
++
+       @Override
+       public TermState termState() throws IOException {
+         //System.out.println("BTR.termState this=" + this);
+@@ -733,7 +737,7 @@ public class BlockTermsReader extends FieldsProducer {
+       /* Does initial decode of next block of terms; this
+          doesn't actually decode the docFreq, totalTermFreq,
+          postings details (frq/prx offset, etc.) metadata;
+-         it just loads them as byte[] blobs which are then      
++         it just loads them as byte[] blobs which are then
+          decoded on-demand if the metadata is ever requested
+          for any term in this block.  This enables terms-only
+          intensive consumes (eg certain MTQs, respelling) to
+@@ -792,7 +796,7 @@ public class BlockTermsReader extends FieldsProducer {
+ 
+         return true;
+       }
+-     
++
+       private void decodeMetaData() throws IOException {
+         //System.out.println("BTR.decodeMetadata mdUpto=" + metaDataUpto + " vs termCount=" + state.termBlockOrd + " state=" + state);
+         if (!seekPending) {
+@@ -851,7 +855,7 @@ public class BlockTermsReader extends FieldsProducer {
+     }
+     return ramBytesUsed;
+   }
+-  
++
+   @Override
+   public Collection<Accountable> getChildResources() {
+     List<Accountable> resources = new ArrayList<>();
+@@ -870,7 +874,7 @@ public class BlockTermsReader extends FieldsProducer {
+   }
+ 
+   @Override
+-  public void checkIntegrity() throws IOException {   
++  public void checkIntegrity() throws IOException {
+     // verify terms
+     CodecUtil.checksumEntireFile(in);
+ 
+diff --git a/lucene/codecs/src/java/org/apache/lucene/codecs/blocktreeords/OrdsBlockTreeTermsReader.java b/lucene/codecs/src/java/org/apache/lucene/codecs/blocktreeords/OrdsBlockTreeTermsReader.java
+index e07cee0..de30ec0 100644
+--- a/lucene/codecs/src/java/org/apache/lucene/codecs/blocktreeords/OrdsBlockTreeTermsReader.java
++++ b/lucene/codecs/src/java/org/apache/lucene/codecs/blocktreeords/OrdsBlockTreeTermsReader.java
+@@ -22,7 +22,9 @@ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.Iterator;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Map;
+ import java.util.TreeMap;
+ 
+ import org.apache.lucene.codecs.CodecUtil;
+@@ -58,15 +60,15 @@ public final class OrdsBlockTreeTermsReader extends FieldsProducer {
+   // produce DocsEnum on demand
+   final PostingsReaderBase postingsReader;
+ 
+-  private final TreeMap<String,OrdsFieldReader> fields = new TreeMap<>();
++  private final Map<String,OrdsFieldReader> fields;
+ 
+   /** Sole constructor. */
+   public OrdsBlockTreeTermsReader(PostingsReaderBase postingsReader, SegmentReadState state) throws IOException {
+-    
++
+     this.postingsReader = postingsReader;
+ 
+-    String termsFile = IndexFileNames.segmentFileName(state.segmentInfo.name, 
+-                                                      state.segmentSuffix, 
++    String termsFile = IndexFileNames.segmentFileName(state.segmentInfo.name,
++                                                      state.segmentSuffix,
+                                                       OrdsBlockTreeTermsWriter.TERMS_EXTENSION);
+     in = state.directory.openInput(termsFile, state.context);
+ 
+@@ -78,9 +80,9 @@ public final class OrdsBlockTreeTermsReader extends FieldsProducer {
+                                                      OrdsBlockTreeTermsWriter.VERSION_START,
+                                                      OrdsBlockTreeTermsWriter.VERSION_CURRENT,
+                                                      state.segmentInfo.getId(), state.segmentSuffix);
+-      
+-      String indexFile = IndexFileNames.segmentFileName(state.segmentInfo.name, 
+-                                                        state.segmentSuffix, 
++
++      String indexFile = IndexFileNames.segmentFileName(state.segmentInfo.name,
++                                                        state.segmentSuffix,
+                                                         OrdsBlockTreeTermsWriter.TERMS_INDEX_EXTENSION);
+       indexIn = state.directory.openInput(indexFile, state.context);
+       int indexVersion = CodecUtil.checkIndexHeader(indexIn, OrdsBlockTreeTermsWriter.TERMS_INDEX_CODEC_NAME,
+@@ -90,14 +92,14 @@ public final class OrdsBlockTreeTermsReader extends FieldsProducer {
+       if (indexVersion != version) {
+         throw new CorruptIndexException("mixmatched version files: " + in + "=" + version + "," + indexIn + "=" + indexVersion, indexIn);
+       }
+-      
++
+       // verify
+       CodecUtil.checksumEntireFile(indexIn);
+ 
+       // Have PostingsReader init itself
+       postingsReader.init(in, state);
+-      
+-      
++
++
+       // NOTE: data file is too costly to verify checksum against all the bytes on open,
+       // but for now we at least verify proper structure of the checksum footer: which looks
+       // for FOOTER_MAGIC + algorithmID. This is cheap and can detect some forms of corruption
+@@ -113,6 +115,7 @@ public final class OrdsBlockTreeTermsReader extends FieldsProducer {
+         throw new CorruptIndexException("invalid numFields: " + numFields, in);
+       }
+ 
++      final Map<String,OrdsFieldReader> sortedFields = new TreeMap<>();
+       for(int i=0;i<numFields;i++) {
+         final int field = in.readVInt();
+         final long numTerms = in.readVLong();
+@@ -145,13 +148,14 @@ public final class OrdsBlockTreeTermsReader extends FieldsProducer {
+           throw new CorruptIndexException("invalid sumTotalTermFreq: " + sumTotalTermFreq + " sumDocFreq: " + sumDocFreq, in);
+         }
+         final long indexStartFP = indexIn.readVLong();
+-        OrdsFieldReader previous = fields.put(fieldInfo.name,       
++        OrdsFieldReader previous = sortedFields.put(fieldInfo.name,
+                                               new OrdsFieldReader(this, fieldInfo, numTerms, rootCode, sumTotalTermFreq, sumDocFreq, docCount,
+                                                                   indexStartFP, longsSize, indexIn, minTerm, maxTerm));
+         if (previous != null) {
+           throw new CorruptIndexException("duplicate field: " + fieldInfo.name, in);
+         }
+       }
++      fields = new LinkedHashMap<>(sortedFields);
+       indexIn.close();
+ 
+       success = true;
+@@ -187,7 +191,7 @@ public final class OrdsBlockTreeTermsReader extends FieldsProducer {
+   public void close() throws IOException {
+     try {
+       IOUtils.close(in, postingsReader);
+-    } finally { 
++    } finally {
+       // Clear so refs to terms index is GCable even if
+       // app hangs onto us:
+       fields.clear();
+@@ -234,7 +238,7 @@ public final class OrdsBlockTreeTermsReader extends FieldsProducer {
+     }
+     return sizeInBytes;
+   }
+-  
++
+   @Override
+   public Collection<Accountable> getChildResources() {
+     List<Accountable> resources = new ArrayList<>();
+@@ -247,11 +251,11 @@ public final class OrdsBlockTreeTermsReader extends FieldsProducer {
+   public void checkIntegrity() throws IOException {
+     // term dictionary
+     CodecUtil.checksumEntireFile(in);
+-      
++
+     // postings
+     postingsReader.checkIntegrity();
+   }
+-  
++
+   @Override
+   public String toString() {
+     return getClass().getSimpleName() + "(fields=" + fields.size() + ",delegate=" + postingsReader.toString() + ")";
+diff --git a/lucene/codecs/src/java/org/apache/lucene/codecs/memory/DirectPostingsFormat.java b/lucene/codecs/src/java/org/apache/lucene/codecs/memory/DirectPostingsFormat.java
+index d9590e1..cef7d31 100644
+--- a/lucene/codecs/src/java/org/apache/lucene/codecs/memory/DirectPostingsFormat.java
++++ b/lucene/codecs/src/java/org/apache/lucene/codecs/memory/DirectPostingsFormat.java
+@@ -20,6 +20,7 @@ import java.io.IOException;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.Iterator;
++import java.util.LinkedHashMap;
+ import java.util.Map;
+ import java.util.TreeMap;
+ 
+@@ -125,12 +126,14 @@ public final class DirectPostingsFormat extends PostingsFormat {
+   }
+ 
+   private static final class DirectFields extends FieldsProducer {
+-    private final Map<String,DirectField> fields = new TreeMap<>();
++    private final Map<String,DirectField> fields;
+ 
+     public DirectFields(SegmentReadState state, Fields fields, int minSkipCount, int lowFreqCutoff) throws IOException {
++      final Map<String,DirectField> sortedFields = new TreeMap<>();
+       for (String field : fields) {
+-        this.fields.put(field, new DirectField(state, field, fields.terms(field), minSkipCount, lowFreqCutoff));
++        sortedFields.put(field, new DirectField(state, field, fields.terms(field), minSkipCount, lowFreqCutoff));
+       }
++      this.fields = new LinkedHashMap<>(sortedFields);
+     }
+ 
+     @Override
+@@ -857,7 +860,7 @@ public final class DirectPostingsFormat extends PostingsFormat {
+               }
+ 
+               return docsEnum.reset(postings);
+-              
++
+             } else if (hasPos == false) {
+               LowFreqDocsEnumNoPos docsEnum;
+               if (reuse instanceof LowFreqDocsEnumNoPos) {
+@@ -1508,7 +1511,7 @@ public final class DirectPostingsFormat extends PostingsFormat {
+       public void seekExact(long ord) {
+         throw new UnsupportedOperationException();
+       }
+-      
++
+     }
+   }
+ 
+diff --git a/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTOrdTermsReader.java b/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTOrdTermsReader.java
+index 12110d9..ddd13ee 100644
+--- a/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTOrdTermsReader.java
++++ b/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTOrdTermsReader.java
+@@ -23,7 +23,9 @@ import java.util.BitSet;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.Iterator;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Map;
+ import java.util.TreeMap;
+ 
+ import org.apache.lucene.codecs.BlockTermState;
+@@ -61,10 +63,10 @@ import org.apache.lucene.util.fst.Outputs;
+ import org.apache.lucene.util.fst.PositiveIntOutputs;
+ import org.apache.lucene.util.fst.Util;
+ 
+-/** 
++/**
+  * FST-based terms dictionary reader.
+  *
+- * The FST index maps each term and its ord, and during seek 
++ * The FST index maps each term and its ord, and during seek
+  * the ord is used fetch metadata from a single block.
+  * The term dictionary is fully memory resident.
+  *
+@@ -72,7 +74,7 @@ import org.apache.lucene.util.fst.Util;
+  */
+ public class FSTOrdTermsReader extends FieldsProducer {
+   static final int INTERVAL = FSTOrdTermsWriter.SKIP_INTERVAL;
+-  final TreeMap<String, TermsReader> fields = new TreeMap<>();
++  final Map<String, TermsReader> fields;
+   final PostingsReaderBase postingsReader;
+   //static final boolean TEST = false;
+ 
+@@ -87,26 +89,27 @@ public class FSTOrdTermsReader extends FieldsProducer {
+     try {
+       indexIn = state.directory.openChecksumInput(termsIndexFileName, state.context);
+       blockIn = state.directory.openInput(termsBlockFileName, state.context);
+-      int version = CodecUtil.checkIndexHeader(indexIn, FSTOrdTermsWriter.TERMS_INDEX_CODEC_NAME, 
+-                                                          FSTOrdTermsWriter.VERSION_START, 
+-                                                          FSTOrdTermsWriter.VERSION_CURRENT, 
++      int version = CodecUtil.checkIndexHeader(indexIn, FSTOrdTermsWriter.TERMS_INDEX_CODEC_NAME,
++                                                          FSTOrdTermsWriter.VERSION_START,
++                                                          FSTOrdTermsWriter.VERSION_CURRENT,
+                                                           state.segmentInfo.getId(), state.segmentSuffix);
+-      int version2 = CodecUtil.checkIndexHeader(blockIn, FSTOrdTermsWriter.TERMS_CODEC_NAME, 
+-                                                           FSTOrdTermsWriter.VERSION_START, 
+-                                                           FSTOrdTermsWriter.VERSION_CURRENT, 
++      int version2 = CodecUtil.checkIndexHeader(blockIn, FSTOrdTermsWriter.TERMS_CODEC_NAME,
++                                                           FSTOrdTermsWriter.VERSION_START,
++                                                           FSTOrdTermsWriter.VERSION_CURRENT,
+                                                            state.segmentInfo.getId(), state.segmentSuffix);
+-      
++
+       if (version != version2) {
+         throw new CorruptIndexException("Format versions mismatch: index=" + version + ", terms=" + version2, blockIn);
+       }
+ 
+       CodecUtil.checksumEntireFile(blockIn);
+-      
++
+       this.postingsReader.init(blockIn, state);
+       seekDir(blockIn);
+ 
+       final FieldInfos fieldInfos = state.fieldInfos;
+       final int numFields = blockIn.readVInt();
++      final Map<String,TermsReader> sortedFields = new TreeMap<>();
+       for (int i = 0; i < numFields; i++) {
+         FieldInfo fieldInfo = fieldInfos.fieldInfo(blockIn.readVInt());
+         boolean hasFreq = fieldInfo.getIndexOptions() != IndexOptions.DOCS;
+@@ -119,9 +122,10 @@ public class FSTOrdTermsReader extends FieldsProducer {
+         FST<Long> index = new FST<>(indexIn, PositiveIntOutputs.getSingleton());
+ 
+         TermsReader current = new TermsReader(fieldInfo, blockIn, numTerms, sumTotalTermFreq, sumDocFreq, docCount, longsSize, index);
+-        TermsReader previous = fields.put(fieldInfo.name, current);
++        TermsReader previous = sortedFields.put(fieldInfo.name, current);
+         checkFieldSummary(state.segmentInfo, indexIn, blockIn, current, previous);
+       }
++      fields = new LinkedHashMap<>(sortedFields);
+       CodecUtil.checkFooter(indexIn);
+       success = true;
+     } finally {
+@@ -298,7 +302,7 @@ public class FSTOrdTermsReader extends FieldsProducer {
+         return Collections.singletonList(Accountables.namedAccountable("terms", index));
+       }
+     }
+-    
++
+     @Override
+     public String toString() {
+       return "FSTOrdTerms(terms=" + numTerms + ",postings=" + sumDocFreq + ",positions=" + sumTotalTermFreq + ",docs=" + docCount + ")";
+@@ -318,7 +322,7 @@ public class FSTOrdTermsReader extends FieldsProducer {
+       final ByteArrayDataInput metaLongsReader = new ByteArrayDataInput();
+       final ByteArrayDataInput metaBytesReader = new ByteArrayDataInput();
+ 
+-      /* To which block is buffered */ 
++      /* To which block is buffered */
+       int statsBlockOrd;
+       int metaBlockOrd;
+ 
+@@ -400,7 +404,7 @@ public class FSTOrdTermsReader extends FieldsProducer {
+         for (int j = 0; j < longsSize; j++) {
+           longs[0][j] = skipInfo[offset + 3 + j] + metaLongsReader.readVLong();
+         }
+-        bytesStart[0] = metaBytesFP; 
++        bytesStart[0] = metaBytesFP;
+         bytesLength[0] = (int)metaLongsReader.readVLong();
+         for (int i = 1; i < INTERVAL && !metaLongsReader.eof(); i++) {
+           for (int j = 0; j < longsSize; j++) {
+@@ -544,7 +548,7 @@ public class FSTOrdTermsReader extends FieldsProducer {
+       /* True when there is pending term when calling next() */
+       boolean pending;
+ 
+-      /* stack to record how current term is constructed, 
++      /* stack to record how current term is constructed,
+        * used to accumulate metadata or rewind term:
+        *   level == term.length + 1,
+        *         == 0 when term is null */
+@@ -649,15 +653,15 @@ public class FSTOrdTermsReader extends FieldsProducer {
+               break;
+             }
+             continue;  // check next target
+-          } 
++          }
+           frame = popFrame();
+           while(level > 0) {
+-            if (loadNextFrame(topFrame(), frame) != null) {  // has valid sibling 
++            if (loadNextFrame(topFrame(), frame) != null) {  // has valid sibling
+               pushFrame(frame);
+               if (isAccept(frame)) {  // gotcha
+                 break DFS;
+               }
+-              continue DFS;   // check next target 
++              continue DFS;   // check next target
+             }
+             frame = popFrame();
+           }
+@@ -750,7 +754,7 @@ public class FSTOrdTermsReader extends FieldsProducer {
+         return frame;
+       }
+ 
+-      /** Load frame for target arc(node) on fst, so that 
++      /** Load frame for target arc(node) on fst, so that
+        *  arc.label &gt;= label and !fsa.reject(arc.label) */
+       Frame loadCeilFrame(int label, Frame top, Frame frame) throws IOException {
+         FST.Arc<Long> arc = frame.arc;
+@@ -852,7 +856,7 @@ public class FSTOrdTermsReader extends FieldsProducer {
+       }
+     }
+   }
+-  
++
+   @Override
+   public long ramBytesUsed() {
+     long ramBytesUsed = postingsReader.ramBytesUsed();
+@@ -861,7 +865,7 @@ public class FSTOrdTermsReader extends FieldsProducer {
+     }
+     return ramBytesUsed;
+   }
+-  
++
+   @Override
+   public Collection<Accountable> getChildResources() {
+     List<Accountable> resources = new ArrayList<>();
+@@ -869,7 +873,7 @@ public class FSTOrdTermsReader extends FieldsProducer {
+     resources.add(Accountables.namedAccountable("delegate", postingsReader));
+     return Collections.unmodifiableList(resources);
+   }
+-  
++
+   @Override
+   public String toString() {
+     return getClass().getSimpleName() + "(fields=" + fields.size() + ",delegate=" + postingsReader + ")";
+diff --git a/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTTermsReader.java b/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTTermsReader.java
+index 43528ce..625768f 100644
+--- a/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTTermsReader.java
++++ b/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTTermsReader.java
+@@ -23,7 +23,9 @@ import java.util.BitSet;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.Iterator;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Map;
+ import java.util.TreeMap;
+ 
+ import org.apache.lucene.codecs.BlockTermState;
+@@ -62,14 +64,14 @@ import org.apache.lucene.util.fst.Util;
+ /**
+  * FST-based terms dictionary reader.
+  *
+- * The FST directly maps each term and its metadata, 
++ * The FST directly maps each term and its metadata,
+  * it is memory resident.
+  *
+  * @lucene.experimental
+  */
+ 
+ public class FSTTermsReader extends FieldsProducer {
+-  final TreeMap<String, TermsReader> fields = new TreeMap<>();
++  final Map<String, TermsReader> fields;
+   final PostingsReaderBase postingsReader;
+   //static boolean TEST = false;
+ 
+@@ -91,6 +93,7 @@ public class FSTTermsReader extends FieldsProducer {
+ 
+       final FieldInfos fieldInfos = state.fieldInfos;
+       final int numFields = in.readVInt();
++      final Map<String, TermsReader> sortedFields = new TreeMap<>();
+       for (int i = 0; i < numFields; i++) {
+         int fieldNumber = in.readVInt();
+         FieldInfo fieldInfo = fieldInfos.fieldInfo(fieldNumber);
+@@ -101,9 +104,10 @@ public class FSTTermsReader extends FieldsProducer {
+         int docCount = in.readVInt();
+         int longsSize = in.readVInt();
+         TermsReader current = new TermsReader(fieldInfo, in, numTerms, sumTotalTermFreq, sumDocFreq, docCount, longsSize);
+-        TermsReader previous = fields.put(fieldInfo.name, current);
++        TermsReader previous = sortedFields.put(fieldInfo.name, current);
+         checkFieldSummary(state.segmentInfo, in, current, previous);
+       }
++      fields = new LinkedHashMap<>(sortedFields);
+       success = true;
+     } finally {
+       if (success) {
+@@ -199,7 +203,7 @@ public class FSTTermsReader extends FieldsProducer {
+         return Collections.singletonList(Accountables.namedAccountable("terms", dict));
+       }
+     }
+-    
++
+     @Override
+     public String toString() {
+       return "FSTTerms(terms=" + numTerms + ",postings=" + sumDocFreq + ",positions=" + sumTotalTermFreq + ",docs=" + docCount + ")";
+@@ -415,14 +419,14 @@ public class FSTTermsReader extends FieldsProducer {
+       /* True when there is pending term when calling next() */
+       boolean pending;
+ 
+-      /* stack to record how current term is constructed, 
++      /* stack to record how current term is constructed,
+        * used to accumulate metadata or rewind term:
+        *   level == term.length + 1,
+        *         == 0 when term is null */
+       Frame[] stack;
+       int level;
+ 
+-      /* to which level the metadata is accumulated 
++      /* to which level the metadata is accumulated
+        * so that we can accumulate metadata lazily */
+       int metaUpto;
+ 
+@@ -549,15 +553,15 @@ public class FSTTermsReader extends FieldsProducer {
+               break;
+             }
+             continue;  // check next target
+-          } 
++          }
+           frame = popFrame();
+           while(level > 0) {
+-            if (loadNextFrame(topFrame(), frame) != null) {  // has valid sibling 
++            if (loadNextFrame(topFrame(), frame) != null) {  // has valid sibling
+               pushFrame(frame);
+               if (isAccept(frame)) {  // gotcha
+                 break DFS;
+               }
+-              continue DFS;   // check next target 
++              continue DFS;   // check next target
+             }
+             frame = popFrame();
+           }
+@@ -650,7 +654,7 @@ public class FSTTermsReader extends FieldsProducer {
+         return frame;
+       }
+ 
+-      /** Load frame for target arc(node) on fst, so that 
++      /** Load frame for target arc(node) on fst, so that
+        *  arc.label &gt;= label and !fsa.reject(arc.label) */
+       Frame loadCeilFrame(int label, Frame top, Frame frame) throws IOException {
+         FST.Arc<FSTTermOutputs.TermData> arc = frame.fstArc;
+@@ -762,7 +766,7 @@ public class FSTTermsReader extends FieldsProducer {
+     }
+     return ramBytesUsed;
+   }
+-  
++
+   @Override
+   public Collection<Accountable> getChildResources() {
+     List<Accountable> resources = new ArrayList<>();
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/blocktree/BlockTreeTermsReader.java b/lucene/core/src/java/org/apache/lucene/codecs/blocktree/BlockTreeTermsReader.java
+index 0e9fe6b..7aaffe8 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/blocktree/BlockTreeTermsReader.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/blocktree/BlockTreeTermsReader.java
+@@ -23,6 +23,7 @@ import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.Iterator;
++import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.TreeMap;
+@@ -110,7 +111,7 @@ public final class BlockTreeTermsReader extends FieldsProducer {
+   public static final String FST_MODE_KEY = "blocktree.terms.fst";
+ 
+   static final Outputs<BytesRef> FST_OUTPUTS = ByteSequenceOutputs.getSingleton();
+-  
++
+   static final BytesRef NO_OUTPUT = FST_OUTPUTS.getNoOutput();
+ 
+   static final int OUTPUT_FLAGS_NUM_BITS = 2;
+@@ -146,19 +147,19 @@ public final class BlockTreeTermsReader extends FieldsProducer {
+   // produce DocsEnum on demand
+   final PostingsReaderBase postingsReader;
+ 
+-  private final TreeMap<String,FieldReader> fields = new TreeMap<>();
++  private final Map<String,FieldReader> fields;
+ 
+   final String segment;
+-  
++
+   final int version;
+ 
+   /** Sole constructor. */
+   public BlockTreeTermsReader(PostingsReaderBase postingsReader, SegmentReadState state, FSTLoadMode defaultLoadMode) throws IOException {
+     boolean success = false;
+-    
++
+     this.postingsReader = postingsReader;
+     this.segment = state.segmentInfo.name;
+-    
++
+     String termsName = IndexFileNames.segmentFileName(segment, state.segmentSuffix, TERMS_EXTENSION);
+     try {
+       termsIn = state.directory.openInput(termsName, state.context);
+@@ -179,7 +180,7 @@ public final class BlockTreeTermsReader extends FieldsProducer {
+ 
+       // Have PostingsReader init itself
+       postingsReader.init(termsIn, state);
+-      
++
+       // NOTE: data file is too costly to verify checksum against all the bytes on open,
+       // but for now we at least verify proper structure of the checksum footer: which looks
+       // for FOOTER_MAGIC + algorithmID. This is cheap and can detect some forms of corruption
+@@ -195,6 +196,7 @@ public final class BlockTreeTermsReader extends FieldsProducer {
+       if (numFields < 0) {
+         throw new CorruptIndexException("invalid numFields: " + numFields, termsIn);
+       }
++      final Map<String,FieldReader> sortedFields = new TreeMap<>();
+       for (int i = 0; i < numFields; ++i) {
+         final int field = termsIn.readVInt();
+         final long numTerms = termsIn.readVLong();
+@@ -227,13 +229,14 @@ public final class BlockTreeTermsReader extends FieldsProducer {
+         }
+         final FSTLoadMode perFieldLoadMode = getLoadMode(state.readerAttributes, FST_MODE_KEY + "." + fieldInfo.name, fstLoadMode);
+         final long indexStartFP = indexIn.readVLong();
+-        FieldReader previous = fields.put(fieldInfo.name,
++        FieldReader previous = sortedFields.put(fieldInfo.name,
+                                           new FieldReader(this, fieldInfo, numTerms, rootCode, sumTotalTermFreq, sumDocFreq, docCount,
+                                                           indexStartFP, longsSize, indexIn, minTerm, maxTerm, state.openedFromWriter, perFieldLoadMode));
+         if (previous != null) {
+           throw new CorruptIndexException("duplicate field: " + fieldInfo.name, termsIn);
+         }
+       }
++      fields = new LinkedHashMap<>(sortedFields);
+       success = true;
+     } finally {
+       if (!success) {
+@@ -261,7 +264,7 @@ public final class BlockTreeTermsReader extends FieldsProducer {
+     if (numBytes < 0) {
+       throw new CorruptIndexException("invalid bytes length: " + numBytes, in);
+     }
+-    
++
+     BytesRef bytes = new BytesRef();
+     bytes.length = numBytes;
+     bytes.bytes = new byte[numBytes];
+@@ -286,7 +289,7 @@ public final class BlockTreeTermsReader extends FieldsProducer {
+   public void close() throws IOException {
+     try {
+       IOUtils.close(indexIn, termsIn, postingsReader);
+-    } finally { 
++    } finally {
+       // Clear so refs to terms index is GCable even if
+       // app hangs onto us:
+       fields.clear();
+@@ -343,10 +346,10 @@ public final class BlockTreeTermsReader extends FieldsProducer {
+   }
+ 
+   @Override
+-  public void checkIntegrity() throws IOException { 
++  public void checkIntegrity() throws IOException {
+     // term dictionary
+     CodecUtil.checksumEntireFile(termsIn);
+-      
++
+     // postings
+     postingsReader.checkIntegrity();
+   }
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/perfield/PerFieldPostingsFormat.java b/lucene/core/src/java/org/apache/lucene/codecs/perfield/PerFieldPostingsFormat.java
+index 81bbf72..1b6f7ca 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/perfield/PerFieldPostingsFormat.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/perfield/PerFieldPostingsFormat.java
+@@ -26,6 +26,7 @@ import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.IdentityHashMap;
+ import java.util.Iterator;
++import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.ServiceLoader;
+@@ -54,14 +55,14 @@ import org.apache.lucene.util.RamUsageEstimator;
+ /**
+  * Enables per field postings support.
+  * <p>
+- * Note, when extending this class, the name ({@link #getName}) is 
++ * Note, when extending this class, the name ({@link #getName}) is
+  * written into the index. In order for the field to be read, the
+  * name must resolve to your implementation via {@link #forName(String)}.
+- * This method uses Java's 
++ * This method uses Java's
+  * {@link ServiceLoader Service Provider Interface} to resolve format names.
+  * <p>
+- * Files written by each posting format have an additional suffix containing the 
+- * format name. For example, in a per-field configuration instead of <tt>_1.prx</tt> 
++ * Files written by each posting format have an additional suffix containing the
++ * format name. For example, in a per-field configuration instead of <tt>_1.prx</tt>
+  * filenames would look like <tt>_1_Lucene40_0.prx</tt>.
+  * @see ServiceLoader
+  * @lucene.experimental
+@@ -109,7 +110,7 @@ public abstract class PerFieldPostingsFormat extends PostingsFormat {
+       throw new IllegalStateException("cannot embed PerFieldPostingsFormat inside itself (field \"" + fieldName + "\" returned PerFieldPostingsFormat)");
+     }
+   }
+-  
++
+   private class FieldsWriter extends FieldsConsumer {
+     final SegmentWriteState writeState;
+     final List<Closeable> toClose = new ArrayList<Closeable>();
+@@ -242,10 +243,10 @@ public abstract class PerFieldPostingsFormat extends PostingsFormat {
+ 
+     private static final long BASE_RAM_BYTES_USED = RamUsageEstimator.shallowSizeOfInstance(FieldsReader.class);
+ 
+-    private final Map<String,FieldsProducer> fields = new TreeMap<>();
++    private final Map<String,FieldsProducer> fields;
+     private final Map<String,FieldsProducer> formats = new HashMap<>();
+     private final String segment;
+-    
++
+     // clone for merge
+     FieldsReader(FieldsReader other) {
+       Map<FieldsProducer,FieldsProducer> oldToNew = new IdentityHashMap<>();
+@@ -257,6 +258,7 @@ public abstract class PerFieldPostingsFormat extends PostingsFormat {
+       }
+ 
+       // Then rebuild fields:
++      fields = new LinkedHashMap<>();
+       for(Map.Entry<String,FieldsProducer> ent : other.fields.entrySet()) {
+         FieldsProducer producer = oldToNew.get(ent.getValue());
+         assert producer != null;
+@@ -272,6 +274,7 @@ public abstract class PerFieldPostingsFormat extends PostingsFormat {
+       boolean success = false;
+       try {
+         // Read field name -> format name
++        final Map<String,FieldsProducer> sortedFields = new TreeMap<>();
+         for (FieldInfo fi : readState.fieldInfos) {
+           if (fi.getIndexOptions() != IndexOptions.NONE) {
+             final String fieldName = fi.name;
+@@ -287,10 +290,11 @@ public abstract class PerFieldPostingsFormat extends PostingsFormat {
+               if (!formats.containsKey(segmentSuffix)) {
+                 formats.put(segmentSuffix, format.fieldsProducer(new SegmentReadState(readState, segmentSuffix)));
+               }
+-              fields.put(fieldName, formats.get(segmentSuffix));
++              sortedFields.put(fieldName, formats.get(segmentSuffix));
+             }
+           }
+         }
++        fields = new LinkedHashMap<>(sortedFields);
+         success = true;
+       } finally {
+         if (!success) {
+@@ -311,7 +315,7 @@ public abstract class PerFieldPostingsFormat extends PostingsFormat {
+       FieldsProducer fieldsProducer = fields.get(field);
+       return fieldsProducer == null ? null : fieldsProducer.terms(field);
+     }
+-    
++
+     @Override
+     public int size() {
+       return fields.size();
+@@ -332,7 +336,7 @@ public abstract class PerFieldPostingsFormat extends PostingsFormat {
+       }
+       return ramBytesUsed;
+     }
+-    
++
+     @Override
+     public Collection<Accountable> getChildResources() {
+       return Accountables.namedAccountables("format", formats);
+@@ -368,8 +372,8 @@ public abstract class PerFieldPostingsFormat extends PostingsFormat {
+     return new FieldsReader(state);
+   }
+ 
+-  /** 
+-   * Returns the postings format that should be used for writing 
++  /**
++   * Returns the postings format that should be used for writing
+    * new segments of <code>field</code>.
+    * <p>
+    * The field to format mapping is written to the index, so
+-- 
+2.9.0
+

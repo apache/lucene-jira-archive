@@ -1,0 +1,659 @@
+diff --git a/lucene/core/src/java/org/apache/lucene/index/PendingSoftDeletes.java b/lucene/core/src/java/org/apache/lucene/index/PendingSoftDeletes.java
+index 1f6c2ef258..b73ac837bf 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/PendingSoftDeletes.java
++++ b/lucene/core/src/java/org/apache/lucene/index/PendingSoftDeletes.java
+@@ -73,7 +73,7 @@ final class PendingSoftDeletes extends PendingDeletes {
+         this.pendingDeleteCount = 0;
+       } else {
+         assert info.info.maxDoc() > 0 : "maxDoc is 0";
+-        applyUpdates(iterator);
++        pendingDeleteCount += applySoftDeletes(iterator, getMutableBits());
+       }
+       dvGeneration = info.getDocValuesGen();
+     }
+@@ -94,19 +94,26 @@ final class PendingSoftDeletes extends PendingDeletes {
+     hardDeletes.reset();
+   }
+ 
+-  private void applyUpdates(DocIdSetIterator iterator) throws IOException {
+-    final MutableBits mutableBits = getMutableBits();
++  /**
++   * Clears all bits in the given bitset that are set and are also in the given DocIdSetIterator.
++   *
++   * @param iterator the doc ID set iterator for apply
++   * @param bits the bit set to apply the deletes to
++   * @return the number of bits changed by this function
++   */
++  static int applySoftDeletes(DocIdSetIterator iterator, MutableBits bits) throws IOException {
++    assert iterator != null;
+     int newDeletes = 0;
+     int docID;
+     while ((docID = iterator.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+-      if (mutableBits.get(docID)) { // doc is live - clear it
+-        mutableBits.clear(docID);
++      if (bits.get(docID)) { // doc is live - clear it
++        bits.clear(docID);
+         newDeletes++;
+         // now that we know we deleted it and we fully control the hard deletes we can do correct accounting
+         // below.
+       }
+     }
+-    pendingDeleteCount += newDeletes;
++    return newDeletes;
+   }
+ 
+   @Override
+@@ -118,7 +125,7 @@ final class PendingSoftDeletes extends PendingDeletes {
+         subs[i] = updatesToApply.get(i).iterator();
+       }
+       DocValuesFieldUpdates.Iterator iterator = DocValuesFieldUpdates.mergedIterator(subs);
+-      applyUpdates(new DocIdSetIterator() {
++      pendingDeleteCount += applySoftDeletes(new DocIdSetIterator() {
+         int docID = -1;
+         @Override
+         public int docID() {
+@@ -139,7 +146,7 @@ final class PendingSoftDeletes extends PendingDeletes {
+         public long cost() {
+           throw new UnsupportedOperationException();
+         }
+-      });
++      }, getMutableBits());
+       dvGeneration = info.getDocValuesGen();
+     }
+   }
+diff --git a/lucene/core/src/java/org/apache/lucene/index/SoftDeletesDirectoryReaderWrapper.java b/lucene/core/src/java/org/apache/lucene/index/SoftDeletesDirectoryReaderWrapper.java
+new file mode 100644
+index 0000000000..36568f6d5f
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/index/SoftDeletesDirectoryReaderWrapper.java
+@@ -0,0 +1,177 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.lucene.index;
++
++import java.io.IOException;
++import java.io.UncheckedIOException;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.Objects;
++
++import org.apache.lucene.document.Field;
++import org.apache.lucene.search.DocIdSetIterator;
++import org.apache.lucene.search.DocValuesFieldExistsQuery;
++import org.apache.lucene.util.Bits;
++import org.apache.lucene.util.FixedBitSet;
++
++/**
++ * This reader filters out documents that have a doc values value in the given field and treat these
++ * documents as soft deleted. Hard deleted documents will also be filtered out in the life docs of this reader.
++ * @see IndexWriterConfig#setSoftDeletesField(String)
++ * @see IndexWriter#softUpdateDocument(Term, Iterable, Field...)
++ * @see SoftDeletesRetentionMergePolicy
++ */
++public final class SoftDeletesDirectoryReaderWrapper extends FilterDirectoryReader {
++  private final String field;
++  private final CacheHelper readerCacheHelper;
++  /**
++   * Creates a new soft deletes wrapper.
++   * @param in the incoming directory reader
++   * @param field the soft deletes field
++   */
++  public SoftDeletesDirectoryReaderWrapper(DirectoryReader in, String field) throws IOException {
++    this(in, new SoftDeletesSubReaderWrapper(Collections.emptyMap(), field));
++  }
++
++  private SoftDeletesDirectoryReaderWrapper(DirectoryReader in, SoftDeletesSubReaderWrapper wrapper) throws IOException {
++    super(in, wrapper);
++    this.field = wrapper.field;
++    readerCacheHelper = in.getReaderCacheHelper() == null ? null : new DelegatingCacheHelper(in.getReaderCacheHelper());
++  }
++
++  @Override
++  protected DirectoryReader doWrapDirectoryReader(DirectoryReader in) throws IOException {
++    Map<CacheKey, LeafReader> readerCache = new HashMap<>();
++    for (LeafReader reader : getSequentialSubReaders()) {
++      // we try to reuse the life docs instances here if the reader cache key didn't change
++      if (reader instanceof SoftDeletesFilterLeafReader && reader.getReaderCacheHelper() != null) {
++        readerCache.put(((SoftDeletesFilterLeafReader) reader).reader.getReaderCacheHelper().getKey(), reader);
++      }
++
++    }
++    return new SoftDeletesDirectoryReaderWrapper(in, new SoftDeletesSubReaderWrapper(readerCache, field));
++  }
++
++  @Override
++  public CacheHelper getReaderCacheHelper() {
++    return readerCacheHelper;
++  }
++
++  private static class SoftDeletesSubReaderWrapper extends SubReaderWrapper {
++    private final Map<CacheKey, LeafReader> mapping;
++    private final String field;
++
++    public SoftDeletesSubReaderWrapper(Map<CacheKey, LeafReader> oldReadersCache, String field) {
++      Objects.requireNonNull(field, "Field must not be null");
++      assert oldReadersCache != null;
++      this.mapping = oldReadersCache;
++      this.field = field;
++    }
++
++    @Override
++    public LeafReader wrap(LeafReader reader) {
++      CacheHelper readerCacheHelper = reader.getReaderCacheHelper();
++      if (readerCacheHelper != null && mapping.containsKey(readerCacheHelper.getKey())) {
++        // if the reader cache helper didn't change and we have it in the cache don't bother creating a new one
++        return mapping.get(readerCacheHelper.getKey());
++      }
++      try {
++        return SoftDeletesDirectoryReaderWrapper.wrap(reader, field);
++      } catch (IOException e) {
++        throw new UncheckedIOException(e);
++      }
++    }
++  }
++
++  static LeafReader wrap(LeafReader reader, String field) throws IOException {
++      DocIdSetIterator iterator = DocValuesFieldExistsQuery.getDocValuesDocIdSetIterator(field, reader);
++      if (iterator == null) {
++        return reader;
++      }
++      Bits liveDocs = reader.getLiveDocs();
++      final FixedBitSet bits;
++      if (liveDocs != null) {
++        bits = SoftDeletesRetentionMergePolicy.cloneLiveDocs(liveDocs);
++      } else {
++        bits = new FixedBitSet(reader.maxDoc());
++        bits.set(0, reader.maxDoc());
++      }
++      int numDeletes = reader.numDeletedDocs() + PendingSoftDeletes.applySoftDeletes(iterator, bits);
++      int numDocs = reader.maxDoc() - numDeletes;
++      return new SoftDeletesFilterLeafReader(reader, bits, numDocs);
++  }
++
++  static final class SoftDeletesFilterLeafReader extends FilterLeafReader {
++    private final LeafReader reader;
++    private final FixedBitSet bits;
++    private final int numDocs;
++    private final CacheHelper readerCacheHelper;
++
++    private SoftDeletesFilterLeafReader(LeafReader reader, FixedBitSet bits, int numDocs) {
++      super(reader);
++      this.reader = reader;
++      this.bits = bits;
++      this.numDocs = numDocs;
++      this.readerCacheHelper = reader.getReaderCacheHelper() == null ? null :
++          new DelegatingCacheHelper(reader.getReaderCacheHelper());
++    }
++
++    @Override
++    public Bits getLiveDocs() {
++      return bits;
++    }
++
++    @Override
++    public int numDocs() {
++      return numDocs;
++    }
++
++    @Override
++    public CacheHelper getCoreCacheHelper() {
++      return reader.getCoreCacheHelper();
++    }
++
++    @Override
++    public CacheHelper getReaderCacheHelper() {
++      return readerCacheHelper;
++    }
++  }
++
++  private static class DelegatingCacheHelper implements CacheHelper {
++    private final CacheHelper delegate;
++    private final CacheKey cacheKey = new CacheKey();
++
++    public DelegatingCacheHelper(CacheHelper delegate) {
++      this.delegate = delegate;
++    }
++
++    @Override
++    public CacheKey getKey() {
++      return cacheKey;
++    }
++
++    @Override
++    public void addClosedListener(ClosedListener listener) {
++      // here we wrap the listener and call it with our cache key
++      // this is important since this key will be used to cache the reader and otherwise we won't free caches etc.
++      delegate.addClosedListener(unused -> listener.onClose(cacheKey));
++    }
++  }
++}
++
+diff --git a/lucene/core/src/java/org/apache/lucene/index/SoftDeletesRetentionMergePolicy.java b/lucene/core/src/java/org/apache/lucene/index/SoftDeletesRetentionMergePolicy.java
+index debe7d7cd4..b0887557be 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/SoftDeletesRetentionMergePolicy.java
++++ b/lucene/core/src/java/org/apache/lucene/index/SoftDeletesRetentionMergePolicy.java
+@@ -99,32 +99,39 @@ public final class SoftDeletesRetentionMergePolicy extends OneMergeWrappingMerge
+     }, reader.maxDoc() - reader.numDocs());
+     Scorer scorer = getScorer(softDeleteField, retentionQuery, wrappedReader);
+     if (scorer != null) {
+-      FixedBitSet mutableBits;
+-      if (liveDocs instanceof FixedBitSet) {
+-        mutableBits = ((FixedBitSet) liveDocs).clone();
+-      } else { // mainly if we have asserting codec
+-        mutableBits = new FixedBitSet(liveDocs.length());
+-        for (int i = 0; i < liveDocs.length(); i++) {
+-          if (liveDocs.get(i)) {
+-            mutableBits.set(i);
+-          }
+-        }
+-      }
++      FixedBitSet cloneLiveDocs = cloneLiveDocs(liveDocs);
+       DocIdSetIterator iterator = scorer.iterator();
+       int numExtraLiveDocs = 0;
+       while (iterator.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
+-        if (mutableBits.getAndSet(iterator.docID()) == false) {
++        if (cloneLiveDocs.getAndSet(iterator.docID()) == false) {
+           // if we bring one back to live we need to account for it
+           numExtraLiveDocs++;
+         }
+       }
+       assert reader.numDocs() + numExtraLiveDocs <= reader.maxDoc() : "numDocs: " + reader.numDocs() + " numExtraLiveDocs: " + numExtraLiveDocs + " maxDoc: " + reader.maxDoc();
+-      return wrapLiveDocs(reader, mutableBits, reader.numDocs() + numExtraLiveDocs);
++      return wrapLiveDocs(reader, cloneLiveDocs, reader.numDocs() + numExtraLiveDocs);
+     } else {
+       return reader;
+     }
+   }
+ 
++  /**
++   * Clones the given live docs
++   */
++  static FixedBitSet cloneLiveDocs(Bits liveDocs) {
++    if (liveDocs instanceof FixedBitSet) {
++      return ((FixedBitSet) liveDocs).clone();
++    } else { // mainly if we have asserting codec
++      FixedBitSet mutableBits = new FixedBitSet(liveDocs.length());
++      for (int i = 0; i < liveDocs.length(); i++) {
++        if (liveDocs.get(i)) {
++          mutableBits.set(i);
++        }
++      }
++      return mutableBits;
++    }
++  }
++
+   private static Scorer getScorer(String softDeleteField, Query retentionQuery, CodecReader reader) throws IOException {
+     BooleanQuery.Builder builder = new BooleanQuery.Builder();
+     builder.add(new DocValuesFieldExistsQuery(softDeleteField), BooleanClause.Occur.FILTER);
+diff --git a/lucene/core/src/java/org/apache/lucene/index/StandardDirectoryReader.java b/lucene/core/src/java/org/apache/lucene/index/StandardDirectoryReader.java
+index 23fbb0473b..488ccaf870 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/StandardDirectoryReader.java
++++ b/lucene/core/src/java/org/apache/lucene/index/StandardDirectoryReader.java
+@@ -197,7 +197,7 @@ public final class StandardDirectoryReader extends DirectoryReader {
+ 
+               if (oldReader.getSegmentInfo().getDelGen() == commitInfo.getDelGen()) {
+                 // only DV updates
+-                newReaders[i] = new SegmentReader(commitInfo, oldReader, oldReader.getLiveDocs(), oldReader.numDocs());
++                newReaders[i] = new SegmentReader(commitInfo, oldReader, oldReader.getLiveDocs(), oldReader.numDocs(), false); // this is not an NRT reader!
+               } else {
+                 // both DV and liveDocs have changed
+                 newReaders[i] = new SegmentReader(commitInfo, oldReader);
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestDirectoryReaderReopen.java b/lucene/core/src/test/org/apache/lucene/index/TestDirectoryReaderReopen.java
+index b38696a375..468e8e2318 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestDirectoryReaderReopen.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestDirectoryReaderReopen.java
+@@ -43,6 +43,7 @@ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.MockDirectoryWrapper;
+ import org.apache.lucene.store.MockDirectoryWrapper.FakeIOException;
+ import org.apache.lucene.store.RAMDirectory;
++import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.LuceneTestCase;
+ import org.apache.lucene.util.TestUtil;
+ 
+@@ -1013,6 +1014,59 @@ public class TestDirectoryReaderReopen extends LuceneTestCase {
+       DirectoryReader.openIfChanged(r);
+     });
+   }
++
++  public void testReuseUnchangedLeafReaderOnDVUpdate() throws IOException {
++    Directory dir = newDirectory();
++    IndexWriterConfig indexWriterConfig = newIndexWriterConfig();
++    indexWriterConfig.setMergePolicy(NoMergePolicy.INSTANCE);
++    IndexWriter writer = new IndexWriter(dir, indexWriterConfig);
++
++    Document doc = new Document();
++    doc.add(new StringField("id", "1", Field.Store.YES));
++    doc.add(new StringField("version", "1", Field.Store.YES));
++    doc.add(new NumericDocValuesField("some_docvalue", 2));
++    writer.addDocument(doc);
++    doc = new Document();
++    doc.add(new StringField("id", "2", Field.Store.YES));
++    doc.add(new StringField("version", "1", Field.Store.YES));
++    writer.addDocument(doc);
++    writer.commit();
++    DirectoryReader reader = DirectoryReader.open(dir);
++    assertEquals(2, reader.numDocs());
++    assertEquals(2, reader.maxDoc());
++    assertEquals(0, reader.numDeletedDocs());
++
++    doc = new Document();
++    doc.add(new StringField("id", "1", Field.Store.YES));
++    doc.add(new StringField("version", "2", Field.Store.YES));
++    writer.updateDocValues(new Term("id", "1"), new NumericDocValuesField("some_docvalue", 1));
++    writer.commit();
++    DirectoryReader newReader = DirectoryReader.openIfChanged(reader);
++    assertNotSame(newReader, reader);
++    reader.close();
++    reader = newReader;
++    assertEquals(2, reader.numDocs());
++    assertEquals(2, reader.maxDoc());
++    assertEquals(0, reader.numDeletedDocs());
++
++    doc = new Document();
++    doc.add(new StringField("id", "3", Field.Store.YES));
++    doc.add(new StringField("version", "3", Field.Store.YES));
++    writer.updateDocument(new Term("id", "3"), doc);
++    writer.commit();
++
++    newReader = DirectoryReader.openIfChanged(reader);
++    assertNotSame(newReader, reader);
++    assertEquals(2, newReader.getSequentialSubReaders().size());
++    assertEquals(1, reader.getSequentialSubReaders().size());
++    assertSame(reader.getSequentialSubReaders().get(0), newReader.getSequentialSubReaders().get(0));
++    reader.close();
++    reader = newReader;
++    assertEquals(3, reader.numDocs());
++    assertEquals(3, reader.maxDoc());
++    assertEquals(0, reader.numDeletedDocs());
++    IOUtils.close(reader, writer, dir);
++  }
+ }
+ 
+ 
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestSoftDeletesDirectoryReaderWrapper.java b/lucene/core/src/test/org/apache/lucene/index/TestSoftDeletesDirectoryReaderWrapper.java
+new file mode 100644
+index 0000000000..dea7bc977b
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/index/TestSoftDeletesDirectoryReaderWrapper.java
+@@ -0,0 +1,199 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.lucene.index;
++
++import java.io.IOException;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.Field;
++import org.apache.lucene.document.NumericDocValuesField;
++import org.apache.lucene.document.StringField;
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.TermQuery;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.IOUtils;
++import org.apache.lucene.util.LuceneTestCase;
++
++public class TestSoftDeletesDirectoryReaderWrapper extends LuceneTestCase {
++
++  public void testReuseUnchangedLeafReader() throws IOException {
++    Directory dir = newDirectory();
++    IndexWriterConfig indexWriterConfig = newIndexWriterConfig();
++    String softDeletesField = "soft_delete";
++    indexWriterConfig.setSoftDeletesField(softDeletesField);
++    indexWriterConfig.setMergePolicy(NoMergePolicy.INSTANCE);
++    IndexWriter writer = new IndexWriter(dir, indexWriterConfig);
++
++    Document doc = new Document();
++    doc.add(new StringField("id", "1", Field.Store.YES));
++    doc.add(new StringField("version", "1", Field.Store.YES));
++    writer.addDocument(doc);
++    doc = new Document();
++    doc.add(new StringField("id", "2", Field.Store.YES));
++    doc.add(new StringField("version", "1", Field.Store.YES));
++    writer.addDocument(doc);
++    writer.commit();
++    DirectoryReader reader = new SoftDeletesDirectoryReaderWrapper(DirectoryReader.open(dir), softDeletesField);
++    assertEquals(2, reader.numDocs());
++    assertEquals(2, reader.maxDoc());
++    assertEquals(0, reader.numDeletedDocs());
++
++    doc = new Document();
++    doc.add(new StringField("id", "1", Field.Store.YES));
++    doc.add(new StringField("version", "2", Field.Store.YES));
++    writer.softUpdateDocument(new Term("id", "1"), doc, new NumericDocValuesField("soft_delete", 1));
++
++    doc = new Document();
++    doc.add(new StringField("id", "3", Field.Store.YES));
++    doc.add(new StringField("version", "1", Field.Store.YES));
++    writer.addDocument(doc);
++    writer.commit();
++
++    DirectoryReader newReader = DirectoryReader.openIfChanged(reader);
++    assertNotSame(newReader, reader);
++    reader.close();
++    reader = newReader;
++    assertEquals(3, reader.numDocs());
++    assertEquals(4, reader.maxDoc());
++    assertEquals(1, reader.numDeletedDocs());
++
++    doc = new Document();
++    doc.add(new StringField("id", "1", Field.Store.YES));
++    doc.add(new StringField("version", "3", Field.Store.YES));
++    writer.softUpdateDocument(new Term("id", "1"), doc, new NumericDocValuesField("soft_delete", 1));
++    writer.commit();
++
++    newReader = DirectoryReader.openIfChanged(reader);
++    assertNotSame(newReader, reader);
++    assertEquals(3, newReader.getSequentialSubReaders().size());
++    assertEquals(2, reader.getSequentialSubReaders().size());
++    assertSame(reader.getSequentialSubReaders().get(0), newReader.getSequentialSubReaders().get(0));
++    assertNotSame(reader.getSequentialSubReaders().get(1), newReader.getSequentialSubReaders().get(1));
++    assertTrue(isWrapped(reader.getSequentialSubReaders().get(0)));
++    // last one has no soft deletes
++    assertFalse(isWrapped(reader.getSequentialSubReaders().get(1)));
++
++    assertTrue(isWrapped(newReader.getSequentialSubReaders().get(0)));
++    assertTrue(isWrapped(newReader.getSequentialSubReaders().get(1)));
++    // last one has no soft deletes
++    assertFalse(isWrapped(newReader.getSequentialSubReaders().get(2)));
++    reader.close();
++    reader = newReader;
++    assertEquals(3, reader.numDocs());
++    assertEquals(5, reader.maxDoc());
++    assertEquals(2, reader.numDeletedDocs());
++    IOUtils.close(reader, writer, dir);
++  }
++
++  private boolean isWrapped(LeafReader reader) {
++    return reader instanceof SoftDeletesDirectoryReaderWrapper.SoftDeletesFilterLeafReader;
++  }
++
++  public void testMixSoftAndHardDeletes() throws IOException {
++    Directory dir = newDirectory();
++    IndexWriterConfig indexWriterConfig = newIndexWriterConfig();
++    String softDeletesField = "soft_delete";
++    indexWriterConfig.setSoftDeletesField(softDeletesField);
++    IndexWriter writer = new IndexWriter(dir, indexWriterConfig);
++    Set<Integer> uniqueDocs = new HashSet<>();
++    for (int i = 0; i < 100; i++) {
++      int docId = random().nextInt(5);
++      uniqueDocs.add(docId);
++      Document doc = new Document();
++      doc.add(new StringField("id",  String.valueOf(docId), Field.Store.YES));
++      if (docId %  2 == 0) {
++        writer.updateDocument(new Term("id", String.valueOf(docId)), doc);
++      } else {
++        writer.softUpdateDocument(new Term("id", String.valueOf(docId)), doc,
++            new NumericDocValuesField(softDeletesField,  0));
++      }
++    }
++
++    writer.commit();
++    writer.close();
++    DirectoryReader reader = new SoftDeletesDirectoryReaderWrapper(DirectoryReader.open(dir), softDeletesField);
++    assertEquals(uniqueDocs.size(), reader.numDocs());
++    IndexSearcher searcher = new IndexSearcher(reader);
++    for (Integer docId : uniqueDocs) {
++      assertEquals(1, searcher.search(new TermQuery(new Term("id", docId.toString())), 1).totalHits);
++    }
++
++    IOUtils.close(reader, dir);
++  }
++
++  public void testReaderCacheKey() throws IOException {
++    Directory dir = newDirectory();
++    IndexWriterConfig indexWriterConfig = newIndexWriterConfig();
++    String softDeletesField = "soft_delete";
++    indexWriterConfig.setSoftDeletesField(softDeletesField);
++    indexWriterConfig.setMergePolicy(NoMergePolicy.INSTANCE);
++    IndexWriter writer = new IndexWriter(dir, indexWriterConfig);
++
++    Document doc = new Document();
++    doc.add(new StringField("id", "1", Field.Store.YES));
++    doc.add(new StringField("version", "1", Field.Store.YES));
++    writer.addDocument(doc);
++    doc = new Document();
++    doc.add(new StringField("id", "2", Field.Store.YES));
++    doc.add(new StringField("version", "1", Field.Store.YES));
++    writer.addDocument(doc);
++    writer.commit();
++    DirectoryReader reader = new SoftDeletesDirectoryReaderWrapper(DirectoryReader.open(dir), softDeletesField);
++    IndexReader.CacheHelper readerCacheHelper = reader.leaves().get(0).reader().getReaderCacheHelper();
++    AtomicInteger leafCalled = new AtomicInteger(0);
++    AtomicInteger dirCalled = new AtomicInteger(0);
++    readerCacheHelper.addClosedListener(key -> {
++      leafCalled.incrementAndGet();
++      assertSame(key, readerCacheHelper.getKey());
++    });
++    IndexReader.CacheHelper dirReaderCacheHelper = reader.getReaderCacheHelper();
++    dirReaderCacheHelper.addClosedListener(key -> {
++      dirCalled.incrementAndGet();
++      assertSame(key, dirReaderCacheHelper.getKey());
++    });
++    assertEquals(2, reader.numDocs());
++    assertEquals(2, reader.maxDoc());
++    assertEquals(0, reader.numDeletedDocs());
++
++    doc = new Document();
++    doc.add(new StringField("id", "1", Field.Store.YES));
++    doc.add(new StringField("version", "2", Field.Store.YES));
++    writer.softUpdateDocument(new Term("id", "1"), doc, new NumericDocValuesField("soft_delete", 1));
++
++    doc = new Document();
++    doc.add(new StringField("id", "3", Field.Store.YES));
++    doc.add(new StringField("version", "1", Field.Store.YES));
++    writer.addDocument(doc);
++    writer.commit();
++    assertEquals(0, leafCalled.get());
++    assertEquals(0, dirCalled.get());
++    DirectoryReader newReader = DirectoryReader.openIfChanged(reader);
++    assertEquals(0, leafCalled.get());
++    assertEquals(0, dirCalled.get());
++    assertNotSame(newReader.getReaderCacheHelper().getKey(), reader.getReaderCacheHelper().getKey());
++    assertNotSame(newReader, reader);
++    reader.close();
++    reader = newReader;
++    assertEquals(1, dirCalled.get());
++    assertEquals(1, leafCalled.get());
++    IOUtils.close(reader, writer, dir);
++  }
++}
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestStressNRT.java b/lucene/core/src/test/org/apache/lucene/index/TestStressNRT.java
+index e6c91b87c5..06aa27756a 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestStressNRT.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestStressNRT.java
+@@ -110,7 +110,11 @@ public class TestStressNRT extends LuceneTestCase {
+     final RandomIndexWriter writer = new RandomIndexWriter(random(), dir, newIndexWriterConfig(new MockAnalyzer(random())), useSoftDeletes);
+     writer.setDoRandomForceMergeAssert(false);
+     writer.commit();
+-    reader = useSoftDeletes ? writer.getReader() : DirectoryReader.open(dir);
++    if (useSoftDeletes) {
++      reader = new SoftDeletesDirectoryReaderWrapper(DirectoryReader.open(dir), writer.w.getConfig().getSoftDeletesField());
++    } else {
++      reader = DirectoryReader.open(dir);
++    }
+ 
+     for (int i=0; i<nWriteThreads; i++) {
+       Thread thread = new Thread("WRITER"+i) {
+@@ -136,7 +140,7 @@ public class TestStressNRT extends LuceneTestCase {
+                   }
+ 
+                   DirectoryReader newReader;
+-                  if (rand.nextInt(100) < softCommitPercent || useSoftDeletes) {
++                  if (rand.nextInt(100) < softCommitPercent) {
+                     // assertU(h.commit("softCommit","true"));
+                     if (random().nextBoolean()) {
+                       if (VERBOSE) {
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestSearcherManager.java b/lucene/core/src/test/org/apache/lucene/search/TestSearcherManager.java
+index cc9a919beb..c9d7e25549 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestSearcherManager.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestSearcherManager.java
+@@ -487,7 +487,7 @@ public class TestSearcherManager extends ThreadedIndexingAndSearchingTestCase {
+ 
+     FilterDirectoryReader reader = new MyFilterDirectoryReader(nrtReader);
+     assertEquals(nrtReader, reader.getDelegate());
+-    assertEquals(nrtReader, FilterDirectoryReader.unwrap(reader));
++    assertEquals(FilterDirectoryReader.unwrap(nrtReader), FilterDirectoryReader.unwrap(reader));
+ 
+     SearcherManager mgr = new SearcherManager(reader, null);
+     for(int i=0;i<10;i++) {
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/index/RandomIndexWriter.java b/lucene/test-framework/src/java/org/apache/lucene/index/RandomIndexWriter.java
+index b82df68029..15ca469c56 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/index/RandomIndexWriter.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/index/RandomIndexWriter.java
+@@ -381,7 +381,7 @@ public class RandomIndexWriter implements Closeable {
+     if (r.nextInt(20) == 2) {
+       doRandomForceMerge();
+     }
+-    if (!applyDeletions || r.nextBoolean() || w.getConfig().getSoftDeletesField() != null) {
++    if (!applyDeletions || r.nextBoolean()) {
+       // if we have soft deletes we can't open from a directory
+       if (LuceneTestCase.VERBOSE) {
+         System.out.println("RIW.getReader: use NRT reader");
+@@ -396,7 +396,12 @@ public class RandomIndexWriter implements Closeable {
+       }
+       w.commit();
+       if (r.nextBoolean()) {
+-        return DirectoryReader.open(w.getDirectory());
++        DirectoryReader reader = DirectoryReader.open(w.getDirectory());
++        if (w.getConfig().getSoftDeletesField() != null) {
++          return new SoftDeletesDirectoryReaderWrapper(reader, w.getConfig().getSoftDeletesField());
++        } else {
++          return reader;
++        }
+       } else {
+         return w.getReader(applyDeletions, writeAllDeletes);
+       }

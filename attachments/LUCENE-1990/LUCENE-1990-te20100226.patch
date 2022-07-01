@@ -1,0 +1,3076 @@
+Index: src/java/org/apache/lucene/util/packed/PackedInts.java
+===================================================================
+--- src/java/org/apache/lucene/util/packed/PackedInts.java	Fri Feb 26 13:16:02 CET 2010
++++ src/java/org/apache/lucene/util/packed/PackedInts.java	Fri Feb 26 13:16:02 CET 2010
+@@ -0,0 +1,443 @@
++package org.apache.lucene.util.packed;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// nocommit -- rename to UnsignedPackedInts?  or pull
++// minValue down
++
++import org.apache.lucene.store.IndexOutput;
++import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.util.CodecUtil;
++import org.apache.lucene.util.Constants;
++import org.apache.lucene.util.ConsumesRAM;
++
++import java.io.IOException;
++
++/**
++ * Simplistic compression for array of long values, where
++ * each value is >= 0 and <= a specified maximum value.  The
++ * values are stored as packed ints, with each value
++ * consuming a fixed number of bits.
++ *
++ * <p>NOTE: this class is meant only to be used internally
++ * by Lucene; it's only public so it can be shared across
++ * packages.  This means the API is freely subject to
++ * change, and, the class could be removed entirely, in any
++ * Lucene release.  Use directly at your own risk!
++ */
++
++// nocommit
++//   - do we need int/long variants (for perf)?  or long
++//     only suffices?
++//   - what native type is best perf?  long/int/short/byte?
++
++public class PackedInts {
++
++  private final static String CODEC_NAME = "PackedInts";
++  private final static int VERSION_START = 0;
++  private final static int VERSION_CURRENT = 0;
++
++  /**
++   * The priority for selecting the Reader and Writer implementation.
++   * </p><p>
++   * packed:  Pack the bits right after each other.<br />
++   * aligned32: Pack bits so that no values cross 32 bit block boundaries.<br />
++   * aligned64: Pack bits so that no values cross 64 bit block boundaries.<br />
++   * auto:    Guesstimate the best implementation.
++   * </p><p>
++   * Note: When a more efficient structure (in terms of memory as well as speed)
++   * can be substituted without penalty, this will be done. Example:
++   * Asking for packed with 3 bits/value will return packed32 or packed64, while
++   * asking for packed with 4 bits/value will return aligned32 or aligned64.
++   * Asking for aligned with 7 bits/value and block preferences bit32 will
++   * return direct8, as this amount of space used by an aligned32 with 7
++   * bits/value is the same as direct8, while direct8 is less processor-
++   * intensive.
++   * </p><p>
++   * Note: 63 bits/value will always be mapped to a direct64, due to the
++   *       problem of stating maxValues > 2^63-1.
++   * </p><p>
++   * Note: auto will never select an aligned64 structure as this has low
++   * performance on 32 bit machines.
++   */
++  public enum STORAGE {packed, aligned32, aligned64, auto}
++
++  /**
++   * The size for the underlying blocks for packed or aligned structures.
++   * Using 64bit blocks (longs) on a 32bit machine is slower than using 32bit
++   * blocks (ints).
++   */
++  enum BLOCK {bit32(32), bit64(64);
++    private int bits;
++    BLOCK(int bits) {
++      this.bits = bits;
++    }
++
++    public int getBits() {
++      return bits;
++    }
++
++    public static BLOCK getSystemDefault() {
++      return Constants.JRE_IS_64BIT ? bit64 : bit32;
++    }
++  }
++
++  /**
++   * The specific implementation derived from bits/value, STORAGE and BLOCK.
++   */
++  enum IMPLEMENTATION {packed32, packed64, aligned32, aligned64,
++    direct8, direct16, direct32, direct64
++  }
++
++  /**
++   * The persistence format used when writing and reading.
++   * @see {@link STORAGE}.
++   */
++  enum PERSISTENCE {packed, aligned32, aligned64}
++
++  /**
++   * A read-only random access array of positive integers.
++   * @lucene.internal
++   */
++  public static interface Reader extends ConsumesRAM {
++    /**
++     * @param index the position of the wanted value.
++     * @return the value at the stated index.
++     */
++    long get(int index);
++
++    /**
++     * @return the number of bits used to store any given value.
++     *         Note: This does not imply that memory usage is
++     *         {@code bitsPerValue * #values} as implementations are free to
++     *         use non-space-optimal packing of bits.
++     */
++    int getBitsPerValue();
++
++    /**
++     * @return the number of values.
++     */
++    int size();
++  }
++
++  /**
++   * A packed integer array that can be modified.
++   * @lucene.internal
++   */
++  public static interface Mutable extends Reader {
++    /**
++     * Set the value at the given index in the array.
++     * @param index where the value should be positioned.
++     * @param value a value conforming to the constraints set by the array.
++     */
++    void set(int index, long value);
++
++    /**
++     * Sets all values to 0.
++     */
++    
++    void clear();
++  }
++
++  /**
++   * A simple base for Readers that keeps track of valueCount and bitsPerValue.
++   * @lucene.internal
++   */
++  public static abstract class ReaderImpl implements Reader {
++    protected final int bitsPerValue;
++    protected final int valueCount;
++
++    protected ReaderImpl(int valueCount, int bitsPerValue) {
++      this.bitsPerValue = bitsPerValue;
++      this.valueCount = valueCount;
++    }
++
++    public int getBitsPerValue() {
++      return bitsPerValue;
++    }
++    
++    public int size() {
++      return valueCount;
++    }
++
++    public long getMaxValue() { // Convenience method
++      return maxValue(bitsPerValue);
++    }
++  }
++
++  /** A write-once Writer.
++   * @lucene.internal
++   */
++  public static abstract class Writer {
++    protected final IndexOutput out;
++    protected final int bitsPerValue;
++    protected final int valueCount;
++
++    protected Writer(IndexOutput out, int valueCount, int bitsPerValue,
++                     PERSISTENCE persistence) throws IOException {
++      assert bitsPerValue <= 64;
++
++      this.out = out;
++      this.valueCount = valueCount;
++      this.bitsPerValue = bitsPerValue;
++      CodecUtil.writeHeader(out, CODEC_NAME, VERSION_START);
++      out.writeString(persistence.toString());
++      out.writeVInt(bitsPerValue);
++      out.writeVInt(valueCount);
++//      System.out.println("Writer PERSISTENCE: " + persistence + " bitsPerValue: " + bitsPerValue);
++    }
++
++    public abstract void add(long v) throws IOException;
++    public abstract void finish() throws IOException;
++  }
++
++  /**
++   * Retrieve PackedInt data from the IndexInput and return a packed int
++   * structure based on it.
++   * @param in positioned at the beginning of a stored packed int structure.
++   * @return a read only random access capable array of positive integers.
++   * @throws IOException if the structure could not be retrieved.
++   * @lucene.internal
++   */
++  public static Reader getReader(IndexInput in) throws IOException {
++    CodecUtil.checkHeader(in, CODEC_NAME, VERSION_START);
++    String pStr = in.readString();
++    PERSISTENCE persistence = PERSISTENCE.valueOf(pStr);
++    final int bitsPerValue = in.readVInt();
++    final int valueCount = in.readVInt();
++//    final long maxValue = in.readVLong();
++
++    IMPLEMENTATION implementation =
++            getImplementation(persistence, bitsPerValue);
++//    System.out.println("getReader PERSISTENCE: " + persistence + " bitsPerValue: " + bitsPerValue + " IMPLEMENTATION: " + implementation);
++    switch (implementation) {
++      case packed32: return new Packed32(in, valueCount, bitsPerValue);
++      case packed64: return new Packed64(in, valueCount, bitsPerValue);
++      case aligned32: return new Aligned32(in, valueCount, bitsPerValue);
++      case aligned64: return new Aligned64(in, valueCount, bitsPerValue);
++      case direct8: return new Direct8(in, valueCount);
++      case direct16: return new Direct16(in, valueCount);
++      case direct32: return new Direct32(in, valueCount);
++      case direct64: return new Direct64(in, valueCount);
++      default: throw new UnsupportedOperationException("Not implemented yet");
++    }
++
++    // TODO an mmap reader as well?
++  }
++
++  /**
++   * Create a packed integer array with the given amount of values initialized
++   * to 0. the valueCount and the bitsPerValue cannot be changed after creation.
++   * All Mutables known by this factory are kept fully in RAM.
++   * @param valueCount   the number of elements.
++   * @param bitsPerValue the number of bits available for any given value.
++   * @param storage the preferred memory-representation.
++   * @return a mutable packed integer array.
++   * @throws java.io.IOException if the Mutable could not be created. With the
++   *         current implementations, this never happens, but the method
++   *         signature allows for future persistence-backed Mutables.
++   * @lucene.internal
++   */
++  public static Mutable getMutable(
++         int valueCount, int bitsPerValue, STORAGE storage) throws IOException {
++    IMPLEMENTATION implementation = getImplementation(bitsPerValue, storage);
++    switch (implementation) {
++      case packed32:  return new Packed32(valueCount, bitsPerValue);
++      case packed64:  return new Packed64(valueCount, bitsPerValue);
++      case direct8:   return new Direct8(valueCount);
++      case direct16:  return new Direct16(valueCount);
++      case direct32:  return new Direct32(valueCount);
++      case direct64:  return new Direct64(valueCount);
++      case aligned32: return new Aligned32(valueCount, bitsPerValue);
++      case aligned64: return new Aligned64(valueCount, bitsPerValue);
++      default: throw new UnsupportedOperationException(
++              implementation + " is not implemented yet");
++    }
++  }
++
++  /**
++   * Create a packed integer array writer for the given number of values at the
++   * given bits/value. Writers append to the given IndexOutput and has very
++   * low memory overhead.
++   * @param out          the destination for the produced bits.
++   * @param valueCount   the number of elements.
++   * @param bitsPerValue the number of bits available for any given value.
++   * @param storage the preferred storage-representation.
++   * @return a Writer ready for receiving values.
++   * @throws IOException if bits could not be written to out.
++   * @lucene.internal
++   */
++  public static Writer getWriter(
++          IndexOutput out, int valueCount, int bitsPerValue,
++          STORAGE storage) throws IOException {
++    return getWriter(
++            out, valueCount, bitsPerValue, storage, BLOCK.getSystemDefault());
++  }
++  static Writer getWriter(
++          IndexOutput out, int valueCount, int bitsPerValue,
++          STORAGE storage, BLOCK block) throws IOException {
++    IMPLEMENTATION implementation = getImplementation(
++            bitsPerValue, storage, block);
++    switch (implementation) {
++      case packed32:
++      case packed64:
++        return new PackedWriter(out, valueCount, bitsPerValue);
++      case direct8:
++        return new PackedWriter(out, valueCount, 8);
++      case direct16:
++        return new PackedWriter(out, valueCount, 16);
++      case direct32:
++        return new PackedWriter(out, valueCount, 32);
++      case direct64:
++        return new PackedWriter(out, valueCount, 64);
++      case aligned32:
++        return new AlignedWriter(
++                out, valueCount, bitsPerValue, BLOCK.bit32);
++      case aligned64:
++        return new AlignedWriter(
++                out, valueCount, bitsPerValue, BLOCK.bit64);
++      default: throw new UnsupportedOperationException(
++              implementation + " is not implemented yet");
++    }
++  }
++
++  /**
++   * Derives the optimal IMPLEMENTATION based on the given preferences. Note
++   * that the specified storage does not guarantee that the selected
++   * implementation will be of a specific type, just that the implementations
++   * persistence format is compatible with storage.
++   * @param bitsPerValue the number of bits available for any given value.
++   *                     The returned IMPLEMENTATION will support values of this
++   *                     size or more.
++   * @param storage memory/speed trade-off.
++   * @return the implementation to use.
++   */
++  static IMPLEMENTATION getImplementation(int bitsPerValue, STORAGE storage) {
++    return getImplementation(bitsPerValue, storage, BLOCK.getSystemDefault());
++  }
++  static IMPLEMENTATION getImplementation(
++          int bitsPerValue, STORAGE storage, BLOCK architecture) {
++
++    switch (storage) {
++      case aligned32: {
++        if (bitsPerValue == 7 || bitsPerValue >= 11) {
++          bitsPerValue = getNextFixedSize(bitsPerValue); // Align to byte, short, int or long
++        }
++        break;
++      }
++      case aligned64: {
++        if ((bitsPerValue >= 13 && bitsPerValue <= 15) ||
++                (bitsPerValue >= 22)) {
++          bitsPerValue = getNextFixedSize(bitsPerValue); // Align to short, int or long
++        }
++      }
++    }
++    if (storage == STORAGE.auto) {
++      if (bitsPerValue > 58 || (bitsPerValue < 32 && bitsPerValue > 29)) { // 10% space-waste is ok
++        bitsPerValue = getNextFixedSize(bitsPerValue);
++      }
++    }
++
++    switch (bitsPerValue) { // The safe choices
++      case 8: return IMPLEMENTATION.direct8;
++      case 16: return IMPLEMENTATION.direct16;
++      case 31:
++      case 32: return IMPLEMENTATION.direct32;
++      case 63:
++      case 64: return IMPLEMENTATION.direct64;
++    }
++
++    if (bitsPerValue == 1 || bitsPerValue == 2 || bitsPerValue == 4) {
++      return storage == STORAGE.aligned64 ?
++              IMPLEMENTATION.aligned64 : IMPLEMENTATION.aligned32;
++    }
++    return bitsPerValue < 32 && architecture == BLOCK.bit32 ?
++            IMPLEMENTATION.packed32 : IMPLEMENTATION.packed64;
++  }
++
++  /**
++   * Derives the optimal IMPLEMENTATION based on the given preferences.
++   * Used for selecting the correct implementation from persistent data.
++   * @param persistence the format of the existing data.
++   * @param bitsPerValue the number of bits available for any given value.
++   * @return the implementation to use.
++   */
++  private static IMPLEMENTATION getImplementation(
++          PERSISTENCE persistence, int bitsPerValue) {
++    return getImplementation(
++            persistence, bitsPerValue, BLOCK.getSystemDefault());
++  }
++  private static IMPLEMENTATION getImplementation(
++            PERSISTENCE persistence, int bitsPerValue, BLOCK architecture) {
++    switch (bitsPerValue) { // The safe choices
++      case 1:
++      case 2:
++      case 4: return architecture == BLOCK.bit32 ?
++              IMPLEMENTATION.aligned32 : IMPLEMENTATION.aligned64;
++      case 8: return IMPLEMENTATION.direct8;
++      case 16: return IMPLEMENTATION.direct16;
++      case 31:
++      case 32: return IMPLEMENTATION.direct32;
++      case 63:
++      case 64: return IMPLEMENTATION.direct64;
++    }
++    if (persistence == PERSISTENCE.aligned32) {
++      return IMPLEMENTATION.aligned32;
++    } else if (persistence == PERSISTENCE.aligned64) {
++      return IMPLEMENTATION.aligned64;
++    }
++    return bitsPerValue < 32 && architecture == BLOCK.bit32 ?
++            IMPLEMENTATION.packed32 : IMPLEMENTATION.packed64;
++  }
++
++  /** Returns how many bits are required to hold values up
++   *  to and including maxValue */
++  public static int bitsRequired(long maxValue) {
++    // Very high long values does not translate well to double, so we do an
++    // explicit check for the edge cases
++    if (maxValue > 0x3FFFFFFFFFFFFFFFL) {
++      return 63;
++    } if (maxValue > 0x1FFFFFFFFFFFFFFFL) {
++      return 62;
++    }
++    return (int) Math.ceil(Math.log(1+maxValue)/Math.log(2.0));
++  }
++
++  /**
++   * Calculates the maximum unsigned long that can be expressed with the given
++   * number of bits.
++   * @param bitsPerValue the number of bits available for any given value.
++   * @return the maximum value for the given bits.
++   */
++  public static long maxValue(int bitsPerValue) {
++    return bitsPerValue == 64 ? Long.MAX_VALUE : ~(~0L << bitsPerValue);
++  }
++
++  private static int getNextFixedSize(int bits) {
++    if (bits <= 8) {
++      return 8;
++    } else if (bits <= 16) {
++      return 16;
++    } else if (bits <= 32) {
++      return 32;
++    } else {
++      return 64;
++    }
++  }
++
++}
+Index: src/java/org/apache/lucene/util/CodecUtil.java
+===================================================================
+--- src/java/org/apache/lucene/util/CodecUtil.java	Fri Jan 22 12:58:35 CET 2010
++++ src/java/org/apache/lucene/util/CodecUtil.java	Fri Jan 22 12:58:35 CET 2010
+@@ -0,0 +1,72 @@
++package org.apache.lucene.util;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++
++/**
++ * <p>NOTE: this class is meant only to be used internally
++ * by Lucene; it's only public so it can be shared across
++ * packages.  This means the API is freely subject to
++ * change, and, the class could be removed entirely, in any
++ * Lucene release.  Use directly at your own risk!
++ */
++
++import org.apache.lucene.store.IndexOutput;
++import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.index.CorruptIndexException;
++
++import java.io.IOException;
++
++public final class CodecUtil {
++  private final static int CODEC_MAGIC = 0x3fd76c17;
++
++  public static void writeHeader(IndexOutput out, String codec, int version)
++    throws IOException {
++    final long start = out.getFilePointer();
++    out.writeInt(CODEC_MAGIC);
++    out.writeString(codec);
++    out.writeInt(version);
++
++    // We require this so we can easily pre-compute header length
++    if (out.getFilePointer()-start != codec.length()+9) {
++      throw new IllegalArgumentException("codec must be simple ASCII, less than 128 characters in length [got " + codec + "]");
++    }
++  }
++
++  public static int headerLength(String codec) {
++    return 9+codec.length();
++  }
++
++  public static int checkHeader(IndexInput in, String codec, int maxVersion)
++    throws IOException {
++    final int actualHeader = in.readInt();
++    if (actualHeader != CODEC_MAGIC) {
++      throw new CorruptIndexException("codec header mismatch: actual header=" + actualHeader + " vs expected header=" + CODEC_MAGIC);
++    }
++    final String actualCodec = in.readString();
++    if (!actualCodec.equals(codec)) {
++      throw new CorruptIndexException("codec mismatch: actual codec=" + actualCodec + " vs expected codec=" + codec);
++    }
++    final int actualVersion = in.readInt();
++    if (actualVersion > maxVersion) {
++      throw new CorruptIndexException("version " + actualVersion + " is too new (expected <= version " + maxVersion + ")");
++    }
++
++    return actualVersion;
++  }
++}
+Index: src/java/org/apache/lucene/util/packed/Packed32.java
+===================================================================
+--- src/java/org/apache/lucene/util/packed/Packed32.java	Tue Feb 23 14:58:46 CET 2010
++++ src/java/org/apache/lucene/util/packed/Packed32.java	Tue Feb 23 14:58:46 CET 2010
+@@ -0,0 +1,220 @@
++package org.apache.lucene.util.packed;
++
++import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.util.RamUsageEstimator;
++
++import java.io.IOException;
++import java.util.Arrays;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * Space optimized random access capable array of values with a fixed number of
++ * bits. The maximum number of bits/value is 31. Use {@link Packed64} for higher
++ * numbers.
++ * </p><p>
++ * The implementation strives to avoid conditionals and expensive operations,
++ * sacrificing code clarity to achieve better performance.
++ */
++class Packed32 extends PackedInts.ReaderImpl implements PackedInts.Mutable {
++  static final int BLOCK_SIZE = 32; // 32 = int, 64 = long
++  static final int BLOCK_BITS = 5; // The #bits representing BLOCK_SIZE
++  static final int MOD_MASK = BLOCK_SIZE - 1; // x % BLOCK_SIZE
++
++  private static final int ENTRY_SIZE = BLOCK_SIZE + 1;
++  private static final int FAC_BITPOS = 3;
++
++  /*
++   * In order to make an efficient value-getter, conditionals should be
++   * avoided. A value can be positioned inside of a block, requiring shifting
++   * left or right or it can span two blocks, requiring a left-shift on the
++   * first block and a right-shift on the right block.
++   * </p><p>
++   * By always shifting the first block both left and right, we get exactly
++   * the right bits. By always shifting the second block right and applying
++   * a mask, we get the right bits there. After that, we | the two bitsets.
++  */
++  private static final int[][] SHIFTS =
++          new int[ENTRY_SIZE][ENTRY_SIZE * FAC_BITPOS];
++  private static final int[][] MASKS = new int[ENTRY_SIZE][ENTRY_SIZE];
++
++  static { // Generate shifts
++    for (int elementBits = 1 ; elementBits <= BLOCK_SIZE ; elementBits++) {
++      for (int bitPos = 0 ; bitPos < BLOCK_SIZE ; bitPos++) {
++        int[] currentShifts = SHIFTS[elementBits];
++        int base = bitPos * FAC_BITPOS;
++        currentShifts[base    ] = bitPos;
++        currentShifts[base + 1] = BLOCK_SIZE - elementBits;
++        if (bitPos <= BLOCK_SIZE - elementBits) { // Single block
++          currentShifts[base + 2] = 0;
++          MASKS[elementBits][bitPos] = 0;
++        } else { // Two blocks
++          int rBits = elementBits - (BLOCK_SIZE - bitPos);
++          currentShifts[base + 2] = BLOCK_SIZE - rBits;
++          MASKS[elementBits][bitPos] = ~(~0 << rBits);
++        }
++      }
++    }
++  }
++
++  /*
++   * The setter requires more masking than the getter.
++  */
++  private static final int[][] WRITE_MASKS =
++          new int[ENTRY_SIZE][ENTRY_SIZE * FAC_BITPOS];
++  static {
++    for (int elementBits = 1 ; elementBits <= BLOCK_SIZE ; elementBits++) {
++      int elementPosMask = ~(~0 << elementBits);
++      int[] currentShifts = SHIFTS[elementBits];
++      int[] currentMasks = WRITE_MASKS[elementBits];
++      for (int bitPos = 0 ; bitPos < BLOCK_SIZE ; bitPos++) {
++        int base = bitPos * FAC_BITPOS;
++        currentMasks[base  ] =~((elementPosMask
++                << currentShifts[base + 1])
++                >>> currentShifts[base]);
++        currentMasks[base+1] = ~(elementPosMask
++                << currentShifts[base + 2]);
++        currentMasks[base+2] = currentShifts[base + 2] == 0 ? 0 : ~0;
++      }
++    }
++  }
++
++  /* The bits */
++  private int[] blocks;
++
++  // Cached calculations
++  private int maxPos;      // blocks.length * BLOCK_SIZE / bitsPerValue - 1
++  private int[] shifts;    // The shifts for the current bitsPerValue
++  private int[] readMasks;
++  private int[] writeMasks;
++
++  /**
++   * Creates an array with the internal structures adjusted for the given
++   * limits and initialized to 0.
++   * @param valueCount   the number of elements.
++   * @param bitsPerValue the number of bits available for any given value.
++   *        Note: bitsPerValue >32 is not supported by this implementation.
++   */
++  public Packed32(int valueCount, int bitsPerValue) {
++    this(new int[(int)(((long)valueCount) * bitsPerValue / BLOCK_SIZE + 2)],
++            valueCount, bitsPerValue);
++  }
++
++  /**
++   * Creates an array with content retrieved from the given IndexInput.
++   * @param in       an IndexInput, positioned at the start of Packed64-content.
++   * @param valueCount  the number of elements.
++   * @param bitsPerValue the number of bits available for any given value.
++   * @throws java.io.IOException if the values for the backing array could not
++   *                             be retrieved.
++   */
++  public Packed32(IndexInput in, int valueCount, int bitsPerValue)
++                                                            throws IOException {
++    super(valueCount, bitsPerValue);
++    int size = size(bitsPerValue, valueCount);
++    blocks = new int[size + 1]; // +1 due to non-conditional tricks
++    for(int i = 0 ; i < size ; i++) {
++      blocks[i] = in.readInt();
++    }
++    if (size % 2 == 1) {
++      in.readInt(); // Align to long
++    }
++    updateCached();
++  }
++
++  private static int size(int bitsPerValue, int valueCount) {
++    final long totBitCount = (long) valueCount * bitsPerValue;
++    return (int) (totBitCount/32 + ((totBitCount % 32 == 0 ) ? 0:1));
++  }
++
++
++  /**
++   * Creates an array backed by the given blocks.
++   * </p><p>
++   * Note: The blocks are used directly, so changes to the given block will
++   * affect the Packed32-structure.
++   * @param blocks   used as the internal backing array.
++   * @param valueCount   the number of values.
++   * @param bitsPerValue the number of bits available for any given value.
++   *        Note: bitsPerValue >32 is not supported by this implementation.
++   */
++  public Packed32(int[] blocks, int valueCount, int bitsPerValue) {
++    // TODO: Check that blocks.length is sufficient for holding length values
++    super(valueCount, bitsPerValue);
++    if (bitsPerValue > 31) {
++      throw new IllegalArgumentException(String.format(
++              "This array only supports values of 31 bits or less. The "
++                      + "required number of bits was %d. The Packed64 "
++                      + "implementation allows values with more than 31 bits",
++              bitsPerValue));
++    }
++    this.blocks = blocks;
++    updateCached();
++  }
++
++  private void updateCached() {
++    readMasks = MASKS[bitsPerValue];
++    maxPos = (int)((((long)blocks.length) * BLOCK_SIZE / bitsPerValue) - 2);
++    shifts = SHIFTS[bitsPerValue];
++    writeMasks = WRITE_MASKS[bitsPerValue];
++  }
++
++  /**
++   * @param index the position of the value.
++   * @return the value at the given index.
++   */
++  public long get(final int index) {
++    final long majorBitPos = index * bitsPerValue;
++    final int elementPos = (int)(majorBitPos >>> BLOCK_BITS); // / BLOCK_SIZE
++    final int bitPos =     (int)(majorBitPos & MOD_MASK); // % BLOCK_SIZE);
++
++    final int base = bitPos * FAC_BITPOS;
++
++    return ((blocks[elementPos] << shifts[base]) >>> shifts[base+1]) |
++            ((blocks[elementPos+1] >>> shifts[base+2])
++                    & readMasks[bitPos]);
++  }
++
++  public void set(final int index, final long value) {
++    final int intValue = (int)value;
++    final long majorBitPos = index * bitsPerValue;
++    final int elementPos = (int)(majorBitPos >>> BLOCK_BITS); // / BLOCK_SIZE
++    final int bitPos =     (int)(majorBitPos & MOD_MASK); // % BLOCK_SIZE);
++    final int base = bitPos * FAC_BITPOS;
++
++    blocks[elementPos  ] = (blocks[elementPos  ] & writeMasks[base])
++            | (intValue << shifts[base + 1] >>> shifts[base]);
++    blocks[elementPos+1] = (blocks[elementPos+1] & writeMasks[base+1])
++            | ((intValue << shifts[base + 2])
++            & writeMasks[base+2]);
++  }
++
++  public void clear() {
++    Arrays.fill(blocks, 0);
++  }
++
++  public String toString() {
++    return "Packed32(bitsPerValue=" + bitsPerValue + ", maxPos=" + maxPos
++            + ", elements.length=" + blocks.length + ")";
++  }
++
++  public long ramBytesUsed() {
++    return RamUsageEstimator.NUM_BYTES_ARRAY_HEADER
++            + blocks.length * RamUsageEstimator.NUM_BYTES_INT;
++  }
++}
+Index: src/java/org/apache/lucene/util/packed/Aligned32.java
+===================================================================
+--- src/java/org/apache/lucene/util/packed/Aligned32.java	Fri Feb 26 13:28:33 CET 2010
++++ src/java/org/apache/lucene/util/packed/Aligned32.java	Fri Feb 26 13:28:33 CET 2010
+@@ -0,0 +1,204 @@
++package org.apache.lucene.util.packed;
++
++import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.util.RamUsageEstimator;
++
++import java.io.IOException;
++import java.util.Arrays;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * Medium space and speed trade off. No values crosses block boundaries.
++ * The maximum number of bits/value is 32.
++ * Use {@link Aligned64} for higher numbers.
++ * </p><p>
++ * The implementation strives to avoid conditionals and expensive operations,
++ * sacrificing code clarity to achieve better performance.
++ * </p><p>
++ * Space is optimally used within the boundaries of alignment, e.g.
++ * 7 bits/value fits 4 values/block for 32 bit and 7 values/block for 64 bit.
++ * Bits are packed left-aligned to be bit pattern compatible with other bit
++ * array implementations where possible.
++ */
++class Aligned32 extends PackedInts.ReaderImpl
++        implements PackedInts.Mutable {
++  static final int BLOCK_SIZE = 32; // 32 = int, 64 = long
++
++  private static final int ENTRY_SIZE = BLOCK_SIZE + 1;
++
++  /*
++   * A value is always positioned inside a single block, requiring a
++   * shift right to position the bits and a mask to extract them.
++  */
++  private static final int[][] SHIFTS = new int[ENTRY_SIZE][ENTRY_SIZE];
++  private static final int[] READ_MASKS = new int[ENTRY_SIZE];
++
++  static { // Generate shifts
++      for (int elementBits = 1 ; elementBits <= BLOCK_SIZE ; elementBits++) {
++          int[] currentShifts = SHIFTS[elementBits];
++          for (int bitPos = 0 ; bitPos < BLOCK_SIZE ; bitPos++) {
++              currentShifts[bitPos] = BLOCK_SIZE - elementBits - bitPos;
++              READ_MASKS[elementBits]  = ~(~0 << elementBits);
++          }
++      }
++  }
++
++  /*
++   * Setting a value requires clearing the destination bits with a mask, then
++   * shifting the value to the left and or'ing the two numbers.
++  */
++  private static final int[][] WRITE_MASKS = new int[ENTRY_SIZE][ENTRY_SIZE];
++  static {
++      for (int elementBits = 1 ; elementBits <= BLOCK_SIZE ; elementBits++) {
++          int elementPosMask = ~(~0 << elementBits);
++          int[] currentShifts = SHIFTS[elementBits];
++          int[] currentMasks = WRITE_MASKS[elementBits];
++          for (int bitPos = 0 ; bitPos < BLOCK_SIZE ; bitPos++) {
++              currentMasks[bitPos] = ~(elementPosMask
++                                       << currentShifts[bitPos]);
++          }
++      }
++  }
++
++  /* The bits */
++  private int[] blocks;
++
++  /* Cached values */
++  private int valuesPerBlock;
++  private int[] shifts;
++  private int readMask;
++  private int[] writeMasks;
++
++  /**
++   * Creates an array with the internal structures adjusted for the given
++   * limits and initialized to 0.
++   * @param valueCount   the number of values.
++   * @param bitsPerValue the number of bits available for any given value.
++   */
++  public Aligned32(int valueCount, int bitsPerValue) {
++    super(valueCount, bitsPerValue);
++    if (bitsPerValue > 32) {
++      throw new IllegalArgumentException(String.format(
++              "This array only supports values of 32 bits or less. The "
++                      + "required number of bits was %d. The Aligned64 "
++                      + "implementation allows values with more than 32 bits",
++              bitsPerValue));
++    }
++    blocks = new int[size(valueCount, bitsPerValue)];
++    updateCached();
++  }
++
++  private static int size(int valueCount, int bitsPerValue) {
++    int valuesPerBlock = BLOCK_SIZE / bitsPerValue;
++    return valueCount == 0 ? 0 : (valueCount-1) / valuesPerBlock + 1;
++  }
++
++  /**
++   * Creates an array with content retrieved from the given IndexInput.
++   * @param in       an IndexInput, positioned at the start of Packed64-content.
++   * @param valueCount  the number of elements.
++   * @param bitsPerValue the number of bits available for any given value.
++   * @throws java.io.IOException if the values for the backing array could not
++   *                             be retrieved.
++   */
++  public Aligned32(IndexInput in, int valueCount, int bitsPerValue)
++                                                            throws IOException {
++    super(valueCount, bitsPerValue);
++    int size = size(valueCount, bitsPerValue);
++    blocks = new int[size];
++    for(int i = 0 ; i < size ; i++) {
++      blocks[i] = in.readInt();
++//      System.out.println("Reading  @bit32: " + Integer.toBinaryString((blocks[i])) + " (" + blocks[i] + ")");
++    }
++    if (size % 2 == 1) {
++      in.readInt(); // Align to long
++    }
++    in.readLong(); // Packed compatibility
++    updateCached();
++  }
++
++
++  /**
++   * Creates an array backed by the given blocks.
++   * </p><p>
++   * Note: The blocks are used directly, so changes to the given block will
++   * affect the Packed32-structure.
++   * @param blocks     used as the internal backing array.
++   * @param valueCount the number of values.
++   * @param bitsPerValue the number of bits available for any given value.
++   */
++  public Aligned32(int[] blocks, int valueCount, int bitsPerValue) {
++    // TODO: Check that blocks.length is sufficient for holding length values
++    super(valueCount, bitsPerValue);
++    this.blocks = blocks;
++    updateCached();
++  }
++
++  private void updateCached() {
++    valuesPerBlock = BLOCK_SIZE / bitsPerValue;
++    shifts = SHIFTS[bitsPerValue];
++    readMask = READ_MASKS[bitsPerValue];
++    writeMasks = WRITE_MASKS[bitsPerValue];
++  }
++
++  /**
++   * @param index the position of the value.
++   * @return the value at the given index.
++   */
++  public long get(final int index) {
++    final int blockPos = index / valuesPerBlock;
++    final int bitPos = (index - (blockPos * valuesPerBlock)) * bitsPerValue;
++
++    return (blocks[blockPos] >>> shifts[bitPos]) & readMask;
++  }
++
++  public void set(final int index, final long value) {
++    final int intValue = (int)value;
++
++    final int blockPos = index / valuesPerBlock;
++    final int bitPos = (index - (blockPos * valuesPerBlock)) * bitsPerValue;
++
++    blocks[blockPos] = (blocks[blockPos] & writeMasks[bitPos])
++            | (intValue << shifts[bitPos]);
++  }
++
++  public void clear() {
++    Arrays.fill(blocks, 0);
++  }
++
++  public long ramBytesUsed() {
++    return RamUsageEstimator.NUM_BYTES_ARRAY_HEADER
++            + blocks.length * RamUsageEstimator.NUM_BYTES_INT;
++  }
++
++  public String toString() {
++    return "Aligned32(" + valueCount + " values at "
++            + bitsPerValue + " bits/value)";
++  }
++
++  /**
++   * The backing array contains the bits for the values in this structure.
++   * The array is returned directly, so any changes will be reflected both ways.
++   * Expert use only.
++   * @return the backing array.
++   */
++  int[] getBackingArray() {
++    return blocks;
++  }
++}
+\ No newline at end of file
+Index: src/java/org/apache/lucene/store/IndexInput.java
+===================================================================
+--- src/java/org/apache/lucene/store/IndexInput.java	(revision 895342)
++++ src/java/org/apache/lucene/store/IndexInput.java	Tue Feb 23 11:19:38 CET 2010
+@@ -64,6 +64,13 @@
+     readBytes(b, offset, len);
+   }
+ 
++  /** Reads two bytes and returns a short.
++   * @see IndexOutput#writeByte(byte)
++   */
++  public short readShort() throws IOException {
++    return (short) (((readByte() & 0xFF) <<  8) |  (readByte() & 0xFF));
++  }
++
+   /** Reads four bytes and returns an int.
+    * @see IndexOutput#writeInt(int)
+    */
+Index: src/java/org/apache/lucene/util/RamUsageEstimator.java
+===================================================================
+--- src/java/org/apache/lucene/util/RamUsageEstimator.java	(revision 901710)
++++ src/java/org/apache/lucene/util/RamUsageEstimator.java	Fri Jan 22 13:01:30 CET 2010
+@@ -35,6 +35,16 @@
+  * estimate is complete.
+  */
+ public final class RamUsageEstimator {
++
++  public static int NUM_BYTES_SHORT = 2;
++  public static int NUM_BYTES_INT = 4;
++  public static int NUM_BYTES_LONG = 8;
++  public static int NUM_BYTES_FLOAT = 4;
++  public static int NUM_BYTES_DOUBLE = 8;
++  public static int NUM_BYTES_OBJ_HEADER = 8;
++  public static int NUM_BYTES_OBJ_REF = Constants.JRE_IS_64BIT ? 8 : 4;
++  public static int NUM_BYTES_ARRAY_HEADER = NUM_BYTES_OBJ_HEADER + NUM_BYTES_INT + NUM_BYTES_OBJ_REF;
++
+   private MemoryModel memoryModel;
+ 
+   private final Map<Object,Object> seen;
+@@ -45,11 +55,6 @@
+ 
+   public final static int NUM_BYTES_OBJECT_REF = Constants.JRE_IS_64BIT ? 8 : 4;
+   public final static int NUM_BYTES_CHAR = 2;
+-  public final static int NUM_BYTES_SHORT = 2;
+-  public final static int NUM_BYTES_INT = 4;
+-  public final static int NUM_BYTES_LONG = 8;
+-  public final static int NUM_BYTES_FLOAT = 4;
+-  public final static int NUM_BYTES_DOUBLE = 8;
+ 
+   private boolean checkInterned;
+ 
+Index: src/java/org/apache/lucene/util/packed/Direct8.java
+===================================================================
+--- src/java/org/apache/lucene/util/packed/Direct8.java	Mon Feb 22 08:42:35 CET 2010
++++ src/java/org/apache/lucene/util/packed/Direct8.java	Mon Feb 22 08:42:35 CET 2010
+@@ -0,0 +1,86 @@
++package org.apache.lucene.util.packed;
++
++import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.store.IndexOutput;
++import org.apache.lucene.util.RamUsageEstimator;
++
++import java.io.IOException;
++import java.util.Arrays;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * Direct wrapping of 8 bit values to a backing array of bytes.
++ */
++class Direct8 extends PackedInts.ReaderImpl
++        implements PackedInts.Mutable {
++  private byte[] blocks;
++  private static final int BITS_PER_VALUE = 8;
++
++  public Direct8(int valueCount) {
++    super(valueCount, BITS_PER_VALUE);
++    blocks = new byte[valueCount];
++  }
++
++  public Direct8(IndexInput in, int valueCount)
++          throws IOException {
++    super(valueCount, BITS_PER_VALUE);
++    byte[] blocks = new byte[valueCount];
++    for(int i=0;i<valueCount;i++) {
++      blocks[i] = in.readByte();
++    }
++    final int mod = valueCount % 8;
++    if (mod != 0) {
++      final int pad = 8-mod;
++      // round out long
++      for(int i=0;i<pad;i++) {
++        in.readByte();
++      }
++    }
++
++    this.blocks = blocks;
++  }
++
++  /**
++   * Creates an array backed by the given blocks.
++   * </p><p>
++   * Note: The blocks are used directly, so changes to the given block will
++   * affect the structure.
++   * @param blocks used as the internal backing array.
++   */
++  public Direct8(byte[] blocks) {
++    super(blocks.length, BITS_PER_VALUE);
++    this.blocks = blocks;
++  }
++
++  public long get(final int index) {
++    return 0xFFL & blocks[index];
++  }
++
++  public void set(final int index, final long value) {
++    blocks[index] = (byte)(value & 0xFF);
++  }
++
++  public long ramBytesUsed() {
++    return RamUsageEstimator.NUM_BYTES_ARRAY_HEADER + blocks.length;
++  }
++
++  public void clear() {
++    Arrays.fill(blocks, (byte)0);
++  }
++}
+\ No newline at end of file
+Index: src/java/org/apache/lucene/util/ConsumesRAM.java
+===================================================================
+--- src/java/org/apache/lucene/util/ConsumesRAM.java	Fri Jan 22 12:58:35 CET 2010
++++ src/java/org/apache/lucene/util/ConsumesRAM.java	Fri Jan 22 12:58:35 CET 2010
+@@ -0,0 +1,22 @@
++package org.apache.lucene.util;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++public interface ConsumesRAM {
++  public long ramBytesUsed();
++}
+Index: src/java/org/apache/lucene/util/packed/PackedIntsPerformance.java
+===================================================================
+--- src/java/org/apache/lucene/util/packed/PackedIntsPerformance.java	Fri Feb 26 14:23:55 CET 2010
++++ src/java/org/apache/lucene/util/packed/PackedIntsPerformance.java	Fri Feb 26 14:23:55 CET 2010
+@@ -0,0 +1,121 @@
++package org.apache.lucene.util.packed;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.StringWriter;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Random;
++
++/**
++ * Simple performance testing of PackedInts.
++ */
++public class PackedIntsPerformance {
++  public static void main(String[] args) {
++    long startTime = System.currentTimeMillis();
++    testSpeed();
++    System.out.println(
++            "\nTotal execution time: "
++            + (System.currentTimeMillis() - startTime) / 1000 + " seconds");
++  }
++  
++  public static void testSpeed() {
++    final int RUN_COUNT = 3;
++    final int SEED = 87;
++    final int[] VALUE_COUNTS = new int[]{
++            1000, 1000*1000, 10*1000*1000};
++    final int[] BITS_PER_VALUE = new int[]{
++            1, 3, 4, 7, 8, 9, 15, 16, 17, 28, 31, 32, 33, 47, 49, 63};
++    final int[] GET_COUNT = new int[]{10*1000*1000};
++    String BASE_HEADER = String.format("%12s%12s%12s",
++            "bitsPerValue", "valueCount", "getCount");
++
++    String oldHeader = null;
++
++    for (int bitsPerValue: BITS_PER_VALUE) {
++      for (int valueCount: VALUE_COUNTS) {
++        for (int getCount: GET_COUNT) {
++          List<PackedInts.Mutable> packedInts =
++                  createPackedInts(valueCount, bitsPerValue);
++          String header = BASE_HEADER;
++          for (PackedInts.Mutable packedInt: packedInts) {
++              header += String.format(
++                      "%12s", packedInt.getClass().getSimpleName());
++          }
++          if (!header.equals(oldHeader)) {
++            System.out.println("\n" + header);
++            oldHeader = header;
++          }
++          measureSpeed(
++                  packedInts, valueCount, bitsPerValue, getCount,
++                  RUN_COUNT, SEED);
++        }
++      }
++    }
++  }
++
++  private static void measureSpeed(
++          List<? extends PackedInts.Reader> packedInts,
++          int valueCount, int bitsPerValue,
++          int getCount, int runCount, int seed) {
++    StringWriter sw = new StringWriter(1000);
++    sw.append(String.format("%12d%12d%12s",
++            bitsPerValue, valueCount, getCount));
++
++    for (PackedInts.Reader packedInt: packedInts) {
++      long minTime = Long.MAX_VALUE;
++      for (int run = 0 ; run < runCount ; run++) {
++        Random random = new Random(seed);
++        long startTime = System.nanoTime();
++        for (int get = 0 ; get < getCount ; get++) {
++          packedInt.get(random.nextInt(valueCount));
++        }
++        minTime = Math.min(minTime, System.nanoTime() - startTime);
++      }
++      sw.append(String.format("%12d", minTime / 1000000));
++    }
++    System.out.println(sw.toString());
++  }
++
++  // Copy-paste from TestPackedInts
++  private static List<PackedInts.Mutable> createPackedInts(
++          int valueCount, int bitsPerValue) {
++    List<PackedInts.Mutable> packedInts = new ArrayList<PackedInts.Mutable>();
++    if (bitsPerValue <= 8) {
++      packedInts.add(new Direct8(valueCount));
++    }
++    if (bitsPerValue <= 16) {
++      packedInts.add(new Direct16(valueCount));
++    }
++    if (bitsPerValue <= 31) {
++      packedInts.add(new Packed32(valueCount, bitsPerValue));
++      packedInts.add(new Aligned32(valueCount, bitsPerValue));
++    }
++    if (bitsPerValue <= 32) {
++      packedInts.add(new Direct32(valueCount));
++    }
++    if (bitsPerValue <= 63) {
++      packedInts.add(new Packed64(valueCount, bitsPerValue));
++      packedInts.add(new Aligned64(valueCount, bitsPerValue));
++    }
++    packedInts.add(new Direct64(valueCount));
++    return packedInts;
++  }
++
++
++}
+Index: src/java/org/apache/lucene/util/packed/TODO
+===================================================================
+--- src/java/org/apache/lucene/util/packed/TODO	Fri Feb 26 14:52:06 CET 2010
++++ src/java/org/apache/lucene/util/packed/TODO	Fri Feb 26 14:52:06 CET 2010
+@@ -0,0 +1,336 @@
++- Test whether aligned is always faster than packed
++Aligned uses more logic (mainly a division), but packed requests two ints/longs
++from RAM for each request. If the extra logic is always slower, we should avoid
++using aligned at all. This would also make the persistent structure consistent
++between the remaining implementations (packed and direct).
++
++- Better JavaDocs (as always)
++
++
++
++********************************************************************************
++Run performance tests with
++java -cp lucene-core-3.1-dev.jar org.apache.lucene.util.packed.PackedIntsPerformance
++********************************************************************************
++
++
++********************************************************************************
++testSpeed result by Toke Eskildsen (te@statsbiblioteket.dk) 2010-02-26
++Java 1.6.0_15-b03 64bit Server, default settings, Linux
++Dell Precision M6500: Intel i7 Q 820 @ 1.73GHz, 8 MB cache,
++                      dual-channel PC 1333 RAM
++********************************************************************************
++bitsPerValue  valueCount    getCount     Direct8    Direct16    Packed32   Aligned32    Direct32    Packed64   Aligned64    Direct64
++           1        1000    10000000         130         132         238         229         164         249         226         165
++           1     1000000    10000000         218         221         258         238         232         255         222         295
++           1    10000000    10000000         335         456         263         262         493         263         258         540
++           3        1000    10000000         158         158         252         224         152         247         223         151
++           3     1000000    10000000         213         215         255         245         223         255         238         293
++           3    10000000    10000000         350         457         272         276         491         293         275         535
++           4        1000    10000000         159         160         252         226         152         249         223         152
++           4     1000000    10000000         212         215         261         250         226         261         250         294
++           4    10000000    10000000         347         453         275         286         490         277         283         531
++           7        1000    10000000         158         158         250         226         152         246         221         151
++           7     1000000    10000000         209         214         261         259         222         262         255         310
++           7    10000000    10000000         345         454         353         397         493         357         360         526
++           8        1000    10000000         158         158         252         224         152         245         222         151
++           8     1000000    10000000         210         214         263         259         223         262         257         290
++           8    10000000    10000000         347         451         383         392         491         386         389         525
++
++bitsPerValue  valueCount    getCount    Direct16    Packed32   Aligned32    Direct32    Packed64   Aligned64    Direct64
++           9        1000    10000000         161         250         224         152         245         222         152
++           9     1000000    10000000         214         264         262         224         263         259         290
++           9    10000000    10000000         453         412         453         491         413         422         533
++          15        1000    10000000         158         251         223         151         245         221         151
++          15     1000000    10000000         214         265         262         221         267         259         299
++          15    10000000    10000000         452         478         498         490         486         492         528
++          16        1000    10000000         159         250         225         152         247         221         152
++          16     1000000    10000000         215         266         263         221         267         262         298
++          16    10000000    10000000         452         487         496         497         489         493         529
++
++bitsPerValue  valueCount    getCount    Packed32   Aligned32    Direct32    Packed64   Aligned64    Direct64
++          17        1000    10000000         251         225         153         246         224         151
++          17     1000000    10000000         265         270         222         266         267         290
++          17    10000000    10000000         491         541         493         498         517         529
++          28        1000    10000000         251         227         171         274         248         169
++          28     1000000    10000000         304         313         255         344         280         296
++          28    10000000    10000000         529         540         492         534         544         533
++          31        1000    10000000         251         225         153         249         223         153
++          31     1000000    10000000         269         281         225         274         276         289
++          31    10000000    10000000         534         543         491         540         547         535
++
++bitsPerValue  valueCount    getCount    Direct32    Packed64   Aligned64    Direct64
++          32        1000    10000000         153         248         222         151
++          32     1000000    10000000         227         275         276         308
++          32    10000000    10000000         506         546         553         542
++
++bitsPerValue  valueCount    getCount    Packed64   Aligned64    Direct64
++          33        1000    10000000         248         223         152
++          33     1000000    10000000         276         345         300
++          33    10000000    10000000         541         579         529
++          47        1000    10000000         250         225         153
++          47     1000000    10000000         295         347         295
++          47    10000000    10000000         564         578         535
++          49        1000    10000000         248         224         153
++          49     1000000    10000000         291         332         295
++          49    10000000    10000000         561         579         532
++          63        1000    10000000         250         223         155
++          63     1000000    10000000         331         341         295
++          63    10000000    10000000         583         580         529
++Total execution time: 270 seconds
++
++********************************************************************************
++testSpeed result by Toke Eskildsen (te@statsbiblioteket.dk) 2010-02-26
++Java 1.6.0_15-b03 64bit Server, default settings, Linux
++Server ps3: Intel Xeon L5420 @ 2.50GHz, 6 MB cache (some other programs running)
++********************************************************************************
++ bitsPerValue  valueCount    getCount     Direct8    Direct16    Packed32   Aligned32    Direct32    Packed64   Aligned64    Direct64
++           1        1000    10000000         288         309         406         429         370         425         428         370
++           1     1000000    10000000         368         377         433         437         383         430         446         642
++           1    10000000    10000000         748        1098         383         382        1259         382         378        1351
++           3        1000    10000000         313         300         365         340         298         369         338         298
++           3     1000000    10000000         308         325         376         372         327         378         368         590
++           3    10000000    10000000         763        1100         400         407        1263         401         403        1355
++           4        1000    10000000         315         302         360         343         300         370         340         300
++           4     1000000    10000000         310         327         381         376         329         388         370         585
++           4    10000000    10000000         762        1100         425         437        1264         415         443        1357
++           7        1000    10000000         315         302         360         343         300         371         339         300
++           7     1000000    10000000         312         327         382         378         334         382         373         579
++           7    10000000    10000000         759        1098         733         882        1261         751         744        1353
++           8        1000    10000000         305         301         358         341         298         369         337         298
++           8     1000000    10000000         309         325         378         376         328         377         372         579
++           8    10000000    10000000         758        1098         832         831        1260         850         827        1353
++
++bitsPerValue  valueCount    getCount    Direct16    Packed32   Aligned32    Direct32    Packed64   Aligned64    Direct64
++           9        1000    10000000         301         358         341         298         368         337         298
++           9     1000000    10000000         325         379         383         332         381         375         578
++           9    10000000    10000000        1096         906        1002        1262         924         913        1354
++          15        1000    10000000         301         365         340         298         369         345         298
++          15     1000000    10000000         325         387         390         331         387         389         581
++          15    10000000    10000000        1097        1156        1184        1271        1174        1176        1355
++          16        1000    10000000         302         359         342         300         371         339         300
++          16     1000000    10000000         327         390         392         331         389         388         591
++          16    10000000    10000000        1097        1172        1178        1261        1194        1176        1352
++
++bitsPerValue  valueCount    getCount    Packed32   Aligned32    Direct32    Packed64   Aligned64    Direct64
++          17        1000    10000000         358         349         298         368         337         298
++          17     1000000    10000000         388         376         331         389         392         582
++          17    10000000    10000000        1193        1321        1259        1214        1260        1351
++          28        1000    10000000         363         349         298         380         337         298
++          28     1000000    10000000         408         378         329         395         398         580
++          28    10000000    10000000        1319        1324        1259        1341        1347        1351
++          31        1000    10000000         364         349         298         369         337         298
++          31     1000000    10000000         399         382         327         398         401         574
++          31    10000000    10000000        1339        1321        1260        1361        1348        1352
++
++bitsPerValue  valueCount    getCount    Direct32    Packed64   Aligned64    Direct64
++          32        1000    10000000         298         369         337         298
++          32     1000000    10000000         329         403         398         582
++          32    10000000    10000000        1261        1366        1348        1352
++
++bitsPerValue  valueCount    getCount    Packed64   Aligned64    Direct64
++          33        1000    10000000         369         342         298
++          33     1000000    10000000         401         635         581
++          33    10000000    10000000        1371        1415        1352
++          47        1000    10000000         375         346         298
++          47     1000000    10000000         471         640         573
++          47    10000000    10000000        1424        1416        1353
++          49        1000    10000000         377         349         298
++          49     1000000    10000000         486         643         582
++          49    10000000    10000000        1429        1417        1355
++          63        1000    10000000         369         343         298
++          63     1000000    10000000         671         636         583
++          63    10000000    10000000        1455        1416        1354
++Total execution time: 530 seconds
++
++********************************************************************************
++testSpeed result by Toke Eskildsen (te@statsbiblioteket.dk) 2010-02-26
++Java 1.6.0_15-b03 64bit Server, default settings, Linux
++Workstation pc286: Intel Core 2 E6550 @ 2.33GHz, 4 MB cache
++********************************************************************************
++bitsPerValue  valueCount    getCount     Direct8    Direct16    Packed32   Aligned32    Direct32    Packed64   Aligned64    Direct64
++           1        1000    10000000         361         374         491         531         439         504         524         439
++           1     1000000    10000000         411         423         481         553         546         482         550         934
++           1    10000000    10000000         999        1155         405         453        1266         403         444        1333
++           3        1000    10000000         333         328         394         392         334         390         389         334
++           3     1000000    10000000         334         356         395         441         477         396         432         847
++           3    10000000    10000000         949        1155         481         596        1266         501         542        1334
++           4        1000    10000000         333         330         394         392         334         390         389         334
++           4     1000000    10000000         418         354         398         442         469         396         432         847
++           4    10000000    10000000        1047        1155         637         700        1266         665         693        1335
++           7        1000    10000000         333         327         394         392         334         393         389         334
++           7     1000000    10000000         346         397         406         457         647         398         435         845
++           7    10000000    10000000         948        1263         962        1090        1267         976        1029        1334
++           8        1000    10000000         334         328         394         392         334         390         389         334
++           8     1000000    10000000         336         354         399         444         441         426         434         848
++           8    10000000    10000000         949        1155        1022        1090        1267        1035        1083        1334
++
++bitsPerValue  valueCount    getCount    Direct16    Packed32   Aligned32    Direct32    Packed64   Aligned64    Direct64
++           9        1000    10000000         330         394         392         334         391         389         334
++           9     1000000    10000000         353         401         451         474         402         438         846
++           9    10000000    10000000        1156        1064        1193        1265        1078        1134        1334
++          15        1000    10000000         328         394         392         334         391         389         334
++          15     1000000    10000000         354         411         459         450         411         454         845
++          15    10000000    10000000        1154        1206        1296        1266        1219        1295        1334
++          16        1000    10000000         328         394         392         334         390         389         334
++          16     1000000    10000000         354         411         459         448         414         455         847
++          16    10000000    10000000        1154        1221        1297        1265        1232        1294        1332
++
++bitsPerValue  valueCount    getCount    Packed32   Aligned32    Direct32    Packed64   Aligned64    Direct64
++          17        1000    10000000         399         392         334         390         389         335
++          17     1000000    10000000         416         562         481         412         469         846
++          17    10000000    10000000        1231        1399        1266        1244        1349        1333
++          28        1000    10000000         394         392         334         392         389         334
++          28     1000000    10000000         477         572         450         462         553         850
++          28    10000000    10000000        1306        1398        1265        1424        1407        1334
++          31        1000    10000000         394         392         334         397         389         334
++          31     1000000    10000000         499         573         448         509         559         851
++          31    10000000    10000000        1317        1395        1266        1330        1406        1333
++
++bitsPerValue  valueCount    getCount    Direct32    Packed64   Aligned64    Direct64
++          32        1000    10000000         334         390         389         334
++          32     1000000    10000000         446         524         556         850
++          32    10000000    10000000        1265        1334        1405        1334
++
++bitsPerValue  valueCount    getCount    Packed64   Aligned64    Direct64
++          33        1000    10000000         391         389         334
++          33     1000000    10000000         537         975         846
++          33    10000000    10000000        1335        1472        1334
++          47        1000    10000000         390         389         334
++          47     1000000    10000000         754         973         846
++          47    10000000    10000000        1366        1474        1335
++          49        1000    10000000         390         389         334
++          49     1000000    10000000         780         974         847
++          49    10000000    10000000        1370        1474        1335
++          63        1000    10000000         391         389         334
++          63     1000000    10000000         923         974         845
++          63    10000000    10000000        1391        1473        1334
++Total execution time: 599 seconds
++
++********************************************************************************
++testSpeed result by Toke Eskildsen (te@statsbiblioteket.dk) 2010-02-26
++Java 1.6.0_03-b05 64bit Server, default settings, Linux
++Server metis: Intel Xeon 5148 @ 2.33GHz, 4 MB cache
++********************************************************************************
++bitsPerValue  valueCount    getCount     Direct8    Direct16    Packed32   Aligned32    Direct32    Packed64   Aligned64    Direct64
++           1        1000    10000000         400         414         523         572         480         524         571         478
++           1     1000000    10000000         453         467         508         594         622         511         591         991
++           1    10000000    10000000        1081        1331         545         615        1443         542         615        1505
++           3        1000    10000000         473         473         552         573         472         543         569         474
++           3     1000000    10000000         449         464         535         603         575         534         598         983
++           3    10000000    10000000        1103        1329         620         779        1442         601         685        1503
++           4        1000    10000000         472         471         551         573         471         542         568         473
++           4     1000000    10000000         449         464         539         611         501         535         600         985
++           4    10000000    10000000        1107        1332         765         913        1447         779         851        1505
++           7        1000    10000000         472         472         554         573         472         548         570         474
++           7     1000000    10000000         451         465         540         608         614         536         600         982
++           7    10000000    10000000        1103        1330        1131        1261        1440        1145        1202        1502
++           8        1000    10000000         473         471         551         572         471         547         568         473
++           8     1000000    10000000         449         465         539         607         545         535         600         980
++           8    10000000    10000000        1099        1329        1194        1263        1439        1209        1257        1504
++
++bitsPerValue  valueCount    getCount    Direct16    Packed32   Aligned32    Direct32    Packed64   Aligned64    Direct64
++           9        1000    10000000         472         552         572         471         542         568         473
++           9     1000000    10000000         463         542         614         576         538         604         981
++           9    10000000    10000000        1326        1241        1377        1442        1260        1313        1498
++          15        1000    10000000         471         552         574         472         546         569         474
++          15     1000000    10000000         464         553         620         551         562         614         980
++          15    10000000    10000000        1336        1406        1498        1448        1419        1495        1506
++          16        1000    10000000         473         553         575         473         547         569         473
++          16     1000000    10000000         464         553         621         544         547         616         982
++          16    10000000    10000000        1330        1413        1489        1443        1431        1488        1499
++
++bitsPerValue  valueCount    getCount    Packed32   Aligned32    Direct32    Packed64   Aligned64    Direct64
++          17        1000    10000000         551         574         472         543         569         473
++          17     1000000    10000000         553         757         484         547         623         986
++          17    10000000    10000000        1429        1608        1448        1449        1550        1503
++          28        1000    10000000         552         573         473         547         570         474
++          28     1000000    10000000         587         760         493         610         777         983
++          28    10000000    10000000        1512        1605        1443        1522        1603        1502
++          31        1000    10000000         552         575         472         547         569         474
++          31     1000000    10000000         611         711         553         620         717         980
++          31    10000000    10000000        1519        1608        1442        1571        1606        1504
++
++bitsPerValue  valueCount    getCount    Direct32    Packed64   Aligned64    Direct64
++          32        1000    10000000         472         546         568         473
++          32     1000000    10000000         530         644         709         984
++          32    10000000    10000000        1442        1535        1606        1498
++
++bitsPerValue  valueCount    getCount    Packed64   Aligned64    Direct64
++          33        1000    10000000         545         568         473
++          33     1000000    10000000         628        1142         982
++          33    10000000    10000000        1541        1668        1500
++          47        1000    10000000         546         569         474
++          47     1000000    10000000         900        1143         979
++          47    10000000    10000000        1571        1665        1503
++          49        1000    10000000         546         568         473
++          49     1000000    10000000         931        1140         981
++          49    10000000    10000000        1578        1668        1498
++          63        1000    10000000         546         568         473
++          63     1000000    10000000        1088        1142         981
++          63    10000000    10000000        1596        1667        1501
++Total execution time: 727 seconds
++
++********************************************************************************
++testSpeed result by Toke Eskildsen (te@statsbiblioteket.dk) 2010-02-26
++Java 1.6.0_07-b06 64bit Server, default settings, Linux
++Server debit: Intel Xeon MP CPU @ 3.16GHz, 1 MB cache
++********************************************************************************
++bitsPerValue  valueCount    getCount     Direct8    Direct16    Packed32   Aligned32    Direct32    Packed64   Aligned64    Direct64
++           1        1000    10000000         431         435         506         756         471         556         755         471
++           1     1000000    10000000         878        1573         561         756        2094         600         756        2360
++           1    10000000    10000000        2379        2522        1187        1384        2632        1255        1359        2807
++           3        1000    10000000         491         491         541         741         497         551         734         497
++           3     1000000    10000000         803        1578         611         793        2100         661         785        2358
++           3    10000000    10000000        2441        2528        2250        2397        2611        2284        2450        2810
++           4        1000    10000000         491         491         541         741         486         550         734         497
++           4     1000000    10000000         895        1599         633         811        2079         678         847        2358
++           4    10000000    10000000        2429        2531        2381        2500        2634        2418        2611        2820
++           7        1000    10000000         493         493         544         742         494         550         733         498
++           7     1000000    10000000         872        1605         810        1132        2088         988        1075        2342
++           7    10000000    10000000        2447        2529        2551        2736        2618        2602        2808        2773
++           8        1000    10000000         491         491         541         740         488         550         734         498
++           8     1000000    10000000         795        1590        1030        1076        2081        1002        1123        2362
++           8    10000000    10000000        2430        2521        2582        2725        2636        2626        2829        2801
++
++bitsPerValue  valueCount    getCount    Direct16    Packed32   Aligned32    Direct32    Packed64   Aligned64    Direct64
++           9        1000    10000000         493         543         742         490         545         733         496
++           9     1000000    10000000        1577        1037        1372        2076        1122        1259        2350
++           9    10000000    10000000        2528        2615        2786        2641        2648        2867        2791
++          15        1000    10000000         493         544         741         497         550         734         497
++          15     1000000    10000000        1590        1669        1852        2162        1691        1903        2360
++          15    10000000    10000000        2525        2672        2851        2618        2751        2963        2800
++          16        1000    10000000         491         542         740         487         551         735         499
++          16     1000000    10000000        1599        1755        1884        2096        1791        1937        2353
++          16    10000000    10000000        2541        2701        2847        2634        2741        2966        2794
++
++bitsPerValue  valueCount    getCount    Packed32   Aligned32    Direct32    Packed64   Aligned64    Direct64
++          17        1000    10000000         545         743         492         545         734         498
++          17     1000000    10000000        1821        2395        2102        1856        2204        2361
++          17    10000000    10000000        2705        2924        2622        2750        2995        2785
++          28        1000    10000000         543         741         489         551         734         497
++          28     1000000    10000000        2195        2379        2175        2250        2506        2363
++          28    10000000    10000000        2760        2933        2625        2824        3033        2805
++          31        1000    10000000         543         741         496         551         735         497
++          31     1000000    10000000        2253        2397        2097        2313        2492        2354
++          31    10000000    10000000        2790        2941        2646        2848        3050        2793
++
++bitsPerValue  valueCount    getCount    Direct32    Packed64   Aligned64    Direct64
++          32        1000    10000000         491         551         735         498
++          32     1000000    10000000        2109        2323        2500        2374
++          32    10000000    10000000        2625        2859        3032        2800
++
++bitsPerValue  valueCount    getCount    Packed64   Aligned64    Direct64
++          33        1000    10000000         551         735         499
++          33     1000000    10000000        2334        2779        2369
++          33    10000000    10000000        2871        3166        2791
++          47        1000    10000000         550         734         498
++          47     1000000    10000000        2501        2788        2378
++          47    10000000    10000000        2964        3149        2803
++          49        1000    10000000         553         738         500
++          49     1000000    10000000        2519        2779        2357
++          49    10000000    10000000        2985        3156        2813
++          63        1000    10000000         552         735         497
++          63     1000000    10000000        2580        2796        2363
++          63    10000000    10000000        3072        3143        2799
++Total execution time: 1440 seconds
+Index: src/java/org/apache/lucene/util/packed/Aligned64.java
+===================================================================
+--- src/java/org/apache/lucene/util/packed/Aligned64.java	Fri Feb 26 13:28:17 CET 2010
++++ src/java/org/apache/lucene/util/packed/Aligned64.java	Fri Feb 26 13:28:17 CET 2010
+@@ -0,0 +1,190 @@
++package org.apache.lucene.util.packed;
++
++import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.util.RamUsageEstimator;
++
++import java.io.IOException;
++import java.util.Arrays;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * Medium space and speed trade off. No values crosses block boundaries.
++ * </p><p>
++ * The implementation strives to avoid conditionals and expensive operations,
++ * sacrificing code clarity to achieve better performance.
++ * </p><p>
++ * Space is optimally used within the boundaries of alignment, e.g.
++ * 7 bits/value fits 7 values/block for 64 bit.
++ * Bits are packed left-aligned to be bit pattern compatible with other bit
++ * array implementations where possible.
++ */
++class Aligned64 extends PackedInts.ReaderImpl
++        implements PackedInts.Mutable {
++  static final int BLOCK_SIZE = 64; // 32 = int, 64 = long
++
++  private static final int ENTRY_SIZE = BLOCK_SIZE + 1;
++
++  /*
++   * A value is always positioned inside a single block, requiring a
++   * shift right to position the bits and a mask to extract them.
++  */
++  private static final int[][] SHIFTS = new int[ENTRY_SIZE][ENTRY_SIZE];
++  private static final long[] READ_MASKS = new long[ENTRY_SIZE];
++
++  static { // Generate shifts
++      for (int elementBits = 1 ; elementBits <= BLOCK_SIZE ; elementBits++) {
++          int[] currentShifts = SHIFTS[elementBits];
++          for (int bitPos = 0 ; bitPos < BLOCK_SIZE ; bitPos++) {
++              currentShifts[bitPos] = BLOCK_SIZE - elementBits - bitPos ;
++//            System.out.println("elementBits=" + elementBits + ", bitPos=" + bitPos + ", shift=" + currentShifts[bitPos]);
++              READ_MASKS[elementBits]  = ~(~0L << elementBits);
++          }
++      }
++  }
++
++  /*
++   * Setting a value requires clearing the destination bits with a mask, then
++   * shifting the value to the left and or'ing the two numbers.
++  */
++  private static final long[][] WRITE_MASKS = new long[ENTRY_SIZE][ENTRY_SIZE];
++  static {
++      for (int elementBits = 1 ; elementBits <= BLOCK_SIZE ; elementBits++) {
++          long elementPosMask = ~(~0L << elementBits);
++          int[] currentShifts = SHIFTS[elementBits];
++          long[] currentMasks = WRITE_MASKS[elementBits];
++          for (int bitPos = 0 ; bitPos < BLOCK_SIZE ; bitPos++) {
++              currentMasks[bitPos] = ~(elementPosMask << currentShifts[bitPos]);
++          }
++      }
++  }
++
++  /* The bits */
++  private long[] blocks;
++
++  /* Cached values */
++  private int valuesPerBlock;
++  private int[] shifts;
++  private long readMask;
++  private long[] writeMasks;
++
++  /**
++   * Creates an array with the internal structures adjusted for the given
++   * limits and initialized to 0.
++   * @param valueCount   the number of values.
++   * @param bitsPerValue the number of bits available for any given value.
++   */
++  public Aligned64(int valueCount, int bitsPerValue) {
++    super(valueCount, bitsPerValue);
++    blocks = new long[size(valueCount, bitsPerValue)];
++    updateCached();
++  }
++
++  private static int size(int valueCount, int bitsPerValue) {
++    int valuesPerBlock = BLOCK_SIZE / bitsPerValue;
++    return valueCount == 0 ? 0 : (valueCount-1) / valuesPerBlock + 1;
++  }
++
++  /**
++   * Creates an array with content retrieved from the given IndexInput.
++   * @param in       an IndexInput, positioned at the start of Packed64-content.
++   * @param valueCount  the number of elements.
++   * @param bitsPerValue the number of bits available for any given value.
++   * @throws java.io.IOException if the values for the backing array could not
++   *                             be retrieved.
++   */
++  public Aligned64(IndexInput in, int valueCount, int bitsPerValue)
++                                                            throws IOException {
++    super(valueCount, bitsPerValue);
++    int size = size(valueCount, bitsPerValue);
++    blocks = new long[size];
++    for(int i = 0 ; i < size ; i++) {
++      blocks[i] = in.readLong();
++//        System.out.println("Reading  @bit64: " + Long.toBinaryString((blocks[i])) + " (" + blocks[i] + ")");
++    }
++    in.readLong(); // The extra long if for packed-compatibility
++    updateCached();
++  }
++
++
++  /**
++   * Creates an array backed by the given blocks.
++   * </p><p>
++   * Note: The blocks are used directly, so changes to the given block will
++   * affect the Packed64-structure.
++   * @param blocks     used as the internal backing array.
++   * @param valueCount the number of values.
++   * @param bitsPerValue the number of bits available for any given value.
++   */
++  public Aligned64(long[] blocks, int valueCount, int bitsPerValue) {
++    // TODO: Check that blocks.length is sufficient for holding length values
++    super(valueCount, bitsPerValue);
++    this.blocks = blocks;
++    updateCached();
++  }
++
++  private void updateCached() {
++    valuesPerBlock = BLOCK_SIZE / bitsPerValue;
++    shifts = SHIFTS[bitsPerValue];
++    readMask = READ_MASKS[bitsPerValue];
++    writeMasks = WRITE_MASKS[bitsPerValue];
++  }
++
++  /**
++   * @param index the position of the value.
++   * @return the value at the given index.
++   */
++  public long get(final int index) {
++    final int blockPos = index / valuesPerBlock;
++    final int bitPos = (index - (blockPos * valuesPerBlock)) * bitsPerValue;
++
++    return (blocks[blockPos] >>> shifts[bitPos]) & readMask;
++  }
++
++  public void set(final int index, final long value) {
++    final int blockPos = index / valuesPerBlock;
++    final int bitPos = (index - (blockPos * valuesPerBlock)) * bitsPerValue;
++
++    blocks[blockPos] = (blocks[blockPos] & writeMasks[bitPos])
++            | (value << shifts[bitPos]);
++  }
++
++  public void clear() {
++    Arrays.fill(blocks, 0);
++  }
++
++  public long ramBytesUsed() {
++    return RamUsageEstimator.NUM_BYTES_ARRAY_HEADER
++            + blocks.length * RamUsageEstimator.NUM_BYTES_INT;
++  }
++
++  public String toString() {
++    return "Aligned64(" + valueCount + " values at " 
++            + bitsPerValue + " bits/value)";
++  }
++
++  /**
++   * The backing array contains the bits for the values in this structure.
++   * The array is returned directly, so any changes will be reflected both ways.
++   * Expert use only.
++   * @return the backing array.
++   */
++  long[] getBackingArray() {
++    return blocks;
++  }
++}
+\ No newline at end of file
+Index: src/java/org/apache/lucene/util/packed/AlignedWriter.java
+===================================================================
+--- src/java/org/apache/lucene/util/packed/AlignedWriter.java	Fri Feb 26 13:08:36 CET 2010
++++ src/java/org/apache/lucene/util/packed/AlignedWriter.java	Fri Feb 26 13:08:36 CET 2010
+@@ -0,0 +1,115 @@
++package org.apache.lucene.util.packed;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.store.IndexOutput;
++
++import java.io.IOException;
++
++// Packs high order byte first, to match
++// IndexOutput.writeInt/Long/Short byte order
++
++/**
++ * Generic writer for block-aligned values: Bits for values are stored so
++ * that block-boundaries are never crossed. For some number of bits, this means
++ * wasted space in the blocks.
++ * </p><p>
++ * The bits for values are stored left-aligned in the blocks, in order to be
++ * bit-pattern compatible with byte, short, int and long-backed implementations
++ * as well as packed for 1, 2, 4, 8, 16, 32 and 64 bits/value.
++ */
++class AlignedWriter extends PackedInts.Writer {
++  private final PackedInts.BLOCK blockPref;
++  private long pending = 0;
++  private int pendingBitPos = 0;
++  private int written = 0;
++  private long flushedInts = 0;
++
++  public AlignedWriter(IndexOutput out, int valueCount,
++                      int bitsPerValue, PackedInts.BLOCK blockPref)
++                                                            throws IOException {
++    super(out, valueCount, bitsPerValue,
++            blockPref == PackedInts.BLOCK.bit32 ?
++            PackedInts.PERSISTENCE.aligned32 :  
++            PackedInts.PERSISTENCE.aligned64);
++    this.blockPref = blockPref;
++  }
++
++  @Override
++  public void add(long value) throws IOException {
++//    System.out.println("Adding " + value + " to " + this);
++
++    // TODO: Consider caching maxValue and bits/block
++    assert value <= PackedInts.maxValue(bitsPerValue) : "value=" + value
++            + " maxValue=" + PackedInts.maxValue(bitsPerValue);
++    assert value >= 0;
++    assert written <= valueCount : "The number of values to write has been " +
++            "exceeded, expected number of values: " + valueCount;
++    pending |= value << (64 - pendingBitPos - bitsPerValue);
++    pendingBitPos += bitsPerValue;
++    if (pendingBitPos > blockPref.getBits() - bitsPerValue) {
++      flush();
++    }
++    written++;
++  }
++
++  @Override
++  public void finish() throws IOException {
++    while (written < valueCount) {
++      add(0L);
++    }
++/*    assert written == valueCount :
++            valueCount + " values should be added, but only " + written
++                    + " has been received";*/
++    if (pendingBitPos != 0) { // Flush pending
++      flush();
++    }
++    if (flushedInts % 2 != 0) { // Align to long
++      out.writeInt(0);
++    }
++    out.writeLong(0L); // Dummy last element to be compatible with packed
++  }
++
++  private void flush() throws IOException {
++    // TODO: Align to 64 bit
++    switch (blockPref) {
++      case bit32: {
++        out.writeInt((int)(pending >>> 32));
++//        System.out.println("Flushing @" + blockPref + ": " + Integer.toBinaryString((int)(pending >>> 32)));
++        flushedInts++;
++        break;
++      }
++      case bit64: {
++        out.writeLong(pending);
++//        System.out.println("Flushing @" + blockPref + ": " + Long.toBinaryString((pending)) + " (" + pending + ")");
++        flushedInts += 2;
++        break;
++      }
++      default: throw new UnsupportedOperationException(
++              "The BLOCK " + blockPref + " is unsupported");
++    }
++    pending = 0;
++    pendingBitPos = 0;
++  }
++
++  public String toString() {
++    return "AlignedWriter" + blockPref.getBits()
++            + "(written " + written + "/" + valueCount + " with "
++            + bitsPerValue + " bits/value)";
++  }
++}
+\ No newline at end of file
+Index: src/java/org/apache/lucene/util/packed/Direct16.java
+===================================================================
+--- src/java/org/apache/lucene/util/packed/Direct16.java	Mon Feb 22 08:42:35 CET 2010
++++ src/java/org/apache/lucene/util/packed/Direct16.java	Mon Feb 22 08:42:35 CET 2010
+@@ -0,0 +1,86 @@
++package org.apache.lucene.util.packed;
++
++import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.store.IndexOutput;
++import org.apache.lucene.util.RamUsageEstimator;
++
++import java.io.IOException;
++import java.util.Arrays;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * Direct wrapping of 16 bit values to a backing array of shorts.
++ */
++class Direct16 extends PackedInts.ReaderImpl
++        implements PackedInts.Mutable {
++  private short[] blocks;
++  private static final int BITS_PER_VALUE = 16;
++
++  public Direct16(int valueCount) {
++    super(valueCount, BITS_PER_VALUE);
++    blocks = new short[valueCount];
++  }
++
++  public Direct16(IndexInput in, int valueCount) throws IOException {
++    super(valueCount, BITS_PER_VALUE);
++    short[] blocks = new short[valueCount];
++    for(int i=0;i<valueCount;i++) {
++      blocks[i] = in.readShort();
++    }
++    final int mod = valueCount % 4;
++    if (mod != 0) {
++      final int pad = 4-mod;
++      // round out long
++      for(int i=0;i<pad;i++) {
++        in.readShort();
++      }
++    }
++
++    this.blocks = blocks;
++  }
++
++  /**
++   * Creates an array backed by the given blocks.
++   * </p><p>
++   * Note: The blocks are used directly, so changes to the given block will
++   * affect the structure.
++   * @param blocks   used as the internal backing array.
++   */
++  public Direct16(short[] blocks) {
++    super(blocks.length, BITS_PER_VALUE);
++    this.blocks = blocks;
++  }
++
++  public long get(final int index) {
++    return 0xFFFFL & blocks[index];
++  }
++
++  public void set(final int index, final long value) {
++    blocks[index] = (short)(value & 0xFFFF);
++  }
++
++  public long ramBytesUsed() {
++    return RamUsageEstimator.NUM_BYTES_ARRAY_HEADER +
++            blocks.length * RamUsageEstimator.NUM_BYTES_SHORT;
++  }
++
++  public void clear() {
++    Arrays.fill(blocks, (short)0);
++  }
++}
+\ No newline at end of file
+Index: src/java/org/apache/lucene/util/packed/PackedWriter.java
+===================================================================
+--- src/java/org/apache/lucene/util/packed/PackedWriter.java	Tue Feb 23 15:42:13 CET 2010
++++ src/java/org/apache/lucene/util/packed/PackedWriter.java	Tue Feb 23 15:42:13 CET 2010
+@@ -0,0 +1,116 @@
++package org.apache.lucene.util.packed;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.store.IndexOutput;
++
++import java.io.IOException;
++
++// Packs high order byte first, to match
++// IndexOutput.writeInt/Long/Short byte order
++
++/**
++ * Generic writer for space-optimal packed values. The resulting bits can be
++ * used directly by Packed32, Packed64 and PackedDirect* and will always be
++ * long-aligned.
++ */
++class PackedWriter extends PackedInts.Writer {
++  private long pending;
++  private int pendingBitPos;
++
++  // masks[n-1] masks for bottom n bits
++  private final long[] masks;
++  private int written = 0;
++
++  // nocommit -- allow minValue too?  ie not just minValue==0
++
++  public PackedWriter(IndexOutput out, int valueCount, int bitsPerValue)
++                                                            throws IOException {
++
++    super(out, valueCount, bitsPerValue, PackedInts.PERSISTENCE.packed);
++
++    pendingBitPos = 64;
++    masks = new long[bitsPerValue - 1];
++
++    int v = 1;
++    for (int i = 0; i < bitsPerValue - 1; i++) {
++      v *= 2;
++      masks[i] = v - 1;
++    }
++  }
++
++  /**
++   * Do not call this after finish
++   */
++  @Override
++  public void add(long v) throws IOException {
++    assert v <= PackedInts.maxValue(bitsPerValue) : "v=" + v
++            + " maxValue=" + PackedInts.maxValue(bitsPerValue);
++    assert v >= 0;
++    //System.out.println("    packedw add v=" + v + " pendingBitPos=" + pendingBitPos);
++
++    // TODO
++    if (pendingBitPos >= bitsPerValue) {
++      // not split
++
++      // write-once, so we can |= w/o first masking to 0s
++      pending |= v << (pendingBitPos - bitsPerValue);
++      if (pendingBitPos == bitsPerValue) {
++        // flush
++        out.writeLong(pending);
++        pending = 0;
++        pendingBitPos = 64;
++      } else {
++        pendingBitPos -= bitsPerValue;
++      }
++
++    } else {
++      // split
++
++      // write top pendingBitPos bits of value into bottom bits of pending
++      pending |= (v >> (bitsPerValue - pendingBitPos)) & masks[pendingBitPos - 1];
++      //System.out.println("      part1 (v >> " + (bitsPerValue - pendingBitPos) + ") & " + masks[pendingBitPos-1]);
++
++      // flush
++      out.writeLong(pending);
++
++      // write bottom (bitsPerValue - pendingBitPos) bits of value into top bits of pending
++      pendingBitPos = 64 - bitsPerValue + pendingBitPos;
++      //System.out.println("      part2 v << " + pendingBitPos);
++      pending = (v << pendingBitPos);
++    }
++    written++;
++  }
++
++  @Override
++  public void finish() throws IOException {
++    while (written < valueCount) {
++      add(0L); // Auto flush
++    }
++
++    if (pendingBitPos != 64) {
++      out.writeLong(pending);
++    }
++    out.writeLong(0L); // Dummy to compensate for not using conditionals
++  }
++
++  public String toString() {
++    return "PackedWriter(written " + written + "/" + valueCount + " with "
++            + bitsPerValue + " bits/value)";
++  }
++}
+\ No newline at end of file
+Index: src/java/org/apache/lucene/util/packed/Direct32.java
+===================================================================
+--- src/java/org/apache/lucene/util/packed/Direct32.java	Mon Feb 22 08:42:35 CET 2010
++++ src/java/org/apache/lucene/util/packed/Direct32.java	Mon Feb 22 08:42:35 CET 2010
+@@ -0,0 +1,82 @@
++package org.apache.lucene.util.packed;
++
++import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.store.IndexOutput;
++import org.apache.lucene.util.RamUsageEstimator;
++
++import java.io.IOException;
++import java.util.Arrays;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * Direct wrapping of 32 bit values to a backing array of ints.
++ */
++class Direct32 extends PackedInts.ReaderImpl
++        implements PackedInts.Mutable {
++  private int[] blocks;
++  private static final int BITS_PER_VALUE = 32;
++
++  public Direct32(int valueCount) {
++    super(valueCount, BITS_PER_VALUE);
++    blocks = new int[valueCount];
++  }
++
++  public Direct32(IndexInput in, int valueCount) throws IOException {
++    super(valueCount, BITS_PER_VALUE);
++    int[] blocks = new int[valueCount];
++    for(int i=0;i<valueCount;i++) {
++      blocks[i] = in.readInt();
++    }
++    final int mod = valueCount % 2;
++    if (mod != 0) {
++      in.readInt();
++    }
++
++    this.blocks = blocks;
++  }
++
++  /**
++   * Creates an array backed by the given blocks.
++   * </p><p>
++   * Note: The blocks are used directly, so changes to the given block will
++   * affect the structure.
++   * @param blocks   used as the internal backing array.
++   */
++  public Direct32(int[] blocks) {
++    super(blocks.length, BITS_PER_VALUE);
++    this.blocks = blocks;
++  }
++
++  public long get(final int index) {
++    return 0xFFFFFFFFL & blocks[index];
++  }
++
++  public void set(final int index, final long value) {
++    blocks[index] = (int)(value & 0xFFFFFFFF);
++  }
++
++  public long ramBytesUsed() {
++    return RamUsageEstimator.NUM_BYTES_ARRAY_HEADER +
++            blocks.length * RamUsageEstimator.NUM_BYTES_INT;
++  }
++
++  public void clear() {
++    Arrays.fill(blocks, 0);
++  }
++}
+\ No newline at end of file
+Index: src/java/org/apache/lucene/util/BytesRef.java
+===================================================================
+--- src/java/org/apache/lucene/util/BytesRef.java	Fri Jan 22 12:58:35 CET 2010
++++ src/java/org/apache/lucene/util/BytesRef.java	Fri Jan 22 12:58:35 CET 2010
+@@ -0,0 +1,170 @@
++package org.apache.lucene.util;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.UnsupportedEncodingException;
++
++// nocommit -- share w/ flex's TermRef
++public class BytesRef {
++
++  public byte[] bytes;
++  public int offset;
++  public int length;
++
++  public abstract static class Comparator {
++    abstract public int compare(BytesRef a, BytesRef b);
++  }
++
++  public BytesRef() {
++  }
++
++  /** Creates bytes ref, wrapping UTF8 bytes from the
++   *  provided string. */
++  public BytesRef(String s) {
++    try {
++      bytes = s.getBytes("UTF-8");
++    } catch (UnsupportedEncodingException uee) {
++      throw new RuntimeException(uee);
++    }
++    offset = 0;
++    length = bytes.length;
++  }
++
++  public BytesRef(BytesRef other) {
++    offset = 0;
++    length = other.length;
++    bytes = new byte[other.length];
++    System.arraycopy(other.bytes, other.offset, bytes, 0, length);
++  }
++
++  public boolean bytesEquals(BytesRef other) {
++    if (length == other.length) {
++      int upto = offset;
++      int otherUpto = other.offset;
++      final byte[] otherBytes = other.bytes;
++      for(int i=0;i<length;i++) {
++        if (bytes[upto++] != otherBytes[otherUpto++]) {
++          return false;
++        }
++      }
++      return true;
++    } else {
++      return false;
++    }
++  }
++
++  public String utf8ToString() {
++    try {
++      return new String(bytes, offset, length, "UTF8");
++    } catch (java.io.UnsupportedEncodingException uee) {
++      throw new RuntimeException(uee);
++    }
++  }
++
++  private final static Comparator straightComparator = new StraightComparator();
++
++  public static Comparator getStraightComparator() {
++    return straightComparator;
++  }
++
++  public static class StraightComparator extends Comparator {
++    public int compare(BytesRef a, BytesRef b) {
++      int aUpto = a.offset;
++      int bUpto = b.offset;
++      final int aStop;
++      if (a.length <= b.length) {
++        aStop = aUpto + a.length;
++      } else {
++        aStop = aUpto + b.length;
++      }
++      while(aUpto < aStop) {
++        final int cmp = a.bytes[aUpto++] - b.bytes[bUpto++];
++        if (cmp != 0) {
++          return cmp;
++        }
++      }
++      return a.length - b.length;
++    }
++  }
++
++  private final static Comparator utf8SortedAsUTF16SortOrder = new UTF8SortedAsUTF16Comparator();
++
++  public static Comparator getUTF8SortedAsUTF16Comparator() {
++    return utf8SortedAsUTF16SortOrder;
++  }
++
++  public static class UTF8SortedAsUTF16Comparator extends Comparator {
++    public int compare(BytesRef a, BytesRef b) {
++
++      final byte[] aBytes = a.bytes;
++      int aUpto = a.offset;
++      final byte[] bBytes = b.bytes;
++      int bUpto = b.offset;
++
++      final int aStop;
++      if (a.length < b.length) {
++        aStop = aUpto + a.length;
++      } else {
++        aStop = aUpto + b.length;
++      }
++
++      while(aUpto < aStop) {
++        int aByte = aBytes[aUpto++] & 0xff;
++        int bByte = bBytes[bUpto++] & 0xff;
++
++        if (aByte != bByte) {
++          // See http://icu-project.org/docs/papers/utf16_code_point_order.html#utf-8-in-utf-16-order
++          // We know the terms are not equal, but, we may
++          // have to carefully fixup the bytes at the
++          // difference to match UTF16's sort order:
++          if (aByte >= 0xee && bByte >= 0xee) {
++            if ((aByte & 0xfe) == 0xee) {
++              aByte += 0x10;
++            }
++            if ((bByte&0xfe) == 0xee) {
++              bByte += 0x10;
++            }
++          }
++          return aByte - bByte;
++        }
++      }
++
++      // One is a prefix of the other, or, they are equal:
++      return a.length - b.length;
++    }
++  }
++
++  // nocommit -- kinda hackish?  needed only (so far) for FieldComparator
++  private static class ComparableBytesRef implements Comparable {
++    private final BytesRef b;
++    private final Comparator c;
++    public ComparableBytesRef(BytesRef b, Comparator c) {
++      this.b = b;
++      this.c = c;
++    }
++
++    public int compareTo(Object other) {
++      final ComparableBytesRef o = (ComparableBytesRef) other;
++      return c.compare(b, o.b);
++    }
++  }
++
++  public static Comparable getComparableBytesRef(BytesRef b, Comparator c) {
++    return new ComparableBytesRef(b, c);
++  }
++}
+Index: src/java/org/apache/lucene/util/packed/Direct64.java
+===================================================================
+--- src/java/org/apache/lucene/util/packed/Direct64.java	Mon Feb 22 08:42:35 CET 2010
++++ src/java/org/apache/lucene/util/packed/Direct64.java	Mon Feb 22 08:42:35 CET 2010
+@@ -0,0 +1,79 @@
++package org.apache.lucene.util.packed;
++
++import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.store.IndexOutput;
++import org.apache.lucene.util.RamUsageEstimator;
++
++import java.io.IOException;
++import java.util.Arrays;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * Direct wrapping of 32 bit values to a backing array of ints.
++ */
++class Direct64 extends PackedInts.ReaderImpl
++        implements PackedInts.Mutable {
++  private long[] blocks;
++  private static final int BITS_PER_VALUE = 64;
++
++  public Direct64(int valueCount) {
++    super(valueCount, BITS_PER_VALUE);
++    blocks = new long[valueCount];
++  }
++
++  public Direct64(IndexInput in, int valueCount) throws IOException {
++    super(valueCount, BITS_PER_VALUE);
++    long[] blocks = new long[valueCount];
++    for(int i=0;i<valueCount;i++) {
++      blocks[i] = in.readLong();
++    }
++
++    this.blocks = blocks;
++  }
++
++
++  /**
++   * Creates an array backed by the given blocks.
++   * </p><p>
++   * Note: The blocks are used directly, so changes to the given block will
++   * affect the structure.
++   * @param blocks   used as the internal backing array.
++   */
++  public Direct64(long[] blocks) {
++    super(blocks.length, BITS_PER_VALUE);
++    this.blocks = blocks;
++  }
++
++  public long get(final int index) {
++    return blocks[index];
++  }
++
++  public void set(final int index, final long value) {
++    blocks[index] = value;
++  }
++
++  public long ramBytesUsed() {
++    return RamUsageEstimator.NUM_BYTES_ARRAY_HEADER +
++            blocks.length * RamUsageEstimator.NUM_BYTES_LONG;
++  }
++
++  public void clear() {
++    Arrays.fill(blocks, 0L);
++  }
++}
+\ No newline at end of file
+Index: src/java/org/apache/lucene/util/packed/Packed64.java
+===================================================================
+--- src/java/org/apache/lucene/util/packed/Packed64.java	Fri Feb 26 13:29:32 CET 2010
++++ src/java/org/apache/lucene/util/packed/Packed64.java	Fri Feb 26 13:29:32 CET 2010
+@@ -0,0 +1,210 @@
++package org.apache.lucene.util.packed;
++
++import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.util.RamUsageEstimator;
++
++import java.io.IOException;
++import java.util.Arrays;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * Space optimized random access capable array of values with a fixed number of
++ * bits. For 32 bits/value and less, performance on 32 bit machines is not
++ * optimal. Consider using {@link Packed32} for such a setup.
++ * </p><p>
++ * The implementation strives to avoid conditionals and expensive operations,
++ * sacrificing code clarity to achieve better performance.
++ */
++class Packed64 extends PackedInts.ReaderImpl implements PackedInts.Mutable {
++  static final int BLOCK_SIZE = 64; // 32 = int, 64 = long
++  static final int BLOCK_BITS = 6; // The #bits representing BLOCK_SIZE
++  static final int MOD_MASK = BLOCK_SIZE - 1; // x % BLOCK_SIZE
++
++  private static final int ENTRY_SIZE = BLOCK_SIZE + 1;
++  private static final int FAC_BITPOS = 3;
++
++  /*
++   * In order to make an efficient value-getter, conditionals should be
++   * avoided. A value can be positioned inside of a block, requiring shifting
++   * left or right or it can span two blocks, requiring a left-shift on the
++   * first block and a right-shift on the right block.
++   * </p><p>
++   * By always shifting the first block both left and right, we get exactly
++   * the right bits. By always shifting the second block right and applying
++   * a mask, we get the right bits there. After that, we | the two bitsets.
++  */
++  private static final int[][] SHIFTS =
++          new int[ENTRY_SIZE][ENTRY_SIZE * FAC_BITPOS];
++          //new int[BLOCK_SIZE+1][BLOCK_SIZE][BLOCK_SIZE+1];
++  private static final long[][] MASKS = new long[ENTRY_SIZE][ENTRY_SIZE];
++
++  static { // Generate shifts
++      for (int elementBits = 1 ; elementBits <= BLOCK_SIZE ; elementBits++) {
++          for (int bitPos = 0 ; bitPos < BLOCK_SIZE ; bitPos++) {
++              int[] currentShifts = SHIFTS[elementBits];
++              int base = bitPos * FAC_BITPOS;
++              currentShifts[base    ] = bitPos;
++              currentShifts[base + 1] = BLOCK_SIZE - elementBits;
++              if (bitPos <= BLOCK_SIZE - elementBits) { // Single block
++                  currentShifts[base + 2] = 0;
++                  MASKS[elementBits][bitPos] = 0;
++              } else { // Two blocks
++                  int rBits = elementBits - (BLOCK_SIZE - bitPos);
++                  currentShifts[base + 2] = BLOCK_SIZE - rBits;
++                  MASKS[elementBits][bitPos] = ~(~0L << rBits);
++              }
++          }
++      }
++  }
++
++  /*
++   * The setter requires more masking than the getter.
++  */
++  private static final long[][] WRITE_MASKS =
++          new long[ENTRY_SIZE][ENTRY_SIZE * FAC_BITPOS];
++  static {
++      for (int elementBits = 1 ; elementBits <= BLOCK_SIZE ; elementBits++) {
++          long elementPosMask = ~(~0L << elementBits);
++          int[] currentShifts = SHIFTS[elementBits];
++          long[] currentMasks = WRITE_MASKS[elementBits];
++          for (int bitPos = 0 ; bitPos < BLOCK_SIZE ; bitPos++) {
++              int base = bitPos * FAC_BITPOS;
++              currentMasks[base  ] =~((elementPosMask
++                                 << currentShifts[base + 1])
++                                >>> currentShifts[base]);
++              currentMasks[base+1] = ~(elementPosMask
++                                 << currentShifts[base + 2]);
++              currentMasks[base+2] = currentShifts[base + 2] == 0 ? 0 : ~0;
++          }
++      }
++  }
++
++  /* The bits */
++  private long[] blocks;
++
++  // Cached calculations
++  private int maxPos;      // blocks.length * BLOCK_SIZE / elementBits - 1
++  private int[] shifts;    // The shifts for the current elementBits
++  private long[] readMasks;
++  private long[] writeMasks;
++
++  /**
++   * Creates an array with the internal structures adjusted for the given
++   * limits and initialized to 0.
++   * @param valueCount   the number of elements.
++   * @param bitsPerValue the number of bits available for any given value.
++   */
++  public Packed64(int valueCount, int bitsPerValue) {
++    // TODO: Test for edge-cases (2^31 values, 63 bitsPerValue)
++    // +2 due to the avoid-conditionals-trick. The last entry is always 0
++    this(new long[(int)((long)valueCount * bitsPerValue / BLOCK_SIZE + 2)],
++            valueCount, bitsPerValue);
++  }
++
++
++  /**
++   * Creates an array backed by the given blocks.
++   * </p><p>
++   * Note: The blocks are used directly, so changes to the given block will
++   * affect the Packed32-structure.
++   * @param blocks   used as the internal backing array. Not that the last
++   *                 element cannot be addressed directly.
++   * @param valueCount the number of values.
++   * @param bitsPerValue the number of bits available for any given value.
++   */
++  public Packed64(long[] blocks, int valueCount, int bitsPerValue) {
++    super(valueCount, bitsPerValue);
++    this.blocks = blocks;
++    updateCached();
++  }
++
++  /**
++   * Creates an array with content retrieved from the given IndexInput.
++   * @param in       an IndexInput, positioned at the start of Packed64-content.
++   * @param valueCount  the number of elements.
++   * @param bitsPerValue the number of bits available for any given value.
++   * @throws java.io.IOException if the values for the backing array could not
++   *                             be retrieved.
++   */
++  public Packed64(IndexInput in, int valueCount, int bitsPerValue)
++                                                            throws IOException {
++    super(valueCount, bitsPerValue);
++    int size = size(valueCount, bitsPerValue);
++    blocks = new long[size+1]; // +1 due to non-conditional tricks
++    for(int i=0;i<size;i++) {
++      blocks[i] = in.readLong();
++    }
++    updateCached();
++  }
++
++  private static int size(int valueCount, int bitsPerValue) {
++    final long totBitCount = (long) valueCount * bitsPerValue;
++    return (int)(totBitCount/64 + ((totBitCount % 64 == 0 ) ? 0:1));
++  }
++
++  private void updateCached() {
++    readMasks = MASKS[bitsPerValue];
++    shifts = SHIFTS[bitsPerValue];
++    writeMasks = WRITE_MASKS[bitsPerValue];
++    maxPos = (int)((((long)blocks.length) * BLOCK_SIZE / bitsPerValue) - 2);
++  }
++
++  /**
++   * @param index the position of the value.
++   * @return the value at the given index.
++   */
++  public long get(final int index) {
++    final long majorBitPos = index * bitsPerValue;
++    final int elementPos = (int)(majorBitPos >>> BLOCK_BITS); // / BLOCK_SIZE
++    final int bitPos =     (int)(majorBitPos & MOD_MASK); // % BLOCK_SIZE);
++
++    final int base = bitPos * FAC_BITPOS;
++
++    return ((blocks[elementPos] << shifts[base]) >>> shifts[base+1]) |
++            ((blocks[elementPos+1] >>> shifts[base+2]) & readMasks[bitPos]);
++  }
++
++  public void set(final int index, final long value) {
++    final long majorBitPos = index * bitsPerValue;
++    final int elementPos = (int)(majorBitPos >>> BLOCK_BITS); // / BLOCK_SIZE
++    final int bitPos =     (int)(majorBitPos & MOD_MASK); // % BLOCK_SIZE);
++    final int base = bitPos * FAC_BITPOS;
++
++    blocks[elementPos  ] = (blocks[elementPos  ] & writeMasks[base])
++                           | (value << shifts[base + 1] >>> shifts[base]);
++    blocks[elementPos+1] = (blocks[elementPos+1] & writeMasks[base+1])
++                           | ((value << shifts[base + 2]) & writeMasks[base+2]);
++  }
++
++  public String toString() {
++    return "Packed64(bitsPerValue=" + bitsPerValue + ", size="
++            + size() + ", maxPos=" + maxPos
++            + ", elements.length=" + blocks.length + ")";
++  }
++
++  public long ramBytesUsed() {
++    return RamUsageEstimator.NUM_BYTES_ARRAY_HEADER
++            + blocks.length * RamUsageEstimator.NUM_BYTES_LONG;
++  }
++
++  public void clear() {
++    Arrays.fill(blocks, 0L);
++  }
++
++}
+\ No newline at end of file
+Index: src/java/org/apache/lucene/util/packed/package.html
+===================================================================
+--- src/java/org/apache/lucene/util/packed/package.html	Mon Feb 22 08:23:22 CET 2010
++++ src/java/org/apache/lucene/util/packed/package.html	Mon Feb 22 08:23:22 CET 2010
+@@ -0,0 +1,16 @@
++<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
++<html>
++<head></head>
++<body bgcolor="white">
++
++<p>
++    The packed package provides random access capable arrays of positive longs.
++    The implementations provides different trade offs between memory usage and
++    access speed. The standard usage scenario is replacing large int or long
++    arrays in order to reduce the memory footprint.
++</p><p>
++    The main access point is the {@link PackedInts} factory.
++</p>
++
++</body>
++</html>
+\ No newline at end of file
+Index: src/test/org/apache/lucene/util/packed/TestPackedInts.java
+===================================================================
+--- src/test/org/apache/lucene/util/packed/TestPackedInts.java	Fri Feb 26 13:36:34 CET 2010
++++ src/test/org/apache/lucene/util/packed/TestPackedInts.java	Fri Feb 26 13:36:34 CET 2010
+@@ -0,0 +1,357 @@
++package org.apache.lucene.util.packed;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.store.*;
++import org.apache.lucene.util.LuceneTestCase;
++
++import java.io.StringWriter;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Random;
++import java.io.IOException;
++
++public class TestPackedInts extends LuceneTestCase {
++
++/*  public void testBitsRequired() throws Exception {
++    assertEquals(61, PackedInts.bitsRequired((long)Math.pow(2, 61)-1));
++    assertEquals(61, PackedInts.bitsRequired(0x1FFFFFFFFFFFFFFFL));
++    assertEquals(62, PackedInts.bitsRequired(0x3FFFFFFFFFFFFFFFL));
++    assertEquals(63, PackedInts.bitsRequired(0x7FFFFFFFFFFFFFFFL));
++  } */
++
++  public void testMaxValues() throws Exception {
++    assertEquals("1 bit -> max == 1",
++            1, PackedInts.maxValue(1));
++    assertEquals("2 bit -> max == 3",
++            3, PackedInts.maxValue(2));
++    assertEquals("8 bit -> max == 255",
++            255, PackedInts.maxValue(8));
++    assertEquals("63 bit -> max == Long.MAX_VALUE",
++            Long.MAX_VALUE, PackedInts.maxValue(63));
++    assertEquals("64 bit -> max == Long.MAX_VALUE (same as for 63 bit)", 
++            Long.MAX_VALUE, PackedInts.maxValue(63));
++  }
++
++  public void testPackedInts() throws IOException {
++    Random rand = newRandom();
++    for(int iter=0;iter<50;iter++) {
++      long ceil = 2;
++      // nocommit -- need to get the 64 bit case working
++      for(int nbits=1;nbits<63;nbits++) {
++        final int valueCount = 100+rand.nextInt(500);
++        final Directory d = new MockRAMDirectory();
++
++        IndexOutput out = d.createOutput("out.bin");
++        PackedInts.Writer w = PackedInts.getWriter(
++                out, valueCount, nbits, PackedInts.STORAGE.packed);
++
++        final long[] values = new long[valueCount];
++        for(int i=0;i<valueCount;i++) {
++          long v = rand.nextLong() % ceil;
++          if (v < 0) {
++            v = -v;
++          }
++          values[i] = v;
++          w.add(values[i]);
++        }
++        w.finish();
++        out.close();
++
++        IndexInput in = d.openInput("out.bin");
++        PackedInts.Reader r = PackedInts.getReader(in);
++        for(int i=0;i<valueCount;i++) {
++          assertEquals("index=" + i + " ceil=" + ceil + " valueCount="
++                  + valueCount + " nbits=" + nbits + " for "
++                  + r.getClass().getSimpleName(), values[i], r.get(i));
++        }
++        in.close();
++        ceil *= 2;
++      }
++    }
++  }
++
++  public void testAligned64Writer() throws IOException {
++    final Directory d = new MockRAMDirectory();
++
++    long[] INPUT = new long[]{1, 0, 1};
++    IndexOutput out = d.createOutput("out.bin");
++    PackedInts.Writer w = PackedInts.getWriter(
++            out, INPUT.length, 1, PackedInts.STORAGE.aligned64);
++    for (long input: INPUT) {
++      w.add(input);
++    }
++    w.finish();
++    out.close();
++
++    IndexInput in = d.openInput("out.bin");
++    PackedInts.Reader r = PackedInts.getReader(in);
++    assertEquals("The first stored bit should be retrievable", 1, r.get(0));
++    assertEquals("The second stored bit should be retrievable", 0, r.get(1));
++    in.close();
++  }
++
++  public void testControlledEquality() {
++    final int VALUE_COUNT = 255;
++    final int BITS_PER_VALUE = 8;
++
++    List<PackedInts.Mutable> packedInts =
++            createPackedInts(VALUE_COUNT, BITS_PER_VALUE);
++    for (PackedInts.Mutable packedInt: packedInts) {
++      for (int i = 0 ; i < packedInt.size() ; i++) {
++        packedInt.set(i, i+1);
++      }
++    }
++    assertListEquality(packedInts);
++  }
++
++  public void testRandomEquality() {
++    final int[] VALUE_COUNTS = new int[]{0, 1, 5, 8, 100, 500};
++    final int MIN_BITS_PER_VALUE = 1;
++    final int MAX_BITS_PER_VALUE = 64;
++    final int RANDOM_SEED = 87;
++
++    for (int valueCount: VALUE_COUNTS) {
++      for (int bitsPerValue = MIN_BITS_PER_VALUE ;
++           bitsPerValue <= MAX_BITS_PER_VALUE ;
++           bitsPerValue++) {
++        assertRandomEquality(valueCount, bitsPerValue, RANDOM_SEED);
++      }
++    }
++  }
++
++  public void testAligned64Fill() throws IOException {
++    testAlignedFill(1, 2, 3,
++            PackedInts.STORAGE.aligned64, PackedInts.BLOCK.bit64);
++  }
++
++  public void testAlignedFill(
++          int valueCount, int bitsPerValue, int value,
++          PackedInts.STORAGE storage, PackedInts.BLOCK block)
++                                                            throws IOException {
++//    long value = PackedInts.maxValue(bitsPerValue);
++
++    Aligned64 aligned64 = new Aligned64(valueCount, bitsPerValue);
++    for (int i = 0 ; i < valueCount ;i++) {
++      aligned64.set(i, value);
++    }
++    for (long backing: aligned64.getBackingArray()) {
++      System.out.println("Direct         : " + Long.toBinaryString(backing) + " (" + backing + ")");
++    }
++/*    assertEquals("Backing long 0 should be fully marked",
++            ~0L, aligned64.getBackingArray()[0]);
++    assertEquals("Backing long 1 should be fully marked",
++            ~0L, aligned64.getBackingArray()[1]);
++  */
++    final Directory d = new MockRAMDirectory();
++    IndexOutput out = d.createOutput("out.bin");
++    PackedInts.Writer w = PackedInts.getWriter(
++            out, valueCount, bitsPerValue, storage, block);
++
++    for (int i = 0 ; i < valueCount ; i++) {
++      w.add(value);
++    }
++    w.finish();
++    out.close();
++
++    IndexInput in = d.openInput("out.bin");
++    PackedInts.Reader reader = PackedInts.getReader(in);
++
++    for (int i = 0 ; i < valueCount ; i++) {
++      assertEquals(String.format(
++              "%s at %s with value count=%d and bits/value=%d at position %d",
++              storage, block, valueCount, bitsPerValue, i),
++              value, reader.get(i));
++    }
++  }
++
++  public void testRandomPersistenceEquality() {
++    final int[] VALUE_COUNTS = new int[]{0, 1, 5, 8, 100, 500};
++    final int MIN_BITS_PER_VALUE = 1;
++    final int MAX_BITS_PER_VALUE = 63;
++    final int RANDOM_SEED = 87;
++
++    for (int valueCount: VALUE_COUNTS) {
++      for (int bitsPerValue = MIN_BITS_PER_VALUE ;
++           bitsPerValue <= MAX_BITS_PER_VALUE ;
++           bitsPerValue++) {
++        assertRandomPersistenceEquality(valueCount, bitsPerValue, RANDOM_SEED);
++      }
++    }
++  }
++
++  public void testFactory() throws Exception {
++    assertEquals(PackedInts.IMPLEMENTATION.aligned64,
++            PackedInts.getImplementation(
++                    1, PackedInts.STORAGE.aligned64, PackedInts.BLOCK.bit64));
++  }
++
++  public void testControlledPersistenceEquality() throws IOException {
++    final int RANDOM_SEED = 87;
++
++//    assertRandomPersistenceEquality(1, 1, RANDOM_SEED);
++//    assertRandomPersistenceEquality(98, 1, RANDOM_SEED);
++
++    PackedInts.Reader aligned64 = writeAndRead(
++            1, 2, PackedInts.STORAGE.aligned64, PackedInts.BLOCK.bit32,
++            RANDOM_SEED);
++    PackedInts.Reader packed = writeAndRead(
++            1, 2, PackedInts.STORAGE.packed, PackedInts.BLOCK.bit32,
++            RANDOM_SEED);
++    assertEquals("The values at position 0 should match",
++            aligned64.get(0), packed.get(0));
++
++   //assertRandomPersistenceEquality(99, 1, RANDOM_SEED);
++    //assertRandomPersistenceEquality(1, 2, RANDOM_SEED);
++  }
++
++  /* ************************************************************************ */
++
++  /* ************************************************************************ */
++
++  private void assertRandomEquality(
++          int valueCount, int bitsPerValue, int randomSeed) {
++    List<PackedInts.Mutable> packedInts =
++            createPackedInts(valueCount, bitsPerValue);
++    for (PackedInts.Mutable packedInt: packedInts) {
++      try {
++        fill(packedInt, (long)(Math.pow(2, bitsPerValue)-1), randomSeed);
++      } catch (Exception e) {
++        e.printStackTrace(System.err);
++        fail(String.format(
++                "Exception while filling %s: valueCount=%d, bitsPerValue=%s",
++                packedInt.getClass().getSimpleName(),
++                valueCount, bitsPerValue));
++      }
++    }
++    assertListEquality(packedInts);
++  }
++
++  private void assertRandomPersistenceEquality(
++          int valueCount, int bitsPerValue, int randomSeed) {
++    List<PackedInts.Reader> packedInts = new ArrayList<PackedInts.Reader>();
++    for (PackedInts.STORAGE storage: PackedInts.STORAGE.values()) {
++      try {
++        packedInts.add(writeAndRead(
++                valueCount, bitsPerValue, storage, PackedInts.BLOCK.bit32,
++                randomSeed));
++        packedInts.add(writeAndRead(
++                valueCount, bitsPerValue, storage, PackedInts.BLOCK.bit64,
++                randomSeed));
++      } catch (Exception e) {
++        e.printStackTrace(System.err);
++        fail(String.format(
++                "Exception while filling %s: valueCount=%d, bitsPerValue=%s",
++                storage, valueCount, bitsPerValue));
++      }
++    }
++    assertListEquality("valueCount=" + valueCount +", bitsPerValue="
++            + bitsPerValue, packedInts);
++  }
++
++  private PackedInts.Reader writeAndRead(
++          int valueCount, int bitsPerValue,
++          PackedInts.STORAGE storage, PackedInts.BLOCK block, int randomSeed)
++                                                            throws IOException {
++    long randMax = bitsPerValue >= 63 ?
++            Long.MAX_VALUE : PackedInts.maxValue(bitsPerValue)+1;
++    Random random = new Random(randomSeed);
++
++    final Directory d = new MockRAMDirectory();
++    IndexOutput out = d.createOutput("out.bin");
++    PackedInts.Writer w = PackedInts.getWriter(
++            out, valueCount, bitsPerValue, storage, block);
++
++//    System.out.println("Writer: " + w);
++
++    for (int i = 0 ; i < valueCount ; i++) {
++      w.add(Math.abs(random.nextLong() % randMax));
++    }
++    w.finish();
++    out.close();
++
++    IndexInput in = d.openInput("out.bin");
++    PackedInts.Reader reader = PackedInts.getReader(in);
++//    System.out.println("Reader: " + reader);
++    return reader;
++  }
++
++  private List<PackedInts.Mutable> createPackedInts(
++          int valueCount, int bitsPerValue) {
++    List<PackedInts.Mutable> packedInts = new ArrayList<PackedInts.Mutable>();
++    if (bitsPerValue <= 8) {
++      packedInts.add(new Direct8(valueCount));
++    }
++    if (bitsPerValue <= 16) {
++      packedInts.add(new Direct16(valueCount));
++    }
++    if (bitsPerValue <= 31) {
++      packedInts.add(new Packed32(valueCount, bitsPerValue));
++      packedInts.add(new Aligned32(valueCount, bitsPerValue));
++    }
++    if (bitsPerValue <= 32) {
++      packedInts.add(new Direct32(valueCount));
++    }
++    if (bitsPerValue <= 63) {
++      packedInts.add(new Packed64(valueCount, bitsPerValue));
++      packedInts.add(new Aligned64(valueCount, bitsPerValue));
++    }
++    packedInts.add(new Direct64(valueCount));
++    return packedInts;
++  }
++
++  private void fill(
++          PackedInts.Mutable packedInt, long maxValue, int randomSeed) {
++    maxValue++;
++    Random random = new Random(randomSeed);
++    for (int i = 0 ; i < packedInt.size() ; i++) {
++      long value = Math.abs(random.nextLong() % maxValue);
++      packedInt.set(i, value);
++      assertEquals(String.format(
++              "The set/get of the value at index %d should match for %s",
++              i, packedInt.getClass().getSimpleName()),
++              value, packedInt.get(i));
++    }
++  }
++
++  private void assertListEquality(
++          List<? extends PackedInts.Reader> packedInts) {
++    assertListEquality("", packedInts);
++  }
++    private void assertListEquality(
++            String message, List<? extends PackedInts.Reader> packedInts) {
++    if (packedInts.size() == 0) {
++      return;
++    }
++    PackedInts.Reader base = packedInts.get(0);
++    int valueCount = base.size();
++    for (PackedInts.Reader packedInt: packedInts) {
++      assertEquals(message + ". The number of values should be the same ",
++              valueCount, packedInt.size());
++    }
++    for (int i = 0 ; i < valueCount ; i++) {
++      for (int j = 1 ; j < packedInts.size() ; j++) {
++        assertEquals(String.format(
++                "%s. The value at index %d should be the same for %s and %s",
++                message, i, base.getClass().getSimpleName(),
++                packedInts.get(j).getClass().getSimpleName()),
++                base.get(i), packedInts.get(j).get(i));
++      }
++    }
++  }
++}

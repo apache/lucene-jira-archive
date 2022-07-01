@@ -1,0 +1,3980 @@
+Index: gen.py
+===================================================================
+--- gen.py	(revision 0)
++++ gen.py	(revision 0)
+@@ -0,0 +1,1834 @@
++import sys
++import os
++
++# pushd ../..; ant compile; popd; ant compile compile-test; java -cp ../../build/classes/test:../../build/classes/java:/tango/software/junit-4.4.jar:../../build/contrib/spec/classes/test:../../build/contrib/spec/classes/java -DtempDir=build -ea org.junit.runner.JUnitCore org.apache.lucene.search.TestSpecializedSearch > out.x
++
++# TODO
++#   - smarter multitermquery that dynamically picks to do OR dynamically or up front
++#     - or use field cache when possible/appropriate
++#   - how to better model query/filter X that is reused frequently, vs is iterated on demand
++#   - runTests.py isn't properly listing classes not covered
++#   - fix test to test minNR
++#   - with dao, if minNR > 0, we should run SHOULD queries in
++#     increasing freq, and stop processing if there's no way minNR will be
++#     satisifed
++#   - how to automagically set tunables?
++#     - eg at what point do you switch to DAO vs CHUNK?
++#     - when to use skip or no?
++#     - chunk size?
++#   - better use skipping w/ buckets case (not just for usedBuckets[0])
++#   - need richer naming scheme, so any query can be toString'd properly, including things like nonorms, omitTf in each termquery
++#   - get nonorms per-field working
++#   - test code coverage -- should be near 100%!
++#   - make it possible to use non-cached filters, ie, filters that are never reused; eg one should not compute cardinality of such filters
++#   - make sure spec test is testing minNR
++#   - if a sparse filt is added to a bq that already has  must
++#     clauses, re-order it along with the must clauses, by count
++#     ascending
++#   - fix: don't create a "float score = 0; score += XYZ"
++#   - to work around sentinel problem, we could always upgrade the
++#     queue to the next higher type; eg when sorting by byte, store a
++#     short in the queue; then it's only Long's max/min that must be
++#     avoided
++#   - allow dao with no skip -- skip is only necessary when greatly imbalanced term freqs are and'd
++#   - allow passing multiple filters in, maybe as arbitrary clauses on BQ (scoring should be properly orthogonal)
++#   - w/ sparse filter on a BQ that has other MUST clauses, order it appropriately
++#   - docAtOnce
++#     - handle should, mustNot
++#     - dynamically pick whether DAO vs chunk should be used
++#   - maybe encode END_DOC into postings list instead of if check @ runtime
++#   - decide whether each clause should use skipping or not
++#   - should I put MUST_NOTs right after MUSTs?
++#   - skip freq more often, ie, don't read freq right when reading doc -- read it (or skip it) when the doc is accepted or not
++#   - w/ only MUST clauses, the sub-collect of the final clause should do the collection
++#     - maybe w/ mixed should/must we should have a must clause go last?
++#   - maybe collapsed usedBuckets as we go, w/ must clauses
++#   - hmm: w/ fielded sort, one should ask the fieldCache for the next doc that has < bottomValue and do skipTo to that doc
++#   - re-org clause order based on approx count
++#   - if a sparse filter is used w/ BQ, stuff it on as a clause
++#   - use coord count instead of separate must count
++#   - make a silly BitVector impl that always returns false, to avoid the null check
++#   - properly handle BQ with only MUST_NOT?
++#   - retest whether pushing fast reject down to termdocs is fastest
++#   - don't apply fast reject to the must-not term query clauses?
++#   - fix minNR -- only applies to SHOULD clauses
++#   - re-org BQs clauses so rare/frequent terms are done first
++#   - use skipping
++#   - better separate out the structural optimizer
++#     - and explicitly test its optimizations are working
++#   - get arbitrary query cascading working (eg BQ of BQ)
++#   - try tricks eg make "final" local var copy of class static var
++#   - choose when to do Bucket class vs parallel arrays
++#   - do the "random access JumpScorer" optimization
++#   - make a simple "gen" mode that has a "learning" step where you
++#     send many queries through and it simply gathers data on which
++#     specs are needed, followed by building those specs
++#   - more strongly model "I am top collector loop" vs "I am secondary"
++#     - split out query gen code that's "in the to loop" vs "a
++#       sub-clause", ie, can do compete/score/collect itself or must
++#       strongly separate doc vs score
++#   - allow per-segment specializing
++#     - eg deletes/no
++#   - clean up this source code
++#   - make verify.cmd faster -- single bnechmark run?
++#   - run all tests, routing queries through spec
++#   - make this more "incremental" eg if I can't specialize the scorer but I can specialize the collector, do so
++#     - eg handle custom FieldComparator (must call setScorer now), custom Collector
++#   - provide a "my field has valid sentinel values" to force docID tie breakers
++#     - mabye do this as part of a s "single warmup" step that does
++#       things like check for no-nulls in FieldCache for string, no
++#       max/min val in numeric fields, etc
++#   - "sort by docid", "sort by score"
++#   - omitTF
++#   - make "valueType" a comparator
++#   - RelevanceComparator is broken
++#   - we can skip freq, instead of reading into freq var, if hit does not compete
++#   - when score is "no" we should have single "skip freq vint" read
++#   - maybe use a custom "skipVInt" method -- reads the bytes w/o building int
++#   - FIX score: don't compute it we are not tracking maxScore
++#   - support sparse filters (as iterator, boolean query clause?)
++#   - reversed sort
++#   - multifield sort
++#   - merge in all stop criteria, eg ++count > aLimit
++#   - for scoredoc we do't need to re-add docBase -- just init doc=0
++#   - hmm: will we "flood" the instruction cache when many threads running different specialized code?
++#   - share norms per field (if multiple term queries run against same field)
++#   - for real integration
++#     - need to "know" that filter will give us an openbitset, somehow?
++#   - tweak order of ifs
++#   - TODO: figure out if side-by-side arrays are slower, or
++#     pointer-to-obj is slower, for the queue
++#     - score doc & fields
++#   - downHeap could be optimized -- that initial "if k < 10"
++#   - for TopScoreDoc collection, try to re-coalesce multiple if statemetns (it got slower!!)
++
++END_DOC = sys.maxint
++
++def firstUpper(s):
++  return s[0].upper() + s[1:]
++
++class Bucket:
++
++  def __init__(self, w, CHUNK):
++    self.w = w
++    self.CHUNK = CHUNK
++    self.attrs = []
++    self.addAttr('int', 'doc', -1)
++
++  def addAttr(self, type, name, default=None):
++    self.attrs.append((type, name, default))
++
++  def writeTopClass(self):
++    w = self.w
++    w('private static final class Bucket {')
++    for type, name, default in self.attrs:
++      if default is None:
++        w('  %s %s;' % (type, name))
++      else:
++        w('  %s %s=%s;' % (type, name, default))
++    w('}')
++    w('private final static Bucket[] buckets = new Bucket[%d];' % self.CHUNK)
++    w('static {')
++    w('  for(int i=0;i<%d;i++) {' % self.CHUNK)
++    w('    buckets[i] = new Bucket();')
++    w('  }')
++    w('}')
++
++  def lookup(self, attr, spot=None):
++    if spot is None:
++      return 'b.%s' % attr
++    else:
++      return 'buckets[%s].%s' % (spot, attr)
++
++  def initOneBucket(self, spotVar):
++    w('final Bucket b = buckets[%s];' % spotVar)
++
++  def initPerReader(self):
++    w('final int lx;')
++    w('if (maxDoc < %s) {' % self.CHUNK)
++    w('  lx = maxDoc;')
++    w('} else {')
++    w('  lx = %s;' % self.CHUNK)
++    w('}')
++    w('for(int bx=0;bx<lx;bx++) {')
++    w('  buckets[%s].doc = -1;')
++    w('}')
++
++class BucketAsArray(Bucket):
++
++  if 0:
++    def __init__(self, w, CHUNK):
++      Bucket.__init__(self, w, CHUNK)
++
++  def writeTopClass(self):
++    w = self.w
++    for type, name, default in self.attrs:
++      w('private final static %s[] bucket%s = new %s[%d];' % (type, firstUpper(name), type, self.CHUNK))
++    if 0:
++      w('static {')
++      w('  Arrays.fill(bucketDoc, -1);')
++      w('}')
++        
++  def initOneBucket(self, spotVar):
++    pass
++
++  def lookup(self, attr, spot='spot'):
++    return 'bucket%s[%s]' % (firstUpper(attr), spot)
++    
++  def initPerReader(self):
++    w = self.w
++    w('final int lx;')
++    w('if (maxDoc < %s) {' % self.CHUNK)
++    w('  lx = maxDoc;')
++    w('} else {')
++    w('  lx = %s;' % self.CHUNK)
++    w('}')
++    w('Arrays.fill(bucketDoc, 0, lx, -1);')
++
++class Writer:
++
++  def __init__(self):
++    self.indent = 0
++    self.l = []
++    self.vars = {}
++    self.upto = 0
++
++  def __call__(self, s):
++    if s.find('}') != -1:
++      self.indent -= 1
++    c = 0
++    while c < len(s)-1 and s[c] == ' ':
++      c += 1
++    self.l.append(' '*(2*self.indent-c) + s)
++    if s.find('{') != -1:
++      self.indent += 1
++
++  def __str__(self):
++    return '\n'.join(self.l)
++
++  def getVar(self, prefix):
++    upto = 0
++    while True:
++      v = '%s%s' % (prefix, upto)
++      if v not in self.vars:
++        self.vars[v] = True
++        return v
++      upto += 1
++
++  def getID(self):
++    s ='q%d' % self.upto
++    self.upto += 1
++    return s
++
++  def releaseVar(self, v):
++    del self.vars[v]
++
++class BasePQCollector:
++
++  valueType = None
++  docsAlwaysInOrder = True
++  fastRejectIsPerfect = False
++
++  def __init__(self, w):
++    self.w = w
++
++  def setState(self, s):
++    self.s = s
++
++  def upperValueType(self, isFieldCache=False):
++    if self.valueType == 'int':
++      if isFieldCache:
++        return 'Int'
++      else:
++        return 'Integer'
++    else:
++      return self.valueType[0].upper() + self.valueType[1:]
++
++  def readerInit(self):
++    pass
++
++  def writeTempBottom(self):
++    pass
++    
++  def writeTopClass(self):
++    pass
++  
++  def topInit(self):
++    if self.s.doTotalHits:
++      self.w('int hitCount = 0;')
++
++  def collectOne(self, q, checkEndDoc=True, docsInOrder=True, checkCompetes=True, doTotalHits=False):
++    w = self.w
++    if checkEndDoc:
++      w('if (doc == %s) {' % END_DOC)
++      w('  break;')
++      w('}')
++    if doTotalHits and self.s.doTotalHits:
++      w('hitCount++;')
++
++    if DEBUG:
++      w('System.out.println("doc=" + (doc+docBase) + " score=" + %s);' % q.scoreVar)
++
++    if not docsInOrder:
++      w('    final int fullDoc = doc + docBase;')
++
++    #w('System.out.println("rx=" + rx + " doc=" + (doc+docBase) + " ord=" + order[doc] + " val=" + lookup[order[doc]] + " bottom.ord=" + bottom.ord + " bottom.val=" + bottom.val);')
++    if checkCompetes:
++      self.writeCompetes(q, docsInOrder)
++
++    if self.doTrackScores:
++      q.writeScore()
++      
++    w('')
++
++    if docsInOrder:
++      w('    final int fullDoc = doc + docBase;')
++      
++    self.copyCurrentToBottom()
++
++    w('')
++    w('    // downheap')
++
++    iVar = w.getVar('i')
++    w('    int %s = 1;' % iVar)
++
++    jVar = w.getVar('j')
++    w('    int %s = %s << 1;' % (jVar, iVar))
++      
++    kVar = w.getVar('k')
++    w('    int %s = %s+1;' % (kVar, jVar))
++    w('    if (%s <= topN) {' % kVar)
++    self.lessThan(kVar, jVar, 'lt')
++    #w('      System.out.println("init lt=" + lt);')
++    w('      if (lt) {')
++    w('        %s = %s;' % (jVar, kVar))
++    w('      }')
++    w('    }')
++    w('    while(%s <= topN) {' % jVar)
++    self.currentGreaterThanBreak(jVar, docsInOrder)
++    self.copy(jVar, iVar)
++    w('      %s = %s;' % (iVar, jVar))
++    w('      %s = %s << 1;' % (jVar, iVar))
++    w('      %s = %s+1;' % (kVar, jVar))
++    w('      if (%s <= topN) {' % kVar)
++    self.lessThan(kVar, jVar, 'lt')
++    w('        if (lt) {')
++    w('          %s = %s;' % (jVar, kVar))
++    w('        }')
++    w('      }')
++    w('    }')
++    w.releaseVar(kVar)
++    w.releaseVar(jVar)
++
++    self.installBottom(iVar)
++    w.releaseVar(iVar)
++
++    self.endInsert()
++
++    # matches writeCompetes
++    if checkCompetes:
++      w('}')
++
++  def createResults(self, v, c):
++    w = self.w
++
++    w('')
++    if self.__class__ == ScoreDocCollector:
++      self.w('final float maxScore = queueScores[1];')
++      
++    w('// Build results -- sort pqueue entries')
++    w('final SorterTemplate sorter = new SorterTemplate() {')
++    w('  protected int compare(int i, int j) {')
++    self.lessThan('i', 'j', 'lt')
++    w('    if (lt) {')
++    w('      return 1;')
++    w('    } else if (%s == %s) {' % (self.queueDoc('i'), self.queueDoc('j')))
++    w('      return 0;')
++    w('    } else {')
++    w('      return -1;')
++    w('    }')
++    w('  }')
++    w('  protected void swap(int i, int j) {')
++    self.swap('i', 'j')
++    w('  }')
++    w('};')
++    
++    w('// Extract results')
++    w('sorter.quickSort(1, topN);')
++    w('ScoreDoc[] hits = new ScoreDoc[topN];')
++    w('for(int i=0;i<topN;i++) {')
++    w('  if (%s == %s) {' % (self.queueDoc('1+i'), END_DOC))
++    w('    final ScoreDoc[] newHits = new ScoreDoc[i];')
++    w('    System.arraycopy(hits, 0, newHits, 0, i);')
++    w('    hits = newHits;')
++    w('    break;')
++    w(' }')
++    self.createScoreDoc('hits[i]', 'i')
++    w('}')
++
++    self.createTopDocs()
++
++class ScoreDocCollector(BasePQCollector):
++  doTrackScores = True
++  doMaxScore = True
++
++  def writeMaxScore(self, q):
++    pass
++  
++  def queueDoc(self, s):
++    return 'queueDocs[%s]' % s
++
++  def needsScores(self):
++    return True
++
++  def createScoreDoc(self, dest, src):
++    self.w('%s = new ScoreDoc(queueDocs[1+%s], queueScores[1+%s]);' % (dest, src, src))
++
++  def topInit(self):
++    BasePQCollector.topInit(self)
++    self.w('final int[] queueDocs = new int[1+topN];')
++    self.w('final float[] queueScores = new float[1+topN];')
++    self.w('// prefill w/ sentinel')
++    self.w('Arrays.fill(queueScores, Float.NEGATIVE_INFINITY);')
++    self.w('Arrays.fill(queueDocs, Integer.MAX_VALUE);')
++    self.w('float bottomScore = Float.NEGATIVE_INFINITY;')
++    if not self.docsAlwaysInOrder:
++      self.w('int bottomDoc = Integer.MAX_VALUE;')
++
++  def currentGreaterThanBreak(self, v, docsInOrder=True):
++    if docsInOrder:
++      self.w('if (queueScores[%s] >= score) {' % v)
++    else:
++      self.w('if (queueScores[%s] > score || (queueScores[%s] == score && queueDocs[%s] < fullDoc)) {' % (v, v, v))
++    self.w('  break;')
++    self.w('}')
++
++  def lessThan(self, a, b, v):
++    self.w('final boolean %s = queueScores[%s] < queueScores[%s] || (queueScores[%s] == queueScores[%s] && queueDocs[%s] > queueDocs[%s]);' % (v, a, b, a, b, a, b))
++
++  def copy(self, src, dest):
++    self.w('queueDocs[%s] = queueDocs[%s];' % (dest, src))
++    self.w('queueScores[%s] = queueScores[%s];' % (dest, src))
++
++  def installBottom(self, dest):
++    self.w('queueDocs[%s] = fullDoc;' % dest)
++    self.w('queueScores[%s] = score;' % dest)
++
++  def copyCurrentToBottom(self):
++    if DEBUG:
++      self.w('System.out.println("  boot doc=" + queueDocs[1] + " for new doc=" + fullDoc + " (eq?=" + (score == bottomScore) + ")" + " score=" + score + " bottomScore=" + bottomScore);')
++    self.w('queueDocs[1] = fullDoc;')
++    self.w('queueScores[1] = score;')
++
++  def endInsert(self):
++    self.w('bottomScore = queueScores[1];')
++    if not self.docsAlwaysInOrder:
++      self.w('bottomDoc = queueDocs[1];')
++    if DEBUG:
++      self.w('System.out.println("  bottom=" + bottomScore + " doc=" + queueDocs[1]);')
++
++  def writeCompetes(self, q, docsInOrder=True):
++    q.writeScore()
++    if docsInOrder:
++      self.w('if (score > bottomScore) {')
++    else:
++      self.w('if (score > bottomScore || (score == bottomScore && fullDoc < bottomDoc)) {')
++
++  def swap(self, i, j):
++    w = self.w
++    w('final int itmp = queueDocs[%s];' % i)
++    w('queueDocs[%s] = queueDocs[%s];' % (i, j))
++    w('queueDocs[%s] = itmp;' % j)
++    w('final float ftmp = queueScores[%s];' % i)
++    w('queueScores[%s] = queueScores[%s];' % (i, j))
++    w('queueScores[%s] = ftmp;' % j)
++
++  def createTopDocs(self):
++    if self.s.doTotalHits:
++      v = 'hitCount'
++    else:
++      v = '-1'
++    self.w('final TopDocs results = new TopDocs(%s, hits, queueScores[1]);' % v)
++
++
++class StringOrdValComparator:
++
++  fastRejectIsPerfect = False
++  
++  def __init__(self, w, replaceNulls):
++    self.w = w
++    self.replaceNulls = replaceNulls
++
++  def getRejectDoc(self):
++    return 'order[__DOC__] > bottom.ord'
++
++  def setFieldValue(self, src):
++    if self.replaceNulls:
++      self.w('if (queue[1+%s].val.equals("\u0000")) {' % src)
++      self.w('  fields[0] = null;')
++      self.w('} else {')
++    self.w('fields[0] = queue[1+%s].val;' % src)
++    if self.replaceNulls:
++      self.w('}')
++      
++  def writeCompetesDef(self):
++    w = self.w
++    w('private final int competes(final Entry bottom, final int ord, final String val) {')
++    w('  // ords are comparable')
++    #w('  System.out.println("competes bottom.ord=" + bottom.ord + " vs docOrd=" + ord + " val=" + val);')
++    w('  final int c = bottom.ord - ord;')
++    w('  if (c != 0) {')
++    w('    return c;')
++    w('  } else {')
++    if self.replaceNulls:
++      w('    return bottom.val.compareTo(val);')
++    else:
++      w('    if (bottom.val == null) {')
++      w('      if (val == null) {')
++      w('        return 0;')
++      w('      } else {')
++      w('        return -1;')
++      w('      }')
++      w('    } else if (val == null) {')
++      w('      return 1;')
++      w('    } else {')
++      w('      return bottom.val.compareTo(val);')
++      w('    }')
++    w('  }')
++    w('}')
++
++  def writeCompetes(self, q, docsInOrder):
++    w = self.w
++    #w('System.out.println("collect doc=" + doc);')
++    if docsInOrder:
++      w('if (competes(bottom, order[doc], lookup[order[doc]]) > 0) {')
++      #w('System.out.println("  competes! doc=" + doc + " val=" + lookup[order[doc]] + " bottom.ord=" + bottom.ord + " bottom.val=" + bottom.val);')
++    else:
++      w('final int cx = competes(bottom, order[doc], lookup[order[doc]]);')
++      w('if (cx > 0 || (cx == 0 && fullDoc < bottom.docID)) {')
++    
++  def currentGreaterThanBreak(self, v, docsInOrder=True):
++    w = self.w
++    w('final int c = compareOrdVal(queue[%s], bottom);' % v)
++    if docsInOrder:
++      w('if (c <= 0) {')
++      #w('  System.out.println("  now break k0=" + k0 + " j0=" + j0 + " c=" + c);')
++    else:
++      w('if (c < 0 || (c == 0 && queue[%s].docID < bottom.docID)) {' % v)
++    w('  break;')
++    w('}')
++
++  def copyCurrentToBottom(self):
++    self.w('bottom.ord = order[doc];')
++    self.w('bottom.val = lookup[bottom.ord];')
++    self.w('bottom.readerGen = rx;')
++    
++  def initSingleEntryQueue(self):
++    self.w('e.ord = Integer.MAX_VALUE;')
++    self.w('e.val = sentinel;')
++
++  def writeTop(self):
++    self.w('// U+FFFF is not a valid unicode char, so this is a safe sentinel')
++    self.w('final String sentinel = new String("\uFFFF");')
++
++  def endInsert(self):
++    self.writeConvertBottom()
++
++  def writeCompare(self):
++    w = self.w
++    w('private final int compareOrdVal(Entry e1, Entry e2) {')
++    #w('   System.out.println("compareOrdVal e1.readerGen=" + e1.readerGen + " e2.readerGen=" + e2.readerGen);')
++    #w('   System.out.println("compareOrdVal e1.val=" + e1.val + " e2.val=" + e2.val);')
++    w('  if (e1.readerGen == e2.readerGen) {')
++    w('    // ords are comparable')
++    w('    final int c = e1.ord - e2.ord;')
++    #w('    System.out.println("  c=" + c);')
++    w('    if (c != 0) {')
++    w('      return c;')
++    w('    }')
++    w('  }')
++    if not self.replaceNulls:
++      w('  if (e1.val == null) {')
++      w('    if (e2.val == null) {')
++      w('      return 0;')
++      w('    } else {')
++      w('      return -1;')
++      w('    }')
++      w('  } else if (e2.val == null) {')
++      w('    return 1;')
++      w('  }')
++    w('  return e1.val.compareTo(e2.val);')
++    w('}')
++    
++  def writeBinarySearch(self):
++    self.w('''  final private static int binarySearch(String[] a, String key) {
++    return binarySearch(a, key, 0, a.length-1);
++  }''')
++
++    self.w('''  final private static int binarySearch(String[] a, String key, int low, int high) {
++
++    while (low <= high) {
++      int mid = (low + high) >>> 1;
++      String midVal = a[mid];
++      int cmp;''')
++
++    if self.replaceNulls:
++      self.w('cmp = midVal.compareTo(key);')
++    else:
++      self.w('''
++      if (midVal != null) {
++        cmp = midVal.compareTo(key);
++      } else {
++        cmp = -1;
++      }''')
++    self.w('''
++      if (cmp < 0)
++        low = mid + 1;
++      else if (cmp > 0)
++        high = mid - 1;
++      else
++        return mid;
++    }
++    return -(low + 1);
++  }''')
++    
++  def writeTopClass(self):
++    self.writeCompare()
++    self.writeCompetesDef()
++    self.writeBinarySearch()
++    if self.replaceNulls:
++      self.w('final HashSet fixedNulls = new HashSet();')
++    
++  def writeEntryClass(self):
++    self.w('int ord;')
++    self.w('String val;')
++    self.w('int readerGen;')
++  
++  def writePerReader(self):
++    self.w('StringIndex sx = ExtendedFieldCache.EXT_DEFAULT.getStringIndex(r, sortFieldID);')
++    self.w('final String[] lookup = sx.lookup;')
++    if self.replaceNulls:
++      self.w('''
++      // nocommit -- not clean, not threadsafe, not right (needs to be tuple of reader & field)
++      if (!fixedNulls.contains(r)) {
++        fixedNulls.add(r);
++        final int size = lookup.length;
++        for(int sxi=0;sxi<size;sxi++) {
++          if (lookup[sxi] == null) {
++            lookup[sxi] = "\u0000";
++          }
++        }
++      }
++''')
++    self.w('final int[] order = sx.order;')
++    self.writeConvertBottom()
++
++  def writeConvertBottom(self):
++    self.w('if (bottom.readerGen != rx) {')
++    if not self.replaceNulls:
++      self.w('if (bottom.val != null) {')
++    self.w('  final int index = binarySearch(lookup, bottom.val);')
++    self.w('  if (index < 0) {')
++    self.w('    bottom.ord = -index-2;')
++    self.w('  } else {')
++    self.w('    bottom.ord = index;')
++    self.w('  }')
++    #self.w('  System.out.println("next reader (rx=" + rx + ") set bottom.ord=" + bottom.ord + " bottom.val=" + bottom.val);')
++    if not self.replaceNulls:
++      self.w('} else {')
++      self.w('  bottom.ord = 0;')
++      self.w('}')
++    self.w('bottom.readerGen = rx;')
++    self.w('}')
++    
++class SortByOneFieldCollector(BasePQCollector):
++
++  fastRejectIsPerfect = True
++
++  def __init__(self, w, doTrackScores, doMaxScore):
++    BasePQCollector.__init__(self, w)
++    self.doTrackScores = doTrackScores
++    self.doMaxScore = doMaxScore
++
++  def queueDoc(self, s):
++    return 'queue[%s].docID' % s
++
++  def setState(self, s):
++    self.s = s
++    if not self.s.doTotalHits and not self.doMaxScore:
++      if self.valueType is not None:
++        if s.rejectDoc is None:
++          s.rejectDoc = 'docValues[__DOC__] >= bottomValue'
++        else:
++          s.rejectDoc = '(docValues[__DOC__] >= bottomValue || %s)' % s.rejectDoc
++      elif self.comp is not None:
++        self.fastRejectIsPerfect = self.comp.fastRejectIsPerfect
++        v = self.comp.getRejectDoc()
++        if v is not None:
++          if s.rejectDoc is None:
++            s.rejectDoc = v
++          else:
++            s.rejectDoc = '(%s || %s)' % (v, s.rejectDoc)
++    else:
++      self.fastRejectIsPerfect = False
++          
++  def needsScores(self):
++    return self.doTrackScores or self.doMaxScore
++  
++  def createScoreDoc(self, dest, src):
++    self.w('final Comparable[] fields = new Comparable[1];')
++    if self.valueType is not None:
++      self.w('fields[0] = new %s(queue[1+%s].value);' % (self.upperValueType(), src))
++    elif self.comp is not None:
++      self.comp.setFieldValue(src)
++    else:
++      self.w('fields[0] = comp.value(queue[1+%s].slot);' % src)
++    if self.doTrackScores:
++      s = 'queue[1+%s].score' % src
++    else:
++      s = 'Float.NaN'
++    self.w('%s = new FieldDoc(queue[1+%s].docID, %s, fields);' % (dest, src, s))
++
++  def readerInit(self):
++    w = self.w
++    if self.valueType is not None:
++      w('// TODO: support custom parser')
++      w('final %s[] docValues = ExtendedFieldCache.EXT_DEFAULT.get%ss(r, sortFieldID);' % \
++        (self.valueType, self.upperValueType(True)))
++    elif self.comp is not None:
++      self.comp.writePerReader()
++    else:
++      w('comp.setNextReader(r, docBase, topN);')
++
++  def writeTopClass(self):
++    w = self.w
++    w('final private static class Entry {')
++    if self.comp is not None:
++      self.comp.writeEntryClass()
++    elif self.valueType is not None:
++      w('  // local inlined value')
++      w('  %s value;' % self.valueType)
++    else:
++      w('  // value by reference')
++      w('  final int slot;')
++    w('  int docID;')
++    if self.doTrackScores:
++      w('  float score;')
++    w('}')
++
++    if self.comp is not None:
++      self.comp.writeTopClass()
++    
++
++  def topInit(self):
++    BasePQCollector.topInit(self)
++    w = self.w
++    if self.doMaxScore:
++      self.w('float maxScore = Float.NEGATIVE_INFINITY;')
++    self.w('final SortField sortField = sort.getSort()[0];')
++    self.w('final String sortFieldID = sortField.getField();')
++    self.w('final Entry[] queue = new Entry[1+topN];')
++    if self.comp is not None:
++      self.comp.writeTop()
++    elif self.valueType is not None:
++      w('// pre-fill queue with "bottom"')
++      w('final %s sentinel;' % self.valueType)
++      w('if (sortField.getReverse()) {')
++      w('  sentinel = %s.MIN_VALUE;' % self.upperValueType())
++      w('} else {')
++      w('  sentinel = %s.MAX_VALUE;' % self.upperValueType())
++      w('}')
++      w('// queue[0] is never used')
++      
++    w('for (int x=1;x<=topN;x++) {')
++    w('  final Entry e = queue[x] = new Entry();')
++    w('  e.docID = Integer.MAX_VALUE;')
++    if self.doTrackScores:
++      w('  e.score = Float.NEGATIVE_INFINITY;')
++    if self.comp is not None:
++      self.comp.initSingleEntryQueue()
++    elif self.valueType is not None:
++      w('  e.value = sentinel;')
++    else:
++      w('  e.slot = i-1;')
++    w('}')
++
++    w('Entry bottom = queue[1];')
++    if self.valueType is None:
++      w('final FieldComparator comp = sort.getSort()[0].getComparator(topN, 0, false);')
++    else:
++      w('%s bottomValue = sentinel;' % self.valueType)
++    if not self.docsAlwaysInOrder:
++      w('int bottomDoc = Integer.MAX_VALUE;')
++    
++  def currentGreaterThanBreak(self, v, docsInOrder=True):
++    w = self.w
++    if self.comp is not None:
++      self.comp.currentGreaterThanBreak(v, docsInOrder)
++    elif self.valueType is None:
++      if docsInOrder:
++        w('if (comp.compare(queue[%s].slot, bottom.slot) <= 0) {' % v)
++        w('  break;')
++        w('}')
++      else:
++        w('final int c = comp.compare(queue[%s].slot, bottom.slot);' % v)
++        w('if (c == 0) {')
++        w('  // Must break tie by docID')
++        w('  if (queue[%s].docID < bottom.docID) {' % v)
++        w('    break;')
++        w('  }')
++        w('} else if (c < 0) {')
++        w('  break;')
++        w('}')
++    else:
++      self.w('if (queue[%s].value == bottomValue) {' % v)
++      w('  // Must break tie by docID')
++      w('  if (queue[%s].docID < bottom.docID) {' % v)
++      w('    break;')
++      w('  }')
++      w('} else if (queue[%s].value < bottomValue) {' % v)
++      w('  break;')
++      w('}')
++      
++  def lessThan(self, a, b, v):
++    w = self.w
++    c = w.getVar('c')
++    w('final boolean %s;'% v)
++    if self.comp is not None:
++      w('final int %s = compareOrdVal(queue[%s], queue[%s]);' % (c, a, b))
++      w('if (%s == 0) {' % c)
++    elif self.valueType is None:
++      w('final int %s = comp.compare(queue[%s].slot, queue[%s].slot);' % (c, a, b))
++      w('if (%s == 0) {' % c)
++    else:
++      w('if (queue[%s].value == queue[%s].value) {' % (a, b))
++    w('  // Must break tie by docID')
++    w('  %s = queue[%s].docID > queue[%s].docID;' % (v, a, b))
++    w('} else {')
++    if self.comp is not None or self.valueType is None:
++      w('  %s = %s > 0;' % (v, c))
++    else:
++      w('  %s = queue[%s].value > queue[%s].value;' % (v, a, b))
++    w('}')
++    w.releaseVar(c)
++
++  def copy(self, src, dest):
++    self.w('queue[%s] = queue[%s];' % (dest, src))
++
++  def installBottom(self, dest):
++    self.w('queue[%s] = bottom;' % dest)
++    
++  def copyCurrentToBottom(self):
++    self.w('bottom.docID = fullDoc;')
++    if self.doTrackScores:
++      self.w('bottom.score = score;')
++    if self.comp is not None:
++      self.comp.copyCurrentToBottom()
++    elif self.valueType is not None:
++      self.w('bottomValue = bottom.value = docValues[doc];')
++    else:
++      if self.doTrackScores:
++        s = 'score'
++      else:
++        s = 'Float.NaN'
++      self.w('comp.copy(bottom.slot, doc, %s);' % s)
++
++  def endInsert(self):
++    self.w('bottom = queue[1];')
++    if self.comp is not None:
++      self.comp.endInsert()
++    elif self.valueType is not None:
++      self.w('bottomValue = bottom.value;')
++    else:
++      self.w('comp.setBottom(bottom.slot);')
++
++  didMaxScore = False
++
++  def writeMaxScore(self, q):
++    w = self.w
++    if self.doMaxScore and not self.didMaxScore:
++      q.writeScore()
++      w('  if (score > maxScore) {')
++      w('    maxScore = score;')
++      w('  }')
++      self.didMaxScore = True
++
++  def writeCompetes(self, q, docsInOrder=True):
++    w = self.w
++
++    self.writeMaxScore(q)
++
++    if self.comp is not None:
++      self.comp.writeCompetes(q, docsInOrder)
++    elif self.valueType is None:
++      w('  final int cmp = comp.compareBottom(doc, Float.NaN);')
++      w('  if (cmp > 0) {')
++    elif docsInOrder:
++      w('  if (docValues[doc] < bottomValue) {')
++    else:
++      w('  if (docValues[doc] < bottomValue || (docValues[doc] == bottomValue && fullDoc < bottom.docID)) {')
++
++    if DEBUG:
++      w('    System.out.println("  does compete bottom");')
++
++  def swap(self, i, j):
++    w = self.w
++    w('final Entry tmp = queue[%s];' % i)
++    w('queue[%s] = queue[%s];' % (i, j))
++    w('queue[%s] = tmp;' % j)
++
++  def createTopDocs(self):
++    if self.doMaxScore:
++      x = 'maxScore'
++    else:
++      x = 'Float.NaN'
++    if self.s.doTotalHits:
++      v = 'hitCount'
++    else:
++      v = '-1'
++    self.w('final TopDocs results = new TopFieldDocs(%s, hits, sort.getSort(), %s);' % (v, x))
++
++class Query:
++
++  hasScores = True
++
++  def var(self, name):
++    return '%s%s%s' % (self.id, name[0].upper(), name[1:])
++
++  def pushState(self, s):
++    self.s = s
++    for query in self.getSubQueries():
++      query.pushState(s)
++
++  def setVars(self, docVar, scoreVar):
++    self.docVar = docVar
++    self.scoreVar = scoreVar
++    for query in self.getSubQueries():
++      query.setVars(query.var('doc'),
++                    query.var('score'))
++
++
++class BooleanQuery(Query):
++
++  # true if we are a "fake" BooleanQuery, created in order to apply a
++  # sparse filter
++
++  def __init__(self, shouldClauses, mustNotClauses, mustClauses, minNR):
++    self.shouldQueries = shouldClauses
++    self.mustNotQueries = mustNotClauses
++    self.mustQueries = mustClauses
++    self.minNR = minNR
++
++  def getSubQueries(self):
++    return self.shouldQueries + self.mustNotQueries + self.mustQueries
++
++  def writeTopClass(self, c):
++    w = self.w
++    self.c = c
++    self.scoreUpFront = self.c.doMaxScore and len(self.mustNotQueries) == 0 and len([x for x in self.mustQueries if x.hasScores]) <= 1
++    self.needsScores = self.c.doMaxScore or self.c.doTrackScores
++
++    c.docsAlwaysInOrder = False
++    if not self.s.docAtOnce:
++      if not self.s.doBucketArray:
++        self.buckets = Bucket(w, self.CHUNK)
++      else:
++        self.buckets = BucketAsArray(w, self.CHUNK)
++      mustCount = len(self.mustQueries)
++      hasMustNot = len(self.mustNotQueries) > 0
++      if hasMustNot:
++        self.buckets.addAttr('boolean', 'reject')
++      if self.scoreUpFront:
++        self.buckets.addAttr('float', 'score')
++      elif self.needsScores:
++        for q in self.shouldQueries + self.mustQueries:
++          q.writeEntryClassData(self.buckets)
++      if len(self.shouldQueries) > 0 and (c.doMaxScore or c.doTrackScores or self.minNR != 0):
++        self.buckets.addAttr('int', 'coord')
++      if mustCount > 1:
++        self.buckets.addAttr('int', 'mustCount')
++
++      self.buckets.writeTopClass()
++      w('private final static int[] usedBuckets = new int[%d];' % self.CHUNK)
++
++  def setWriter(self, w):
++    self.w = w
++    self.id = w.getID()
++    for q in self.mustQueries+self.shouldQueries+self.mustNotQueries:
++      q.setWriter(w)
++
++  didScore = False
++  def writeScore(self):
++    if self.didScore:
++      return
++    self.didScore = True
++    w = self.w
++    c = self.c
++    if self.scoreUpFront:
++      # we are inside the sub-collect loop (for one clause): add in score for one hit
++      if len(self.shouldQueries) > 0:
++        w('final float %s = %s * coordFactors[%s];' % \
++          (self.scoreVar, self.buckets.lookup('score'), self.buckets.lookup('coord')))
++      else:
++        w('final float %s = %s;' % (self.scoreVar, self.buckets.lookup('score')))
++    elif self.needsScores:
++      # we are inside the collect loop: now sum score for all the clauses
++      self.w('float %s = 0f;' % self.scoreVar)
++      for q in self.mustQueries + self.shouldQueries:
++        if q.hasScores:
++          q.writeScore(required=q in self.mustQueries)
++          # w('score += %s;' % q.scoreVar)
++      if len(self.shouldQueries) > 0:
++        w('%s *= coordFactors[%s];' % (self.scoreVar, self.buckets.lookup('coord')))
++    
++  def writeTop(self, c, qVar, scores=True):
++    w = self.w
++    
++    w('BooleanClause[] clauses = ((BooleanQuery) q).getClauses();')
++    if len(self.mustQueries) > 0 and isinstance(self.mustQueries[0], FilterAsQuery) and \
++           (len(self.mustQueries) + len(self.shouldQueries) + len(self.mustNotQueries) > 2):
++      # back-translate to orig boolean query @ search time so sub-weights are correctly computed
++      w('final BooleanQuery qcx = new BooleanQuery();')
++      upto = 0
++      for i in range(len(self.shouldQueries)+len(self.mustNotQueries)+len(self.mustQueries)):
++        if i == 0 and len(self.mustQueries) > 0 and isinstance(self.mustQueries[0], FilterAsQuery):
++          continue
++        w('qcx.add(clauses[%d]);' % i)
++      w('clauses = qcx.getClauses();')
++      w('final Weight qcxWeight = qcx.weight(searcher);')
++      myWeightVar = 'qcxWeight'
++    else:
++      myWeightVar = self.var('weight')
++
++    upto = 0
++    for i in range(len(self.shouldQueries)+len(self.mustNotQueries)+len(self.mustQueries)):
++      if i == 0 and len(self.mustQueries) > 0 and isinstance(self.mustQueries[0], FilterAsQuery):
++        continue
++      if myWeightVar == 'qcxWeight':
++        idx = upto
++      else:
++        idx = i
++      w('final Query q%d = clauses[%d].getQuery();' % (1+upto, idx))
++      upto += 1
++      
++    if c.doTrackScores or c.doMaxScore:
++      if len(self.mustQueries) == 2 and len(self.shouldQueries) == 0 and len(self.mustNotQueries) == 0 and isinstance(self.mustQueries[0], FilterAsQuery):
++        # special case -- weight must be re-derived from underlying term query
++        w('final Weight %s = q1.weight(searcher);' % self.mustQueries[1].var('weight'))
++      else:
++        upto = 0
++        for i, q in enumerate(self.mustQueries+self.shouldQueries):
++          if i == 0 and len(self.mustQueries) > 0 and isinstance(self.mustQueries[0], FilterAsQuery):
++            continue
++          w('final Weight %s = ((BooleanQuery.BooleanWeight) %s).subWeight(%d);' % \
++            (q.var('weight'), myWeightVar, upto))
++          upto += 1
++    upto = 0
++    for i in range(len(self.mustQueries)):
++      if isinstance(self.mustQueries[i], FilterAsQuery):
++        continue
++      self.mustQueries[i].writeTop(c, 'q%d' % (1+upto))
++      upto += 1
++    for i in range(len(self.shouldQueries)):
++      self.shouldQueries[i].writeTop(c, 'q%d' % (1+upto))
++      upto += 1
++    shouldMustCount = upto
++    for i in range(len(self.mustNotQueries)):
++      self.mustNotQueries[i].writeTop(c, 'q%d' % (1+upto), scores=False)
++      upto += 1
++    if len(self.shouldQueries) > 0 and (c.doTrackScores or c.doMaxScore):
++      self.maxCoord = len([x for x in self.shouldQueries + self.mustQueries if x.hasScores])
++      w('final float coordFactors[] = new float[%d];' % (self.maxCoord+1))
++      for i in range(self.maxCoord+1):
++        w('coordFactors[%d] = sim.coord(%d, %d);' % (i, i, self.maxCoord))
++
++  def writePerReader(self, c):
++    first = True
++    for q in self.mustQueries + self.shouldQueries:
++      q.writePerReader(c, doSkip=self.s.doSkipping and not first)
++      first = False
++    for q in self.mustNotQueries:
++      q.writePerReader(c, scores=False, doSkip=self.s.doSkipping)
++    self.w('int limit = 0;')
++    for q in self.mustQueries+self.shouldQueries:
++      isMust = q in self.mustQueries
++      if isMust:
++        s = 'must'
++      else:
++        s = 'should'
++      self.w(' // init %s query for this reader' % s)
++      q.next(doReject=False)
++      if isMust:
++        self.w('if (%s == %s) {' % (q.docVar, END_DOC))
++        self.w('  continue;')
++        self.w('}')
++    for q in self.mustNotQueries:
++      self.w(' // init must-not query for this reader')
++      q.next(doReject=False, scores=False)
++    if not self.s.docAtOnce:      
++      self.buckets.initPerReader()
++
++  CHUNK = 512
++
++  def writeInitBucket(self, q):
++    w = self.w
++    mustCount = len(self.mustQueries)
++    haveMust = mustCount > 0
++    haveMustNot = len(self.mustNotQueries) > 0
++
++    w('  %s = %s;' % (self.buckets.lookup('doc'), q.docVar))
++    if haveMustNot:
++      w('  %s = false;' % self.buckets.lookup('reject'));
++    w('  usedBuckets[usedCount++] = spot;')
++
++    if q.hasScores:
++      coordInit = 1
++      if self.scoreUpFront:
++        q.writeScore()
++        w('  %s = %s;' % (self.buckets.lookup('score'), q.scoreVar))
++      elif self.needsScores:
++        #for qx in self.mustQueries+self.shouldQueries:
++        if q in self.mustQueries:
++          q.writeSaveScoreData(self.buckets)
++        for qx in self.shouldQueries:
++          if q == qx:
++            qx.writeSaveScoreData(self.buckets)
++          else:
++            qx.clearScoreData(self.buckets)
++    else:
++      coordInit = 0
++      if self.scoreUpFront:
++        w('  %s = 0.0f;' % self.buckets.lookup('score'))
++      elif self.needsScores:
++        #for qx in self.mustQueries+self.shouldQueries:
++        if q in self.mustQueries:
++          if q.hasScores:
++            q.writeSaveScoreData(self.buckets)
++        for qx in self.shouldQueries:
++          if qx.hasScores:
++            if q == qx:
++              qx.writeSaveScoreData(self.buckets)
++            else:
++              qx.clearScoreData(self.buckets)
++      
++    # TODO: combine coord/mustCount
++    if len(self.shouldQueries) > 0 and (self.c.doTrackScores or self.c.doMaxScore or self.minNR != 0):
++      self.w('  %s = %s;' % (self.buckets.lookup('coord'), coordInit))
++    if mustCount > 1:
++      self.w('  %s = 1;' % self.buckets.lookup('mustCount'))
++
++  def writeUpdateBucket(self, q):
++    w = self.w
++    if self.scoreUpFront:
++      # TODO: pass in b.score as scorevar
++      q.writeScore()
++      w('%s += %s;' % (self.buckets.lookup('score'), q.scoreVar))
++    elif self.needsScores:
++      q.writeSaveScoreData(self.buckets)
++
++    if len(self.shouldQueries) > 0 and (self.c.doTrackScores or self.c.doMaxScore or self.minNR != 0):
++      self.w('%s++;' % self.buckets.lookup('coord'))
++  
++  def writeFirstSubCollect(self, q):
++
++    # first clause is either MUST or SHOULD, which are treated exactly
++    # the same: iterate through chunk, recording all matches in
++    # buckets
++
++    w = self.w
++    mustCount = len(self.mustQueries)
++    haveMust = mustCount > 0
++    haveMustNot = len(self.mustNotQueries) > 0
++    isMust = q in self.mustQueries
++
++    w('while(%s < limit) {' % q.docVar)
++    if self.s.rejectDoc is not None:
++      w('  if (!(%s)) {' % self.s.rejectDoc.replace('__DOC__', q.docVar))
++    w('  final int spot = %s&%s;' % (q.docVar, self.CHUNK-1))
++
++    self.buckets.initOneBucket('spot')
++    self.writeInitBucket(q)
++
++    if self.s.rejectDoc is not None:
++      w('}')      
++    
++    q.next(scores=self.needsScores, doReject=False)
++    w('}')
++
++    if haveMust:
++      w('if (usedCount == 0) {')
++      #w('  System.out.println("first zero");')
++      w('  continue;')
++      w('}')
++      #w('System.out.println("2gap=" + (bucketDoc[usedBuckets[0]] - q2Doc));')
++
++  def writeNonFirstMustSubCollect(self, q):
++
++    # non-1st MUST clause
++    
++    w = self.w
++    haveMust = len(self.mustQueries) > 0
++    haveMustNot = len(self.mustNotQueries) > 0
++
++    if self.s.doSkipping:
++      q.writeSkipTo(self.buckets.lookup('doc', 'usedBuckets[0]'))
++
++    w('while(%s < limit) {' % q.docVar)
++    w('  final int spot = %s&%s;' % (q.docVar, self.CHUNK-1))
++
++    self.buckets.initOneBucket('spot')
++
++    w('  if (%s == %s) {' % (self.buckets.lookup('doc'), q.docVar))
++    # bucket is valid
++    if len(self.mustQueries) == 2:
++      w('   %s = 2;' % self.buckets.lookup('mustCount'))
++    elif len(self.mustQueries) > 2:
++      w('    %s++;' % self.buckets.lookup('mustCount'))
++    self.writeUpdateBucket(q)
++    w('  }')
++    q.next(scores=self.needsScores, doReject=False)
++    w('}')
++  
++  def writeShouldHasMust(self, q):
++
++    # non-1st SHOULD clause, has MUST clauses
++
++    w = self.w
++    mustCount = len(self.mustQueries)
++
++    w('while(%s < limit) {' % q.docVar)
++    w('  final int spot = %s&%s;' % (q.docVar, self.CHUNK-1))
++
++    self.buckets.initOneBucket('spot')
++
++    # we cannot create a new bucket -- only update valid bucket
++    if mustCount > 1:
++      w('  // only accept doc if it\'s already valid (from all prior must clauses)')
++      w('  if (%s == %s && %s == %s)  {' %
++        (self.buckets.lookup('doc'), q.docVar,
++         self.buckets.lookup('mustCount'), mustCount))
++    else:
++      w('  // only accept doc if it\'s already valid (from prior must clause)')
++      w('  if (%s == %s) {' %
++        (self.buckets.lookup('doc'), q.docVar))
++
++    self.writeUpdateBucket(q)
++    w('  }')
++    
++    q.next(scores=self.needsScores, doReject=False)
++    w('}')
++
++  def writeShouldHasNoMust(self, q):
++
++    # non-1st SHOULD clause, no MUST clauses
++
++    w = self.w
++    haveMustNot = len(self.mustNotQueries) > 0
++
++    w('while(%s < limit) {' % q.docVar)
++
++    if self.s.rejectDoc is not None:
++      w('  if (!(%s)) {' % self.s.rejectDoc.replace('__DOC__', q.docVar))
++
++    w('  final int spot = %s&%s;' % (q.docVar, self.CHUNK-1))
++
++    self.buckets.initOneBucket('spot')
++
++    if self.scoreUpFront:
++      q.writeScore()
++
++    w('  if (%s == %s) {' %
++      (self.buckets.lookup('doc'), q.docVar))
++
++    # bucket already init'd -- we just update w/ our score data
++    self.writeUpdateBucket(q)
++    w('  } else {')
++    # bucket not init'd -- we init it now
++    self.writeInitBucket(q)
++    w('  }')
++
++    if self.s.rejectDoc is not None:
++      w('}')      
++
++    q.next(scores=self.needsScores, doReject=False)
++    w('}')
++
++  def writeMustNot(self, q):
++    
++    # non-1st SHOULD clause, no MUST clauses
++    w = self.w
++    w('while(%s < limit) {' % q.docVar)
++    w('  final int spot = %s&%s;' % (q.docVar, self.CHUNK-1))
++    self.buckets.initOneBucket('spot')
++    w('  %s = true;' % self.buckets.lookup('reject'))
++    q.next(scores=False, doReject=False)
++    w('}')
++
++  # docAtOnce top loop
++  def writeDAOTopIter(self, c):
++    
++    w = self.w
++    first = self.mustQueries[0]
++    iterFilter = isinstance(first, FilterAsQuery)
++    if iterFilter:
++      w('// drive iter w/ filter as iterator')
++    else:
++      w('// drive iter w/ first must query')
++    w('while(%s != %s) {' % (first.docVar, END_DOC))
++    if self.s.rejectDoc is not None:
++      w('  // fast doc reject')
++      w('  if (%s) {' % (self.s.rejectDoc.replace('__DOC__', first.docVar)))
++      first.next(scores=self.needsScores, doReject=False)
++      w('    continue;')
++      w('  }')
++
++    if self.scoreUpFront:
++      w('  float %s = 0.0f;' % self.scoreVar)
++      if first.hasScores:
++        first.writeScore(required=True)
++        w('%s += %s;' % (self.scoreVar, first.scoreVar))
++
++    for q in self.mustQueries[1:]:
++      idx = 1+self.mustQueries.index(q)
++      if iterFilter:
++        idx -= 1
++      w('  // must query %s' % idx)
++      if self.s.doSkipping:
++        w('  if (%s < %s) {' % (q.docVar, first.docVar))
++        w('// %s.skip()' % q.id)
++        q.writeSkipTo(first.docVar)
++      w('    while (%s < %s) {' % (q.docVar, first.docVar))
++      q.next(scores=self.needsScores, doReject=False)
++      w('    }')
++      if self.s.doSkipping:
++        w('  }')
++      w('  if (%s > %s) {' % (q.docVar, first.docVar))
++      first.next(scores=self.needsScores, doReject=False)
++      w('    continue;')
++      w('  }')
++
++      if self.scoreUpFront:
++        q.writeScore(required=True)
++        w('%s += %s;' % (self.scoreVar, q.scoreVar))
++
++    for q in self.mustNotQueries:
++      w('// must not query %s' % (1+self.mustNotQueries.index(q)))
++      if self.s.doSkipping:
++        w('  if (%s < %s) {' % (q.docVar, first.docVar))
++        w('// %s.skip()' % q.id)
++        q.writeSkipTo(first.docVar)
++      w('    while (%s < %s) {' % (q.docVar, first.docVar))
++      q.next(scores=False, doReject=False)
++      w('    }')
++      if self.s.doSkipping:
++        w('  }')
++      w('  if (%s == %s) {' % (q.docVar, first.docVar))
++      first.next(scores=self.needsScores, doReject=False)
++      w('    continue;')
++      w('  }')
++
++    # hit passes at this point -- compute base score from scoring must clauses
++    if self.minNR == 0:
++      w('// this hit passes')
++    if self.needsScores:
++      if not self.scoreUpFront:
++        self.w('float %s = 0f;' % self.scoreVar)
++        for q in self.mustQueries:
++          if q.hasScores:
++            q.writeScore(required=q in self.mustQueries)
++            w('%s += %s;' % (self.scoreVar, q.scoreVar))
++    
++    # fold in should queries/scores
++    if len(self.shouldQueries) > 0:
++      w('  int coord = %s;' % len([x for x in self.mustQueries if x.hasScores]))
++    for q in self.shouldQueries:
++      w('// should query %s' % (1+self.shouldQueries.index(q)))
++      if self.s.doSkipping:
++        w('  if (%s < %s) {' % (q.docVar, first.docVar))
++        w('// %s.skip()' % q.id)
++        q.writeSkipTo(first.docVar)
++      w('    while (%s < %s) {' % (q.docVar, first.docVar))
++      q.next(scores=self.needsScores, doReject=False)
++      w('    }')
++      if self.s.doSkipping:
++        w('  }')
++      w('  if (%s == %s) {' % (q.docVar, first.docVar))
++      w('    coord++;')
++      if self.needsScores:
++        q.writeScore()
++        w('    %s += %s;' % (self.scoreVar, q.scoreVar))
++      w('  }')
++      
++    if self.minNR != 0:
++      w('  if (coord < %s) {' % self.minNR)
++      first.next(scores=self.needsScores, doReject=False)
++      w('    continue;')
++      w('  }')
++      w('// this hit passes')
++      
++    if self.s.doTotalHits:
++      w('  hitCount++;')
++    w('  final int doc = %s;' % first.docVar)
++    if self.needsScores and len(self.shouldQueries) > 0:
++      w('  %s *= coordFactors[coord];' % self.scoreVar)
++
++    self.didScore = True
++    c.writeMaxScore(self)
++    c.collectOne(self, checkEndDoc=False, docsInOrder=True, doTotalHits=False, checkCompetes=not c.fastRejectIsPerfect)
++
++    for q in self.mustQueries:
++      w('// %s.next()' % q.id)
++      q.next(scores=self.needsScores, doReject=False)
++      
++    w('}')
++  
++
++  def writeTopIter(self, c):
++    if self.s.docAtOnce:
++      self.writeDAOTopIter(c)
++      return
++    
++    w = self.w
++    w('while(limit < maxDoc) { // loop for all hits')
++    w('  limit += %d;' % self.CHUNK)
++    w('  if (limit > maxDoc) {')
++    w('    limit = maxDoc;')
++    w('  }')
++
++    w('  int usedCount=0;')
++
++    l = self.mustQueries + self.shouldQueries + self.mustNotQueries
++    for i, q in enumerate(l):
++      if i == 0:
++        if q in self.mustQueries:
++          vx = 'must'
++        else:
++          vx = 'should'
++        w('  // sub-collect first %s sub-query' % vx)
++        self.writeFirstSubCollect(q)
++      else:
++        if q in self.mustQueries:
++          w('  // sub-collect non-first must sub-query')
++          self.writeNonFirstMustSubCollect(q)
++        elif q in self.shouldQueries:
++          if len(self.mustQueries) > 0:
++            w('  // sub-collect non-first should sub-query, when there\'s at least one must query')
++            self.writeShouldHasMust(q)
++          else:
++            w('  // sub-collect non-first should sub-query, when there\'re no must queries')
++            self.writeShouldHasNoMust(q)
++        else:
++          w('  // sub-collect must-not query')
++          self.writeMustNot(q)
++          
++    w('  // now do real collect')
++    if self.s.doTotalHits and len(self.mustQueries) == 0 and len(self.mustNotQueries) == 0 and self.minNR == 0:
++      w('  hitCount += usedCount;')
++
++    if len(self.mustQueries) == 0:
++      w('  while(usedCount-- != 0) {')
++      w('    final int spot = usedBuckets[usedCount];')
++    else:
++      w('  int upto = 0;')
++      w('  while(upto < usedCount) {')
++      w('    final int spot = usedBuckets[upto++];')
++    self.buckets.initOneBucket('spot')
++    
++    l = []
++    if len(self.mustNotQueries) > 0:
++      l.append(self.buckets.lookup('reject'))
++    if len(self.shouldQueries) > 0 and self.minNR != 0:
++      l.append('%s < %d' % (self.buckets.lookup('coord'), self.minNR))
++    if len(self.mustQueries) > 1:
++      l.append('%s != %d' % (self.buckets.lookup('mustCount'), len(self.mustQueries)))
++    if len(l) > 0:
++      w('    if (%s) {' % (' || '.join(l)))
++      w('      continue;')
++      w('    }')
++    if self.s.doTotalHits and not (len(self.mustQueries) == 0 and len(self.mustNotQueries) == 0 and self.minNR == 0):
++      w('  hitCount++;')
++    w('    final int doc = %s;' % self.buckets.lookup('doc'))
++    c.collectOne(self, checkEndDoc=False, docsInOrder=len(self.mustQueries) != 0, doTotalHits=False)
++    w('  }')
++    if len(self.mustQueries) != 0:
++      w('  usedCount = 0;')
++    w('  if (limit == maxDoc) {')
++    w('    break;')
++    w('  }')
++    w('}')
++
++class TermQuery(Query):
++
++  SCORE_CACHE_SIZE = 32
++  BLOCK_SIZE = 32
++
++  didScore = False
++  hasNorms = True
++  
++  def setWriter(self, w):
++    self.w = w
++    self.id = w.getID()
++
++  def getSubQueries(self):
++    return ()
++
++  def writeEntryClassData(self, buckets):
++    buckets.addAttr('int', self.var('Freq'))
++
++  def writeTopClass(self, c):
++    pass
++
++  def releaseVar(self, v):
++    self.w.releaseVar(v)
++
++  didSaveScoreData = None
++  def writeSaveScoreData(self, buckets):
++    self.w('%s = %s;' % (buckets.lookup(self.var('Freq')),
++                         self.var('freq')))
++    self.didSaveScoreData = buckets.lookup(self.var('Freq'))
++
++  def clearScoreData(self, buckets):
++    self.w('%s = -1;' % buckets.lookup(self.var('Freq')))
++
++  def writeScore(self, required=False):
++    w = self.w
++    if not self.didScore:
++      self.didScore = True
++      if self.didSaveScoreData is not None:
++        freqVar = self.var('freqA')
++        w('final int %s = %s;' % (freqVar, self.didSaveScoreData))
++        if not required:
++          w('if (%s != -1) {' % freqVar)
++        docVar = 'doc'
++      else:
++        freqVar = self.var('freq')
++        docVar = self.docVar
++
++      if self.hasNorms:
++        w('  final float %s = (%s < %d ? %s[%s] : sim.tf(%s)*%s) * normDecoder[%s[%s] & 0xFF];' % \
++          (self.scoreVar,
++           freqVar,
++           self.SCORE_CACHE_SIZE,
++           self.var('scoreCache'),
++           freqVar,
++           freqVar,
++           self.var('weightValue'),
++           self.var('norms'),
++           docVar))
++      else:
++        w('  final float %s = (%s < %d ? %s[%s] : sim.tf(%s)*%s);' % \
++          (self.scoreVar,
++           freqVar,
++           self.SCORE_CACHE_SIZE,
++           self.var('scoreCache'),
++           freqVar,
++           freqVar,
++           self.var('weightValue')))
++
++      if self.didSaveScoreData is not None:
++        self.w('  score += %s;' % self.scoreVar)
++        if not required:
++          self.w('}')
++
++  def writeTop(self, c, qVar, scores=True):
++    w = self.w
++    w('final Term %s = ((TermQuery) %s).getTerm();' % (self.var('t'), qVar))
++
++    if scores and c.needsScores():
++      w('final float[] %s = new float[%s];' % (self.var('scoreCache'), self.SCORE_CACHE_SIZE))
++      w('final float %s = %s.getValue();' % \
++        (self.var('weightValue'), self.var('weight')))
++      w('for(int i=0;i<%s;i++) {' % self.SCORE_CACHE_SIZE)
++      w('  %s[i] = sim.tf(i) * %s;' % (self.var('scoreCache'), self.var('weightValue')))
++      w('}')
++
++  def writeSkipTo(self, dest):
++    w = self.w
++    w('final int %s = %s.skipTo(%s);' % \
++      (self.var('newCount'), self.var('skipper'), dest))
++    w('if (%s > %s) {' % (self.var('newCount'), self.var('count')))
++    w('  %s.seek(%s.getFreqPointer());' % (self.var('freqStream'), self.var('skipper')))
++    #skipProx(skipListReader.getProxPointer(), skipListReader.getPayloadLength());
++    w('  %s = %s.getDoc();' % (self.var('doc'), self.var('skipper')))
++    w('  %s = %s;' % (self.var('count'), self.var('newCount')))
++    w('}')
++
++  def writePerReader(self, c, scores=True, doSkip=False):
++    w = self.w
++    if scores and c.needsScores() and self.hasNorms:
++      w('final byte[] %s = r.norms(%s.field());' % (self.var('norms'), self.var('t')))
++    w('int %s = 0;' % self.docVar)
++    if scores:
++      w('int %s = 0;' % self.var('freq'))
++    w('// only used to get the raw freqStream & limit')
++    w('final TermDocs %s = r.termDocs(%s);' % (self.var('TD'), self.var('t')))
++    w('final %s %s = (%s) ((SegmentTermDocs) %s).getFreqStream();' % (self.s.dirIndexInputType,
++                                                                      self.var('freqStream'),
++                                                                      self.s.dirIndexInputType,
++                                                                      self.var('TD')))
++    w('final int %s = ((SegmentTermDocs ) %s).getTermFreq();' % (self.var('limit'),
++                                                                 self.var('TD')))
++
++    if doSkip:
++      w('final TermInfo %s = r.getTermInfo(%s);' % (self.var('termInfo'), self.var('t')))
++      w('final DefaultSkipListReader %s;' % self.var('skipper'))
++      w('if (%s != 0) {' % self.var('limit'))
++      w('  %s = new DefaultSkipListReader((IndexInput) %s.clone(), r.getMaxSkipLevels(), r.getSkipInterval());' % (self.var('skipper'), self.var('freqStream')))
++      w('  // TODO: handle payloads properly (don\'t just pass false in)')
++      w('  %s.init(%s.freqPointer + %s.skipOffset, %s.freqPointer, %s.proxPointer, %s, false);' %
++        (self.var('skipper'), self.var('termInfo'), self.var('termInfo'), self.var('termInfo'), self.var('termInfo'), self.var('limit')))
++      w('} else {')
++      w('  %s = null;' % self.var('skipper'))
++      w('}')
++        
++    w('int %s = 0;' % self.var('count'))
++
++  def writeTopIter(self, c):
++    w = self.w
++    if self.s.doTotalHits and self.s.rejectDoc is None:
++      w('  hitCount += %s;' % self.var('limit'))
++    w('while(true) { // until we are done collecting hits from this reader')
++    self.next(True, scores=c.doMaxScore or c.doTrackScores)
++    if self.s.doTotalHits and self.s.rejectDoc is not None:
++      w('  hitCount++;')
++    c.collectOne(self, checkEndDoc=False, checkCompetes=not c.fastRejectIsPerfect)
++    w('}')
++    
++  def next(self, isTop=False, scores=True, doReject=True):
++    w = self.w
++    if not isTop and self.s.rejectDoc is not None and doReject:
++      w('while(true) { // until we find a non-deleted & non-filtered-out doc')
++    w('if (++%s > %s) {' % (self.var('count'), self.var('limit')))
++    if not isTop:
++      w('  %s = %s;' % (self.docVar, END_DOC))
++      if doReject and self.s.rejectDoc is not None:
++        w('  break;')
++    else:
++      w('  break;')
++    w('} else {')
++    w('  final int %s = %s.readVInt();' % (self.var('x'), self.var('freqStream')))
++    w('  %s += %s>>>1;' % (self.docVar, self.var('x')))
++    if doReject and self.s.rejectDoc is not None:
++      w('  // fast reject')
++      w('  if (%s) {' % (self.s.rejectDoc.replace('__DOC__', self.docVar)))
++      w('    if ((%s & 1) == 0) {' % self.var('x'))
++      w('      // skip freq')
++      w('      %s.skipVInt();' % self.var('freqStream'))
++      w('    }')
++      w('    continue;')
++      w('  } else {')
++      if scores:
++        w('    if ((%s&1) != 0) {' % self.var('x'))
++        w('      %s = 1;' % self.var('freq'))
++        w('    } else {')
++        w('      %s = %s.readVInt();' % (self.var('freq'), self.var('freqStream')))
++        w('    }')
++      else:
++        w('    if ((%s&1) == 0) {' % self.var('x'))
++        w('      // skip freq')
++        w('      %s.skipVInt();' % self.var('freqStream'))
++        w('    }')
++      if not isTop:
++        w('    break;')
++      w('  }')
++    else:
++      if scores:
++        w('  if ((%s&1) != 0) {' % self.var('x'))
++        w('    %s = 1;' % self.var('freq'))
++        w('  } else {')
++        w('    %s = %s.readVInt();' % (self.var('freq'), self.var('freqStream')))
++        w('  }')
++      else:
++        w('  if ((%s&1) == 0) {' % self.var('x'))
++        w('    // skip freq')
++        w('    %s.skipVInt();' % self.var('freqStream'))
++        w('  }')
++
++    w('  }')
++    if not isTop and self.s.rejectDoc is not None and doReject:
++      w('  }')
++
++
++class FilterAsQuery(Query):
++
++  hasScores = False
++
++  def setWriter(self, w):
++    self.w = w
++    self.id = 'sparseFilt'
++
++  def getSubQueries(self):
++    return ()
++
++  def writeEntryClassData(self, buckets):
++    pass
++
++  def writeTopClass(self, c):
++    pass
++
++  def writeSaveScoreData(self, buckets):
++    pass
++
++  def clearScoreData(self, buckets):
++    pass
++
++  def writeScore(self, required=False):
++    pass
++
++  def writeTop(self, c, qVar, scores=True):
++    pass
++
++  def writeSkipTo(self, dest):
++    w = self.w
++    w('if (filterBitsIter.skipTo(%s)) {' % dest)
++    w('  %s = filterBitsIter.doc();'  % self.docVar)
++    w('} else {')
++    w('  %s = %s;' % (self.docVar, END_DOC))
++    w('}')
++
++  def writePerReader(self, c, scores=True, doSkip=False):
++    w = self.w
++    w('int sparseFiltDoc;')
++    w('final DocIdSetIterator filterBitsIter = filter.getDocIdSet(r).iterator();')
++
++  def next(self, isTop=False, scores=True, doReject=True):
++    w = self.w
++    w('if (filterBitsIter.next()) {')
++    w('  %s = filterBitsIter.doc();' % self.docVar)
++    w('} else {')
++    w('  %s = %s;' % (self.docVar, END_DOC))
++    w('}')
++
++DEBUG = '-verbose' in sys.argv
++
++def writeTopIter(q, c):
++  w = q.w
++  w('while(true) { // until we are done collecting hits from this reader')
++  q.next()
++  c.collectOne(q)
++  w('}')
++
++class State:
++  pass
++
++def gen(w, query, c, doFilter, doDeletes, doTotalHits,
++        fileName, dirIndexInputType, doSkipping, docAtOnce):
++  s = State()
++  s.doFilter = doFilter
++  s.doDeletes = doDeletes
++  s.doSkipping = doSkipping
++  s.dirIndexInputType = dirIndexInputType
++  s.docAtOnce = docAtOnce
++  if s.doFilter == 'RandomAccess':
++    s.rejectDoc = '!filterBits.fastGet(__DOC__)'
++  elif s.doDeletes:
++    s.rejectDoc = 'deletedDocs.get(__DOC__)'
++  else:
++    s.rejectDoc = None
++  s.doTotalHits = doTotalHits
++  s.doBucketArray = True
++
++  query.pushState(s)
++  query.setWriter(w)
++  query.setVars('doc', 'score')
++
++  c.setState(s)
++
++  w('package org.apache.lucene.search;')
++
++  w('import org.apache.lucene.util.*;')
++  w('import org.apache.lucene.store.*;')
++  w('import org.apache.lucene.search.FieldCache.StringIndex;')
++  w('import org.apache.lucene.index.*;')
++  w('import java.io.IOException;')
++  w('import java.util.Arrays;')
++  w('import java.util.HashSet;')
++  w('import java.util.HashMap;')
++
++  className = os.path.splitext(os.path.split(fileName)[1])[0]
++
++  w('final class %s extends SpecSearch {' % className)
++  w('  final private static SpecSearch instance = new %s();' % className);
++  w('  SpecSearch getInstance() {')
++  w('    return instance;')
++  w('  }')
++
++  c.writeTopClass()
++  query.writeTopClass(c)
++  if s.doDeletes:
++    w('final HashMap fakeDeletes = new HashMap();')
++  
++  w('  public TopDocs search(final IndexSearcher searcher, final Query q, final Filter filter, final Sort sort, final int topN) throws IOException {')
++
++  c.topInit()
++
++  w('    final float[] normDecoder = Similarity.getNormDecoder();')
++  w('    final Similarity sim = searcher.getSimilarity();')
++  w('    final IndexReader[] subReaders = searcher.getIndexReader().getSequentialSubReaders();')
++  w('    final int[] docBases = new int[subReaders.length];')
++  w('    {')
++  w('    int docBase = 0;')
++  w('    for(int rx=0;rx<docBases.length;rx++) {')
++  w('      docBases[rx] = docBase;')
++  w('      docBase += subReaders[rx].maxDoc();')
++  w('    }')
++  w('    }')
++
++  w('    final Weight %s = q.weight(searcher);' % query.var('weight'))
++  query.writeTop(c, 'q')
++
++  w('')
++
++  # per reader:
++  w('  for(int rx=0;rx<subReaders.length;rx++) {')
++  w('    final SegmentReader r = (SegmentReader) subReaders[rx];')
++  w('    final int maxDoc = r.maxDoc();')
++
++  if s.doDeletes:
++    w('    final BitVector deletedDocs;')
++    w('    final BitVector bx = r.getDeletedDocs();')
++    w('    if (bx == null) {')
++    w('      if (!fakeDeletes.containsKey(r)) {')
++    w('        deletedDocs = new BitVector(maxDoc);')
++    w('        fakeDeletes.put(r, deletedDocs);')
++    w('      } else {')
++    w('        deletedDocs = (BitVector) fakeDeletes.get(r);')
++    w('      }')
++    w('    } else {')
++    w('      deletedDocs = bx;')
++    w('    }')
++    
++  w('    final int docBase = docBases[rx];')
++
++  if doFilter == 'RandomAccess':
++    w('    final OpenBitSet filterBits = (OpenBitSet) filter.getDocIdSet(r);')
++
++  c.readerInit()
++  query.writePerReader(c)
++
++  if hasattr(query, 'writeTopIter'):
++    # Query has optimized way to drive top iter
++    query.writeTopIter(c)
++  else:
++    # Fallback to generic top iter
++    writeTopIter(query, c)
++
++  w('  }')
++
++  c.createResults('results', c)
++  
++  w('  return results;')
++  w('}')
++  w('}')
++  w('')
++  
++  open(fileName, 'wb').write(str(w))
++
++def main():
++  w = Writer()  
++  c = ScoreDocCollector(w, 10)
++  q = Boolean(TermQuery(), TermQuery())
++  gen(w, q, c, False, False, 'Search.java', None)
++  
++if __name__ == '__main__':
++  main()
+Index: bench.cmd
+===================================================================
+--- bench.cmd	(revision 0)
++++ bench.cmd	(revision 0)
+@@ -0,0 +1 @@
++python -u ../spec/bench.py -delindex /lucene/work.wikifull.8seg.5pdel -nodelindex /lucene/work.wikifull.8seg
+Index: bench.py
+===================================================================
+--- bench.py	(revision 0)
++++ bench.py	(revision 0)
+@@ -0,0 +1,454 @@
++import re
++import time
++import os
++import shutil
++import sys
++import cPickle
++import datetime
++
++import gen
++import genall
++
++if sys.platform.lower().find('darwin') != -1:
++  windows = False
++elif sys.platform.lower().find('win') != -1:
++  windows = True
++else:
++  windows = False
++
++linux = sys.platform.lower().find('linux') != -1
++
++# rm -rf logs; mkdir logs; python -uOO run.py
++
++if 0:
++  print 'compile...'
++  if os.system('cd ../..; ant jar-core > compiletop.log 2>&1') != 0:
++    raise RuntimeError('compile failed (see compiletop.log)')
++
++if 1:
++  print 'genall...'
++  #genall.main('FSDirectory.FSIndexInput', [('bq', 0, 0, 2, 0, 'Yes')])
++  genall.main('FSDirectory.FSIndexInput', ['Term'])
++  
++os.chdir('../benchmark')
++
++if 1:
++  if '-nocompile' not in sys.argv:
++    print 'compile...'
++    if os.system('ant compile > compile.log 2>&1') != 0:
++      print open('compile.log').read()
++      raise RuntimeError('compile failed (see compile.log)')
++
++if windows:
++  RESULTS = 'results.win64'
++else:
++  RESULTS = 'results'
++
++VERIFY = '-verify' in sys.argv
++
++ALG = '''
++analyzer=org.apache.lucene.analysis.standard.StandardAnalyzer
++directory=FSDirectory
++work.dir = $INDEX$
++search.num.hits = 10
++query.maker=org.apache.lucene.benchmark.byTask.feeds.FileBasedQueryMaker
++file.query.maker.file = queries.txt
++log.queries=true
++filter.pct = $FILT$
++search.spec = $SEARCH_SPEC$
++use.skip = $SEARCH_USE_SKIP$
++total.hits = $TOTAL_HITS$
++
++OpenReader  
++{"XSearchWarm" $SEARCH$}
++$ROUNDS$
++CloseReader 
++RepSumByPrefRound XSearch
++'''
++
++if os.path.exists('searchlogs'):
++  shutil.rmtree('searchlogs')
++
++os.makedirs('searchlogs')
++
++open('%s.txt' % RESULTS, 'wb').write('||Query||Sort||Filt|Deletes||Scoring||Hits||QPS (base)||QPS (new)||%||\n')
++
++numHit = 10
++counter = 0
++
++if '-delindex' in sys.argv:
++  i = sys.argv.index('-delindex')
++  DEL_INDEX = sys.argv[1+i]
++  del sys.argv[i:i+2]
++  if False and not os.path.exists(DEL_INDEX):
++    raise RuntimeError('index "%s" does not exist' % DEL_INDEX)
++else:
++  DEL_INDEX = None
++  
++if '-nodelindex' in sys.argv:
++  i = sys.argv.index('-nodelindex')
++  NO_DEL_INDEX = sys.argv[1+i]
++  del sys.argv[i:i+2]
++  if False and not os.path.exists(NO_DEL_INDEX):
++    raise RuntimeError('index "%s" does not exist' % NO_DEL_INDEX)
++else:
++  NO_DEL_INDEX = None
++
++if DEL_INDEX is None and NO_DEL_INDEX is None:
++  raise RuntimeError('you must specify at least one of -delindex or -nodelindex')
++
++def boolToYesNo(b):
++  if b:
++    return 'true'
++  else:
++    return 'false'
++  
++def run(new, query, sortField, doScore, filt, delP, doTotalHits, doSkip):
++  global counter
++  
++  t0 = time.time()
++
++  s = ALG
++
++  if not VERIFY:
++    s = s.replace('$ROUNDS$',
++'''                
++{ "Rounds"
++  { "Run"
++    { "TestSearchSpeed"
++      { "XSearchReal" $SEARCH$ > : 3.0s
++    }
++    NewRound
++  } : $NROUND$
++} 
++''')
++    nround = 5
++    s = s.replace('$NROUND$', str(nround))
++  else:
++    s = s.replace('$ROUNDS$', '')
++
++  if linux:
++    prefix = '/big/scratch/lucene'
++  else:
++    prefix = '/lucene'
++
++  if delP is None:
++    index = NO_DEL_INDEX
++  else:
++    index = DEL_INDEX
++
++  s = s.replace('$INDEX$', index)
++
++  if doTotalHits:
++    v = 'true'
++  else:
++    v = 'false'
++  s = s.replace('$TOTAL_HITS$', v)
++      
++  open('queries.txt', 'wb').write(query + '\n')
++
++  if filt == None:
++    f = '0.0'
++  else:
++    f = str(filt)
++  s = s.replace('$FILT$', f)
++
++  if doScore == 'both':
++    doTrackScores = True
++    doMaxScore = True
++  elif doScore == 'track':
++    doTrackScores = True
++    doMaxScore = False
++  elif doScore == 'no':
++    doTrackScores = False
++    doMaxScore = False
++
++  s = s.replace('$SEARCH_SPEC$', boolToYesNo(new))
++  s = s.replace('$SEARCH_USE_SKIP$', boolToYesNo(doSkip=='Yes'))
++
++  l = []
++  if not doMaxScore:
++    l.append('nomaxscore')
++  if not doTrackScores:
++    l.append('noscore')
++
++  if len(l) > 0:
++    sv = ',%s' % (','.join(l))
++  else:
++    sv = ''
++  
++  if sortField == 'score':
++    search = 'Search'
++  elif sortField == 'doctitle':
++    search = 'SearchWithSort(doctitle:string%s)' % sv
++  elif sortField == 'docdate':
++    search = 'SearchWithSort(docdate:long%s)' % sv
++  else:
++    raise RuntimeError("no")
++
++  s = s.replace('$SEARCH$', search)
++  fileOut = 'searchlogs/%d' % counter
++  counter += 1
++
++  if 0:
++    fileOut = 'searchlogs/query_%s_%s_%s_%s_%s_%s' % \
++              (query.replace(' ', '_').replace('"', ''),
++               sortField, filt, doScore, new, delP)
++
++  open('tmp.alg', 'wb').write(s)
++
++  if windows:
++    command = 'java -Xms1024M -Xmx1024M -Xbatch -server -cp "../../build/classes/java;../../build/classes/demo;../../build/contrib/highlighter/classes/java;../../build/contrib/spec/classes/java;../../contrib/benchmark/lib/commons-digester-1.7.jar;../../contrib/benchmark/lib/commons-collections-3.1.jar;../../contrib/benchmark/lib/commons-logging-1.0.4.jar;../../contrib/benchmark/lib/commons-beanutils-1.7.0.jar;../../contrib/benchmark/lib/xerces-2.9.0.jar;../../contrib/benchmark/lib/xml-apis-2.9.0.jar;../../build/contrib/benchmark/classes/java" org.apache.lucene.benchmark.byTask.Benchmark tmp.alg > %s' % fileOut
++  else:
++    command = 'java -Xms1024M -Xmx1024M -Xbatch -server -cp ../../build/classes/java:../../build/classes/demo:../../build/contrib/highlighter/classes/java:../../build/contrib/spec/classes/java:../../contrib/benchmark/lib/commons-digester-1.7.jar:../../contrib/benchmark/lib/commons-collections-3.1.jar:../../contrib/benchmark/lib/commons-logging-1.0.4.jar:../../contrib/benchmark/lib/commons-beanutils-1.7.0.jar:../../contrib/benchmark/lib/xerces-2.9.0.jar:../../contrib/benchmark/lib/xml-apis-2.9.0.jar:../../build/contrib/benchmark/classes/java org.apache.lucene.benchmark.byTask.Benchmark tmp.alg > %s' % fileOut
++
++  print '    %s' % fileOut
++
++  res = os.system(command)
++
++  if res != 0:
++    raise RuntimeError('FAILED')
++
++  best = None
++  count = 0
++  nhits = None
++  warmTime = None
++  meths = []
++  r = re.compile('^  ([0-9]+): (.*)$')
++  topN = []
++  sawSpec = False
++  maxScore = None
++  spec = None
++  
++  for line in open(fileOut, 'rb').readlines():
++    m = r.match(line.rstrip())
++    if m is not None:
++      topN.append(m.group(2))
++    if line.find('SPEC search') != -1:
++      sawSpec = True
++      spec = line[12:].strip()
++    if line.startswith('NUMHITS='):
++      nhits = int(line[8:].strip())
++    if line.startswith('MAXSCORE='):
++      maxScore = line[9:].strip()
++    if line.startswith('XSearchWarm'):
++      v = line.strip().split()
++      warmTime = float(v[5])
++    if line.startswith('XSearchReal'):
++      v = line.strip().split()
++      # print len(v), v
++      upto = 0
++      i = 0
++      qps = None
++      while i < len(v):
++        if v[i] == '-':
++          i += 1
++          continue
++        else:
++          upto += 1
++          i += 1
++          if upto == 5:
++            #print 'GOT: %s' % v[i-1]
++            qps = float(v[i-1].replace(',', ''))
++            break
++
++      if qps is None:
++        raise RuntimeError('did not find qps')
++      
++      count += 1
++      if best is None or qps > best:
++        best = qps
++
++  if sawSpec != new:
++    raise RuntimeError('spec did not kick in properly')
++    
++  if nhits is None:
++    raise RuntimeError('did not see NUMHITS= line')
++
++  if maxScore is None:
++    raise RuntimeError('did not see MAXSCORE= line')
++
++  if not VERIFY:
++    if count != nround:
++      raise RuntimeError('did not find %s rounds (got %s)' % (nround, count))
++
++    if warmTime is None:
++      raise RuntimeError('did not find warm time')
++    
++    # print '  NHIT: %s' % nhits
++
++    # print '  %.1f qps; %.1f sec' %  (best, time.time()-t0)
++    all.append((new, query, sortBy, filt, nhits, warmTime, best))
++  else:
++    best = 1.0
++    
++  return nhits, best, topN, maxScore, spec
++
++def cleanScores(l):
++  for i in range(len(l)):
++    pos = l[i].find(' score=')
++    l[i] = l[i][:pos].strip()
++
++rx = re.compile('doc=(\d+) score=(.*?)$')
++rx2 = re.compile('doc=(\d+) v=(.*?) score=(.*?)$')
++
++def parse(topN, hasValues):
++  l = []
++  for e in topN:
++    if hasValues:
++      m = rx2.search(e)
++      l.append((int(m.group(1)), m.group(2), m.group(3)))
++    else:
++      m = rx.search(e)
++      l.append((int(m.group(1)), m.group(2)))
++  return l
++
++def equals(topN1, topN2, hasValues):
++  if len(topN1) != len(topN2):
++    return False
++  top1 = parse(topN1, hasValues)
++  top2 = parse(topN2, hasValues)
++  for i in range(len(top1)):
++    if not hasValues:
++      doc1, score1 = top1[i]
++      doc2, score2 = top2[i]
++    else:
++      doc1, v1, score1 = top1[i]
++      doc2, v2, score2 = top2[i]
++    if doc1 != doc2:
++      return False
++    if score1 == 'Nan' and score2 == 'Nan':
++      pass
++    elif score1 == 'Nan' or score2 == 'Nan':
++      return False
++    else:
++      score1 = float(score1)
++      score2 = float(score2)
++      if abs(score1-score2) > 0.000001:
++        return False
++    if hasValues and v1 != v2:
++      return False
++    
++  return True
++
++all = []
++
++if VERIFY:
++  filts = (None, 5.0, 10.0, 25.0)
++else:
++  filts = (None, 5.0, 25.0)
++
++if VERIFY:
++  #queries = ['1 OR 2 OR 3', '1 OR -2', '1 OR 2', '1']
++  #queries = ['1 OR 2 OR 3']
++  #queries = ['1']
++  queries = ['1']
++else:
++  queries = ['1']
++  
++if VERIFY:
++  sort = ('score', 'doctitle', 'docdate')
++else:
++  sort = ('docdate', 'score')
++
++deletes = (None, 5)
++
++if VERIFY:
++  doScores = ('no', 'both', 'track')
++else:
++  doScores = ('no', 'track')
++
++for query in queries:
++  qx = genall.parseQuery(query)
++  if qx[0] == 'bq' and qx[5] == 'Yes':
++    skips = ('Yes',)
++  elif qx[0] == 'bq' and qx[3] > 0:
++    skips = ('Yes', 'No')
++  else:
++    skips = ('No',)
++  
++  for sortBy in sort:
++
++    if sortBy == 'score':
++      doScores0 = ('both',)
++    else:
++      doScores0 = doScores
++
++    for doScore in doScores0:
++      for filt in filts:
++        for delP in deletes:
++
++          for doTotalHits in (False, True):
++
++            for doSkip in skips:
++
++              if delP is None and NO_DEL_INDEX is None:
++                continue
++              if delP is not None and DEL_INDEX is None:
++                continue
++
++              print
++              print 'RUN: query=%s sort=%s scores=%s filt=%s deletes=%s preciseTotHits=%s doSkips=%s [%s]' % (query, sortBy, doScore, filt, delP, doTotalHits, doSkip, datetime.datetime.now())
++              print '  new...'
++              nhits1, qps1, topN1, maxScore1, spec = run(True, query, sortBy, doScore, filt, delP, doTotalHits, doSkip)
++              print '    qps %.2f' % qps1
++              print '    spec = src/java/org/apache/lucene/search/%s.java' % spec[25:]
++              print '  old...'
++              nhits2, qps2, topN2, maxScore2, ign = run(False, query, sortBy, doScore, filt, delP, doTotalHits, doSkip)
++              print '    qps %.2f' % qps2
++              if doTotalHits:
++                print '    %d hits' % nhits1
++              print '    %.1f%%' % (100.*(qps1-qps2)/qps2)
++
++              f = open('%s.pk' % RESULTS, 'wb')
++              cPickle.dump(all, f)
++              f.close()
++
++              if nhits1 != nhits2 and doTotalHits:
++                raise RuntimeError('hits differ: %s vs %s' % (nhits1, nhits2))
++
++              if maxScore1 is None or maxScore2 is None:
++                if maxScore1 != maxScore2:
++                  raise RuntimeError('maxScore differ: %s vs %s' % (maxScore1, maxScore2))
++              elif abs(float(maxScore1)-float(maxScore2)) > 0.00001:
++                raise RuntimeError('maxScore differ: %s vs %s' % (maxScore1, maxScore2))
++
++              if len(topN1) != numHit:
++                raise RuntimeError('not enough hits: %s vs %s' % (len(topN1), nhits1))
++
++              if not equals(topN1, topN2, sortBy != 'score'):
++                raise RuntimeError('results differ')
++
++              if sortBy == 'score':
++                s0 = 'Relevance'
++              elif sortBy == 'doctitle':
++                s0 = 'Title (string)'
++              elif sortBy == 'docdate':
++                s0 = 'Date (long)'
++
++              if filt == None:
++                f = 'no'
++              else:
++                f = '%d%%' % filt
++
++              if delP == None:
++                d = 'no'
++              else:
++                d = '%d%%' % delP
++
++              if doScore == 'both':
++                s = 'Track,Max'
++              elif doScore == 'track':
++                s = 'Track'
++              else:
++                s = 'no'
++
++              pct = (qps1-qps2)/qps2
++              if pct <= 0.0:
++                color = 'red'
++              else:
++                color = 'green'
++              p = '{color:%s}%.1f%%{color}' % (color, 100.*pct)
++
++              open('%s.txt' % RESULTS, 'ab').write('|%s|%s|%s|%s|%s|%d|%.1f|%.1f|%s|\n' % \
++                                                   (query, s0, f, d, s, nhits1, qps2, qps1, p))
+Index: verify.cmd
+===================================================================
+--- verify.cmd	(revision 0)
++++ verify.cmd	(revision 0)
+@@ -0,0 +1 @@
++python -u bench.py -delindex /lucene/work.wikifull.8seg.5pdel -nodelindex /lucene/work.wikifull.8seg -verify
+Index: NOTES.txt
+===================================================================
+--- NOTES.txt	(revision 0)
++++ NOTES.txt	(revision 0)
+@@ -0,0 +1,48 @@
++
++To run this:
++
++  * cd contrib/spec
++
++  * python -u genall.py
++
++  * ant compile
++
++Then change your code like this:
++
++  import org.apache.lucene.search.FastSearch;
++
++  final private FastSearch fastSearch = new FastSearch();
++
++  if (sort == null) {
++    hits = fastSearch.search(searcher, q, filter, numHits, doTotalHits);
++  } else {
++    hits = fastSearch.search(searcher, q, filter, sort, withScore(), withMaxScore(), true, numHits, doTotalHits);
++  }
++
++That call will simply pass through to IndexSearcher if there's no
++specialized class.
++
++Caveats/limitations:
++
++  * This code is NOT thread safe; it uses pre-initialized static state
++
++  * If you pass a filter in, it must 1) return OpenDocIdSet from
++    getDocIdSet(), and 2) that bit set must have already "folded in"
++    deletes
++
++  * When you sort by String, this code will silently replace any null
++    values with a sentinel value (U+0000)
++
++  * If you sort by field, no docs may have the "sentinel" value (eg if
++    you sort by long, Long.MAX_VALUE).
++
++  * It can only specialize single-field, or by score topN collection
++
++  * It cannot do reversed sort
++
++  * BooleanQuery with only OR and MUST_NOT TermQuery as clauses will
++    be specialized.  But each TermQuery must be against the same
++    field.
++
++  * It can only handle single TermQuery, or N-clause OR of TermQuery
++    (with MUST_NOT clauses and with minimumNumberShouldMatch).
+Index: src/test/org/apache/lucene/search/TestSpecializedSearch.java
+===================================================================
+--- src/test/org/apache/lucene/search/TestSpecializedSearch.java	(revision 0)
++++ src/test/org/apache/lucene/search/TestSpecializedSearch.java	(revision 0)
+@@ -0,0 +1,514 @@
++package org.apache.lucene.search;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// TODO
++//   - test different minNRs
++//   - test nonorms
++//   - test across all queries
++//   - randomly make each query, eg 2-TERM or query can
++//     randomly pick any two different terms
++
++import org.apache.lucene.util.*;
++import org.apache.lucene.store.*;
++import org.apache.lucene.index.*;
++import org.apache.lucene.search.*;
++import org.apache.lucene.document.*;
++import org.apache.lucene.analysis.standard.*;
++import org.apache.lucene.queryParser.*;
++import java.util.*;
++import java.io.*;
++
++public final class TestSpecializedSearch extends LuceneTestCase {
++
++  private final Directory dir;
++  private final Random r;
++  private final IndexSearcher noDeletesSearcher;
++  private final IndexSearcher deletesSearcher;
++
++  private final static boolean VERBOSE = true;
++
++  public TestSpecializedSearch() throws Throwable {
++    r = newRandom();
++    dir = new MockRAMDirectory();
++
++    final int numDocs = 6000 + r.nextInt(2000);
++    IndexWriter w = new IndexWriter(dir, new StandardAnalyzer(), IndexWriter.MaxFieldLength.UNLIMITED);
++    w.setMergeFactor(1000);
++    w.setUseCompoundFile(false);
++    final Document doc = new Document();
++    final Field field = new Field("text", "", Field.Store.NO, Field.Index.ANALYZED);
++    final Field textSortField = new Field("textSort", "", Field.Store.NO, Field.Index.NOT_ANALYZED);
++    final Field intSortField = new Field("intSort", "", Field.Store.NO, Field.Index.NOT_ANALYZED);
++    doc.add(field);
++    doc.add(textSortField);
++    doc.add(intSortField);
++    final char[] text = new char[20];
++
++    int segCount = 0;
++    int segLimit = numDocs/10;
++    int counter = 0;
++
++    for(int i=0;i<numDocs;i++) {
++      int upto = 0;
++      for(int j=0;j<10;j++) {
++        final int x = r.nextInt();
++        final char ch;
++        if (x % 128 == 0) {
++          ch = '1';
++        } else if (x % 64 == 0) {
++          ch = '2';
++        } else if (x % 32 == 0) {
++          ch = '3';
++        } else if (x % 16 == 0) {
++          ch = '4';
++        } else if (x % 8 == 0) {
++          ch = '5';
++        } else if (x % 4 == 0) {
++          ch = '6';
++        } else if (x % 2 == 0) {
++          ch = '7';
++        } else {
++          ch = '8';
++        }
++        text[upto++] = ch;
++        text[upto++] = ' ';
++      }
++      final String v = new String(text, 0, 19);
++      field.setValue(v);
++      textSortField.setValue(v);
++      intSortField.setValue(""+r.nextInt(100000));
++      w.addDocument(doc);
++      if (counter++ == segLimit) {
++        // System.out.println("commit @ " + counter);
++        counter = 0;
++        w.commit();
++        segCount++;
++        if (segCount == 9 && segLimit >= 50) {
++          segCount = 0;
++          segLimit /= 10;
++        }
++      }
++    }
++    w.close();
++
++    IndexReader rx = IndexReader.open(dir);
++    noDeletesSearcher = new IndexSearcher(rx.clone(true));
++
++    // do 5% deletes
++    int delCount = 0;
++    while(delCount < numDocs/20) {
++      final int docID = r.nextInt(numDocs);
++      if (!rx.isDeleted(docID)) {
++        rx.deleteDocument(docID);
++        delCount++;
++      }
++    }
++
++    deletesSearcher = new IndexSearcher(rx.clone(true));
++    rx.close();
++  }
++
++  private static FastSearch fast = new FastSearch();
++  private int testCount;
++  private HashSet classesTested = new HashSet();
++
++  private boolean testOne(Query query, Filter filter, Sort sort, int topN, boolean doTrackScores, boolean doMaxScore, boolean doTotalHits, boolean useDeletes,
++                          boolean useSkip, boolean docAtOnce, boolean filterIsRandomAccess) throws Throwable {
++
++    if (VERBOSE) {
++      System.out.println();
++      System.out.println("TEST");
++    }
++
++    final IndexSearcher s;
++    if (useDeletes) {
++      s = deletesSearcher;
++    } else {
++      s = noDeletesSearcher;
++    }
++
++    Query q2 = fast.translateQuery(s, query, filter, sort, doTrackScores, doMaxScore, topN, doTotalHits, filterIsRandomAccess);
++    String queryDesc = "query=" + query + " (translated to " + q2 + ")";
++    if (q2 instanceof BooleanQuery) {
++      queryDesc += " minNR=" + ((BooleanQuery) q2).getMinimumNumberShouldMatch();
++    }
++
++    if (useSkip || docAtOnce) {
++      // skipping & docAtOnce can only used if there's at least one must clause (iter filter counts as must clause)
++      if (q2 instanceof BooleanQuery) {
++        List clauses = ((BooleanQuery) q2).clauses();
++        final int numClauses = clauses.size();
++        boolean hasMust = false;
++        for(int cx=0;cx<numClauses;cx++) {
++          if (((BooleanClause) clauses.get(cx)).getOccur() == BooleanClause.Occur.MUST) {
++            hasMust = true;
++            break;
++          }
++        }
++        if (!hasMust) {
++          return false;
++        }
++      } else {
++        return false;
++      }
++    }
++
++    final String cl = fast.getSpecClassName(s,
++                                            q2,
++                                            filter,
++                                            sort,
++                                            doTrackScores, doMaxScore, topN, doTotalHits, filterIsRandomAccess, useSkip, docAtOnce);
++    if (VERBOSE) {
++      System.out.println("  impl: src/java/org/apache/lucene/search/" + cl.substring(25) + ".java");
++      System.out.println("  " + queryDesc);
++      System.out.println("  filter=" + filter + " sort=" + sort + " doTrackScores=" + doTrackScores + " doMaxScore=" + doMaxScore + " doTotalHits=" + doTotalHits + " useDeletes=" + useDeletes + " useSkip=" + useSkip + " docAtOnce=" + docAtOnce + " filterIsRandomAccess=" + filterIsRandomAccess);
++      if (classesTested.contains(cl)) {
++        System.out.println("  ALREADY TESTED");
++      }
++    }
++
++    // nocommit
++    /*
++    final String cx = fast.getSpecClassName(s,
++                                            query,
++                                            filter,
++                                            sort,
++                                            doTrackScores, doMaxScore, topN, doTotalHits);
++
++    if (!cx.equals("org.apache.lucene.search.Spec_Query1Should1MustNot1Must_MinNr0_SortScore_FilterYes_DeletesNo_TrackScoresYes_MaxScoreYes_NormsYes_TotalHitsNo")) {
++      return false;
++    }
++    */
++
++    testCount++;
++
++    // core
++    TopDocs coreHits;
++    if (sort != null) {
++      TopFieldCollector collector = TopFieldCollector.create(sort, topN, true, doTrackScores, doMaxScore, false);
++      s.search(query, filter, collector);
++      coreHits = collector.topDocs();
++    } else {
++      coreHits = s.search(query, filter, topN);
++    }
++
++    // spec
++    TopDocs specHits;
++    if (sort == null) {
++      specHits = fast.search(s, query, filter, topN, doTotalHits, useSkip, docAtOnce, false);
++    } else {
++      specHits = fast.search(s, query, filter, sort, doTrackScores, doMaxScore, true, topN, doTotalHits, useSkip, docAtOnce, false);
++    }
++
++    // compare
++    List reasons = new ArrayList();
++    if (doTotalHits && coreHits.totalHits != specHits.totalHits) {
++      reasons.add("totalHits differs: core=" + coreHits.totalHits + " spec=" + specHits.totalHits);
++    }
++
++    if (doMaxScore && Math.abs(coreHits.getMaxScore() - specHits.getMaxScore()) > 0.00001) {
++      reasons.add("maxScore differs: core=" + coreHits.getMaxScore() + " spec=" + specHits.getMaxScore());
++    }
++
++    if (coreHits.scoreDocs.length != specHits.scoreDocs.length) {
++      reasons.add("different topN count: core=" + coreHits.scoreDocs.length + " spec=" + specHits.scoreDocs.length);
++    }
++
++    final int limit;
++    if (coreHits.scoreDocs.length < specHits.scoreDocs.length) {
++      limit = coreHits.scoreDocs.length;
++    } else {
++      limit = specHits.scoreDocs.length;
++    }
++
++    for(int i=0;i<limit;i++) {
++      ScoreDoc coreHit = coreHits.scoreDocs[i];
++      ScoreDoc specHit = specHits.scoreDocs[i];
++      if (coreHit.doc != specHit.doc &&
++          (!doTrackScores || Math.abs(coreHit.score-specHit.score) > 0.00001)) {
++        reasons.add("different docs (core=" + coreHit.doc + " spec=" + specHit.doc + ")");
++        break;
++      }
++      if (doTrackScores && Math.abs(coreHit.score-specHit.score) > 0.00001) {
++        reasons.add("different scores");
++        break;
++      }
++
++      if (sort != null) {
++        final Object coreValue = ((FieldDoc) coreHit).fields[0];
++        final Object specValue = ((FieldDoc) specHit).fields[0];
++        if (coreValue == null || specValue == null) {
++          if (coreValue != specValue) {
++            reasons.add("different values");
++            break;
++          }
++        } else if (!coreValue.equals(specValue)) {
++          reasons.add("different values");
++          break;
++        }
++      }
++    }
++
++    classesTested.add(cl);
++
++    if (reasons.size() > 0) {
++      if (!VERBOSE) {
++        System.out.println("FAILED: " + queryDesc + " deletes=" + useDeletes + " filter=" + filter + " sort=" + sort + " topN=" + topN + " doTrackScores=" + doTrackScores + " doMaxScore=" + doMaxScore + " doTotalHits=" + doTotalHits);
++        System.out.println("  impl: src/java/org/apache/lucene/search/" + cl.substring(25) + ".java");
++      } else {
++        System.out.println("FAILED");
++      }
++      System.out.print("  diffs:");
++      Iterator it = reasons.iterator();
++      while(it.hasNext()) {
++        System.out.print(" " + it.next());
++      }
++      System.out.println();
++      printHits("core", coreHits);
++      printHits("spec", specHits);
++
++      return true;
++    } else {
++      return false;
++    }
++  }
++
++  private void printHits(String desc, TopDocs hits) {
++    System.out.println("  " + desc + " hits maxScore=" + hits.getMaxScore() + " totalHits=" + hits.totalHits + ":");
++    for(int i=0;i<hits.scoreDocs.length;i++) {
++      final ScoreDoc hit = hits.scoreDocs[i];
++      if (hit instanceof FieldDoc) {
++        System.out.println("     doc=" + hit.doc + " score=" + hit.score + " value=" + ((FieldDoc) hit).fields[0]);
++      } else {
++        System.out.println("     doc=" + hit.doc + " score=" + hit.score);
++      }
++    }
++  }
++
++  static final HashMap filters = new HashMap();
++
++  private static final class MyFilter extends Filter {
++    private final double fpct;
++    private final boolean filtSparse;
++
++    MyFilter(double fpct, boolean filtSparse) {
++      this.fpct = fpct;
++      this.filtSparse = filtSparse;
++    }
++    
++    public DocIdSet getDocIdSet(IndexReader reader) throws IOException {
++      DocIdSet bits = (DocIdSet) filters.get(reader);
++      if (bits == null) {
++        final int numDocs = reader.maxDoc();
++        OpenBitSet openBits = new OpenBitSet(numDocs);
++        final Random r = new java.util.Random(42244224);
++        int setCount = 0;
++        final boolean inverted;
++        final double fpct2;
++        if (fpct > 50.0) {
++          fpct2 = 100.0 - fpct;
++          inverted = true;
++        } else {
++          fpct2 = fpct;
++          inverted = false;
++        }
++
++        final int target = (int) ((fpct2/100.0)*numDocs);
++        while(setCount < target) {
++          setCount += openBits.getAndSet(r.nextInt(numDocs)) ? 0:1;
++        }
++        if (setCount != openBits.cardinality()) {
++          throw new RuntimeException("count mismatch");
++        }
++        if (inverted) {
++          OpenBitSet bits2 = new OpenBitSet(numDocs);
++          for(int i=0;i<numDocs;i++) {
++            if (!openBits.fastGet(i)) {
++              bits2.set(i);
++            }
++          }
++          openBits = bits2;
++        }
++
++        // pre-fold deletes in
++        BitVector dels = ((SegmentReader) reader).getDeletedDocs();
++        if (dels != null) {
++          final int limit = reader.maxDoc();
++          for(int i=0;i<limit;i++) {
++            if (dels.get(i)) {
++              openBits.clear(i);
++            }
++          }
++        }
++
++        if (fpct <= 10.0 && filtSparse) {
++          bits = new SortedVIntList(openBits);
++        } else {
++          bits = openBits;
++        }
++        filters.put(reader, bits);
++      }
++      return bits;
++    }
++  }
++
++  public void testQueries() throws Throwable {
++    //final String[] queries = new String[] {"1", "-3 +1 2", "1 2", "+1 +2", "+1 2"};
++    final String[] queries = new String[] {"1 2 -3"};
++    final Sort[] sorts = new Sort[3];
++    sorts[0] = null;
++    sorts[1] = new Sort(new SortField("textSort", SortField.STRING));
++    sorts[2] = new Sort(new SortField("intSort", SortField.INT));
++
++    // suppress otherwise confusing print
++    FastSearch.first = false;
++
++    boolean failures = false;
++
++    final Runtime runtime = Runtime.getRuntime();
++
++    QueryParser qp = new QueryParser("text", new StandardAnalyzer());
++    for(int qx=0; qx<queries.length;qx++) {
++      final Query q = qp.parse(queries[qx]);
++
++      int maxMinNR = 0;
++      if (q instanceof BooleanQuery) {
++        List clauses = ((BooleanQuery) q).clauses();
++        final int numClauses = clauses.size();
++        int shouldCount = 0;
++        for(int cx=0;cx<numClauses;cx++) {
++          if (((BooleanClause) clauses.get(cx)).getOccur() == BooleanClause.Occur.SHOULD) {
++            shouldCount++;
++          }
++        }
++        if (shouldCount > 1) {
++          maxMinNR = shouldCount;
++        }
++      }
++
++      for(int mx=0;mx<=maxMinNR;mx++) {
++        int minNR = mx;
++        if (q instanceof BooleanQuery) {
++          ((BooleanQuery) q).setMinimumNumberShouldMatch(minNR);
++          System.out.println("set minNR=" + minNR);
++        }
++
++        /*
++        // generate
++        Process child = runtime.exec(new String[] {"/usr/bin/python",
++        "-uOO",
++        "genall.py",
++        "IndexInput",
++        queries[qx]});
++        System.out.println("now wait...");
++        child.waitFor();
++        if (child.exitValue() != 0) {
++        throw new RuntimeException("genall failed");
++        }
++        */
++      
++        for(int sx=0;sx<sorts.length;sx++) {
++          final Sort sort = sorts[sx];
++          for(int scx=0;scx<3;scx++) {
++            boolean doMaxScore;
++            boolean doTrackScores;
++            if (scx == 0) {
++              doMaxScore = doTrackScores = false;
++            } else if (scx == 1) {
++              doMaxScore = false;
++              doTrackScores = true;
++            } else {
++              doMaxScore = true;
++              doTrackScores = true;
++            }
++
++            for(int fx=0;fx<3;fx++) {
++              final Filter filter;
++              final boolean filterIsRandomAccess;
++              if (fx == 0) {
++                filter = null;
++                filterIsRandomAccess = false;
++              } else if (fx == 1) {
++                // sparse
++                filter = new MyFilter(5.0, true);
++                filterIsRandomAccess = false;
++              } else {
++                // dense
++                filter = new MyFilter(25.0, false);
++                filterIsRandomAccess = true;
++              }
++            
++              for(int dx=0;dx<2;dx++) {
++                final boolean doDeletes = dx == 1;
++                if (filter != null && doDeletes) {
++                  // uninteresting: app is expected to pre-fold-in deletes to a filter
++                  continue;
++                }
++
++                for(int tx=0;tx<2;tx++) {
++                  final boolean doTotalHits = tx == 1;
++                  for(int usx=0;usx<2;usx++) {
++                    boolean useSkip = usx == 0;
++                    for(int ax=0;ax<2;ax++) {
++                      boolean docAtOnce = ax==0;
++
++                      /*
++                      if ((useSkip || docAtOnce) && (filter == null || filterIsRandomAccess)) {
++                        // skipping & docAtOnce can only used if there's at least one must clause (iter filter counts as must clause)
++                        if (q instanceof BooleanQuery) {
++                          List clauses = ((BooleanQuery) q).clauses();
++                          final int numClauses = clauses.size();
++                          boolean hasMust = false;
++                          for(int cx=0;cx<numClauses;cx++) {
++                            if (((BooleanClause) clauses.get(cx)).getOccur() == BooleanClause.Occur.MUST) {
++                              hasMust = true;
++                              break;
++                            }
++                          }
++                          if (!hasMust) {
++                            continue;
++                          }
++                        } else {
++                          continue;
++                        }
++                      }
++                      */
++                      
++                      failures |= testOne(q, filter, sort, 500, doTrackScores, doMaxScore, doTotalHits, doDeletes, useSkip, docAtOnce, filterIsRandomAccess);
++                    }
++                  }
++                }
++              }
++            }
++
++            if (sx == 0) {
++              // doMax/TrackScores is unused for default
++              // (score) sort
++              break;
++            }
++          }
++        }
++      }
++    }
++
++    System.out.println("tested " + testCount + " query cases; " + classesTested.size() + " unique spec classes");
++
++    assertFalse(failures);
++  }
++}
+\ No newline at end of file
+Index: src/java/org/apache/lucene/search/SpecSearch.java
+===================================================================
+--- src/java/org/apache/lucene/search/SpecSearch.java	(revision 0)
++++ src/java/org/apache/lucene/search/SpecSearch.java	(revision 0)
+@@ -0,0 +1,26 @@
++package org.apache.lucene.search;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++
++/** All generated classes subclass this */
++abstract class SpecSearch {
++  abstract SpecSearch getInstance();
++  abstract TopDocs search(IndexSearcher searcher, Query query, Filter filter, Sort sort, final int topN) throws IOException;
++}
+\ No newline at end of file
+Index: src/java/org/apache/lucene/search/FastSearch.java
+===================================================================
+--- src/java/org/apache/lucene/search/FastSearch.java	(revision 0)
++++ src/java/org/apache/lucene/search/FastSearch.java	(revision 0)
+@@ -0,0 +1,676 @@
++package org.apache.lucene.search;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.util.OpenBitSet;
++import org.apache.lucene.util.SortedVIntList;
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.MultiSegmentReader;
++import java.io.IOException;
++import java.util.List;
++import java.util.HashSet;
++import java.util.ArrayList;
++import java.util.Iterator;
++import java.util.Comparator;
++import java.util.Collections;
++
++/**
++ * If you pass a non-null filter, you must ensure:
++ *
++ *   1) Its getDocIdSet method always returns an OpenBitSet
++ *
++ *   2) That returned OpenBitSet has pre-multiplied in
++ *      any doc deletions
++ */
++
++public class FastSearch {
++
++  public TopDocs search(IndexSearcher searcher,
++                        Query query,
++                        Filter filter,
++                        int topN,
++                        boolean doTotalHits,
++                        boolean allowSkip,
++                        boolean docAtOnce,
++                        boolean allowFallback) throws IOException {
++    return _search(searcher, query, filter, null, false, false, false, topN, doTotalHits, allowSkip, docAtOnce, allowFallback);
++  }
++
++
++  /** When possible, uses a pre-compiled specialized class
++   *  to execute the specific sort; else, simply falls
++   *  through to the "normal" corresponding method in
++   *  IndexSearcher */
++  public TopFieldDocs search(IndexSearcher searcher,
++                             Query query,
++                             Filter filter,
++                             Sort sort,
++                             boolean doTrackScores,
++                             boolean doMaxScore,
++                             boolean fillFields,
++                             int topN,
++                             boolean doTotalHits,
++                             boolean allowSkip,
++                             boolean docAtOnce,
++                             boolean allowFallback) throws IOException {
++
++    return (TopFieldDocs) _search(searcher, query, filter, sort, doTrackScores, doMaxScore, fillFields, topN, doTotalHits, allowSkip, docAtOnce, allowFallback);
++  }
++
++  static public boolean first = true;
++
++  private static final boolean VERBOSE = true;
++
++  private TopDocs _search(IndexSearcher searcher,
++                          Query query,
++                          Filter filter,
++                          Sort sort,
++                          boolean doTrackScores,
++                          boolean doMaxScore,
++                          boolean fillFields,
++                          int topN,
++                          boolean doTotalHits,
++                          boolean allowSkip,
++                          boolean docAtOnce,
++                          boolean allowFallback) throws IOException {
++    
++    final boolean filterIsRandomAccess;
++
++    // figure out if filter is sparse or dense
++    // TODO: need cleaner approach
++    if (filter != null) {
++      final DocIdSet bits = filter.getDocIdSet(searcher.getIndexReader().getSequentialSubReaders()[0]);
++      if (bits instanceof OpenBitSet) {
++        filterIsRandomAccess = true;
++      } else if (bits instanceof SortedVIntList) {
++        filterIsRandomAccess = false;
++      } else {
++        throw new RuntimeException("when non-null, Filter.getDocIdSet must return either OpenBitSet or SortedVIntList (got \"" + bits + "\")");
++      }
++    } else {
++      filterIsRandomAccess = false;
++    }
++
++    final Query newQuery = translateQuery(searcher, query, filter, sort, doTrackScores, doMaxScore, topN, doTotalHits, filterIsRandomAccess);
++
++    final String specClassName = getSpecClassName(searcher, newQuery, filter, sort, doTrackScores, doMaxScore, topN, doTotalHits, filterIsRandomAccess, allowSkip, docAtOnce);
++
++    if (VERBOSE) {
++      System.out.println("  spec=" + specClassName + " skip=" + allowSkip + " isRandom=" + filterIsRandomAccess + " dao=" + docAtOnce);
++    }
++
++    if (specClassName != null) {
++
++      if (specClassName.equals("NO_RESULTS")) {
++        if (sort != null) {        
++          return new TopFieldDocs(0, new FieldDoc[0], null, Float.NaN);
++        } else {
++          new TopDocs(0, new ScoreDoc[0], Float.NaN);
++        }
++      }
++
++      // specializer can handle this query: load the class
++      Class c;
++
++      try {
++        c = Class.forName(specClassName);
++      } catch (ClassNotFoundException e) {
++        throw new IOException("unable to find specialized search class " + specClassName);
++      }
++
++      SpecSearch specSearch;
++      try {
++        specSearch = (SpecSearch) c.newInstance();
++      } catch (IllegalAccessException e) {
++        throw new IOException("IllegalAccessException when instantiating SpecClass " + specClassName);
++      } catch (InstantiationException e) {
++        throw new IOException("InstantiationException when instantiating SpecClass " + specClassName);
++      } catch (ClassCastException e) {
++        throw new IOException("unable to cast SpecClass " + specClassName + " instance to a SpecSearch");
++      }
++
++      specSearch = specSearch.getInstance();
++
++      if (first) {
++        System.out.println("SPEC search=" + specClassName);
++        System.out.println("NEW QUERY=" + newQuery);
++        first = false;
++      }
++      
++      return specSearch.search(searcher, newQuery, filter, sort, topN);
++
++    } else {
++      // fallback
++      if (!allowFallback) {
++        throw new RuntimeException("this case cannot be specialized");
++      }
++      if (sort != null) {
++        final TopFieldCollector collector = TopFieldCollector.create(sort, topN, fillFields, doTrackScores, doMaxScore, false);
++        searcher.search(query, filter, collector);
++        return collector.topDocs();
++      } else {
++        return searcher.search(query, filter, topN, sort);
++      }
++    }
++  }
++
++  private static final class IncreasingFreq implements Comparator {
++    final IndexReader r;
++    IncreasingFreq(IndexReader r) {
++      this.r = r;
++    }
++    public int compare(Object o1, Object o2) {
++      TermQuery q1 = (TermQuery) ((BooleanClause) o1).getQuery();
++      TermQuery q2 = (TermQuery) ((BooleanClause) o2).getQuery();
++      try {
++        //System.out.println("term=" + q1.getTerm() + " freq=" + r.docFreq(q1.getTerm()));
++        //System.out.println("term2=" + q2.getTerm() + " freq=" + r.docFreq(q2.getTerm()));
++        return r.docFreq(q1.getTerm()) - r.docFreq(q2.getTerm());
++      } catch (IOException ioe) {
++        throw new RuntimeException(ioe);
++      }
++    }
++  }
++
++  private static final class DecreasingFreq implements Comparator {
++    final IndexReader r;
++    DecreasingFreq(IndexReader r) {
++      this.r = r;
++    }
++    public int compare(Object o1, Object o2) {
++      TermQuery q1 = (TermQuery) ((BooleanClause) o1).getQuery();
++      TermQuery q2 = (TermQuery) ((BooleanClause) o2).getQuery();
++      try {
++        //System.out.println("term=" + q1.getTerm() + " freq=" + r.docFreq(q1.getTerm()));
++        //System.out.println("term2=" + q2.getTerm() + " freq=" + r.docFreq(q2.getTerm()));
++        return r.docFreq(q2.getTerm()) - r.docFreq(q1.getTerm());
++      } catch (IOException ioe) {
++        throw new RuntimeException(ioe);
++      }
++    }
++  }
++
++  private boolean removeDups(List l) {
++    HashSet seen = new HashSet();
++    int upto = 0;
++    boolean changed = false;
++    while(upto < l.size()) {
++      Object o = l.get(upto);
++      if (seen.contains(o)) {
++        l.remove(upto);
++        changed = true;
++      } else {
++        seen.add(o);
++        upto++;
++      }
++    }
++    return changed;
++  }
++
++  /* For each object in l2, remove it if it's also in l1 */
++  private boolean removeDups(List l1, List l2) {
++    HashSet seen = new HashSet();
++    int upto = 0;
++    while(upto < l1.size()) {
++      seen.add(l1.get(upto++));
++    }
++    upto = 0;
++    boolean changed = false;
++    while(upto < l2.size()) {
++      Object o = l2.get(upto);
++      if (seen.contains(o)) {
++        l2.remove(upto);
++        changed = true;
++      } else {
++        upto++;
++      }
++    }
++
++    return changed;
++  }
++
++  // Performs structural rewrite optimizations (Query -> Query) orthogonal to specialization
++  public Query translateQuery(IndexSearcher searcher,
++                              Query query,
++                              Filter filter,
++                              Sort sort,
++                              boolean doTrackScores,
++                              boolean doMaxScore,
++                              int topN,
++                              boolean doTotalHits,
++                              boolean filterIsRandomAccess) throws IOException {
++
++
++    if (VERBOSE) {
++      System.out.println("translate: start with " + query);
++    }
++
++    // ordinary rewrite first
++    query = (Query) searcher.rewrite(query).clone();
++
++    if (VERBOSE) {
++      System.out.println("  after rewrite: " + query);
++    }
++
++    boolean changed;
++    int count = 0;
++
++    do {
++      changed = false;
++      if (count++ == 10) {
++        throw new RuntimeException("no");
++      }
++      if (VERBOSE) {
++        System.out.println("  cycle: query=" + query);
++      }
++
++      if (query instanceof BooleanQuery) {
++        if (VERBOSE) {
++          System.out.println("  minNR=" + ((BooleanQuery) query).getMinimumNumberShouldMatch());
++        }
++        BooleanClause[] clauses = ((BooleanQuery) query).getClauses();
++        List shouldClauses = new ArrayList();
++        List mustNotClauses = new ArrayList();
++        List mustClauses = new ArrayList();
++        for(int i=0;i<clauses.length;i++) {
++          if (clauses[i].getOccur() == BooleanClause.Occur.SHOULD) {
++            shouldClauses.add(clauses[i]);
++          } else if (clauses[i].getOccur() == BooleanClause.Occur.MUST_NOT) {
++            mustNotClauses.add(clauses[i]);
++          } else if (clauses[i].getOccur() == BooleanClause.Occur.MUST) {
++            mustClauses.add(clauses[i]);
++          } else {
++            throw new RuntimeException("unrecognized BooleanQuery.Occur type");
++          }
++        }
++
++        int minNR = ((BooleanQuery) query).getMinimumNumberShouldMatch();
++        if (minNR == 1 && mustClauses.size() == 0) {
++          ((BooleanQuery) query).setMinimumNumberShouldMatch(0);
++          minNR = 0;
++          changed = true;
++          if (VERBOSE) {
++            System.out.println("set minNR to 0");
++          }
++        }
++      
++        // remove redundant clauses
++        changed |= removeDups(mustClauses);
++        changed |= removeDups(mustNotClauses);
++        changed |= removeDups(shouldClauses);
++
++        // if should clause is also must, remove it from should
++        changed |= removeDups(mustClauses, shouldClauses);
++        if (VERBOSE && changed) {
++          System.out.println("removed dups");
++        }
++
++        // structural optimizations:
++        if (!doTrackScores && !doMaxScore && mustClauses.size() > 0 && minNR == 0 && shouldClauses.size() > 0) {
++          boolean doClear = true;
++          if (sort != null) {
++            SortField[] fields = sort.getSort();
++            for(int i=0;i<fields.length;i++) {
++              if (fields[i].getType() == SortField.SCORE) {
++                doClear = false;
++                break;
++              }
++            }
++          } else {
++            doClear = false;
++          }
++
++          if (doClear) {
++            // the should clauses are not needed
++            shouldClauses.clear();
++            changed = true;
++            if (VERBOSE) {
++              System.out.println("clear should");
++            }
++          }
++        }
++
++        if (shouldClauses.size() > 0 && shouldClauses.size() == minNR) {
++          // upgrade SHOULD to MUST
++          final Iterator it = shouldClauses.iterator();
++          while(it.hasNext()) {
++            final BooleanClause clause = (BooleanClause) it.next();
++            mustClauses.add(new BooleanClause(clause.getQuery(), BooleanClause.Occur.MUST));
++          }
++          shouldClauses.clear();
++          ((BooleanQuery) query).setMinimumNumberShouldMatch(0);
++          minNR = 0;
++          removeDups(mustClauses);
++          changed = true;
++          if (VERBOSE) {
++            System.out.println("upgrade should -> must: " + mustClauses.size() + " must clauses");
++          }
++        }
++
++        // structural optimization: BooleanQuery with single
++        // SHOULD or MUST clause is the same as the query in
++        // that single clause
++        if (mustNotClauses.size() == 0) {
++          boolean applies = false;
++          if (mustClauses.size() == 1 && shouldClauses.size() == 0) {
++            query = ((BooleanClause) mustClauses.get(0)).getQuery();
++            applies = true;
++          } else if (mustClauses.size() == 0 && shouldClauses.size() == 1) {
++            query = ((BooleanClause) shouldClauses.get(0)).getQuery();
++            applies = true;
++          }
++          if (applies) {
++            changed = true;
++            if (VERBOSE) {
++              System.out.println("single clause now query=" + query);
++            }
++            continue;
++          }
++        }
++
++        // sort must, mustNot clauses by increasing freq
++        Comparator increasingFreq = new IncreasingFreq(searcher.getIndexReader());
++        Collections.sort(mustClauses, increasingFreq);
++        Collections.sort(mustNotClauses, increasingFreq);
++
++        // must clauses must all be first
++        BooleanQuery bq = new BooleanQuery();
++        bq.setMinimumNumberShouldMatch(minNR);
++        Iterator it = mustClauses.iterator();
++        while(it.hasNext()) {
++          bq.add((BooleanClause) it.next());
++        }
++
++        // sort should clauses by decreasing freq
++        Comparator decreasingFreq = new DecreasingFreq(searcher.getIndexReader());
++        Collections.sort(shouldClauses, decreasingFreq);
++
++        // should clauses next
++        it = shouldClauses.iterator();
++        while(it.hasNext()) {
++          bq.add((BooleanClause) it.next());
++        }
++
++        // must_not clauses last
++        it = mustNotClauses.iterator();
++        while(it.hasNext()) {
++          bq.add((BooleanClause) it.next());
++        }
++
++        query = bq;
++      }
++    } while (changed);
++
++    // fold in filter as iterator
++    if (filter != null && !filterIsRandomAccess) {
++      if (query instanceof BooleanQuery) {
++        // insert as must clause
++        BooleanQuery bq = (BooleanQuery) query;
++        List clauses = bq.clauses();
++        final int numClauses = clauses.size();
++        boolean hasMust = false;
++        for(int i=0;i<numClauses;i++) {
++          BooleanClause clause = (BooleanClause) clauses.get(i);
++          if (clause.getOccur() == BooleanClause.Occur.MUST) {
++            hasMust = true;
++            break;
++          }
++        }
++        bq.clauses().add(0, new BooleanClause(new ConstantScoreQuery(filter), BooleanClause.Occur.MUST));
++        if (!hasMust && bq.getMinimumNumberShouldMatch() == 0) {
++          bq.setMinimumNumberShouldMatch(1);
++        }
++      } else if (query instanceof TermQuery) {
++        // add as must clause
++        BooleanQuery bq = new BooleanQuery();
++        bq.add(new BooleanClause(new ConstantScoreQuery(filter), BooleanClause.Occur.MUST));
++        bq.add(new BooleanClause(query, BooleanClause.Occur.MUST));
++        query = bq;
++      }
++    }
++
++    return query;
++  }
++
++  public String getSpecClassName(IndexSearcher searcher,
++                                 Query query,
++                                 Filter filter,
++                                 Sort sort,
++                                 boolean doTrackScores,
++                                 boolean doMaxScore,
++                                 int topN,
++                                 boolean doTotalHits,
++                                 boolean filterIsRandomAccess,
++                                 boolean allowSkip,
++                                 boolean docAtOnce) throws IOException {
++
++    final IndexReader r = searcher.getIndexReader();
++    if (r instanceof MultiSegmentReader) {
++      String sortDesc;
++      if (sort == null) {
++        sortDesc = "Score";
++        doTrackScores = true;
++        doMaxScore = true;
++      } else {
++        SortField[] sortFields = sort.getSort();
++        if (sortFields.length == 1) {
++          if (!sortFields[0].getReverse()) {
++            switch(sortFields[0].getType()) {
++            case SortField.SCORE:
++              sortDesc = "Score";
++              break;
++            case SortField.DOC:
++              sortDesc = null;
++              break;
++            case SortField.AUTO:
++              sortDesc = null;
++              break;
++            case SortField.STRING:
++              sortDesc = "String";
++              break;
++            case SortField.INT:
++              sortDesc = "Int";
++              break;
++            case SortField.FLOAT:
++              sortDesc = "Float";
++              break;
++            case SortField.LONG:
++              sortDesc = "Long";
++              break;
++            case SortField.DOUBLE:
++              sortDesc = "Double";
++              break;
++            case SortField.SHORT:
++              sortDesc = "Short";
++              break;
++            case SortField.CUSTOM:
++              sortDesc = null;
++              break;
++            case SortField.BYTE:
++              sortDesc = "Byte";
++              break;
++            default:
++              sortDesc = null;
++              break;
++            }
++          } else {
++            sortDesc = null;
++          }
++        } else {
++          sortDesc = null;
++        }
++      }
++
++      String trackScoresDesc;
++      if (doTrackScores || doMaxScore) {
++        trackScoresDesc = "Yes";
++      } else {
++        trackScoresDesc = "No";
++      }
++
++      String maxScoreDesc;
++      if (doMaxScore) {
++        maxScoreDesc = "Yes";
++      } else {
++        maxScoreDesc = "No";
++      }
++
++      String queryDesc;
++      boolean useSkip;
++
++      if (query instanceof TermQuery) {
++        queryDesc = "Term";
++        useSkip = false;
++        docAtOnce = false;
++      } else if (query instanceof BooleanQuery) {
++        BooleanClause[] clauses = ((BooleanQuery) query).getClauses();
++        boolean fail = false;
++        // TODO: share code w/ translateQuery
++        List shouldClauses = new ArrayList();
++        List mustNotClauses = new ArrayList();
++        List mustClauses = new ArrayList();
++        for(int i=0;i<clauses.length;i++) {
++          if (clauses[i].getOccur() == BooleanClause.Occur.SHOULD) {
++            shouldClauses.add(clauses[i]);
++          } else if (clauses[i].getOccur() == BooleanClause.Occur.MUST_NOT) {
++            mustNotClauses.add(clauses[i]);
++          } else if (clauses[i].getOccur() == BooleanClause.Occur.MUST) {
++            mustClauses.add(clauses[i]);
++          } else {
++            fail = true;
++            break;
++          }
++
++          if (clauses[i].getQuery() instanceof TermQuery) {
++            // ok
++          } else if (clauses[i].getQuery() instanceof ConstantScoreQuery) {
++            // ok in pos 0 only, for now
++            if (i != 0) {
++              fail = true;
++              break;
++            }
++          } else {
++            fail = true;
++            break;
++          }
++        }
++
++        if (!fail) {
++          final int minNR = ((BooleanQuery) query).getMinimumNumberShouldMatch();
++          useSkip = allowSkip && (mustClauses.size() > 0 || filter != null);
++          StringBuffer b = new StringBuffer();
++          if (shouldClauses.size() > 0) {
++            b.append("_Should").append(shouldClauses.size());
++          }
++          if (mustClauses.size() > 0) {
++            b.append("_Must").append(mustClauses.size());
++          }
++          if (mustNotClauses.size() > 0) {
++            b.append("_MustNot").append(mustNotClauses.size());
++          }
++          if (minNR != 0) {
++            b.append("_MinNR").append(minNR);
++          }
++          queryDesc = b.toString().substring(1);
++        } else {
++          useSkip = false;
++          queryDesc = null;
++        }
++      } else {
++        useSkip = false;
++        queryDesc = null;
++      }
++
++      String filterDesc;
++      if (filter == null) {
++        filterDesc = "No";
++      } else if (filterIsRandomAccess) {
++        filterDesc = "RandomAccess";
++      } else {
++        filterDesc = "Iter";
++      }
++
++      String delDesc;
++      if (r.hasDeletions()) {
++        delDesc = "Yes";
++      } else {
++        delDesc = "No";
++      }
++
++      if (filter != null) {
++        // Filter must have pre-multiplied deletes
++        delDesc = "No";
++      }
++
++      String totalHitsDesc;
++      if (doTotalHits) {
++        totalHitsDesc = "Yes";
++      } else {
++        totalHitsDesc = "No";
++      }
++
++      String skipDesc = useSkip ? "Yes": "No";
++
++      String daoDesc;
++      if (docAtOnce) {
++        daoDesc = "Yes";
++      } else {
++        daoDesc = "No";
++      }
++
++      if (sortDesc != null && filterDesc != null && queryDesc != null) {
++
++        StringBuffer b = new StringBuffer();
++        b.append("org.apache.lucene.search.Spec_").append(queryDesc);
++
++        if (!sortDesc.equals("Score")) {
++          b.append("_Sort").append(sortDesc);
++        }
++        
++        if (!filterDesc.equals("No")) {
++          b.append("_Filter").append(filterDesc);
++        } else if (!delDesc.equals("No")) {
++          b.append("_Deletes");
++        }
++        if (!sortDesc.equals("Score")) {
++          if (trackScoresDesc.equals("Yes")) {
++            b.append("_TrackScores");
++          }
++          if (maxScoreDesc.equals("Yes")) {
++            b.append("_MaxScore");
++          }
++        }
++        if (totalHitsDesc.equals("No")) {
++          b.append("_NoTotHits");
++        }
++        if (skipDesc.equals("Yes")) {
++          b.append("_Skip");
++        }
++        if (daoDesc.equals("Yes")) {
++          b.append("_DAO");
++        }
++
++        return b.toString();
++      } else {
++        return null;
++      }
++    } else {
++      return null;
++    }
++  }
++}
+\ No newline at end of file
+Index: genall.py
+===================================================================
+--- genall.py	(revision 0)
++++ genall.py	(revision 0)
+@@ -0,0 +1,267 @@
++import sys
++import os
++import shutil
++import gen
++
++numHit = 10
++
++#queries = [('bq', 1, 1, 1, 0)]
++DEFAULT_QUERIES = ['Term']
++
++def parseQuery(s):
++  if s.find(' ') != -1:
++    l = s.strip().replace('(', '').replace(')', '').split()
++    numMust = 0
++    numShould = 0
++    numMustNot = 0
++    minNR = 0
++    for x in l:
++      if x[0] == '+':
++        numMust += 1
++      elif x[0] == '-':
++        numMustNot += 1
++      elif x.startswith('minNR='):
++        minNR = int(x[6:])
++      else:
++        numShould += 1
++    return ['bq', numShould, numMustNot, numMust, minNR, 'Yes']
++  else:
++    return 'Term'
++
++# rough equivalent of FastSearch.translateQuery
++
++def translateQuery(query, sortDesc, filterDesc, trackScoresDesc, maxScoreDesc):
++
++  while True:
++    changed = False
++
++    if query[0] == 'bq':
++      numShould = query[1]
++      numMustNot = query[2]
++      numMust = query[3]
++      minNR = query[4]
++
++      # structural optimizations:
++      if minNR > numShould:
++        # matches no docs -- short circuited @ runtime
++        return None
++
++      if minNR == 1 and numShould > 0 and numMust == 0:
++        minNR = 0
++        changed = True
++
++      # drop should clauses if they are unused
++      if numMust > 0 and numShould > 0 and minNR == 0:
++        if trackScoresDesc == 'No' and maxScoreDesc == 'No':
++          if sortDesc != 'Score':
++            numShould = 0
++            changed = True
++
++      if numShould != 0 and numShould == minNR:
++        # upgrade all SHOULD clauses to MUST
++        numMust += numShould
++        numShould = 0
++        minNR = 0
++        changed = True
++
++      if numShould + numMust == 1 and numMustNot == 0:
++        # a single SHOULD or MUST clause is the same as a single query
++        query = 'Term'
++        continue
++
++      query = ['bq', numShould, numMustNot, numMust, minNR]
++
++    if not changed:
++      break
++    
++  # iter filter becomes MUST clause on boolean query
++  if filterDesc == 'Iter':
++    # insert filter as clause on boolean query
++    if query[0] == 'bq':
++      query = ['bq', query[1], query[2], query[3] + 1, query[4]]
++      if query[3] == 1 and query[4] == 0:
++        # if bq previously had no must clauses and minNR was 0 then increment minNR to make sure we don't accept hits matching only the filter
++        query[4] = 1
++    else:
++      query = ['bq', 0, 0, 2, 0]
++
++  return query
++
++def main(indexInput=None, queries=None):
++
++  os.system('rm -f src/java/org/apache/lucene/search/Spec_*.java')
++
++  if indexInput is None:
++    if len(sys.argv) > 1:
++      indexInput = sys.argv[1]
++      queries = [parseQuery(x) for x in sys.argv[2:]]
++    else:
++      indexInput = 'FSDirectory.FSIndexInput'
++      queries = DEFAULT_QUERIES
++
++  done = {}
++
++  for query in queries:
++    for filterDesc in ('No', 'RandomAccess', 'Iter'):
++      if filterDesc != 'No':
++        delDescs = ('No',)
++      else:
++        delDescs = ('No', 'Yes')
++
++      if query[0] == 'bq' or filterDesc != 'No':
++        daos = ('Yes', 'No')
++      else:
++        daos = ('No',)
++
++      if query[0] == 'bq' and query[1] > 1:
++        minNRs = range(0, 1+query[1])
++      else:
++        minNRs = (0,)
++
++      for minNR in minNRs:
++        if query[0] == 'bq':
++          query[4] = minNR
++          
++        skips = ('Yes', 'No')
++
++        for dao in daos:
++
++          for delDesc in delDescs:
++            #for sortDesc in ('Score', 'String', 'Byte', 'Short', 'Int', 'Long', 'Float', 'Double'):
++            for sortDesc in ('Score', 'String', 'Int'):
++
++              if sortDesc != 'Score':
++                maxScoreDescs = ('Yes', 'No')
++                trackScoresDescs = ('Yes', 'No')
++              else:
++                maxScoreDescs = ('Yes',)
++                trackScoresDescs = ('Yes',)
++
++              for maxScoreDesc in maxScoreDescs:
++                for trackScoresDesc in trackScoresDescs:
++                  for doTotalHits in ('Yes', 'No'):
++
++                    for skip in skips:
++
++                      if maxScoreDesc == 'Yes' and trackScoresDesc == 'No':
++                        # if we need max score, always track scores
++                        continue
++
++                      query2 = translateQuery(query, sortDesc, filterDesc, trackScoresDesc, maxScoreDesc)
++
++                      if query2 is None:
++                        continue
++
++                      if query2[0] == 'bq':
++                        vx = []
++                        numShould, numMustNot, numMust, minNR = query2[1:5]
++                        if numShould > 0:
++                          vx.append('Should%d' % numShould)
++                        if numMust > 0:
++                          vx.append('Must%d' % numMust)
++                        if numMustNot > 0:
++                          vx.append('MustNot%d' % numMustNot)
++                        if minNR != 0:
++                          vx.append('MinNR%d' % minNR)
++                        queryDesc = '_'.join(vx)
++                        if numMust == 0:
++                          # cannot skip or do doc-at-once w/o at least one must clause
++                          skip = dao2 = 'No'
++                      else:
++                        queryDesc = query2
++                        minNR = None
++                        skip = 'No'
++                        dao2 = 'No'
++
++                      # we cannot do docAtOnce for queries that don't have a must clause
++                      if dao == 'Yes' and \
++                         (filterDesc in ('No', 'RandomAccess') and (query2 == 'Term' or (query2[0] == 'bq' and query2[3] == 0))):
++                        dao2 = 'No'
++                        print '  wire dao2 to No'
++                      else:
++                        dao2 = dao
++
++                      fileName = 'src/java/org/apache/lucene/search/Spec_%s' % queryDesc
++                      if sortDesc != 'Score':
++                        fileName += '_Sort%s' % sortDesc
++
++                      if filterDesc != 'No':
++                        fileName += '_Filter%s' % filterDesc
++                      elif delDesc != 'No':
++                        fileName += '_Deletes'
++
++                      if sortDesc != 'Score':
++                        if trackScoresDesc != 'No':
++                          fileName += '_TrackScores'
++
++                        if maxScoreDesc != 'No':
++                          fileName += '_MaxScore'
++                      else:
++                        if trackScoresDesc != 'Yes':
++                          raise RuntimeError('no')
++                        if maxScoreDesc != 'Yes':
++                          raise RuntimeError('no')
++
++                      if doTotalHits == 'No':
++                        fileName += '_NoTotHits'
++
++                      if skip == 'Yes':
++                        fileName += '_Skip'
++
++                      if dao2 == 'Yes':
++                        fileName += '_DAO'
++
++                      fileName += '.java'
++
++                      print fileName[fileName.rfind('/')+1:]
++
++                      if fileName in done:
++                        continue
++
++                      done[fileName] = True
++
++                      w = gen.Writer()
++
++                      if sortDesc == 'Score':
++                        c = gen.ScoreDocCollector(w)
++                      else:
++                        c = gen.SortByOneFieldCollector(w, trackScoresDesc=='Yes', maxScoreDesc=='Yes')
++
++                        if sortDesc == 'String':
++                          c.comp = gen.StringOrdValComparator(w, replaceNulls=True)
++                          c.valueType = None
++                        else:
++                          c.comp = None
++                          c.valueType = sortDesc.lower()
++
++                      if queryDesc == 'Term':
++                        q = gen.TermQuery()
++                      else:
++
++                        qMust = []
++                        for i in range(numMust):
++                          if i == 0 and filterDesc == 'Iter':
++                            clause = gen.FilterAsQuery()
++                          else:
++                            clause = gen.TermQuery()
++                          qMust.append(clause)
++                        qShould = []
++                        for i in range(numShould):
++                          qShould.append(gen.TermQuery())
++                        qMustNot = []
++                        for i in range(numMustNot):
++                          qMustNot.append(gen.TermQuery())
++                        q = gen.BooleanQuery(qShould, qMustNot, qMust, minNR=minNR)
++
++                      if False and fileName.find('Spec_Query3ClauseOr_SortString_FilterYes_DeletesNo_TrackScoresYes_MaxScoreYes_NormsYes_TotalHitsNo') == -1:
++                        continue
++
++                      # print 'Generate %s...' % (fileName[fileName.rfind('/')+1:])
++                      gen.gen(w, q, c, filterDesc, delDesc=='Yes',
++                              doTotalHits=='Yes', fileName,
++                              indexInput, skip=='Yes', docAtOnce=dao2=='Yes')
++
++  print 'Created %d classes' % len(done)
++
++if __name__ == '__main__':
++  main()
+Index: build.xml
+===================================================================
+--- build.xml	(revision 0)
++++ build.xml	(revision 0)
+@@ -0,0 +1,27 @@
++<?xml version="1.0"?>
++
++<!--
++    Licensed to the Apache Software Foundation (ASF) under one or more
++    contributor license agreements.  See the NOTICE file distributed with
++    this work for additional information regarding copyright ownership.
++    The ASF licenses this file to You under the Apache License, Version 2.0
++    the "License"); you may not use this file except in compliance with
++    the License.  You may obtain a copy of the License at
++ 
++        http://www.apache.org/licenses/LICENSE-2.0
++ 
++    Unless required by applicable law or agreed to in writing, software
++    distributed under the License is distributed on an "AS IS" BASIS,
++    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++    See the License for the specific language governing permissions and
++    limitations under the License.
++ -->
++
++<project name="spec" default="default">
++
++  <description>
++    Fast source-code specialized search
++  </description>
++
++  <import file="../contrib-build.xml"/>
++</project>
+Index: runTests.py
+===================================================================
+--- runTests.py	(revision 0)
++++ runTests.py	(revision 0)
+@@ -0,0 +1,74 @@
++import re
++import os
++
++def main():
++
++  queries = ['1',
++             '1 2',
++             '1 +2',
++             '+1 +2',
++             '1 2 3 4',
++             '+1 +2 +3 +4',
++             '+1 +2 -3',
++             '1 2 -3']
++
++  for query in queries:
++    print '\nTEST: query=%s' % query
++    print '  genall...'
++    if os.system('python -uOO genall.py IndexInput "%s" >& genall.log' % query):
++      print open('genall.log').read()
++      raise RuntimeError('genall failed')
++
++    allgen = {}
++    rx = re.compile('Created (\d+) classes')
++    count = None
++    for line in open('genall.log').readlines():
++      line = line.strip()
++      if line.startswith('Spec_'):
++        #print 'gen %s' % line
++        allgen[line] = True
++      else:
++        m = rx.search(line)
++        if m is not None:
++          count = int(m.group(1))
++    print '    %d classes' % count
++
++    s = open('src/test/org/apache/lucene/search/TestSpecializedSearch.java', 'rb').read()
++    rx = re.compile(r'  final String\[\] queries = new String\[\] \{".*?"\};')
++    s = rx.sub('  final String[] queries = new String[] {"%s"};' % query, s)
++    open('src/test/org/apache/lucene/search/TestSpecializedSearch.java', 'wb').write(s)
++    
++    print '  compile...'
++    if os.system('ant clean compile compile-test >& compile.log'):
++      print open('compile.log').read()
++      raise RuntimeError('compile failed')
++    
++    print '  test...'
++    if os.system('java -cp ../../build/classes/test:../../build/classes/java:/tango/software/junit-4.4.jar:../../build/contrib/spec/classes/test:../../build/contrib/spec/classes/java -DtempDir=build -ea org.junit.runner.JUnitCore org.apache.lucene.search.TestSpecializedSearch >& test.log'):
++      raise RuntimeError('test failed')
++
++    allused = {}
++    for line in open('test.log').readlines():
++      line = line.strip()
++      if line.startswith('impl: '):
++        #print 'tested %s' % line[40:]
++        allused[line[40:]] = True
++
++    p = False
++    for c in allgen.keys():
++      if c not in allused:
++        if not p:
++          print '\nGENd but not tested:'
++          p = True
++        print '  src/java/org/apache/lucene/search/%s' % c
++
++    p = False
++    for c in allused.keys():
++      if c not in allgen:
++        if not p:
++          print '\nTESTed but not gend:'
++          p = True
++        print '  src/java/org/apache/lucene/search/%s' % c
++
++if __name__ == '__main__':
++  main()

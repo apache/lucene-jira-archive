@@ -1,0 +1,205 @@
+diff --git a/lucene/core/src/java/org/apache/lucene/search/BooleanQuery.java b/lucene/core/src/java/org/apache/lucene/search/BooleanQuery.java
+index 04ddbc39926..9d095e50c1c 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/BooleanQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/BooleanQuery.java
+@@ -108,6 +108,10 @@ public class BooleanQuery extends Query implements Iterable<BooleanClause> {
+       // We do the final deep check for max clauses count limit during
+       // <code>IndexSearcher.rewrite</code> but do this check to short
+       // circuit in case a single query holds more than numClauses
++      //
++      // NOTE: this is not just an early check for optimization -- it's
++      // neccessary to prevent run-away 'rewriting' of bad queries from
++      // creating BQ objects that might eat up all the Heap.
+       if (clauses.size() >= IndexSearcher.maxClauseCount) {
+         throw new IndexSearcher.TooManyClauses();
+       }
+diff --git a/lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java b/lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java
+index 1f6e9b4a878..d7937a5cba9 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java
++++ b/lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java
+@@ -776,7 +776,7 @@ public class IndexSearcher {
+   /**
+    * Returns a QueryVisitor which recursively checks the total number of clauses that a query and
+    * its children cumulatively have and validates that the total number does not exceed the
+-   * specified limit
++   * specified limit. Throws {@link TooManyNestedClauses} if the limit is exceeded.
+    */
+   private static QueryVisitor getNumClausesCheckVisitor() {
+     return new QueryVisitor() {
+@@ -792,7 +792,7 @@ public class IndexSearcher {
+       @Override
+       public void visitLeaf(Query query) {
+         if (numClauses > maxClauseCount) {
+-          throw new TooManyClauses();
++          throw new TooManyNestedClauses();
+         }
+         ++numClauses;
+       }
+@@ -800,7 +800,7 @@ public class IndexSearcher {
+       @Override
+       public void consumeTerms(Query query, Term... terms) {
+         if (numClauses > maxClauseCount) {
+-          throw new TooManyClauses();
++          throw new TooManyNestedClauses();
+         }
+         ++numClauses;
+       }
+@@ -809,7 +809,7 @@ public class IndexSearcher {
+       public void consumeTermsMatching(
+           Query query, String field, Supplier<ByteRunAutomaton> automaton) {
+         if (numClauses > maxClauseCount) {
+-          throw new TooManyClauses();
++          throw new TooManyNestedClauses();
+         }
+         ++numClauses;
+       }
+@@ -966,8 +966,33 @@ public class IndexSearcher {
+    * many terms during search.
+    */
+   public static class TooManyClauses extends RuntimeException {
++    private final int maxClauseCount;
++
++    public TooManyClauses(String msg) {
++      super(msg);
++      this.maxClauseCount = IndexSearcher.getMaxClauseCount();
++    }
++
+     public TooManyClauses() {
+-      super("maxClauseCount is set to " + maxClauseCount);
++      this("maxClauseCount is set to " + IndexSearcher.getMaxClauseCount());
++    }
++    /** The value of {@link IndexSearcher#getMaxClauseCount()} when this Exception was created */
++    public int getMaxClauseCount() {
++      return maxClauseCount;
++    }
++  }
++
++  /**
++   * Thrown when a client attempts to execute a Query that has more than {@link
++   * #getMaxClauseCount()} total clauses cumulatively in all of it's children.
++   *
++   * @see #rewrite
++   */
++  public static class TooManyNestedClauses extends TooManyClauses {
++    public TooManyNestedClauses() {
++      super(
++          "Query contains too many nested clauses; maxClauseCount is set to "
++              + IndexSearcher.getMaxClauseCount());
+     }
+   }
+ 
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestBooleanQuery.java b/lucene/core/src/test/org/apache/lucene/search/TestBooleanQuery.java
+index d5c672fcb25..282f68f150c 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestBooleanQuery.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestBooleanQuery.java
+@@ -178,11 +178,18 @@ public class TestBooleanQuery extends LuceneTestCase {
+     assertEquals(hashCode, bq.hashCode());
+   }
+ 
+-  public void testException() {
++  public void testTooManyClauses() {
++    // Bad code (such as in a Query.rewrite() impl) should be prevented from creating a BooleanQuery
++    // that directly exceeds the maxClauseCount (prior to needing IndexSearcher.rewrite() to do a
++    // full walk of the final result)
++    BooleanQuery.Builder bq = new BooleanQuery.Builder();
++    for (int i = 0; i < IndexSearcher.getMaxClauseCount(); i++) {
++      bq.add(new TermQuery(new Term("foo", "bar-" + i)), Occur.SHOULD);
++    }
+     expectThrows(
+-        IllegalArgumentException.class,
++        IndexSearcher.TooManyClauses.class,
+         () -> {
+-          IndexSearcher.setMaxClauseCount(0);
++          bq.add(new TermQuery(new Term("foo", "bar-MAX")), Occur.SHOULD);
+         });
+   }
+ 
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestMaxClauseLimit.java b/lucene/core/src/test/org/apache/lucene/search/TestMaxClauseLimit.java
+index 7ed9c1966f5..7519723352f 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestMaxClauseLimit.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestMaxClauseLimit.java
+@@ -24,6 +24,19 @@ import org.apache.lucene.index.Term;
+ import org.apache.lucene.util.LuceneTestCase;
+ 
+ public class TestMaxClauseLimit extends LuceneTestCase {
++  public void testIllegalArgumentExceptionOnZero() {
++    final int current = IndexSearcher.getMaxClauseCount();
++    expectThrows(
++        IllegalArgumentException.class,
++        () -> {
++          IndexSearcher.setMaxClauseCount(0);
++        });
++    assertEquals(
++        "attempt to change to 0 should have failed w/o modifying",
++        current,
++        IndexSearcher.getMaxClauseCount());
++  }
++
+   public void testFlattenInnerDisjunctionsWithMoreThan1024Terms() throws IOException {
+     IndexSearcher searcher = newSearcher(new MultiReader());
+ 
+@@ -38,11 +51,15 @@ public class TestMaxClauseLimit extends LuceneTestCase {
+             .add(new TermQuery(new Term("foo", "baz")), BooleanClause.Occur.SHOULD)
+             .build();
+ 
+-    expectThrows(
+-        IndexSearcher.TooManyClauses.class,
+-        () -> {
+-          searcher.rewrite(query);
+-        });
++    Exception e =
++        expectThrows(
++            IndexSearcher.TooManyClauses.class,
++            () -> {
++              searcher.rewrite(query);
++            });
++    assertFalse(
++        "Should have been caught during flattening and not required full nested walk",
++        e instanceof IndexSearcher.TooManyNestedClauses);
+   }
+ 
+   public void testLargeTermsNestedFirst() throws IOException {
+@@ -66,8 +83,9 @@ public class TestMaxClauseLimit extends LuceneTestCase {
+ 
+     Query query = builderMixed.build();
+ 
++    // Can't be flattened, but high clause count should still be cause during nested walk...
+     expectThrows(
+-        IndexSearcher.TooManyClauses.class,
++        IndexSearcher.TooManyNestedClauses.class,
+         () -> {
+           searcher.rewrite(query);
+         });
+@@ -95,8 +113,9 @@ public class TestMaxClauseLimit extends LuceneTestCase {
+ 
+     Query query = builderMixed.build();
+ 
++    // Can't be flattened, but high clause count should still be cause during nested walk...
+     expectThrows(
+-        IndexSearcher.TooManyClauses.class,
++        IndexSearcher.TooManyNestedClauses.class,
+         () -> {
+           searcher.rewrite(query);
+         });
+@@ -116,8 +135,9 @@ public class TestMaxClauseLimit extends LuceneTestCase {
+ 
+     DisjunctionMaxQuery dmq = new DisjunctionMaxQuery(Arrays.asList(clausesQueryArray), 0.5f);
+ 
++    // Can't be flattened, but high clause count should still be cause during nested walk...
+     expectThrows(
+-        IndexSearcher.TooManyClauses.class,
++        IndexSearcher.TooManyNestedClauses.class,
+         () -> {
+           searcher.rewrite(dmq);
+         });
+@@ -131,8 +151,9 @@ public class TestMaxClauseLimit extends LuceneTestCase {
+       qb.add(new Term[] {new Term("foo", "bar-" + i), new Term("foo", "bar+" + i)}, 0);
+     }
+ 
++    // Can't be flattened, but high clause count should still be cause during nested walk...
+     expectThrows(
+-        IndexSearcher.TooManyClauses.class,
++        IndexSearcher.TooManyNestedClauses.class,
+         () -> {
+           searcher.rewrite(qb.build());
+         });

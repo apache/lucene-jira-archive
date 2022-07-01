@@ -1,0 +1,207 @@
+Index: lucene/CHANGES.txt
+===================================================================
+--- lucene/CHANGES.txt	(revision 998175)
++++ lucene/CHANGES.txt	(working copy)
+@@ -220,6 +220,9 @@
+   FieldComparator instance.  You can "return this", to just reuse the
+   same instance, or you can return a comparator optimized to the new
+   segment.  (yonik, Mike McCandless)
++  
++* LUCENE-2648: PackedInts.Iterator now supports to advance by more than a
++  single ordinal. (Simon Willnauer) 
+ 
+ Optimizations
+ 
+Index: lucene/src/java/org/apache/lucene/util/packed/PackedInts.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/util/packed/PackedInts.java	(revision 998175)
++++ lucene/src/java/org/apache/lucene/util/packed/PackedInts.java	(working copy)
+@@ -76,8 +76,14 @@
+     int getBitsPerValue();
+     /** Returns number of values */
+     int size();
++    /** Returns the current position */
++    int ord();
++    /** Skips to the given ordinal and returns its value.
++     * @return the value at the given position
++     * @throws IOException if reading the value throws an IOException*/
++    long advance(int ord) throws IOException;
+   }
+-
++  
+   /**
+    * A packed integer array that can be modified.
+    * @lucene.internal
+@@ -192,10 +198,9 @@
+     final int bitsPerValue = in.readVInt();
+     assert bitsPerValue > 0 && bitsPerValue <= 64: "bitsPerValue=" + bitsPerValue;
+     final int valueCount = in.readVInt();
+-
+     return new PackedReaderIterator(bitsPerValue, valueCount, in);
+   }
+-
++  
+   /**
+    * Create a packed integer array with the given amount of values initialized
+    * to 0. the valueCount and the bitsPerValue cannot be changed after creation.
+Index: lucene/src/java/org/apache/lucene/util/packed/PackedReaderIterator.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/util/packed/PackedReaderIterator.java	(revision 998175)
++++ lucene/src/java/org/apache/lucene/util/packed/PackedReaderIterator.java	(working copy)
+@@ -21,12 +21,13 @@
+ 
+ import java.io.IOException;
+ 
+-class PackedReaderIterator implements PackedInts.ReaderIterator {
++final class PackedReaderIterator implements PackedInts.ReaderIterator {
+   private long pending;
+   private int pendingBitsLeft;
+   private final IndexInput in;
+   private final int bitsPerValue;
+   private final int valueCount;
++  private int position = -1;
+ 
+   // masks[n-1] masks for bottom n bits
+   private final long[] masks;
+@@ -38,7 +39,6 @@
+     this.bitsPerValue = bitsPerValue;
+     
+     this.in = in;
+-
+     masks = new long[bitsPerValue];
+ 
+     long v = 1;
+@@ -61,24 +61,51 @@
+       pending = in.readLong();
+       pendingBitsLeft = 64;
+     }
+-
+-    if (pendingBitsLeft >= bitsPerValue) {
+-      // not split
+-      final long result = (pending >> (pendingBitsLeft - bitsPerValue)) & masks[bitsPerValue-1];
++    
++    final long result;
++    if (pendingBitsLeft >= bitsPerValue) { // not split
++      result = (pending >> (pendingBitsLeft - bitsPerValue)) & masks[bitsPerValue-1];
+       pendingBitsLeft -= bitsPerValue;
+-      return result;
+-    } else {
+-      // split
++    } else { // split
+       final int bits1 = bitsPerValue - pendingBitsLeft;
+       final long result1 = (pending & masks[pendingBitsLeft-1]) << bits1;
+       pending = in.readLong();
+       final long result2 = (pending >> (64 - bits1)) & masks[bits1-1];
+       pendingBitsLeft = 64 + pendingBitsLeft - bitsPerValue;
+-      return result1 | result2;
++      result = result1 | result2;
+     }
++    
++    ++position;
++    return result;
+   }
+ 
+   public void close() throws IOException {
+     in.close();
+   }
++
++  public int ord() {
++    return position;
++  }
++
++  public long advance(final int ord) throws IOException{
++    assert ord < valueCount : "ord must be less than valueCount";
++    assert ord > position : "ord must be greater than the current position";
++    final long bits = (long) bitsPerValue;
++    final int posToSkip = ord - 1 - position;
++    final long bitsToSkip = (bits * (long)posToSkip);
++    if(bitsToSkip < pendingBitsLeft ){ // enough bits left - no seek required
++      pendingBitsLeft -= bitsToSkip;
++    }else {
++      final long skip = bitsToSkip-pendingBitsLeft;
++      final long closestByte = (skip >> 6) << 3;
++      if(closestByte != 0) { // need to seek 
++        final long filePointer = in.getFilePointer();
++        in.seek(filePointer + closestByte);
++      }
++      pending = in.readLong();
++      pendingBitsLeft = 64 - (int)(skip % 64);
++    }
++    position = ord-1;
++    return next();
++  }
+ }
+Index: lucene/src/test/org/apache/lucene/util/packed/TestPackedInts.java
+===================================================================
+--- lucene/src/test/org/apache/lucene/util/packed/TestPackedInts.java	(revision 998175)
++++ lucene/src/test/org/apache/lucene/util/packed/TestPackedInts.java	(working copy)
+@@ -70,26 +70,51 @@
+         w.finish();
+         final long fp = out.getFilePointer();
+         out.close();
+-
+-        IndexInput in = d.openInput("out.bin");
+-        PackedInts.Reader r = PackedInts.getReader(in);
+-        assertEquals(fp, in.getFilePointer());
+-        for(int i=0;i<valueCount;i++) {
+-          assertEquals("index=" + i + " ceil=" + ceil + " valueCount="
+-                  + valueCount + " nbits=" + nbits + " for "
+-                  + r.getClass().getSimpleName(), values[i], r.get(i));
++        {// test reader
++          IndexInput in = d.openInput("out.bin");
++          PackedInts.Reader r = PackedInts.getReader(in);
++          assertEquals(fp, in.getFilePointer());
++          for(int i=0;i<valueCount;i++) {
++            assertEquals("index=" + i + " ceil=" + ceil + " valueCount="
++                    + valueCount + " nbits=" + nbits + " for "
++                    + r.getClass().getSimpleName(), values[i], r.get(i));
++          }
++          in.close();
+         }
+-        in.close();
+-
+-        in = d.openInput("out.bin");
+-        PackedInts.ReaderIterator r2 = PackedInts.getReaderIterator(in);
+-        for(int i=0;i<valueCount;i++) {
+-          assertEquals("index=" + i + " ceil=" + ceil + " valueCount="
+-                  + valueCount + " nbits=" + nbits + " for "
+-                  + r.getClass().getSimpleName(), values[i], r2.next());
++        { // test reader iterator next
++          IndexInput in = d.openInput("out.bin");
++          PackedInts.ReaderIterator r = PackedInts.getReaderIterator(in);
++          for(int i=0;i<valueCount;i++) {
++            assertEquals("index=" + i + " ceil=" + ceil + " valueCount="
++                    + valueCount + " nbits=" + nbits + " for "
++                    + r.getClass().getSimpleName(), values[i], r.next());
++          }
++          assertEquals(fp, in.getFilePointer());
++          in.close();
+         }
+-        assertEquals(fp, in.getFilePointer());
+-        in.close();
++        { // test reader iterator next vs. advance
++          IndexInput in = d.openInput("out.bin");
++          PackedInts.ReaderIterator intsEnum = PackedInts.getReaderIterator(in);
++          for (int i = 0; i < valueCount; i += 
++            1 + ((valueCount - i) <= 20 ? random.nextInt(valueCount - i)
++              : random.nextInt(20))) {
++            final String msg = "index=" + i + " ceil=" + ceil + " valueCount="
++                + valueCount + " nbits=" + nbits + " for "
++                + intsEnum.getClass().getSimpleName();
++            if (i - intsEnum.ord() == 1 && random.nextBoolean()) {
++              assertEquals(msg, values[i], intsEnum.next());
++            } else {
++              assertEquals(msg, values[i], intsEnum.advance(i));
++            }
++            assertEquals(msg, i, intsEnum.ord());
++          }
++          if (intsEnum.ord() < valueCount - 1)
++            assertEquals(values[valueCount - 1], intsEnum
++                .advance(valueCount - 1));
++          assertEquals(valueCount - 1, intsEnum.ord());
++          assertEquals(fp, in.getFilePointer());
++          in.close();
++        }
+         ceil *= 2;
+         d.close();
+       }

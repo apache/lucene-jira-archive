@@ -1,0 +1,188 @@
+Index: lucene/core/src/java/org/apache/lucene/search/FilteredQuery.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/search/FilteredQuery.java	(revision 1662068)
++++ lucene/core/src/java/org/apache/lucene/search/FilteredQuery.java	(working copy)
+@@ -25,6 +25,7 @@
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.LeafReaderContext;
+ import org.apache.lucene.index.Term;
++import org.apache.lucene.search.BooleanClause.Occur;
+ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.ToStringUtils;
+ 
+@@ -301,6 +302,16 @@
+    * it returns a new {@code FilteredQuery} wrapping the rewritten query. */
+   @Override
+   public Query rewrite(IndexReader reader) throws IOException {
++    if (filter instanceof QueryWrapperFilter) {
++      // In that case the filter does not implement random-access anyway so
++      // we want to take advantage of approximations
++      BooleanQuery rewritten = new BooleanQuery();
++      rewritten.add(query, Occur.MUST);
++      rewritten.add(((QueryWrapperFilter) filter).getQuery(), Occur.FILTER);
++      rewritten.setBoost(getBoost());
++      return rewritten;
++    }
++
+     final Query queryRewritten = query.rewrite(reader);
+     
+     if (queryRewritten != query) {
+Index: lucene/core/src/java/org/apache/lucene/search/QueryWrapperFilter.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/search/QueryWrapperFilter.java	(revision 1662068)
++++ lucene/core/src/java/org/apache/lucene/search/QueryWrapperFilter.java	(working copy)
+@@ -17,12 +17,12 @@
+  * limitations under the License.
+  */
+ 
+-import org.apache.lucene.index.PostingsEnum;
++import java.io.IOException;
++
++import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.LeafReaderContext;
+ import org.apache.lucene.util.Bits;
+ 
+-import java.io.IOException;
+-
+ /** 
+  * Constrains search results to only match those which also match a provided
+  * query.  
+@@ -44,6 +44,13 @@
+     this.query = query;
+   }
+   
++  @Override
++  public Query rewrite(IndexReader reader) throws IOException {
++    ConstantScoreQuery rewritten = new ConstantScoreQuery(query);
++    rewritten.setBoost(0);
++    return rewritten;
++  }
++  
+   /** returns the inner Query */
+   public final Query getQuery() {
+     return query;
+Index: lucene/core/src/test/org/apache/lucene/search/TestFilteredQuery.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/search/TestFilteredQuery.java	(revision 1662068)
++++ lucene/core/src/test/org/apache/lucene/search/TestFilteredQuery.java	(working copy)
+@@ -25,6 +25,8 @@
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.Field;
+ import org.apache.lucene.document.SortedDocValuesField;
++import org.apache.lucene.document.StringField;
++import org.apache.lucene.document.Field.Store;
+ import org.apache.lucene.index.LeafReader;
+ import org.apache.lucene.index.LeafReaderContext;
+ import org.apache.lucene.index.PostingsEnum;
+@@ -587,6 +589,51 @@
+     assertEquals(totalDocsWithZero, search.totalHits);
+     IOUtils.close(reader, directory);
+   }
++
++  public void testPreservesScores() throws IOException {
++    Directory dir = newDirectory();
++    RandomIndexWriter writer = new RandomIndexWriter(random(), dir);
++    Document doc = new Document();
++    doc.add(new StringField("foo", "bar", Store.NO));
++    writer.addDocument(doc);
++    writer.commit();
++    final IndexReader reader = writer.getReader();
++    writer.close();
++    final IndexSearcher searcher = new IndexSearcher(reader);
++    final Query query = new TermQuery(new Term("foo", "bar"));
++    query.setBoost(random().nextFloat());
++    FilteredQuery fq = new FilteredQuery(query, new Filter() {
++      @Override
++      public DocIdSet getDocIdSet(LeafReaderContext context, Bits acceptDocs)
++          throws IOException {
++        return new DocIdSet() {
++          
++          @Override
++          public long ramBytesUsed() {
++            return 0;
++          }
++          
++          @Override
++          public DocIdSetIterator iterator() throws IOException {
++            return DocIdSetIterator.all(context.reader().maxDoc());
++          }
++        };
++      }
++      @Override
++      public String toString(String field) {
++        return "dummy";
++      }
++    });
++    assertEquals(searcher.search(query, 1).scoreDocs[0].score, searcher.search(fq, 1).scoreDocs[0].score, 0f);
++    fq.setBoost(random().nextFloat());
++    // QueryWrapperFilter has special rewrite rules
++    FilteredQuery fq2 = new FilteredQuery(query, new QueryWrapperFilter(new MatchAllDocsQuery()));
++    fq2.setBoost(fq.getBoost());
++    fq2.setBoost(42);
++    assertEquals(searcher.search(fq, 1).scoreDocs[0].score, searcher.search(fq2, 1).scoreDocs[0].score, 10e-5);
++    reader.close();
++    dir.close();
++  }
+ }
+ 
+ 
+Index: lucene/core/src/test/org/apache/lucene/search/TestQueryWrapperFilter.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/search/TestQueryWrapperFilter.java	(revision 1662068)
++++ lucene/core/src/test/org/apache/lucene/search/TestQueryWrapperFilter.java	(working copy)
+@@ -16,11 +16,14 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
++import java.io.IOException;
+ import java.util.HashSet;
+ import java.util.Set;
+ 
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.Field;
++import org.apache.lucene.document.Field.Store;
++import org.apache.lucene.document.StringField;
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.RandomIndexWriter;
+ import org.apache.lucene.index.Term;
+@@ -148,4 +151,40 @@
+     reader.close();
+     dir.close();
+   }
++
++  public void testScore() throws IOException {
++    Directory dir = newDirectory();
++    RandomIndexWriter writer = new RandomIndexWriter(random(), dir);
++    Document doc = new Document();
++    doc.add(new StringField("foo", "bar", Store.NO));
++    writer.addDocument(doc);
++    writer.commit();
++    final IndexReader reader = writer.getReader();
++    writer.close();
++    final IndexSearcher searcher = new IndexSearcher(reader);
++    final Query query = new QueryWrapperFilter(new TermQuery(new Term("foo", "bar")));
++    final TopDocs topDocs = searcher.search(query, 1);
++    assertEquals(1, topDocs.totalHits);
++    assertEquals(0f, topDocs.scoreDocs[0].score, 0f);
++    reader.close();
++    dir.close();
++  }
++
++  public void testQueryWrapperFilterPropagatesApproximations() throws IOException {
++    Directory dir = newDirectory();
++    RandomIndexWriter writer = new RandomIndexWriter(random(), dir);
++    Document doc = new Document();
++    doc.add(new StringField("foo", "bar", Store.NO));
++    writer.addDocument(doc);
++    writer.commit();
++    final IndexReader reader = writer.getReader();
++    writer.close();
++    final IndexSearcher searcher = new IndexSearcher(reader);
++    final Query query = new QueryWrapperFilter(new RandomApproximationQuery(new TermQuery(new Term("foo", "bar")), random()));
++    final Weight weight = searcher.createNormalizedWeight(query, random().nextBoolean());
++    final Scorer scorer = weight.scorer(reader.leaves().get(0), null);
++    assertNotNull(scorer.asTwoPhaseIterator());
++    reader.close();
++    dir.close();
++  }
+ }

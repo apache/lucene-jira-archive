@@ -1,0 +1,416 @@
+From da28e3511bf71c57109b26f624091ee4a0e8a1c6 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?N=C3=A1ndor=20M=C3=A1trav=C3=B6lgyi?=
+ <nandor.matra@gmail.com>
+Date: Tue, 17 Dec 2019 22:23:42 +0100
+Subject: [PATCH] LUCENE-9093: Unified highlighter with word separator never
+ gives context to the left
+
+---
+ lucene/CHANGES.txt                            |   3 +
+ .../search/uhighlight/FieldHighlighter.java   |   6 +-
+ .../uhighlight/LengthGoalBreakIterator.java   | 108 ++++++++++++------
+ .../LengthGoalBreakIteratorTest.java          |  92 ++++++++++-----
+ .../highlight/UnifiedSolrHighlighter.java     |   3 +-
+ solr/solr-ref-guide/src/highlighting.adoc     |   5 +
+ .../solr/common/params/HighlightParams.java   |   1 +
+ 7 files changed, 155 insertions(+), 63 deletions(-)
+
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index 89c6146ba89..d7a4d30c7be 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -43,6 +43,9 @@ API Changes
+ 
+ Improvements
+ 
++* LUCENE-9093: Added hl.fragalign parameter to Unified highlighter which influences
++  how much text to include around a match on the left and the right.
++
+ * LUCENE-8757: When provided with an ExecutorService to run queries across
+   multiple threads, IndexSearcher now groups small segments together, up to
+   250k docs per slice. (Atri Sharma via Adrien Grand)
+diff --git a/lucene/highlighter/src/java/org/apache/lucene/search/uhighlight/FieldHighlighter.java b/lucene/highlighter/src/java/org/apache/lucene/search/uhighlight/FieldHighlighter.java
+index f2a34dc9ea5..c34e21b88f8 100644
+--- a/lucene/highlighter/src/java/org/apache/lucene/search/uhighlight/FieldHighlighter.java
++++ b/lucene/highlighter/src/java/org/apache/lucene/search/uhighlight/FieldHighlighter.java
+@@ -141,6 +141,7 @@ public class FieldHighlighter {
+       }
+     });
+     Passage passage = new Passage(); // the current passage in-progress.  Will either get reset or added to queue.
++    int lastPassageEnd = 0;
+ 
+     do {
+       int start = off.startOffset();
+@@ -159,8 +160,9 @@ public class FieldHighlighter {
+           break;
+         }
+         // advance breakIterator
+-        passage.setStartOffset(Math.max(this.breakIterator.preceding(start + 1), 0));
+-        passage.setEndOffset(Math.min(this.breakIterator.following(start), contentLength));
++        passage.setStartOffset(Math.max(this.breakIterator.preceding(start + 1), lastPassageEnd));
++        lastPassageEnd = Math.min(this.breakIterator.following(start), contentLength);
++        passage.setEndOffset(lastPassageEnd);
+       }
+       // Add this term to the passage.
+       BytesRef term = off.getTerm();// a reference; safe to refer to
+diff --git a/lucene/highlighter/src/java/org/apache/lucene/search/uhighlight/LengthGoalBreakIterator.java b/lucene/highlighter/src/java/org/apache/lucene/search/uhighlight/LengthGoalBreakIterator.java
+index 3134013ab35..8d251ff8fe2 100644
+--- a/lucene/highlighter/src/java/org/apache/lucene/search/uhighlight/LengthGoalBreakIterator.java
++++ b/lucene/highlighter/src/java/org/apache/lucene/search/uhighlight/LengthGoalBreakIterator.java
+@@ -33,23 +33,32 @@ public class LengthGoalBreakIterator extends BreakIterator {
+ 
+   private final BreakIterator baseIter;
+   private final int lengthGoal;
++  private final float fragmentAlignment; // how much text to align before match-fragment, valid in range [0, 1]
+   private final boolean isMinimumLength; // if false then is "closest to" length
++  private int fragmentEndFromPreceding; // store the match-break end for reuse in following()
++  private int fragmentEndFollowingLengthGoalFromPreceding; // store the remaining length to collect in following()
+ 
+   /** Breaks will be at least {@code minLength} apart (to the extent possible). */
+-  public static LengthGoalBreakIterator createMinLength(BreakIterator baseIter, int minLength) {
+-    return new LengthGoalBreakIterator(baseIter, minLength, true);
++  public static LengthGoalBreakIterator createMinLength(BreakIterator baseIter, int minLength,
++                                                        float fragmentAlignment) {
++    return new LengthGoalBreakIterator(baseIter, minLength, fragmentAlignment,true);
+   }
+ 
+   /** Breaks will be on average {@code targetLength} apart; the closest break to this target (before or after)
+    * is chosen. */
+-  public static LengthGoalBreakIterator createClosestToLength(BreakIterator baseIter, int targetLength) {
+-    return new LengthGoalBreakIterator(baseIter, targetLength, false);
++  public static LengthGoalBreakIterator createClosestToLength(BreakIterator baseIter, int targetLength,
++                                                              float fragmentAlignment) {
++    return new LengthGoalBreakIterator(baseIter, targetLength, fragmentAlignment, false);
+   }
+ 
+-  private LengthGoalBreakIterator(BreakIterator baseIter, int lengthGoal, boolean isMinimumLength) {
++  private LengthGoalBreakIterator(BreakIterator baseIter, int lengthGoal, float fragmentAlignment,
++                                  boolean isMinimumLength) {
+     this.baseIter = baseIter;
+     this.lengthGoal = lengthGoal;
++    this.fragmentAlignment = Math.max(Math.min(fragmentAlignment, 1.f), 0.f);
+     this.isMinimumLength = isMinimumLength;
++    this.fragmentEndFromPreceding = 0;
++    this.fragmentEndFollowingLengthGoalFromPreceding = 0;
+   }
+ 
+   // note: the only methods that will get called are setText(txt), getText(),
+@@ -60,12 +69,15 @@ public class LengthGoalBreakIterator extends BreakIterator {
+   @Override
+   public String toString() {
+     String goalDesc = isMinimumLength ? "minLen" : "targetLen";
+-    return getClass().getSimpleName() + "{" + goalDesc + "=" + lengthGoal + ", baseIter=" + baseIter + "}";
++    return String.format(
++        "%s{%s=%d, fragAlign=%f, baseIter=%s}",
++        getClass().getSimpleName(), goalDesc, lengthGoal, fragmentAlignment, baseIter
++    );
+   }
+ 
+   @Override
+   public Object clone() {
+-    return new LengthGoalBreakIterator((BreakIterator) baseIter.clone(), lengthGoal, isMinimumLength);
++    return new LengthGoalBreakIterator((BreakIterator) baseIter.clone(), lengthGoal, fragmentAlignment, isMinimumLength);
+   }
+ 
+   @Override
+@@ -107,7 +119,9 @@ public class LengthGoalBreakIterator extends BreakIterator {
+   // called by getSummaryPassagesNoHighlight to generate default summary.
+   @Override
+   public int next() {
+-    return following(current());
++    this.fragmentEndFromPreceding = current();
++    this.fragmentEndFollowingLengthGoalFromPreceding = lengthGoal;
++    return following(this.fragmentEndFromPreceding);
+   }
+ 
+   @Override
+@@ -116,28 +130,20 @@ public class LengthGoalBreakIterator extends BreakIterator {
+     return baseIter.previous();
+   }
+ 
+-  // called while the current position is the start of a new passage; find end of passage
++  // NOTE: this.fragmentEndFromPreceding is used instead of the parameter!
++  // This is a big diversion from the API a BreakIterator should implement, but specifically this optimization is fine.
+   @Override
+   public int following(int followingIdx) {
+-    final int startIdx = current();
+-    if (followingIdx < startIdx) {
+-      assert false : "Not supported";
+-      return baseIter.following(followingIdx);
++    if (fragmentEndFollowingLengthGoalFromPreceding <= 0) {
++      return fragmentEndFromPreceding;
+     }
+-    final int targetIdx = startIdx + lengthGoal;
+-    // When followingIdx >= targetIdx, we can simply delegate since it will be >= the target
+-    if (followingIdx >= targetIdx - 1) {
+-      return baseIter.following(followingIdx);
+-    }
+-    // If target exceeds the text length, return the last index.
++    final int targetIdx = fragmentEndFromPreceding + fragmentEndFollowingLengthGoalFromPreceding;
+     if (targetIdx >= getText().getEndIndex()) {
+       return baseIter.last();
+     }
+-
+-    // Find closest break >= the target
+     final int afterIdx = baseIter.following(targetIdx - 1);
+-    if (afterIdx == DONE) { // we're at the end; can this happen?
+-      return current();
++    if (afterIdx == DONE) {
++      return baseIter.current();
+     }
+     if (afterIdx == targetIdx) { // right on the money
+       return afterIdx;
+@@ -146,17 +152,14 @@ public class LengthGoalBreakIterator extends BreakIterator {
+       return afterIdx;
+     }
+ 
+-    // note: it is a shame that we invoke preceding() *in addition to* following(); BI's are sometimes expensive.
++    // note: it is a shame that we invoke preceding() *one more time*; BI's are sometimes expensive.
+ 
+-    // Find closest break < target
+-    final int beforeIdx = baseIter.preceding(targetIdx); // or could do baseIter.previous() but we hope the BI implements preceding()
+-    if (beforeIdx <= followingIdx) { // too far back
+-      return moveToBreak(afterIdx);
+-    }
+-
+-    if (targetIdx - beforeIdx <= afterIdx - targetIdx) {
++    // Find closest break to target
++    final int beforeIdx = baseIter.preceding(targetIdx);
++    if (targetIdx - beforeIdx < afterIdx - targetIdx) {
+       return beforeIdx;
+     }
++    // moveToBreak is necessary for when getSummaryPassagesNoHighlight calls next and current() is used
+     return moveToBreak(afterIdx);
+   }
+ 
+@@ -174,7 +177,48 @@ public class LengthGoalBreakIterator extends BreakIterator {
+   // called at start of new Passage given first word start offset
+   @Override
+   public int preceding(int offset) {
+-    return baseIter.preceding(offset); // no change needed
++    final int fragmentStart = Math.max(baseIter.preceding(offset), 0); // convert DONE to 0
++    fragmentEndFromPreceding = baseIter.following(fragmentStart);
++    if (fragmentEndFromPreceding == DONE) {
++      fragmentEndFromPreceding = baseIter.last();
++    }
++    final int centerLength = fragmentEndFromPreceding - fragmentStart;
++    final int extraPrecedingLengthGoal = (int)((lengthGoal - centerLength) * fragmentAlignment);
++    if (extraPrecedingLengthGoal <= 0) {
++      // With uneven alignment like 0.1 the preceding portion could be 0 because of rounding, while the following
++      // could be a small positive value. This means to favor extra text after the match if not negative.
++      fragmentEndFollowingLengthGoalFromPreceding = lengthGoal - centerLength;
++      return fragmentStart;
++    }
++    final int targetIdx = fragmentStart - extraPrecedingLengthGoal;
++    if (targetIdx <= 0) {
++      fragmentEndFollowingLengthGoalFromPreceding = lengthGoal - fragmentEndFromPreceding;
++      return 0;
++    }
++    final int beforeIdx = baseIter.preceding(targetIdx);
++    if (beforeIdx == DONE) {
++      fragmentEndFollowingLengthGoalFromPreceding = lengthGoal - fragmentEndFromPreceding;
++      return 0;
++    }
++    if (beforeIdx == targetIdx) { // right on the money
++      fragmentEndFollowingLengthGoalFromPreceding = (lengthGoal - fragmentEndFromPreceding) + beforeIdx;
++      return beforeIdx;
++    }
++    if (isMinimumLength) { // thus never undershoot
++      fragmentEndFollowingLengthGoalFromPreceding = (lengthGoal - fragmentEndFromPreceding) + beforeIdx;
++      return beforeIdx;
++    }
++
++    // note: it is a shame that we invoke following() *one more time*; BI's are sometimes expensive.
++
++    // Find closest break to target
++    final int afterIdx = baseIter.following(targetIdx - 1);
++    if (afterIdx - targetIdx < targetIdx - beforeIdx) {
++      fragmentEndFollowingLengthGoalFromPreceding = (lengthGoal - fragmentEndFromPreceding) + afterIdx;
++      return afterIdx;
++    }
++    fragmentEndFollowingLengthGoalFromPreceding = (lengthGoal - fragmentEndFromPreceding) + beforeIdx;
++    return beforeIdx;
+   }
+ 
+   @Override
+diff --git a/lucene/highlighter/src/test/org/apache/lucene/search/uhighlight/LengthGoalBreakIteratorTest.java b/lucene/highlighter/src/test/org/apache/lucene/search/uhighlight/LengthGoalBreakIteratorTest.java
+index 2434f5259e5..cbd8256d723 100644
+--- a/lucene/highlighter/src/test/org/apache/lucene/search/uhighlight/LengthGoalBreakIteratorTest.java
++++ b/lucene/highlighter/src/test/org/apache/lucene/search/uhighlight/LengthGoalBreakIteratorTest.java
+@@ -28,6 +28,7 @@ import org.apache.lucene.util.QueryBuilder;
+ 
+ public class LengthGoalBreakIteratorTest extends LuceneTestCase {
+   private static final String FIELD = "body";
++  private static final float[] ALIGNS = {0.f, 0.5f, 1.f};
+ 
+   // We test LengthGoalBreakIterator as it is used by the UnifiedHighlighter instead of directly, because it is
+   //  not a general purpose BreakIterator.  A unit test of it directly wouldn't give as much confidence.
+@@ -45,59 +46,94 @@ public class LengthGoalBreakIteratorTest extends LuceneTestCase {
+ 
+     // at first word:
+     Query query = query("aa");
+-    assertEquals("almost two sent",
+-        "<b>Aa</b> bb.", highlightClosestToLen(CONTENT, query, 9));
+-    assertEquals( "barely two sent",
+-        "<b>Aa</b> bb. Cc dd.", highlightClosestToLen(CONTENT, query, 10));
+-    assertEquals("long goal",
+-        "<b>Aa</b> bb. Cc dd. Ee ff", highlightClosestToLen(CONTENT, query, 17 + random().nextInt(20)));
++    for (float align : ALIGNS) { // alignment is not meaningful to boundary anchored matches
++      assertEquals(String.format("almost two sent %f", align),
++          "<b>Aa</b> bb.", highlightClosestToLen(CONTENT, query, 9, align));
++      assertEquals(String.format("barely two sent %f", align),
++          "<b>Aa</b> bb. Cc dd.", highlightClosestToLen(CONTENT, query, 11, align));
++      assertEquals(String.format("long goal %f", align),
++          "<b>Aa</b> bb. Cc dd. Ee ff", highlightClosestToLen(CONTENT, query, 17 + random().nextInt(20), align));
++    }
+ 
+     // at some word not at start of passage
+     query = query("dd");
+-    assertEquals("short goal",
+-        " Cc <b>dd</b>.", highlightClosestToLen(CONTENT, query, random().nextInt(5)));
+-    assertEquals("almost two sent",
+-        " Cc <b>dd</b>.", highlightClosestToLen(CONTENT, query, 10));
+-    assertEquals("barely two sent",
+-        " Cc <b>dd</b>. Ee ff", highlightClosestToLen(CONTENT, query, 11));
+-    assertEquals("long goal",
+-        " Cc <b>dd</b>. Ee ff", highlightClosestToLen(CONTENT, query, 12 + random().nextInt(20)));
++    for (float align : ALIGNS) {
++      // alignment is not meaningful when lengthGoal is less than match-fragment
++      assertEquals(String.format("short goal %f", align),
++          " Cc <b>dd</b>.", highlightClosestToLen(CONTENT, query, random().nextInt(5), align));
++      // alignment is not meaningful when target indexes are closer to than match-fragment than prev-next fragments
++      assertEquals(String.format("almost two sent %f", align),
++          " Cc <b>dd</b>.", highlightClosestToLen(CONTENT, query, 9, align));
++    }
++    // preceding/following inclusion by alignment parameter
++    assertEquals("barely two sent A",
++        " Cc <b>dd</b>. Ee ff", highlightClosestToLen(CONTENT, query, 11, 0.f));
++    assertEquals("barely two sent B",
++        " Cc <b>dd</b>. Ee ff", highlightClosestToLen(CONTENT, query, 11, 0.5f));
++    assertEquals("barely two sent C",
++        "Aa bb. Cc <b>dd</b>.", highlightClosestToLen(CONTENT, query, 11, 1.f));
++    assertEquals("long goal A",
++        " Cc <b>dd</b>. Ee ff", highlightClosestToLen(CONTENT, query, 17 + random().nextInt(20), 0.f));
++    assertEquals("long goal B",
++        "Aa bb. Cc <b>dd</b>. Ee ff", highlightClosestToLen(CONTENT, query, 17 + random().nextInt(20), 0.5f));
++    assertEquals("long goal C",
++        "Aa bb. Cc <b>dd</b>. Ee ff", highlightClosestToLen(CONTENT, query, 17 + random().nextInt(20), 1.f));
+   }
+ 
+   public void testMinLen() throws IOException {
+     // minLen mode is simpler than targetLen... just test a few cases
+ 
+     Query query = query("dd");
+-    assertEquals("almost two sent",
+-        " Cc <b>dd</b>.", highlightMinLen(CONTENT, query, 6));
+-    assertEquals("barely two sent",
+-        " Cc <b>dd</b>. Ee ff", highlightMinLen(CONTENT, query, 7));
++    for (float align : ALIGNS) { // alignment is not meaningful when lengthGoal is less or equals than match-fragment
++      assertEquals("almost two sent",
++          " Cc <b>dd</b>.", highlightMinLen(CONTENT, query, 7, align));
++    }
++    assertEquals("barely two sent A",
++        " Cc <b>dd</b>. Ee ff", highlightMinLen(CONTENT, query, 8, 0.f));
++    assertEquals("barely two sent B",
++        " Cc <b>dd</b>. Ee ff", highlightMinLen(CONTENT, query, 8, 0.5f));
++    assertEquals("barely two sent C",
++        "Aa bb. Cc <b>dd</b>.", highlightMinLen(CONTENT, query, 8, 1.f));
++    assertEquals("barely two sent D",
++        " Cc <b>dd</b>. Ee ff", highlightMinLen(CONTENT, query, 8, 0.55f));
++    assertEquals("barely two sent D",
++        "Aa bb. Cc <b>dd</b>.", highlightMinLen(CONTENT, query, 9, 0.55f));
++    assertEquals("barely two sent D",
++        " Cc <b>dd</b>. Ee ff", highlightMinLen(CONTENT, query, 9, 0.45f));
+   }
+ 
+   public void testDefaultSummaryTargetLen() throws IOException {
+     Query query = query("zz");
+-    assertEquals("Aa bb.",
+-        highlightClosestToLen(CONTENT, query, random().nextInt(10))); // < 10
++    for (float align : ALIGNS) { // alignment is not used for creating default-summary
++      assertEquals("Aa bb.",
++          highlightClosestToLen(CONTENT, query, 6 + random().nextInt(4), align));
++      assertEquals("Aa bb. Cc dd.",
++          highlightClosestToLen(CONTENT, query, 12 + random().nextInt(4), align));
++      assertEquals("Aa bb. Cc dd. Ee ff",
++          highlightClosestToLen(CONTENT, query, 17 + random().nextInt(20), align));
++    }
+     assertEquals("Aa bb. Cc dd.",
+-        highlightClosestToLen(CONTENT, query, 10 + 6)); // cusp of adding 3rd sentence
+-    assertEquals("Aa bb. Cc dd. Ee ff",
+-        highlightClosestToLen(CONTENT, query, 17 + random().nextInt(20))); // >= 14
++        highlightClosestToLen(CONTENT, query, 6 + random().nextInt(4), 0.f, 2));
+   }
+ 
+   private Query query(String qStr) {
+     return new QueryBuilder(analyzer).createBooleanQuery(FIELD, qStr);
+   }
+ 
+-  private String highlightClosestToLen(String content, Query query, int lengthGoal) throws IOException {
++  private String highlightClosestToLen(String content, Query query, int lengthGoal, float fragAlign) throws IOException {
++    return highlightClosestToLen(content, query, lengthGoal, fragAlign, 1);
++  }
++
++  private String highlightClosestToLen(String content, Query query, int lengthGoal, float fragAlign, int maxPassages) throws IOException {
+     UnifiedHighlighter highlighter = new UnifiedHighlighter(null, analyzer);
+-    highlighter.setBreakIterator(() -> LengthGoalBreakIterator.createClosestToLength(new CustomSeparatorBreakIterator('.'), lengthGoal));
+-    return highlighter.highlightWithoutSearcher(FIELD, query, content, 1).toString();
++    highlighter.setBreakIterator(() -> LengthGoalBreakIterator.createClosestToLength(new CustomSeparatorBreakIterator('.'), lengthGoal, fragAlign));
++    return highlighter.highlightWithoutSearcher(FIELD, query, content, maxPassages).toString();
+   }
+ 
+-  private String highlightMinLen(String content, Query query, int lengthGoal) throws IOException {
++  private String highlightMinLen(String content, Query query, int lengthGoal, float fragAlign) throws IOException {
+     // differs from above only by "createMinLength"
+     UnifiedHighlighter highlighter = new UnifiedHighlighter(null, analyzer);
+-    highlighter.setBreakIterator(() -> LengthGoalBreakIterator.createMinLength(new CustomSeparatorBreakIterator('.'), lengthGoal));
++    highlighter.setBreakIterator(() -> LengthGoalBreakIterator.createMinLength(new CustomSeparatorBreakIterator('.'), lengthGoal, fragAlign));
+     return highlighter.highlightWithoutSearcher(FIELD, query, content, 1).toString();
+   }
+ }
+\ No newline at end of file
+diff --git a/solr/core/src/java/org/apache/solr/highlight/UnifiedSolrHighlighter.java b/solr/core/src/java/org/apache/solr/highlight/UnifiedSolrHighlighter.java
+index fc43687eaf6..182806427c4 100644
+--- a/solr/core/src/java/org/apache/solr/highlight/UnifiedSolrHighlighter.java
++++ b/solr/core/src/java/org/apache/solr/highlight/UnifiedSolrHighlighter.java
+@@ -326,7 +326,8 @@ public class UnifiedSolrHighlighter extends SolrHighlighter implements PluginInf
+       if (fragsize <= 1) { // no real minimum size
+         return baseBI;
+       }
+-      return LengthGoalBreakIterator.createMinLength(baseBI, fragsize);
++      float fragalign = params.getFieldFloat(field, HighlightParams.FRAGALIGN, 0.f);
++      return LengthGoalBreakIterator.createMinLength(baseBI, fragsize, fragalign);
+       // TODO option for using createClosestToLength()
+     }
+ 
+diff --git a/solr/solr-ref-guide/src/highlighting.adoc b/solr/solr-ref-guide/src/highlighting.adoc
+index 8055b79d7de..c3824ef3dec 100644
+--- a/solr/solr-ref-guide/src/highlighting.adoc
++++ b/solr/solr-ref-guide/src/highlighting.adoc
+@@ -225,6 +225,11 @@ By default, the Unified Highlighter will usually pick the right offset source (s
+ +
+ The offset source can be explicitly configured to one of: `ANALYSIS`, `POSTINGS`, `POSTINGS_WITH_TERM_VECTORS`, or `TERM_VECTORS`.
+ 
++`hl.fragalign`::
++Fragment alignment can influence where the match in a passage is positioned. This floating point value is used to break the remaining `hl.fragsize` of the passage around the match. The default value of `0.0` means to align the match to the left, this is the backward-compatible setting. A value of `0.5` would mean that equal amount of text should be around the match on both sides, while `1.0` to align it to the right. _Note: there are situations where the requested alignment is not plausible. This depends on the length of the match, the used breakiterator and the text content around the match._
+++
++Before the introduction of this parameter all passages had left-aligned matches. Changing the `hl.bs.type` to `WORD` and the `hl.fragalign` to `0.5` will make results that closely resemble what the other highlighters produce by default.
++
+ `hl.tag.ellipsis`::
+ By default, each snippet is returned as a separate value (as is done with the other highlighters). Set this parameter to instead return one string with this text as the delimiter. _Note: this is likely to be removed in the future._
+ 
+diff --git a/solr/solrj/src/java/org/apache/solr/common/params/HighlightParams.java b/solr/solrj/src/java/org/apache/solr/common/params/HighlightParams.java
+index c4825b70627..25402225d32 100644
+--- a/solr/solrj/src/java/org/apache/solr/common/params/HighlightParams.java
++++ b/solr/solrj/src/java/org/apache/solr/common/params/HighlightParams.java
+@@ -47,6 +47,7 @@ public interface HighlightParams {
+ 
+   // sizing
+   public static final String FRAGSIZE    = HIGHLIGHT+".fragsize"; // OH, FVH, UH
++  public static final String FRAGALIGN   = HIGHLIGHT+".fragalign"; // UH
+   public static final String FRAGMENTER  = HIGHLIGHT+".fragmenter"; // OH
+   public static final String INCREMENT   = HIGHLIGHT+".increment"; // OH
+   public static final String REGEX       = "regex"; // OH
+-- 
+2.23.0
+

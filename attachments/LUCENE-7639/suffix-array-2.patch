@@ -1,0 +1,970 @@
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/blocktree/FieldReader.java b/lucene/core/src/java/org/apache/lucene/codecs/blocktree/FieldReader.java
+index 4ee3826..362fa5c 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/blocktree/FieldReader.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/blocktree/FieldReader.java
+@@ -61,6 +61,9 @@ public final class FieldReader extends Terms implements Accountable {
+   final BlockTreeTermsReader parent;
+ 
+   final FST<BytesRef> index;
++
++  final WildcardHelper wildcardHelper;
++
+   //private boolean DEBUG;
+ 
+   FieldReader(BlockTreeTermsReader parent, FieldInfo fieldInfo, long numTerms, BytesRef rootCode, long sumTotalTermFreq, long sumDocFreq, int docCount,
+@@ -99,8 +102,14 @@ public final class FieldReader extends Terms implements Accountable {
+         w.close();
+         }
+       */
++      if (Boolean.parseBoolean(System.getProperty("lucene.suffixArray.enable", "false"))) {
++        wildcardHelper = new WildcardHelper(this, this::iterator);
++      } else {
++        wildcardHelper = null;
++      }
+     } else {
+       index = null;
++      wildcardHelper = null;
+     }
+   }
+ 
+@@ -185,12 +194,22 @@ public final class FieldReader extends Terms implements Accountable {
+     if (compiled.type != CompiledAutomaton.AUTOMATON_TYPE.NORMAL) {
+       throw new IllegalArgumentException("please use CompiledAutomaton.getTermsEnum instead");
+     }
++    final String wildcardText = compiled.wildcardText;
++    if (wildcardText != null && wildcardText.startsWith("*") && wildcardHelper != null && wildcardHelper.isReady()) {
++      String[] parts = wildcardText.split("[*?]");
++      for (final String part : parts) {
++        if (part.length() > 2) {
++          return wildcardHelper.getTermsEnum(wildcardText, part, compiled.runAutomaton);
++        }
++      }
++    }
+     return new IntersectTermsEnum(this, compiled.automaton, compiled.runAutomaton, compiled.commonSuffixRef, startTerm, compiled.sinkState);
+   }
+     
+   @Override
+   public long ramBytesUsed() {
+-    return BASE_RAM_BYTES_USED + ((index!=null)? index.ramBytesUsed() : 0);
++    return BASE_RAM_BYTES_USED + ((index!=null)? index.ramBytesUsed() : 0)
++        + (wildcardHelper != null ? wildcardHelper.ramBytesUsed() : 0);
+   }
+ 
+   @Override
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/blocktree/SuffixArrayBytes.java b/lucene/core/src/java/org/apache/lucene/codecs/blocktree/SuffixArrayBytes.java
+new file mode 100644
+index 0000000..abefc95
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/codecs/blocktree/SuffixArrayBytes.java
+@@ -0,0 +1,171 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.codecs.blocktree;
++
++import java.util.LinkedList;
++
++/**
++ * Sort suffixes of the bytes array and allows to select range of suffixes that starts with given prefix.
++ */
++public class SuffixArrayBytes {
++
++  private final byte[] text;
++
++  /**
++   * index[i] = j means text.substring(j) is ith largest suffix
++   */
++  private final int[] index;
++
++  /**
++   * number of suffixes, {@link #index} length
++   */
++  private final int n;
++
++  /**
++   * Creates sorted suffix array for the given bytes array.
++   * 3-way radix quicksort based on <a href="http://algs4.cs.princeton.edu/63suffix/SuffixArrayX.java.html">http://algs4.cs.princeton.edu/63suffix/SuffixArrayX.java.html</a>
++   * @param text the input bytes array that ends with {@link WildcardHelper#SAFETY_PAD_SIZE} {@link Byte#MIN_VALUE} values
++   * @param index values of this array are starting position of suffixes in {@code text}
++   */
++  public SuffixArrayBytes(final byte[] text, final int[] index) {
++    this.text = text;
++    this.index = index;
++    this.n = index.length;
++
++    LinkedList<int[]> tasks = new LinkedList<>();
++    tasks.add(new int[] {0, n-1, 0});
++    while (!tasks.isEmpty()) {
++      final int[] task = tasks.removeFirst();
++      final int lo = task[0];
++      final int hi = task[1];
++      if (hi <= lo) {
++        continue;
++      }
++      final int d = task[2];
++
++      int lt = lo, gt = hi;
++      //index[lo] - probe suffix
++      final byte probeSuffixPositionD = text[index[lo] + d];
++      int i = lo + 1;
++      while (i <= gt) {
++        byte currentSuffixPositionD = text[index[i] + d];
++        if (currentSuffixPositionD < probeSuffixPositionD) {
++          swapSuffixes(lt++, i++);
++        } else if (currentSuffixPositionD > probeSuffixPositionD) {
++          swapSuffixes(i, gt--);
++        } else {
++          i++;
++        }
++      }
++
++      // index[lo]..index[lt-1] - suffixes before probe
++      tasks.add(new int[] {lo, lt-1, d});
++      // index[lt]..index[gt] - suffixes with the same d symbol as in probe
++      tasks.add(new int[] {lt, gt, d+1});
++      // index[gt+1]..index[hi] - suffixes after probe
++      tasks.add(new int[] {gt+1, hi, d});
++    }
++  }
++
++  /**
++   * @return bytes array that represents input text for suffix array construction
++   */
++  public byte[] getText() {
++    return text;
++  }
++
++  private void swapSuffixes(final int i, final int j) {
++    final int swap = index[i];
++    index[i] = index[j];
++    index[j] = swap;
++  }
++
++  /**
++   * @param i an integer between 0 and <em>n</em>-1
++   * @return the starting position of the <em>i</em>th smallest suffix.
++   */
++  public int index(final int i) {
++    return index[i];
++  }
++
++  /**
++   * Finds range of suffixes with given prefix.
++   * @param prefix part of the wildcard query without * and ? converted to bytes
++   * @return the range of suffixes starting with {@code prefix}, range[0] is the least suffix not less than {@code prefix},
++   * {@code range[1]} - is the least not-matched after {@code range[0]}. If there is no matched suffixes {@code range[0] == range[1]};
++   */
++  public int[] getSuffixesWithPrefix(final byte[] prefix) {
++    int lessThanPrefix = -1;
++    int moreThanPrefix = n;
++    while (lessThanPrefix + 1 < moreThanPrefix) {
++      int mid = lessThanPrefix + (moreThanPrefix - lessThanPrefix) / 2;
++      if (suffixIsAfterPrefix(index[mid], prefix)) {
++        moreThanPrefix = mid;
++      } else {
++        lessThanPrefix = mid;
++      }
++    }
++    if (moreThanPrefix == n || !suffixStartsWithPrefix(index[moreThanPrefix], prefix)) {
++      return new int[] {moreThanPrefix, moreThanPrefix};
++    }
++    int maxValid = moreThanPrefix;
++    int minInvalid = n;
++    while (maxValid + 1 < minInvalid) {
++      int mid = maxValid + (minInvalid - maxValid) / 2;
++      if (suffixStartsWithPrefix(index[mid], prefix)) {
++        maxValid = mid;
++      } else {
++        minInvalid = mid;
++      }
++    }
++    return new int[]{moreThanPrefix, minInvalid};
++  }
++
++  /**
++   * Checks that suffix is after {@code prefix} bytes.
++   * @param suffixStart start of the suffix
++   * @param prefix for comparison
++   * @return suffix is after {@code prefix}
++   */
++  private boolean suffixIsAfterPrefix(final int suffixStart, final byte[] prefix) {
++    for (int j = 0; j < prefix.length; j++) {
++      byte prefixByte = prefix[j];
++      byte suffixByte = text[suffixStart + j];
++      if (prefixByte < suffixByte) {
++        return true;
++      } else if (prefixByte > suffixByte) {
++        return false;
++      }
++    }
++    return true;
++  }
++
++  /**
++   * Checks that suffix starts with {@code prefix} bytes.
++   * @param suffixStart start of the suffix
++   * @param prefix prefix
++   * @return suffix starts with {@code prefix}
++   */
++  private boolean suffixStartsWithPrefix(final int suffixStart, final byte[] prefix) {
++    for (int j = 0; j < prefix.length; j++) {
++      if (prefix[j] != text[suffixStart + j]) {
++        return false;
++      }
++    }
++    return true;
++  }
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/blocktree/WildcardHelper.java b/lucene/core/src/java/org/apache/lucene/codecs/blocktree/WildcardHelper.java
+new file mode 100644
+index 0000000..dc69fe5
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/codecs/blocktree/WildcardHelper.java
+@@ -0,0 +1,392 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.codecs.blocktree;
++
++import org.apache.lucene.index.PostingsEnum;
++import org.apache.lucene.index.TermState;
++import org.apache.lucene.index.TermsEnum;
++import org.apache.lucene.util.Accountable;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.BytesRefIterator;
++import org.apache.lucene.util.RamUsageEstimator;
++import org.apache.lucene.util.automaton.ByteRunAutomaton;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.LinkedBlockingQueue;
++import java.util.concurrent.ThreadPoolExecutor;
++import java.util.concurrent.TimeUnit;
++
++/**
++ * Finds terms matched to given wildcard using suffix array.
++ */
++public class WildcardHelper implements Accountable {
++
++  /**
++   * Number of {@link Byte#MIN_VALUE} values added to the end of the list of all words to avoid array bounds check while comparing suffixes.
++   */
++  public static final int SAFETY_PAD_SIZE = 8;
++
++  /**
++   * Suffix array created asynchronously.
++   */
++  private volatile SuffixArrayBytes suffixArray;
++
++  /**
++   * List of all words represented as bytes from {@link org.apache.lucene.util.BytesRef} with
++   * {#SAFETY_PAD_SIZE} {@link Byte#MIN_VALUE} values at the end.
++   */
++  private volatile byte[] allWords;
++
++  /**
++   * Starts of words {@link #allWords}, last element is total length of all words in bytes.
++   */
++  private volatile int[] wordStarts;
++
++  /**
++   * Original {#link FieldReader} where we add suffix array support for better performance.
++   */
++  private final FieldReader fieldReader;
++
++  /**
++   * Service that allows us to use several threads for suffix arrays sorting.
++   */
++  private final static ExecutorService suffixArrayInitializationService;
++
++  private final boolean optimizeForUTF;
++
++  static {
++    int initializationThreadsCount = 5;
++
++    try {
++      String value = System.getProperty("lucene.suffixArray.initializationThreadsCount", "5");
++      if (value != null) {
++        initializationThreadsCount = Integer.parseInt(value);
++        //it should be at least 1 thread
++        if (initializationThreadsCount < 0) {
++          initializationThreadsCount = 5;
++        }
++      }
++    } catch (Throwable ignored) {
++    }
++
++    if (initializationThreadsCount > 0) {
++      //we should not create more threads than initializationThreadsCount and we need to free all of them after initialization is finished
++      suffixArrayInitializationService = new ThreadPoolExecutor(0, initializationThreadsCount,
++          0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>());
++    } else {
++      suffixArrayInitializationService = null;
++    }
++  }
++
++  /**
++   * Valid suffix starts in {@link #allWords}
++   */
++  private volatile int[] suffixes;
++
++  /**
++   * @param fieldReader              original {@link FieldReader} we are trying to improve
++   * @param bytesRefIteratorProvider source for list of words (will be called 2 times)
++   */
++  public WildcardHelper(final FieldReader fieldReader, final BytesRefIteratorProvider bytesRefIteratorProvider) {
++    this.fieldReader = fieldReader;
++    optimizeForUTF = Boolean.parseBoolean(System.getProperty("lucene.suffixArray.optimizeForUTF", "true"));
++
++    final Runnable suffixArrayInitializer = () -> {
++      try {
++        BytesRefIterator it = bytesRefIteratorProvider.iterator();
++        int totalBytes = 0;
++        int totalCharacters = 0;
++        final List<Integer> suffixArrayWordStartsList = new ArrayList<>();
++        BytesRef ref;
++        while ((ref = it.next()) != null) {
++          suffixArrayWordStartsList.add(totalBytes);
++          totalBytes += ref.length;
++          if (optimizeForUTF) {
++            final String word = ref.utf8ToString();
++            totalCharacters += word.length();
++            for (int i = 0; i < word.length(); i++) {
++              if (isSecondSymbolInSurrogatePair(word, i)) {
++                totalCharacters--;
++              }
++            }
++          } else {
++            totalCharacters += ref.length;
++          }
++        }
++        suffixArrayWordStartsList.add(totalBytes);
++        wordStarts = suffixArrayWordStartsList.stream().mapToInt(i -> i).toArray();
++
++        final int bytesCount = wordStarts[wordStarts.length - 1];
++        allWords = new byte[bytesCount + (optimizeForUTF ? SAFETY_PAD_SIZE : 1024)];
++        for (int i = bytesCount; i < allWords.length; i++) {
++          allWords[i] = Byte.MIN_VALUE;
++        }
++        //This is workaround for the case when original list of all words has two -128 symbols at the end.
++        if (!optimizeForUTF) {
++          allWords[allWords.length - 1] = Byte.MIN_VALUE + 1;
++        }
++
++        suffixes = new int[totalCharacters];
++
++        it = bytesRefIteratorProvider.iterator();
++        int curCharacter = 0;
++        int curByte = 0;
++        while ((ref = it.next()) != null) {
++          System.arraycopy(ref.bytes, ref.offset, allWords, curByte, ref.length);
++          curByte += ref.length;
++          if (optimizeForUTF) {
++            String word = ref.utf8ToString();
++            for (int i = 0; i < word.length(); i++) {
++              if (isSecondSymbolInSurrogatePair(word, i)) {
++                continue;
++              }
++              int suffixLength = new BytesRef(word.substring(i)).length;
++              suffixes[curCharacter] = curByte - suffixLength;
++              curCharacter++;
++            }
++          } else {
++            for (int i = 0; i < ref.length; i++) {
++              suffixes[curCharacter] = curCharacter;
++              curCharacter++;
++            }
++          }
++        }
++        suffixArray = new SuffixArrayBytes(allWords, suffixes);
++      } catch (IOException e) {
++        //Failed to initialize suffix array.
++        allWords = null;
++        suffixes = null;
++      }
++    };
++
++    if (suffixArrayInitializationService != null) {
++      suffixArrayInitializationService.submit(suffixArrayInitializer);
++    } else {
++      suffixArrayInitializer.run();
++    }
++  }
++
++  /**
++   * @return if suffix array already created and we are ready to process requests
++   */
++  public boolean isReady() {
++    return suffixArray != null;
++  }
++
++  /**
++   * Used only for tests.
++   */
++  protected  void waitUntilSuffixArrayInitialization() throws InterruptedException {
++    while (!isReady())
++      suffixArrayInitializationService.awaitTermination(1, TimeUnit.SECONDS);
++  }
++
++  public long ramBytesUsed() {
++    return RamUsageEstimator.shallowSizeOfInstance(WildcardHelper.class) +
++        allWords.length + 4 * (wordStarts.length + suffixes.length)
++        + RamUsageEstimator.shallowSizeOfInstance(SuffixArrayBytes.class);
++  }
++
++  /**
++   * Fast search for terms that matches wildcard query.
++   *
++   * @param wildcardQuery original query
++   * @param hint          substring of original query without * and ?
++   * @param checker       checks matching words against wildcard
++   * @return TermsEnum with matched terms
++   */
++  public TermsEnum getTermsEnum(final String wildcardQuery, final String hint, final ByteRunAutomaton checker) throws IOException {
++    final List<Integer> matchingWords = getMatchingWords(wildcardQuery, hint, checker);
++    return new ListTermsEnum(matchingWords, allWords, wordStarts, fieldReader);
++  }
++
++  /**
++   * Gets terms that matches wildcard query using suffix array.
++   *
++   * @param wildcardQuery original query
++   * @param hint          substring of original query without * and ?
++   * @param checker       checks matching words against wildcard
++   * @return collection of matched terms
++   */
++  public List<Integer> getMatchingWords(final String wildcardQuery, final String hint, final ByteRunAutomaton checker) {
++    final byte[] prefix = convertStringToBytes(hint);
++    final int prefixLength = prefix.length;
++    final CheckWord checkWord;
++    if (wildcardQuery.equals("*" + hint + "*") && optimizeForUTF) {
++      checkWord = (wordStart, suffix, wordEnd) -> true;
++    } else if (wildcardQuery.equals("*" + hint) && optimizeForUTF) {
++      checkWord = (wordStart, suffix, wordEnd) -> suffix + prefixLength == wordEnd;
++    } else {
++      checkWord = (wordStart, suffix, wordEnd) -> checker.run(allWords, wordStart, wordEnd - wordStart);
++    }
++
++    final int[] range = suffixArray.getSuffixesWithPrefix(prefix);
++    final Set<Integer> words = new HashSet<>();
++    for (int pos = range[0]; pos < range[1]; pos++) {
++      final int suffix = suffixArray.index(pos);
++      final int wordIndex = getWordIndex(suffix);
++      final int wordEnd = wordStarts[wordIndex + 1];
++      if (wordEnd >= suffix + prefixLength) {
++        final int wordStart = wordStarts[wordIndex];
++        if (checkWord.accept(wordStart, suffix, wordEnd)) {
++          words.add(wordIndex);
++        }
++      }
++    }
++
++    List<Integer> filteredWords = new ArrayList<>(words);
++    Collections.sort(filteredWords);
++
++    return filteredWords;
++  }
++
++  /**
++   * Converts {@code String} to {@code byte[]} representation from {@link BytesRef}
++   */
++  public static byte[] convertStringToBytes(String hint) {
++    BytesRef ref = new BytesRef(hint);
++    byte[] prefix = new byte[ref.length];
++    System.arraycopy(ref.bytes, ref.offset, prefix, 0, ref.length);
++    return prefix;
++  }
++
++  /**
++   * Finds word that matches to position in {@link #allWords}.
++   *
++   * @param pos index of byte in {@link #allWords}
++   * @return index that points to word start in {@link #wordStarts}
++   */
++  public int getWordIndex(final int pos) {
++    int start = 0;
++    int finish = wordStarts.length - 1;
++    while (wordStarts[start + 1] <= pos) {
++      start++;
++      int middle = (start + finish) / 2;
++      int middlePos = wordStarts[middle];
++      if (middlePos > pos) {
++        finish = middle;
++      } else {
++        start = middle;
++      }
++    }
++    return start;
++  }
++
++  /**
++   * Surrogate pair represented in {@link BytesRef} by 4 bytes, but single {@code char} from
++   * the surrogate pair represented by 3 special bytes. It means that suffix starting with the 2nd
++   * {@code char} in surrogate pair makes no sense.
++   *
++   * @return char at charPosition is the 2nd char in surrogate pair
++   */
++  private boolean isSecondSymbolInSurrogatePair(String word, int charPosition) {
++    int utf32 = word.charAt(charPosition);
++    //Code values from org.apache.lucene.util.UnicodeUtil.UTF16toUTF8() method
++    return utf32 >= 0xDC00 && utf32 <= 0xDFFF;
++  }
++
++  /**
++   * Allows to replace wildcard  usage with trivial checks fro queries like *abc and *abc*.
++   */
++  private interface CheckWord {
++    boolean accept(final int wordStart, final int suffix, final int wordEnd);
++  }
++
++  /**
++   * This interface allows to create {@code WildcardHelper} in unit tests.
++   */
++  public interface BytesRefIteratorProvider {
++    BytesRefIterator iterator() throws IOException;
++  }
++
++  /**
++   * Simple {@link TermsEnum} implementation when we have all matched terms already.
++   */
++  public static class ListTermsEnum extends TermsEnum {
++    private int currentTerm = -1;
++    private final List<Integer> wordIds;
++    private final byte[] allWords;
++    private final int[] wordStarts;
++
++    private final SegmentTermsEnum termsEnum;
++
++    public ListTermsEnum(final List<Integer> terms, final byte[] allWords, final int[] wordStarts, final FieldReader fieldReader) throws IOException {
++      termsEnum = new SegmentTermsEnum(fieldReader);
++      this.wordIds = terms;
++      this.allWords = allWords;
++      this.wordStarts = wordStarts;
++    }
++
++    @Override
++    public SeekStatus seekCeil(final BytesRef text) throws IOException {
++      return termsEnum.seekCeil(text);
++    }
++
++    @Override
++    public void seekExact(final long ord) throws IOException {
++      termsEnum.seekExact(ord);
++    }
++
++    @Override
++    public BytesRef term() throws IOException {
++      return termsEnum.term();
++    }
++
++    @Override
++    public long ord() throws IOException {
++      return termsEnum.ord();
++    }
++
++    @Override
++    public int docFreq() throws IOException {
++      return termsEnum.docFreq();
++    }
++
++    @Override
++    public long totalTermFreq() throws IOException {
++      return termsEnum.totalTermFreq();
++    }
++
++    @Override
++    public PostingsEnum postings(PostingsEnum reuse, int flags) throws IOException {
++      return termsEnum.postings(reuse, flags);
++    }
++
++    @Override
++    public BytesRef next() throws IOException {
++      currentTerm++;
++      if (currentTerm >= wordIds.size()) {
++        return null;
++      }
++      int wordId = wordIds.get(currentTerm);
++      int wordStart = wordStarts[wordId];
++      termsEnum.seekExact(new BytesRef(allWords, wordStart, wordStarts[wordId + 1] - wordStart));
++      return term();
++    }
++
++    @Override
++    public TermState termState() throws IOException {
++      return termsEnum.termState();
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/lucene/core/src/java/org/apache/lucene/search/WildcardQuery.java b/lucene/core/src/java/org/apache/lucene/search/WildcardQuery.java
+index b775dca..d6b8a94 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/WildcardQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/WildcardQuery.java
+@@ -100,8 +100,11 @@ public class WildcardQuery extends AutomatonQuery {
+       }
+       i += length;
+     }
+-    
+-    return Operations.concatenate(automata);
++
++    Automaton automaton = Operations.concatenate(automata);
++    automaton.setWildcardText(wildcardText);
++    return automaton;
++
+   }
+   
+   /**
+diff --git a/lucene/core/src/java/org/apache/lucene/util/automaton/Automaton.java b/lucene/core/src/java/org/apache/lucene/util/automaton/Automaton.java
+index e4a5bd9..1852d72 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/automaton/Automaton.java
++++ b/lucene/core/src/java/org/apache/lucene/util/automaton/Automaton.java
+@@ -83,6 +83,9 @@ public class Automaton implements Accountable {
+   /** True if no state has two transitions leaving with the same label. */
+   private boolean deterministic = true;
+ 
++  /** Original wildcard query. */
++  private String wildcardText = null;
++
+   /** Sole constructor; creates an automaton with no states. */
+   public Automaton() {
+      this(2, 2);
+@@ -322,6 +325,20 @@ public class Automaton implements Accountable {
+     return deterministic;
+   }
+ 
++  /**
++   * @return original wildcard query
++   */
++  public String getWildcardText() {
++    return wildcardText;
++  }
++
++  /**
++   * Sets original wildcard query.
++   */
++  public void setWildcardText(String wildcardText) {
++    this.wildcardText = wildcardText;
++  }
++
+   /** Finishes the current state; call this once you are done adding
+    *  transitions for a state.  This is automatically called if you
+    *  start adding transitions to a new source state, but for the last
+diff --git a/lucene/core/src/java/org/apache/lucene/util/automaton/CompiledAutomaton.java b/lucene/core/src/java/org/apache/lucene/util/automaton/CompiledAutomaton.java
+index bd00a70..d868dfd 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/automaton/CompiledAutomaton.java
++++ b/lucene/core/src/java/org/apache/lucene/util/automaton/CompiledAutomaton.java
+@@ -93,6 +93,9 @@ public class CompiledAutomaton {
+   /** Which state, if any, accepts all suffixes, else -1. */
+   public final int sinkState;
+ 
++  /** Original wildcard query */
++  public final String wildcardText;
++
+   /** Create this, passing simplify=true and finite=null, so that we try
+    *  to simplify the automaton and determine if it is finite. */
+   public CompiledAutomaton(Automaton automaton) {
+@@ -149,6 +152,8 @@ public class CompiledAutomaton {
+       automaton.createState();
+     }
+ 
++    wildcardText = automaton.getWildcardText();
++
+     if (simplify) {
+ 
+       // Test whether the automaton is a "simple" form and
+diff --git a/lucene/core/src/test/org/apache/lucene/codecs/blocktree/TestSuffixArrayBytes.java b/lucene/core/src/test/org/apache/lucene/codecs/blocktree/TestSuffixArrayBytes.java
+new file mode 100644
+index 0000000..e17a57a
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/codecs/blocktree/TestSuffixArrayBytes.java
+@@ -0,0 +1,124 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.codecs.blocktree;
++
++import com.carrotsearch.randomizedtesting.RandomizedContext;
++import com.carrotsearch.randomizedtesting.RandomizedRunner;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.LuceneTestCase;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++
++import java.util.Random;
++
++/**
++ * Tests for {@link SuffixArrayBytes}.
++ */
++@RunWith(RandomizedRunner.class)
++public class TestSuffixArrayBytes extends LuceneTestCase {
++
++  @Test
++  public void testSuffixArraySortingEnglish() throws Exception {
++    final Random rnd = RandomizedContext.current().getRandom();
++    int capacity = 10000 + rnd.nextInt(10000);
++    String text = getText(rnd, capacity, "qwertyuiopasdfghjklzxcvbnm");
++    SuffixArrayBytes sa = getSuffixArray(text);
++
++    for (int i = 0; i < capacity - 1; i++) {
++      String s1 = text.substring(sa.index(i));
++      String s2 = text.substring(sa.index(i + 1));
++      assertTrue("Suffix " + i + " should be before suffix " + (i+1), s1.compareTo(s2) < 0);
++    }
++  }
++
++  private SuffixArrayBytes getSuffixArray(String text) {
++    byte[] textBytes = WildcardHelper.convertStringToBytes(text);
++    for (int i = textBytes.length - WildcardHelper.SAFETY_PAD_SIZE; i < textBytes.length; i++) {
++      textBytes[i] = Byte.MIN_VALUE;
++    }
++
++    int[] suffixes = new int[text.length() - WildcardHelper.SAFETY_PAD_SIZE];
++    for (int i = 0; i < suffixes.length; i++) {
++      suffixes[i] = textBytes.length - new BytesRef(text.substring(i)).length;
++    }
++
++    return new SuffixArrayBytes(textBytes, suffixes);
++  }
++
++  @Test
++  public void testSuffixArrayRange() throws Exception {
++    final Random rnd = RandomizedContext.current().getRandom();
++    int mainTextLength = 10000 + rnd.nextInt(10000);
++    String text = getText(rnd, mainTextLength, "qwertyuiopasdfghjklzxcvbnmйцукенгшщзхъфывапролджэячсмитьбю");
++    SuffixArrayBytes sa = getSuffixArray(text);
++    byte[] bytes = sa.getText();
++    for (int i = 0; i < mainTextLength - 1; i++) {
++      int start1 = sa.index(i);
++      int start2 = sa.index(i + 1);
++      int diff = 0;
++      while (true) {
++        if (bytes[start1 + diff] < bytes[start2 + diff]) {
++          break;
++        }
++        if (bytes[start1 + diff] > bytes[start2 + diff]) {
++          fail("Suffix " + i + "greater than " + (i+1));
++        }
++        diff++;
++      }
++    }
++
++    int endSuffixLength = 1 + rnd.nextInt(50);
++    int endSuffixStart = mainTextLength - endSuffixLength;
++    byte[] query = WildcardHelper.convertStringToBytes(text.substring(endSuffixStart, mainTextLength));
++    assertEquals("End suffix should be found at the end", bytes.length - query.length - WildcardHelper.SAFETY_PAD_SIZE, sa.index(sa.getSuffixesWithPrefix(query)[0]));
++    for (int i = 1; i < 1000; i++) {
++      int beginIndex = rnd.nextInt(text.length() - 1000);
++      String suffix = text.substring(beginIndex, beginIndex + 1 + rnd.nextInt(100));
++      int[] range = sa.getSuffixesWithPrefix(WildcardHelper.convertStringToBytes(suffix));
++      for (int pos = range[0]; pos < range[1]; pos++) {
++        assertTrue("Suffix should be found in text", getSuffix(sa, sa.index(pos)).startsWith(suffix));
++      }
++      if (range[0] > 0) {
++        int suffixStart = sa.index(range[0] - 1);
++        assertFalse("Suffix should not be found before range at " + (range[0] - 1), getSuffix(sa, suffixStart).startsWith(suffix));
++      }
++      if (range[1] < mainTextLength) {
++        int suffixStart = sa.index(range[1]);
++        assertFalse("Suffix should not be found after range at " + range[1], getSuffix(sa, suffixStart).startsWith(suffix));
++      }
++
++    }
++    assertEquals("{127} suffix should be positioned at the end", sa.getSuffixesWithPrefix(new byte[]{127, 127, 127, 127})[0], mainTextLength);
++    assertEquals("{-128} suffix should be positioned at 0", sa.getSuffixesWithPrefix(new byte[]{-128, -128, -128,-128})[0], 0);
++  }
++
++  private String getText(Random rnd, int mainTextLength, String letters) {
++    StringBuilder sb = new StringBuilder(mainTextLength);
++    for (int i = 0; i < mainTextLength; i++) {
++      sb.append(letters.charAt(rnd.nextInt(letters.length())));
++    }
++    for (int i = 0; i < WildcardHelper.SAFETY_PAD_SIZE; i++) {
++      sb.append("0");
++    }
++    return sb.toString();
++  }
++
++  private String getSuffix(final SuffixArrayBytes sa, final int suffixStart) {
++    final byte[] textBytes = sa.getText();
++    return new BytesRef(textBytes, suffixStart, textBytes.length - suffixStart - WildcardHelper.SAFETY_PAD_SIZE).utf8ToString();
++  }
++}
+diff --git a/lucene/core/src/test/org/apache/lucene/codecs/blocktree/TestWildcardHelper.java b/lucene/core/src/test/org/apache/lucene/codecs/blocktree/TestWildcardHelper.java
+new file mode 100644
+index 0000000..2280459
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/codecs/blocktree/TestWildcardHelper.java
+@@ -0,0 +1,127 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.codecs.blocktree;
++
++import com.carrotsearch.randomizedtesting.RandomizedContext;
++import com.carrotsearch.randomizedtesting.RandomizedRunner;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.BytesRefIterator;
++import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util.automaton.Automaton;
++import org.apache.lucene.util.automaton.ByteRunAutomaton;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Random;
++import java.util.Set;
++
++/**
++ * Tests for {@link WildcardHelper}.
++ */
++@RunWith(RandomizedRunner.class)
++public class TestWildcardHelper extends LuceneTestCase {
++
++  @Test
++  public void testSuffixArrayIntegration() throws Exception {
++    final Random rnd = RandomizedContext.current().getRandom();
++    int capacity = 100000 + rnd.nextInt(100000);
++    String letters = "qwertyuiopasdfghjklzxcvbnmйцукенгшщзхъфывапролджэячсмитьбю";
++    final List<String> words = new ArrayList<>();
++    final Set<String> allWordsSet = new HashSet<>();
++    StringBuilder wordBuilder = new StringBuilder();
++    for (int i = 0; i < capacity; i++) {
++      char ch = letters.charAt(rnd.nextInt(letters.length()));
++      wordBuilder.append(ch);
++      if (rnd.nextInt(10) == 1) {
++        String word = wordBuilder.toString();
++        if (allWordsSet.add(word)) {
++          words.add(word);
++          wordBuilder = new StringBuilder();
++        }
++      }
++    }
++
++    Collections.sort(words);
++
++    WildcardHelper wildcardHelper = new WildcardHelper(null, () ->
++        new BytesRefIterator() {
++          private int cur = -1;
++
++          @Override
++          public BytesRef next() throws IOException {
++            cur++;
++            return cur >= words.size() ? null : new BytesRef(words.get(cur));
++          }
++        });
++
++    wildcardHelper.waitUntilSuffixArrayInitialization();
++
++    int pos = 0;
++    for (int i = 0; i < words.size(); i++) {
++      String word = words.get(i);
++      int len = new BytesRef(word).length;
++      for (int j = 0; j < len; j++) {
++        assertEquals(pos + " points to wrong word", i, wildcardHelper.getWordIndex(pos));
++        pos++;
++      }
++    }
++    while (!wildcardHelper.isReady()) {
++      Thread.sleep(1000);
++    }
++    String substring = "";
++    for (int i = 0; i < 6; i++) {
++      char ch = letters.charAt(rnd.nextInt(letters.length()));
++      substring += ch;
++      Set<String> wordsWithSubstringSet = new HashSet<>();
++      Set<String> wordsEndsWithSubstringSet = new HashSet<>();
++      Set<String> wordsEndsWithSubstringQSet = new HashSet<>();
++      for (String word : words) {
++        if (word.contains(substring)) {
++          wordsWithSubstringSet.add(word);
++        }
++        if (word.endsWith(substring)) {
++          wordsEndsWithSubstringSet.add(word);
++        }
++        if (word.substring(0, word.length() -1).endsWith(substring)) {
++          wordsEndsWithSubstringQSet.add(word);
++        }
++      }
++      testCollection(words, wildcardHelper, "*" + substring + "*", wordsWithSubstringSet, substring);
++      testCollection(words, wildcardHelper, "*" + substring, wordsEndsWithSubstringSet, substring);
++      testCollection(words, wildcardHelper, "*" + substring + "?", wordsEndsWithSubstringQSet, substring);
++    }
++  }
++
++  private void testCollection(List<String> words, WildcardHelper wildcardHelper,
++                              String wildcardText, Set<String> matchingWordsSet, String substring) throws IOException {
++    List<String> matchingWords = new ArrayList<>(matchingWordsSet);
++    Collections.sort(matchingWords);
++    Collection<Integer> wordIds = wildcardHelper.getMatchingWords(wildcardText, substring,
++        new ByteRunAutomaton(new Automaton()));
++    int pos = 0;
++    for (int wordId : wordIds) {
++      assertEquals("Mismatch in list of words for " + wildcardText + " at position " + pos, words.get(wordId), matchingWords.get(pos));
++      pos++;
++    }
++  }
++}
+
+

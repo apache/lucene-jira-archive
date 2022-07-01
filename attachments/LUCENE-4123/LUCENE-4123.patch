@@ -1,0 +1,330 @@
+Index: lucene/core/src/java/org/apache/lucene/store/SimpleFSDirectory.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/store/SimpleFSDirectory.java	(revision 1381230)
++++ lucene/core/src/java/org/apache/lucene/store/SimpleFSDirectory.java	(working copy)
+@@ -202,6 +202,9 @@
+   
+     @Override
+     public SimpleFSIndexInput clone() {
++      if (!file.isOpen) {
++        throw new AlreadyClosedException("SimpleFSIndexInput already closed: " + this);
++      }
+       SimpleFSIndexInput clone = (SimpleFSIndexInput)super.clone();
+       clone.isClone = true;
+       return clone;
+Index: lucene/core/src/java/org/apache/lucene/store/CachingRAMDirectory.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/store/CachingRAMDirectory.java	(revision 0)
++++ lucene/core/src/java/org/apache/lucene/store/CachingRAMDirectory.java	(working copy)
+@@ -0,0 +1,304 @@
++package org.apache.lucene.store;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.EOFException;
++import java.io.IOException;
++import java.util.Collection;
++import java.util.concurrent.ConcurrentHashMap;
++
++// TODO
++//   - off heap alloc?  native (unsafe) alloc?
++//   - we could segment the byte[] so we can handle > 2.1 GB
++//     files
++
++// nocommit back move to misc
++
++/** Wraps another directory but on opening an input fully
++ *  loads the file's contents into a single byte[] and reads
++ *  from that.  This cannot handle files over ~2.1 GB! */
++public class CachingRAMDirectory extends Directory implements Cloneable {
++  private final Directory delegate;
++
++  private final ConcurrentHashMap<String,CachedIndexInput> files = new ConcurrentHashMap<String,CachedIndexInput>();
++
++  public CachingRAMDirectory(Directory delegate) {
++    this.delegate = delegate;
++    this.lockFactory = delegate.getLockFactory();
++  }
++
++  // nocommit
++  public CachingRAMDirectory() {
++    this(new RAMDirectory());
++  }
++
++  @Override
++  public synchronized Lock makeLock(String name) {
++    return delegate.makeLock(name);
++  }
++
++  @Override
++  public synchronized void clearLock(String name) throws IOException {
++    delegate.clearLock(name);
++  }
++
++  @Override
++  public synchronized void setLockFactory(LockFactory lockFactory) throws IOException {
++    delegate.setLockFactory(lockFactory);
++  }
++
++  @Override
++  public synchronized LockFactory getLockFactory() {
++    return delegate.getLockFactory();
++  }
++
++  @Override
++  public synchronized String getLockID() {
++    return delegate.getLockID();
++  }
++
++  @Override
++  public final String[] listAll() throws IOException {
++    return delegate.listAll();
++  }
++
++  @Override
++  public final boolean fileExists(String name) throws IOException {
++    return delegate.fileExists(name);
++  }
++
++  @Override
++  public final long fileLength(String name) throws IOException {
++    return delegate.fileLength(name);
++  }
++
++  @Override
++  public void deleteFile(String name) throws IOException {
++    files.remove(name);
++    delegate.deleteFile(name);
++  }
++
++  @Override
++  public synchronized IndexOutput createOutput(String name, IOContext context) throws IOException {
++    // NOTE: Lucene doesn't normally double-write, but some
++    // tests do:
++    if (files.containsKey(name)) {
++      files.remove(name);
++    }
++    return delegate.createOutput(name, context);
++  }
++
++  @Override
++  public void sync(Collection<String> names) throws IOException {
++    delegate.sync(names);
++  }
++
++  private boolean doCache(String name) {
++    if (name.startsWith("segments")) {
++      // We cannot cache the segments_N files: Lucene will
++      // in general open them while they are still being
++      // written
++      return false;
++    } else {
++      // All other files are only opened once they are done
++      // being written:
++      return true;
++    }
++  }
++
++  @Override
++  public synchronized IndexInput openInput(String name, IOContext context) throws IOException {
++    if (!doCache(name)) {
++      return delegate.openInput(name, context);
++    } else {
++      if (!files.containsKey(name)) {
++        files.put(name, new CachedIndexInput(name, loadBytes(name, context)));
++      }
++    }
++
++    return files.get(name).clone();
++  }
++
++  void checkSize(String name, long size) {
++    if (size > Integer.MAX_VALUE) {
++      throw new IllegalStateException("cannot read file " + name + ": size (= " + size + ") is over Integer.MAX_VALUE");          
++    }
++  }
++
++  @Override
++  public IndexInputSlicer createSlicer(final String name, final IOContext context) throws IOException {
++    ensureOpen();
++
++    if (!doCache(name)) {
++      // NOTE: This is purely defensive ... we never
++      // createSlicer on segments_N files:
++      return delegate.createSlicer(name, context);
++    }
++
++    final CachedIndexInput input = (CachedIndexInput) openInput(name, context);
++
++    return new IndexInputSlicer() {
++
++      @Override
++      public void close() {
++        input.close();
++      }
++
++      @Override
++      public IndexInput openSlice(String sliceDescription, long offset, long length) throws IOException {
++        input.ensureOpen();
++        if (offset + length > input.bytes.length) {
++          throw new IllegalArgumentException("offset (= " + offset + ") + length (=" + length + ") > file length (=" + input.bytes.length + ")");
++        }
++        if (offset < 0) {
++          throw new IllegalArgumentException("offset must be >= 0 (got " + offset + ")");
++        }
++        if (length < 0) {
++          throw new IllegalArgumentException("length must be >= 0 (got " + length + ")");
++        }
++        String name = sliceDescription + " in path=\"" + input + "\" slice=" + offset + ":" + (offset+length) + ")";
++        checkSize(name, offset+length);
++        return new CachedIndexInput(name, input.bytes, (int) offset, (int) length);
++      }
++
++      @Override
++      public IndexInput openFullSlice() throws IOException {
++        return openSlice("full-slice", 0, input.bytes.length);
++      }
++    };
++  }
++
++  @Override
++  public void close() throws IOException {
++    delegate.close();
++    files.clear();
++  }
++
++  private byte[] loadBytes(String name, IOContext context) throws IOException {
++    long length = delegate.fileLength(name);
++    checkSize(name, length);
++
++    IndexInput in = delegate.openInput(name, context);
++    final byte[] bytes = new byte[(int) length];
++    try {
++      if (in instanceof BufferedIndexInput) {
++        ((BufferedIndexInput) in).readBytes(bytes, 0, (int) length, false);
++      } else {
++        in.readBytes(bytes, 0, (int) length);
++      }
++    } finally {
++      in.close();
++    }
++
++    return bytes;
++  }
++
++  // TODO: can we somehow merge w/ or extend ByteArrayDataInput?
++  private static final class CachedIndexInput extends IndexInput {
++    // NOTE: 2.1 GB limit!!!
++    final byte[] bytes;
++    private int pos;
++    private final int offset;
++    private final int length;
++
++    public CachedIndexInput(String name, byte[] bytes, int offset, int length) throws IOException {
++      super("CachedIndexInput(" + name + ")");
++      this.pos = offset;
++      this.bytes = bytes;
++      this.offset = offset;
++      this.length = length;
++    }
++
++    public CachedIndexInput(String name, byte[] bytes) throws IOException {
++      this(name, bytes, 0, bytes.length);
++    }
++
++    @Override
++    public void close() {
++      // We check this (below) to throw AlreadyClosedException:
++      pos = Integer.MIN_VALUE;
++    }
++
++    @Override
++    public long length() {
++      return length;
++    }
++
++    @Override
++    public byte readByte() throws IOException {
++      // nocommit does not enforce slice length.... hmm:
++      try {
++        return bytes[pos++];
++      } catch (ArrayIndexOutOfBoundsException aioobe) {
++        handleExc();
++        // Dead code, but compiler disagrees:
++        return 0;
++      }
++    }
++
++    @Override
++    public void readBytes(byte[] b, int offset, int len) throws IOException {
++      // nocommit does not enforce slice length.... hmm:
++      try {
++        System.arraycopy(bytes, pos, b, offset, len);
++      } catch (IndexOutOfBoundsException ioobe) {
++        handleExc();
++      } 
++      pos += len;
++    }
++
++    @Override
++    public IndexInput clone() {
++      ensureOpen();
++      return super.clone();
++    }
++
++    @Override
++    public long getFilePointer() {
++      ensureOpen();
++      return pos - offset;
++    }
++
++    @Override
++    public void seek(long pos) throws IOException {
++      ensureOpen();
++      if ((pos+offset) > bytes.length) {
++        throw new EOFException("read past EOF: " + this);
++      } else if (pos < 0) {
++        throw new IllegalArgumentException("pos must be >=0 (got: " + pos + ")");
++      }
++      this.pos = (int) (offset + pos);
++    }
++
++    void ensureOpen() {
++      if (pos < 0) {
++        throw new AlreadyClosedException("CachedIndexInput already closed: " + this);
++      }
++    }
++
++    private void handleExc() throws IOException {
++      if (pos < 0) {
++        // readByte() will have incremented it:
++        pos = Integer.MIN_VALUE;
++        ensureOpen();
++      } else {
++        throw new EOFException("read past EOF: " + this);
++      }
++    }
++  }
++}
+
+Property changes on: lucene/core/src/java/org/apache/lucene/store/CachingRAMDirectory.java
+___________________________________________________________________
+Added: svn:eol-style
+## -0,0 +1 ##
++native
+\ No newline at end of property

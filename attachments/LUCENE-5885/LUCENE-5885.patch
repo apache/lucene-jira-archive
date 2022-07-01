@@ -1,0 +1,433 @@
+Index: lucene/CHANGES.txt
+===================================================================
+--- lucene/CHANGES.txt	(revision 1618011)
++++ lucene/CHANGES.txt	(working copy)
+@@ -173,6 +173,10 @@
+   merge with UpgradeIndexMergePolicy without reopening the writer. Also, MergePolicy
+   no longer implements Closeable; if you need to release your custom MegePolicy's
+   resources, you need to implement close() and call it explicitly. (Shai Erera)
++
++* LUCENE-5885: MergeScheduler no longer implements Closeable. Also, 
++  ConcurrentMergeScheduler.sync() was removed - you can call IndexWriter.waitForMerges()
++  to get similar effect. (Shai Erera) 
+   
+ Optimizations
+ 
+Index: lucene/core/src/java/org/apache/lucene/index/ConcurrentMergeScheduler.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/index/ConcurrentMergeScheduler.java	(revision 1618011)
++++ lucene/core/src/java/org/apache/lucene/index/ConcurrentMergeScheduler.java	(working copy)
+@@ -17,15 +17,15 @@
+  * limitations under the License.
+  */
+ 
+-import org.apache.lucene.store.Directory;
+-import org.apache.lucene.util.ThreadInterruptedException;
+-import org.apache.lucene.util.CollectionUtil;
+-
+ import java.io.IOException;
+-import java.util.List;
+ import java.util.ArrayList;
+ import java.util.Comparator;
++import java.util.List;
+ 
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.CollectionUtil;
++import org.apache.lucene.util.ThreadInterruptedException;
++
+ /** A {@link MergeScheduler} that runs each merge using a
+  *  separate thread.
+  *
+@@ -257,42 +257,6 @@
+     }
+   }
+ 
+-  @Override
+-  public void close() {
+-    sync();
+-  }
+-
+-  /** Wait for any running merge threads to finish. This call is not interruptible as used by {@link #close()}. */
+-  public void sync() {
+-    boolean interrupted = false;
+-    try {
+-      while (true) {
+-        MergeThread toSync = null;
+-        synchronized (this) {
+-          for (MergeThread t : mergeThreads) {
+-            if (t.isAlive()) {
+-              toSync = t;
+-              break;
+-            }
+-          }
+-        }
+-        if (toSync != null) {
+-          try {
+-            toSync.join();
+-          } catch (InterruptedException ie) {
+-            // ignore this Exception, we will retry until all threads are dead
+-            interrupted = true;
+-          }
+-        } else {
+-          break;
+-        }
+-      }
+-    } finally {
+-      // finally, restore interrupt status:
+-      if (interrupted) Thread.currentThread().interrupt();
+-    }
+-  }
+-
+   /**
+    * Returns the number of merge threads that are alive. Note that this number
+    * is &le; {@link #mergeThreads} size.
+Index: lucene/core/src/java/org/apache/lucene/index/IndexWriter.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/index/IndexWriter.java	(revision 1618011)
++++ lucene/core/src/java/org/apache/lucene/index/IndexWriter.java	(working copy)
+@@ -32,8 +32,8 @@
+ import java.util.LinkedList;
+ import java.util.List;
+ import java.util.Locale;
++import java.util.Map;
+ import java.util.Map.Entry;
+-import java.util.Map;
+ import java.util.Queue;
+ import java.util.Set;
+ import java.util.concurrent.atomic.AtomicInteger;
+@@ -1997,7 +1997,7 @@
+     }
+     
+     try {
+-      synchronized(this) {
++      synchronized (this) {
+         finishMerges(false);
+         stopMerges = true;
+       }
+@@ -2006,9 +2006,7 @@
+         infoStream.message("IW", "rollback: done finish merges");
+       }
+ 
+-      // Must pre-close in case it increments changeCount so that we can then
+-      // set it to false before calling closeInternal
+-      mergeScheduler.close();
++      assert pendingMerges.isEmpty() && runningMerges.isEmpty() : "we should not have any merges pending or running at this point!";
+ 
+       bufferedUpdatesStream.clear();
+       docWriter.close(); // mark it as closed first to prevent subsequent indexing actions/flushes 
+@@ -2057,12 +2055,6 @@
+     } catch (OutOfMemoryError oom) {
+       handleOOM(oom, "rollbackInternal");
+     } finally {
+-      if (!success) {
+-        // Must not hold IW's lock while closing
+-        // mergeScheduler: this can lead to deadlock,
+-        // e.g. TestIW.testThreadInterruptDeadlock
+-        IOUtils.closeWhileHandlingException(mergeScheduler);
+-      }
+       synchronized(this) {
+         if (!success) {
+           // we tried to be nice about it: do the minimum
+@@ -2203,11 +2195,22 @@
+       // sure they all stop.  It should not take very long
+       // because the merge threads periodically check if
+       // they are aborted.
+-      while(runningMerges.size() > 0) {
+-        if (infoStream.isEnabled("IW")) {
+-          infoStream.message("IW", "now wait for " + runningMerges.size() + " running merge/s to abort");
++      boolean interrupted = false;
++      try {
++        while (runningMerges.size() > 0) {
++          if (infoStream.isEnabled("IW")) {
++            infoStream.message("IW", "now wait for " + runningMerges.size() + " running merge/s to abort");
++          }
++          try {
++            doWait();
++          } catch (ThreadInterruptedException e) {
++            interrupted = true; // ignore exception until all running merges finish
++          }
+         }
+-        doWait();
++      } finally {
++        if (interrupted) {
++          Thread.currentThread().interrupt(); // restore interrupt state
++        }
+       }
+ 
+       stopMerges = false;
+@@ -4221,7 +4224,7 @@
+       throw new ThreadInterruptedException(ie);
+     }
+   }
+-
++  
+   private boolean keepFullyDeletedSegments;
+ 
+   /** Only for testing.
+Index: lucene/core/src/java/org/apache/lucene/index/MergeScheduler.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/index/MergeScheduler.java	(revision 1618011)
++++ lucene/core/src/java/org/apache/lucene/index/MergeScheduler.java	(working copy)
+@@ -17,7 +17,6 @@
+  * limitations under the License.
+  */
+ 
+-import java.io.Closeable;
+ import java.io.IOException;
+ 
+ /** <p>Expert: {@link IndexWriter} uses an instance
+@@ -29,7 +28,7 @@
+  *  instance.</p>
+  * @lucene.experimental
+ */
+-public abstract class MergeScheduler implements Closeable {
++public abstract class MergeScheduler {
+ 
+   /** Sole constructor. (For invocation by subclass 
+    *  constructors, typically implicit.) */
+@@ -36,14 +35,17 @@
+   protected MergeScheduler() {
+   }
+ 
+-  /** Run the merges provided by {@link IndexWriter#getNextMerge()}.
+-   * @param writer the {@link IndexWriter} to obtain the merges from.
+-   * @param trigger the {@link MergeTrigger} that caused this merge to happen
+-   * @param newMergesFound <code>true</code> iff any new merges were found by the caller otherwise <code>false</code>
++  /**
++   * Run the merges provided by {@link IndexWriter#getNextMerge()}.
++   * 
++   * @param writer
++   *          the {@link IndexWriter} to obtain the merges from.
++   * @param trigger
++   *          the {@link MergeTrigger} that caused this merge to happen
++   * @param newMergesFound
++   *          <code>true</code> iff any new merges were found by the caller
++   *          otherwise <code>false</code>
+    * */
+   public abstract void merge(IndexWriter writer, MergeTrigger trigger, boolean newMergesFound) throws IOException;
+ 
+-  /** Close this MergeScheduler. */
+-  @Override
+-  public abstract void close() throws IOException;
+ }
+Index: lucene/core/src/java/org/apache/lucene/index/NoMergeScheduler.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/index/NoMergeScheduler.java	(revision 1618011)
++++ lucene/core/src/java/org/apache/lucene/index/NoMergeScheduler.java	(working copy)
+@@ -37,9 +37,6 @@
+   }
+ 
+   @Override
+-  public void close() {}
+-
+-  @Override
+   public void merge(IndexWriter writer, MergeTrigger trigger, boolean newMergesFound) {}
+ 
+   @Override
+Index: lucene/core/src/java/org/apache/lucene/index/SerialMergeScheduler.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/index/SerialMergeScheduler.java	(revision 1618011)
++++ lucene/core/src/java/org/apache/lucene/index/SerialMergeScheduler.java	(working copy)
+@@ -41,6 +41,4 @@
+     }
+   }
+ 
+-  @Override
+-  public void close() {}
+ }
+Index: lucene/core/src/test/org/apache/lucene/TestMergeSchedulerExternal.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/TestMergeSchedulerExternal.java	(revision 1618011)
++++ lucene/core/src/test/org/apache/lucene/TestMergeSchedulerExternal.java	(working copy)
+@@ -102,7 +102,6 @@
+     for(int i=0;i<20;i++)
+       writer.addDocument(doc);
+ 
+-    ((MyMergeScheduler) writer.getConfig().getMergeScheduler()).sync();
+     writer.close();
+     
+     assertTrue(mergeThreadCreated);
+@@ -123,9 +122,6 @@
+         writer.merge(merge);
+       }
+     }
+-
+-    @Override
+-    public void close() throws IOException {}
+     
+   }
+ 
+Index: lucene/core/src/test/org/apache/lucene/index/TestCrash.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/index/TestCrash.java	(revision 1618011)
++++ lucene/core/src/test/org/apache/lucene/index/TestCrash.java	(working copy)
+@@ -55,10 +55,9 @@
+ 
+   private void crash(final IndexWriter writer) throws IOException {
+     final MockDirectoryWrapper dir = (MockDirectoryWrapper) writer.getDirectory();
+-    ConcurrentMergeScheduler cms = (ConcurrentMergeScheduler) writer.getConfig().getMergeScheduler();
+-    cms.sync();
++    writer.waitForMerges();
+     dir.crash();
+-    cms.sync();
++    writer.waitForMerges();
+     dir.clearCrash();
+   }
+ 
+Index: lucene/core/src/test/org/apache/lucene/index/TestIndexWriter.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/index/TestIndexWriter.java	(revision 1618011)
++++ lucene/core/src/test/org/apache/lucene/index/TestIndexWriter.java	(working copy)
+@@ -84,8 +84,8 @@
+ import org.apache.lucene.util.TestUtil;
+ import org.apache.lucene.util.ThreadInterruptedException;
+ import org.apache.lucene.util.automaton.Automata;
++import org.apache.lucene.util.automaton.Automaton;
+ import org.apache.lucene.util.automaton.CharacterRunAutomaton;
+-import org.apache.lucene.util.automaton.Automaton;
+ import org.junit.Test;
+ 
+ public class TestIndexWriter extends LuceneTestCase {
+@@ -333,7 +333,7 @@
+         Document doc = new Document();
+         doc.add(new Field("field", "aaa" + j, storedTextType));
+         writer.addDocument(doc);
+-        TestUtil.syncConcurrentMerges(writer);
++        writer.waitForMerges();
+         int flushCount = writer.getFlushCount();
+         if (j == 1)
+           lastFlushCount = flushCount;
+@@ -392,7 +392,7 @@
+       int lastFlushCount = -1;
+       for(int j=1;j<52;j++) {
+         writer.deleteDocuments(new Term("field", "aaa" + j));
+-        TestUtil.syncConcurrentMerges(writer);
++        writer.waitForMerges();
+         int flushCount = writer.getFlushCount();
+        
+         if (j == 1)
+@@ -2705,10 +2705,6 @@
+           }
+           super.doMerge(merge);
+         }
+-
+-        @Override
+-        public void close() {
+-        }
+       });
+     IndexWriter w = new IndexWriter(dir, iwc);
+     Document doc = new Document();
+Index: lucene/core/src/test/org/apache/lucene/index/TestIndexWriterExceptions.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/index/TestIndexWriterExceptions.java	(revision 1618011)
++++ lucene/core/src/test/org/apache/lucene/index/TestIndexWriterExceptions.java	(working copy)
+@@ -457,7 +457,7 @@
+         break;
+       }
+ 
+-    ((ConcurrentMergeScheduler) w.getConfig().getMergeScheduler()).sync();
++    w.waitForMerges();
+     assertTrue(testPoint.failed);
+     w.close();
+     dir.close();
+@@ -868,7 +868,7 @@
+         }
+       }
+     }
+-    ((ConcurrentMergeScheduler) writer.getConfig().getMergeScheduler()).sync();
++    writer.waitForMerges();
+     assertTrue(failure.didFail);
+     failure.clearDoFail();
+     writer.close();
+Index: lucene/core/src/test/org/apache/lucene/index/TestIndexWriterMerging.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/index/TestIndexWriterMerging.java	(revision 1618011)
++++ lucene/core/src/test/org/apache/lucene/index/TestIndexWriterMerging.java	(working copy)
+@@ -326,8 +326,6 @@
+       }
+     }
+ 
+-    @Override
+-    public void close() {}
+   }
+ 
+   // LUCENE-1013
+Index: lucene/core/src/test/org/apache/lucene/index/TestIndexWriterOnDiskFull.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/index/TestIndexWriterOnDiskFull.java	(revision 1618011)
++++ lucene/core/src/test/org/apache/lucene/index/TestIndexWriterOnDiskFull.java	(working copy)
+@@ -362,7 +362,7 @@
+           
+           // Make sure all threads from
+           // ConcurrentMergeScheduler are done
+-          TestUtil.syncConcurrentMerges(writer);
++          writer.waitForMerges();
+           
+           if (VERBOSE) {
+             System.out.println("  now test readers");
+@@ -446,11 +446,6 @@
+         
+         writer.close();
+         
+-        // Wait for all BG threads to finish else
+-        // dir.close() will throw IOException because
+-        // there are still open files
+-        TestUtil.syncConcurrentMerges(ms);
+-        
+         dir.close();
+         
+         // Try again with more free space:
+Index: lucene/core/src/test/org/apache/lucene/index/TestIndexWriterReader.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/index/TestIndexWriterReader.java	(revision 1618011)
++++ lucene/core/src/test/org/apache/lucene/index/TestIndexWriterReader.java	(working copy)
+@@ -630,7 +630,7 @@
+     for (int i = 0; i < num; i++) {
+       writer.addDocument(DocHelper.createDocument(i, "test", 4));
+     }
+-    ((ConcurrentMergeScheduler) writer.getConfig().getMergeScheduler()).sync();
++    writer.waitForMerges();
+ 
+     assertTrue(warmer.warmCount > 0);
+     final int count = warmer.warmCount;
+@@ -663,7 +663,7 @@
+     for (int i = 0; i < 10; i++) {
+       writer.addDocument(DocHelper.createDocument(i, "test", 4));
+     }
+-    ((ConcurrentMergeScheduler) writer.getConfig().getMergeScheduler()).sync();
++    writer.waitForMerges();
+ 
+     DirectoryReader r2 = DirectoryReader.openIfChanged(r1);
+     if (r2 != null) {
+Index: lucene/core/src/test/org/apache/lucene/index/TestNoMergeScheduler.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/index/TestNoMergeScheduler.java	(revision 1618011)
++++ lucene/core/src/test/org/apache/lucene/index/TestNoMergeScheduler.java	(working copy)
+@@ -31,7 +31,6 @@
+   @Test
+   public void testNoMergeScheduler() throws Exception {
+     MergeScheduler ms = NoMergeScheduler.INSTANCE;
+-    ms.close();
+     ms.merge(null, RandomPicks.randomFrom(random(), MergeTrigger.values()), random().nextBoolean());
+   }
+ 
+Index: lucene/test-framework/src/java/org/apache/lucene/util/TestUtil.java
+===================================================================
+--- lucene/test-framework/src/java/org/apache/lucene/util/TestUtil.java	(revision 1618011)
++++ lucene/test-framework/src/java/org/apache/lucene/util/TestUtil.java	(working copy)
+@@ -176,15 +176,6 @@
+     zipFile.close();
+   }
+   
+-  public static void syncConcurrentMerges(IndexWriter writer) {
+-    syncConcurrentMerges(writer.getConfig().getMergeScheduler());
+-  }
+-
+-  public static void syncConcurrentMerges(MergeScheduler ms) {
+-    if (ms instanceof ConcurrentMergeScheduler)
+-      ((ConcurrentMergeScheduler) ms).sync();
+-  }
+-
+   /** This runs the CheckIndex tool on the index in.  If any
+    *  issues are hit, a RuntimeException is thrown; else,
+    *  true is returned. */

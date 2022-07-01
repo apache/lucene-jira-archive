@@ -1,0 +1,453 @@
+Index: src/test/org/apache/lucene/index/TestDeletionPolicy.java
+===================================================================
+--- src/test/org/apache/lucene/index/TestDeletionPolicy.java	(revision 701087)
++++ src/test/org/apache/lucene/index/TestDeletionPolicy.java	(working copy)
+@@ -33,6 +33,7 @@
+ import org.apache.lucene.search.TermQuery;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.RAMDirectory;
++import org.apache.lucene.store.MockRAMDirectory;
+ import org.apache.lucene.util.LuceneTestCase;
+ 
+ /*
+@@ -344,6 +345,108 @@
+     }
+   }
+ 
++  /* Uses KeepAllDeletionPolicy to keep all commits around,
++   * then, opens a new IndexWriter on a previous commit
++   * point. */
++  public void testOpenPriorSnapshot() throws IOException {
++  
++    // Never deletes a commit
++    KeepAllDeletionPolicy policy = new KeepAllDeletionPolicy();
++
++    Directory dir = new MockRAMDirectory();
++    policy.dir = dir;
++
++    IndexWriter writer = new IndexWriter(dir, new WhitespaceAnalyzer(), policy, IndexWriter.MaxFieldLength.LIMITED);
++    writer.setMaxBufferedDocs(2);
++    for(int i=0;i<10;i++) {
++      addDoc(writer);
++      if ((1+i)%2 == 0)
++        writer.commit();
++    }
++    writer.close();
++
++    Collection commits = IndexReader.listCommits(dir);
++    assertEquals(6, commits.size());
++    IndexCommit lastCommit = null;
++    Iterator it = commits.iterator();
++    while(it.hasNext()) {
++      IndexCommit commit = (IndexCommit) it.next();
++      if (lastCommit == null || commit.getGeneration() > lastCommit.getGeneration())
++        lastCommit = commit;
++    }
++    assertTrue(lastCommit != null);
++
++    // Now add 1 doc and optimize
++    writer = new IndexWriter(dir, new WhitespaceAnalyzer(), policy, IndexWriter.MaxFieldLength.LIMITED);
++    addDoc(writer);
++    assertEquals(11, writer.numDocs());
++    writer.optimize();
++    writer.close();
++
++    assertEquals(7, IndexReader.listCommits(dir).size());
++
++    // Now open writer on the commit just before optimize:
++    writer = new IndexWriter(dir, new WhitespaceAnalyzer(), policy, IndexWriter.MaxFieldLength.LIMITED, lastCommit);
++    assertEquals(10, writer.numDocs());
++
++    // Should undo our rollback:
++    writer.rollback();
++
++    IndexReader r = IndexReader.open(dir);
++    // Still optimized, still 11 docs
++    assertTrue(r.isOptimized());
++    assertEquals(11, r.numDocs());
++    r.close();
++
++    writer = new IndexWriter(dir, new WhitespaceAnalyzer(), policy, IndexWriter.MaxFieldLength.LIMITED, lastCommit);
++    assertEquals(10, writer.numDocs());
++    // Commits the rollback:
++    writer.close();
++
++    // Now 8 because we made another commit
++    assertEquals(8, IndexReader.listCommits(dir).size());
++    
++    r = IndexReader.open(dir);
++    // Not optimized because we rolled it back, and now only
++    // 10 docs
++    assertTrue(!r.isOptimized());
++    assertEquals(10, r.numDocs());
++    r.close();
++
++    // Reoptimize
++    writer = new IndexWriter(dir, new WhitespaceAnalyzer(), policy, IndexWriter.MaxFieldLength.LIMITED);
++    writer.optimize();
++    writer.close();
++
++    r = IndexReader.open(dir);
++    assertTrue(r.isOptimized());
++    assertEquals(10, r.numDocs());
++    r.close();
++
++    // Now open writer on the commit just before optimize,
++    // but this time keeping only the last commit:
++    writer = new IndexWriter(dir, new WhitespaceAnalyzer(), new KeepOnlyLastCommitDeletionPolicy(), IndexWriter.MaxFieldLength.LIMITED, lastCommit);
++    assertEquals(10, writer.numDocs());
++    
++    // Reader still sees optimized index, because writer
++    // opened on the prior commit has not yet committed:
++    r = IndexReader.open(dir);
++    assertTrue(r.isOptimized());
++    assertEquals(10, r.numDocs());
++    r.close();
++
++    writer.close();
++
++    // Now reader sees unoptimized index:
++    r = IndexReader.open(dir);
++    assertTrue(!r.isOptimized());
++    assertEquals(10, r.numDocs());
++    r.close();
++
++    dir.close();
++  }
++
++
+   /* Test keeping NO commit points.  This is a viable and
+    * useful case eg where you want to build a big index with
+    * autoCommit false and you know there are no readers.
+Index: src/java/org/apache/lucene/index/DirectoryIndexReader.java
+===================================================================
+--- src/java/org/apache/lucene/index/DirectoryIndexReader.java	(revision 701087)
++++ src/java/org/apache/lucene/index/DirectoryIndexReader.java	(working copy)
+@@ -266,6 +266,7 @@
+         // Have the deleter remove any now unreferenced
+         // files due to this commit:
+         deleter.checkpoint(segmentInfos, true);
++        deleter.close();
+ 
+         if (writeLock != null) {
+           writeLock.release();  // release write lock
+Index: src/java/org/apache/lucene/index/SegmentInfos.java
+===================================================================
+--- src/java/org/apache/lucene/index/SegmentInfos.java	(revision 701087)
++++ src/java/org/apache/lucene/index/SegmentInfos.java	(working copy)
+@@ -840,4 +840,14 @@
+     }
+     return buffer.toString();
+   }
++
++  /** Replaces all segments in this instance, but keeps
++   *  generation, version, counter so that future commits
++   *  remain write once.
++   */
++  void replace(SegmentInfos other) {
++    clear();
++    addAll(other);
++    lastGeneration = other.lastGeneration;
++  }
+ }
+Index: src/java/org/apache/lucene/index/IndexWriter.java
+===================================================================
+--- src/java/org/apache/lucene/index/IndexWriter.java	(revision 701087)
++++ src/java/org/apache/lucene/index/IndexWriter.java	(working copy)
+@@ -547,7 +547,7 @@
+    */
+   public IndexWriter(String path, Analyzer a, boolean create, MaxFieldLength mfl)
+        throws CorruptIndexException, LockObtainFailedException, IOException {
+-    init(FSDirectory.getDirectory(path), a, create, true, null, false, mfl.getLimit());
++    init(FSDirectory.getDirectory(path), a, create, true, null, false, mfl.getLimit(), null);
+   }
+ 
+   /**
+@@ -576,7 +576,7 @@
+    */
+   public IndexWriter(String path, Analyzer a, boolean create)
+        throws CorruptIndexException, LockObtainFailedException, IOException {
+-    init(FSDirectory.getDirectory(path), a, create, true, null, true, DEFAULT_MAX_FIELD_LENGTH);
++    init(FSDirectory.getDirectory(path), a, create, true, null, true, DEFAULT_MAX_FIELD_LENGTH, null);
+   }
+ 
+   /**
+@@ -607,7 +607,7 @@
+    */
+   public IndexWriter(File path, Analyzer a, boolean create, MaxFieldLength mfl)
+        throws CorruptIndexException, LockObtainFailedException, IOException {
+-    init(FSDirectory.getDirectory(path), a, create, true, null, false, mfl.getLimit());
++    init(FSDirectory.getDirectory(path), a, create, true, null, false, mfl.getLimit(), null);
+   }
+ 
+   /**
+@@ -636,7 +636,7 @@
+    */
+   public IndexWriter(File path, Analyzer a, boolean create)
+        throws CorruptIndexException, LockObtainFailedException, IOException {
+-    init(FSDirectory.getDirectory(path), a, create, true, null, true, DEFAULT_MAX_FIELD_LENGTH);
++    init(FSDirectory.getDirectory(path), a, create, true, null, true, DEFAULT_MAX_FIELD_LENGTH, null);
+   }
+ 
+   /**
+@@ -667,7 +667,7 @@
+    */
+   public IndexWriter(Directory d, Analyzer a, boolean create, MaxFieldLength mfl)
+        throws CorruptIndexException, LockObtainFailedException, IOException {
+-    init(d, a, create, false, null, false, mfl.getLimit());
++    init(d, a, create, false, null, false, mfl.getLimit(), null);
+   }
+ 
+   /**
+@@ -695,7 +695,7 @@
+    */
+   public IndexWriter(Directory d, Analyzer a, boolean create)
+        throws CorruptIndexException, LockObtainFailedException, IOException {
+-    init(d, a, create, false, null, true, DEFAULT_MAX_FIELD_LENGTH);
++    init(d, a, create, false, null, true, DEFAULT_MAX_FIELD_LENGTH, null);
+   }
+ 
+   /**
+@@ -722,7 +722,7 @@
+    */
+   public IndexWriter(String path, Analyzer a, MaxFieldLength mfl)
+     throws CorruptIndexException, LockObtainFailedException, IOException {
+-    init(FSDirectory.getDirectory(path), a, true, null, false, mfl.getLimit());
++    init(FSDirectory.getDirectory(path), a, true, null, false, mfl.getLimit(), null);
+   }
+ 
+   /**
+@@ -746,7 +746,7 @@
+    */
+   public IndexWriter(String path, Analyzer a)
+     throws CorruptIndexException, LockObtainFailedException, IOException {
+-    init(FSDirectory.getDirectory(path), a, true, null, true, DEFAULT_MAX_FIELD_LENGTH);
++    init(FSDirectory.getDirectory(path), a, true, null, true, DEFAULT_MAX_FIELD_LENGTH, null);
+   }
+ 
+   /**
+@@ -773,7 +773,7 @@
+    */
+   public IndexWriter(File path, Analyzer a, MaxFieldLength mfl)
+     throws CorruptIndexException, LockObtainFailedException, IOException {
+-    init(FSDirectory.getDirectory(path), a, true, null, false, mfl.getLimit());
++    init(FSDirectory.getDirectory(path), a, true, null, false, mfl.getLimit(), null);
+   }
+ 
+   /**
+@@ -797,7 +797,7 @@
+    */
+   public IndexWriter(File path, Analyzer a)
+     throws CorruptIndexException, LockObtainFailedException, IOException {
+-    init(FSDirectory.getDirectory(path), a, true, null, true, DEFAULT_MAX_FIELD_LENGTH);
++    init(FSDirectory.getDirectory(path), a, true, null, true, DEFAULT_MAX_FIELD_LENGTH, null);
+   }
+ 
+   /**
+@@ -824,7 +824,7 @@
+    */
+   public IndexWriter(Directory d, Analyzer a, MaxFieldLength mfl)
+     throws CorruptIndexException, LockObtainFailedException, IOException {
+-    init(d, a, false, null, false, mfl.getLimit());
++    init(d, a, false, null, false, mfl.getLimit(), null);
+   }
+ 
+   /**
+@@ -849,7 +849,7 @@
+    */
+   public IndexWriter(Directory d, Analyzer a)
+     throws CorruptIndexException, LockObtainFailedException, IOException {
+-    init(d, a, false, null, true, DEFAULT_MAX_FIELD_LENGTH);
++    init(d, a, false, null, true, DEFAULT_MAX_FIELD_LENGTH, null);
+   }
+ 
+   /**
+@@ -875,7 +875,7 @@
+    */
+   public IndexWriter(Directory d, boolean autoCommit, Analyzer a)
+     throws CorruptIndexException, LockObtainFailedException, IOException {
+-    init(d, a, false, null, autoCommit, DEFAULT_MAX_FIELD_LENGTH);
++    init(d, a, false, null, autoCommit, DEFAULT_MAX_FIELD_LENGTH, null);
+   }
+ 
+   /**
+@@ -905,7 +905,7 @@
+    */
+   public IndexWriter(Directory d, boolean autoCommit, Analyzer a, boolean create)
+        throws CorruptIndexException, LockObtainFailedException, IOException {
+-    init(d, a, create, false, null, autoCommit, DEFAULT_MAX_FIELD_LENGTH);
++    init(d, a, create, false, null, autoCommit, DEFAULT_MAX_FIELD_LENGTH, null);
+   }
+ 
+   /**
+@@ -932,7 +932,7 @@
+    */
+   public IndexWriter(Directory d, Analyzer a, IndexDeletionPolicy deletionPolicy, MaxFieldLength mfl)
+     throws CorruptIndexException, LockObtainFailedException, IOException {
+-    init(d, a, false, deletionPolicy, false, mfl.getLimit());
++    init(d, a, false, deletionPolicy, false, mfl.getLimit(), null);
+   }
+ 
+   /**
+@@ -959,7 +959,7 @@
+    */
+   public IndexWriter(Directory d, boolean autoCommit, Analyzer a, IndexDeletionPolicy deletionPolicy)
+     throws CorruptIndexException, LockObtainFailedException, IOException {
+-    init(d, a, false, deletionPolicy, autoCommit, DEFAULT_MAX_FIELD_LENGTH);
++    init(d, a, false, deletionPolicy, autoCommit, DEFAULT_MAX_FIELD_LENGTH, null);
+   }
+   
+   /**
+@@ -992,7 +992,7 @@
+    */
+   public IndexWriter(Directory d, Analyzer a, boolean create, IndexDeletionPolicy deletionPolicy, MaxFieldLength mfl)
+        throws CorruptIndexException, LockObtainFailedException, IOException {
+-    init(d, a, create, false, deletionPolicy, false, mfl.getLimit());
++    init(d, a, create, false, deletionPolicy, false, mfl.getLimit(), null);
+   }
+ 
+   /**
+@@ -1025,19 +1025,60 @@
+    */
+   public IndexWriter(Directory d, boolean autoCommit, Analyzer a, boolean create, IndexDeletionPolicy deletionPolicy)
+           throws CorruptIndexException, LockObtainFailedException, IOException {
+-    init(d, a, create, false, deletionPolicy, autoCommit, DEFAULT_MAX_FIELD_LENGTH);
++    init(d, a, create, false, deletionPolicy, autoCommit, DEFAULT_MAX_FIELD_LENGTH, null);
+   }
+ 
+-  private void init(Directory d, Analyzer a, boolean closeDir, IndexDeletionPolicy deletionPolicy, boolean autoCommit, int maxFieldLength)
++  /**
++   * Expert: constructs an IndexWriter on specific commit
++   * point, with a custom {@link IndexDeletionPolicy}, for
++   * the index in <code>d</code>.  Text will be analyzed
++   * with <code>a</code>.
++   *
++   * <p> This is only meaningful if you've used a {@link
++   * IndexDeletionPolicy} in that past that keeps more than
++   * just the last commit.
++   * 
++   * <p>This operation is similar to {@link #rollback()},
++   * except that method can only rollback what's been done
++   * with the current instance of IndexWriter since its last
++   * commit, whereas this method can rollback to an
++   * arbitrary commit point from the past, assuming the
++   * {@link IndexDeletionPolicy} has preserved past
++   * commits.
++   *
++   * <p><b>NOTE</b>: autoCommit (see <a
++   * href="#autoCommit">above</a>) is set to false with this
++   * constructor.
++   *
++   * @param d the index directory
++   * @param a the analyzer to use
++   * @param deletionPolicy see <a href="#deletionPolicy">above</a>
++   * @param mfl whether or not to limit field lengths
++   * @param commitPoint which commit point to open
++   * @throws CorruptIndexException if the index is corrupt
++   * @throws LockObtainFailedException if another writer
++   *  has this index open (<code>write.lock</code> could not
++   *  be obtained)
++   * @throws IOException if the directory cannot be read/written to, or
++   *  if it does not exist and <code>create</code> is
++   *  <code>false</code> or if there is any other low-level
++   *  IO error
++   */
++  public IndexWriter(Directory d, Analyzer a, IndexDeletionPolicy deletionPolicy, MaxFieldLength mfl, IndexCommit commitPoint)
++       throws CorruptIndexException, LockObtainFailedException, IOException {
++    init(d, a, false, false, deletionPolicy, false, mfl.getLimit(), commitPoint);
++  }
++
++  private void init(Directory d, Analyzer a, boolean closeDir, IndexDeletionPolicy deletionPolicy, boolean autoCommit, int maxFieldLength, IndexCommit commitPoint)
+     throws CorruptIndexException, LockObtainFailedException, IOException {
+     if (IndexReader.indexExists(d)) {
+-      init(d, a, false, closeDir, deletionPolicy, autoCommit, maxFieldLength);
++      init(d, a, false, closeDir, deletionPolicy, autoCommit, maxFieldLength, commitPoint);
+     } else {
+-      init(d, a, true, closeDir, deletionPolicy, autoCommit, maxFieldLength);
++      init(d, a, true, closeDir, deletionPolicy, autoCommit, maxFieldLength, commitPoint);
+     }
+   }
+ 
+-  private void init(Directory d, Analyzer a, final boolean create, boolean closeDir, IndexDeletionPolicy deletionPolicy, boolean autoCommit, int maxFieldLength)
++  private void init(Directory d, Analyzer a, final boolean create, boolean closeDir, IndexDeletionPolicy deletionPolicy, boolean autoCommit, int maxFieldLength, IndexCommit commitPoint)
+     throws CorruptIndexException, LockObtainFailedException, IOException {
+     this.closeDir = closeDir;
+     directory = d;
+@@ -1071,6 +1112,21 @@
+       } else {
+         segmentInfos.read(directory);
+ 
++        if (commitPoint != null) {
++          // Swap out all segments, but, keep metadata in
++          // SegmentInfos, like version & generation, to
++          // preserve write-once.  This is important if
++          // readers are open against the future commit
++          // points.
++          if (commitPoint.getDirectory() != directory)
++            throw new IllegalArgumentException("IndexCommit's directory doesn't match my directory");
++          SegmentInfos oldInfos = new SegmentInfos();
++          oldInfos.read(directory, commitPoint.getSegmentsFileName());
++          segmentInfos.replace(oldInfos);
++          changeCount++;
++          message("init: loaded commit \"" + commitPoint.getSegmentsFileName() + "\"");
++        }
++
+         // We assume that this segments_N was previously
+         // properly sync'd:
+         for(int i=0;i<segmentInfos.size();i++) {
+@@ -3410,6 +3466,7 @@
+       try {
+         message("commit: pendingCommit != null");
+         pendingCommit.finishCommit(directory);
++        message("commit: wrote segments file \"" + pendingCommit.getCurrentSegmentFileName() + "\"");
+         lastCommitChangeCount = pendingCommitChangeCount;
+         segmentInfos.updateGeneration(pendingCommit);
+         setRollbackSegmentInfos(pendingCommit);
+Index: src/java/org/apache/lucene/index/IndexFileDeleter.java
+===================================================================
+--- src/java/org/apache/lucene/index/IndexFileDeleter.java	(revision 701087)
++++ src/java/org/apache/lucene/index/IndexFileDeleter.java	(working copy)
+@@ -122,10 +122,8 @@
+   /**
+    * Initialize the deleter: find all previous commits in
+    * the Directory, incref the files they reference, call
+-   * the policy to let it delete commits.  The incoming
+-   * segmentInfos must have been loaded from a commit point
+-   * and not yet modified.  This will remove any files not
+-   * referenced by any of the commits.
++   * the policy to let it delete commits.  This will remove
++   * any files not referenced by any of the commits.
+    * @throws CorruptIndexException if the index is corrupt
+    * @throws IOException if there is a low-level IO error
+    */
+@@ -242,12 +240,9 @@
+     // startup:
+     policy.onInit(commits);
+ 
+-    // It's OK for the onInit to remove the current commit
+-    // point; we just have to checkpoint our in-memory
+-    // SegmentInfos to protect those files that it uses:
+-    if (currentCommitPoint.deleted) {
+-      checkpoint(segmentInfos, false);
+-    }
++    // Always protect the incoming segmentInfos since
++    // sometime it may not be the most recent commit
++    checkpoint(segmentInfos, false);
+     
+     deleteCommits();
+   }
+@@ -341,6 +336,14 @@
+   }
+ 
+   public void close() throws IOException {
++    // DecRef old files from the last checkpoint, if any:
++    int size = lastFiles.size();
++    if (size > 0) {
++      for(int i=0;i<size;i++)
++        decRef((List) lastFiles.get(i));
++      lastFiles.clear();
++    }
++
+     deletePendingFiles();
+   }
+ 

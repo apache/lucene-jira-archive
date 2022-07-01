@@ -1,0 +1,681 @@
+Index: lucene/core/src/java/org/apache/lucene/search/spans/FilterSpans.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/search/spans/FilterSpans.java	(revision 1671420)
++++ lucene/core/src/java/org/apache/lucene/search/spans/FilterSpans.java	(working copy)
+@@ -25,7 +25,7 @@
+ 
+ /**
+  * A {@link Spans} implementation wrapping another spans instance,
+- * allowing to override selected methods in a subclass.
++ * allowing to filter spans matches easily by implementing {@link #accept}
+  */
+ public abstract class FilterSpans extends Spans {
+  
+@@ -32,53 +32,97 @@
+   /** The wrapped spans instance. */
+   protected final Spans in;
+   
++  private boolean atFirstInCurrentDoc = false;
++  private int startPos = -1;
++  
+   /** Wrap the given {@link Spans}. */
+-  public FilterSpans(Spans in) {
++  protected FilterSpans(Spans in) {
+     this.in = Objects.requireNonNull(in);
+   }
+   
++  /** 
++   * Returns YES if the candidate should be an accepted match,
++   * NO if it should not, and NO_MORE_IN_CURRENT_DOC if iteration
++   * should move on to the next document.
++   */
++  protected abstract AcceptStatus accept(Spans candidate) throws IOException;
++  
+   @Override
+-  public int nextDoc() throws IOException {
+-    return in.nextDoc();
++  public final int nextDoc() throws IOException {
++    while (true) {
++      int doc = in.nextDoc();
++      if (doc == NO_MORE_DOCS) {
++        return NO_MORE_DOCS;
++      } else if (twoPhaseCurrentDocMatches()) {
++        return doc;
++      }
++    }
+   }
+ 
+   @Override
+-  public int advance(int target) throws IOException {
+-    return in.advance(target);
++  public final int advance(int target) throws IOException {
++    int doc = in.advance(target);
++    while (doc != NO_MORE_DOCS) {
++      if (twoPhaseCurrentDocMatches()) {
++        break;
++      }
++      doc = in.nextDoc();
++    }
++
++    return doc;
+   }
+ 
+   @Override
+-  public int docID() {
++  public final int docID() {
+     return in.docID();
+   }
+ 
+   @Override
+-  public int nextStartPosition() throws IOException {
+-    return in.nextStartPosition();
++  public final int nextStartPosition() throws IOException {
++    if (atFirstInCurrentDoc) {
++      atFirstInCurrentDoc = false;
++      return startPos;
++    }
++
++    for (;;) {
++      startPos = in.nextStartPosition();
++      if (startPos == NO_MORE_POSITIONS) {
++        return NO_MORE_POSITIONS;
++      }
++      switch(accept(in)) {
++        case YES:
++          return startPos;
++        case NO:
++          break;
++        case NO_MORE_IN_CURRENT_DOC:
++          return startPos = NO_MORE_POSITIONS; // startPos ahead for the current doc.
++      }
++    }
+   }
+ 
+   @Override
+-  public int startPosition() {
+-    return in.startPosition();
++  public final int startPosition() {
++    return atFirstInCurrentDoc ? -1 : startPos;
+   }
+-  
++
+   @Override
+-  public int endPosition() {
+-    return in.endPosition();
++  public final int endPosition() {
++    return atFirstInCurrentDoc ? -1
++          : (startPos != NO_MORE_POSITIONS) ? in.endPosition() : NO_MORE_POSITIONS;
+   }
+   
+   @Override
+-  public Collection<byte[]> getPayload() throws IOException {
++  public final Collection<byte[]> getPayload() throws IOException {
+     return in.getPayload();
+   }
+ 
+   @Override
+-  public boolean isPayloadAvailable() throws IOException {
++  public final boolean isPayloadAvailable() throws IOException {
+     return in.isPayloadAvailable();
+   }
+   
+   @Override
+-  public long cost() {
++  public final long cost() {
+     return in.cost();
+   }
+   
+@@ -88,7 +132,7 @@
+   }
+   
+   @Override
+-  public TwoPhaseIterator asTwoPhaseIterator() {
++  public final TwoPhaseIterator asTwoPhaseIterator() {
+     TwoPhaseIterator inner = in.asTwoPhaseIterator();
+     if (inner != null) {
+       // wrapped instance has an approximation
+@@ -115,5 +159,41 @@
+    * <p>
+    * This is called during two-phase processing.
+    */
+-  public abstract boolean twoPhaseCurrentDocMatches() throws IOException;
++  // return true if the current document matches
++  @SuppressWarnings("fallthrough")
++  private final boolean twoPhaseCurrentDocMatches() throws IOException {
++    atFirstInCurrentDoc = false;
++    startPos = in.nextStartPosition();
++    assert startPos != NO_MORE_POSITIONS;
++    for (;;) {
++      switch(accept(in)) {
++        case YES:
++          atFirstInCurrentDoc = true;
++          return true;
++        case NO:
++          startPos = in.nextStartPosition();
++          if (startPos != NO_MORE_POSITIONS) {
++            break;
++          }
++          // else fallthrough
++        case NO_MORE_IN_CURRENT_DOC:
++          startPos = -1;
++          return false;
++      }
++    }
++  }
++  
++  public static enum AcceptStatus {
++    /** Indicates the match should be accepted */
++    YES,
++
++    /** Indicates the match should be rejected */
++    NO,
++
++    /**
++     * Indicates the match should be rejected, and the enumeration may continue
++     * with the next document.
++     */
++    NO_MORE_IN_CURRENT_DOC
++  };
+ }
+Index: lucene/core/src/java/org/apache/lucene/search/spans/NearSpansUnordered.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/search/spans/NearSpansUnordered.java	(revision 1671420)
++++ lucene/core/src/java/org/apache/lucene/search/spans/NearSpansUnordered.java	(working copy)
+@@ -17,6 +17,7 @@
+  * limitations under the License.
+  */
+ 
++import org.apache.lucene.search.TwoPhaseIterator;
+ import org.apache.lucene.util.PriorityQueue;
+ 
+ import java.io.IOException;
+@@ -71,11 +72,12 @@
+   private int totalSpanLength;
+   private SpansCell maxEndPositionCell;
+ 
+-  private class SpansCell extends FilterSpans {
++  private class SpansCell extends Spans {
+     private int spanLength = -1;
++    final Spans in;
+ 
+     public SpansCell(Spans spans) {
+-      super(spans);
++      this.in = spans;
+     }
+ 
+     @Override
+@@ -106,11 +108,51 @@
+     }
+ 
+     @Override
+-    public boolean twoPhaseCurrentDocMatches() throws IOException {
+-      return true; // we don't modify the spans, we just capture information from it.
++    public int startPosition() {
++      return in.startPosition();
+     }
+ 
+     @Override
++    public int endPosition() {
++      return in.endPosition();
++    }
++
++    @Override
++    public Collection<byte[]> getPayload() throws IOException {
++      return in.getPayload();
++    }
++
++    @Override
++    public boolean isPayloadAvailable() throws IOException {
++      return in.isPayloadAvailable();
++    }
++
++    @Override
++    public TwoPhaseIterator asTwoPhaseIterator() {
++      return in.asTwoPhaseIterator();
++    }
++
++    @Override
++    public int docID() {
++      return in.docID();
++    }
++
++    @Override
++    public int nextDoc() throws IOException {
++      return in.nextDoc();
++    }
++
++    @Override
++    public int advance(int target) throws IOException {
++      return in.advance(target);
++    }
++
++    @Override
++    public long cost() {
++      return in.cost();
++    }
++
++    @Override
+     public String toString() {
+       return "NearSpansUnordered.SpansCell(" + in.toString() + ")";
+     }
+Index: lucene/core/src/java/org/apache/lucene/search/spans/SpanFirstQuery.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/search/spans/SpanFirstQuery.java	(revision 1671331)
++++ lucene/core/src/java/org/apache/lucene/search/spans/SpanFirstQuery.java	(working copy)
+@@ -17,6 +17,7 @@
+  * limitations under the License.
+  */
+ 
++import org.apache.lucene.search.spans.FilterSpans.AcceptStatus;
+ import org.apache.lucene.util.ToStringUtils;
+ 
+ import java.io.IOException;
+Index: lucene/core/src/java/org/apache/lucene/search/spans/SpanNearPayloadCheckQuery.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/search/spans/SpanNearPayloadCheckQuery.java	(revision 1671331)
++++ lucene/core/src/java/org/apache/lucene/search/spans/SpanNearPayloadCheckQuery.java	(working copy)
+@@ -16,6 +16,7 @@
+  * limitations under the License.
+  */
+ 
++import org.apache.lucene.search.spans.FilterSpans.AcceptStatus;
+ import org.apache.lucene.util.ToStringUtils;
+ 
+ import java.io.IOException;
+Index: lucene/core/src/java/org/apache/lucene/search/spans/SpanNotQuery.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/search/spans/SpanNotQuery.java	(revision 1671331)
++++ lucene/core/src/java/org/apache/lucene/search/spans/SpanNotQuery.java	(working copy)
+@@ -21,13 +21,13 @@
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.index.TermContext;
++import org.apache.lucene.search.DocIdSetIterator;
+ import org.apache.lucene.search.Query;
++import org.apache.lucene.search.TwoPhaseIterator;
+ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.ToStringUtils;
+ 
+ import java.io.IOException;
+-import java.util.ArrayList;
+-import java.util.Collection;
+ import java.util.Map;
+ import java.util.Set;
+ import java.util.Objects;
+@@ -115,159 +115,53 @@
+     if (excludeSpans == null) {
+       return includeSpans;
+     }
+-
+-    return new Spans() {
+-      private boolean moreInclude = true;
+-      private int includeStart = -1;
+-      private int includeEnd = -1;
+-      private boolean atFirstInCurrentDoc = false;
+-
+-      private boolean moreExclude = excludeSpans.nextDoc() != NO_MORE_DOCS;
+-      private int excludeStart = moreExclude ? excludeSpans.nextStartPosition() : NO_MORE_POSITIONS;
+-
+-
++    
++    TwoPhaseIterator excludeTwoPhase = excludeSpans.asTwoPhaseIterator();
++    DocIdSetIterator excludeApproximation = excludeTwoPhase == null ? null : excludeTwoPhase.approximation();
++    
++    return new FilterSpans(includeSpans) {
++      // last document we have checked matches() against for the exclusion, and failed
++      // when using approximations, so we don't call it again, and pass thru all inclusions.
++      int lastNonMatchingDoc = -1;
++      
+       @Override
+-      public int nextDoc() throws IOException {
+-        if (moreInclude) {
+-          moreInclude = includeSpans.nextDoc() != NO_MORE_DOCS;
+-          if (moreInclude) {
+-            atFirstInCurrentDoc = true;
+-            includeStart = includeSpans.nextStartPosition();
+-            assert includeStart != NO_MORE_POSITIONS;
+-          }
+-        }
+-        toNextIncluded();
+-        int res = moreInclude ? includeSpans.docID() : NO_MORE_DOCS;
+-        return res;
+-      }
+-
+-      private void toNextIncluded() throws IOException {
+-        while (moreInclude && moreExclude) {
+-          if (includeSpans.docID() > excludeSpans.docID()) {
+-            moreExclude = excludeSpans.advance(includeSpans.docID()) != NO_MORE_DOCS;
+-            if (moreExclude) {
+-              excludeStart = -1; // only use exclude positions at same doc
++      protected AcceptStatus accept(Spans candidate) throws IOException {
++        int doc = candidate.docID();
++        if (doc > excludeSpans.docID()) {
++          // catch up 'exclude' to the current doc
++          if (excludeTwoPhase != null) {
++            if (excludeApproximation.advance(doc) == doc) {
++              if (!excludeTwoPhase.matches()) {
++                lastNonMatchingDoc = doc; // mark as non-match
++              }
+             }
++          } else {
++            excludeSpans.advance(doc);
+           }
+-          if (excludeForwardInCurrentDocAndAtMatch()) {
+-            break; // at match.
+-          }
+-
+-          // else intersected: keep scanning, to next doc if needed
+-          includeStart = includeSpans.nextStartPosition();
+-          if (includeStart == NO_MORE_POSITIONS) {
+-            moreInclude = includeSpans.nextDoc() != NO_MORE_DOCS;
+-            if (moreInclude) {
+-              atFirstInCurrentDoc = true;
+-              includeStart = includeSpans.nextStartPosition();
+-              assert includeStart != NO_MORE_POSITIONS;
+-            }
+-          }
+         }
+-      }
+-
+-      private boolean excludeForwardInCurrentDocAndAtMatch() throws IOException {
+-        assert moreInclude;
+-        assert includeStart != NO_MORE_POSITIONS;
+-        if (! moreExclude) {
+-          return true;
++        
++        if (doc == lastNonMatchingDoc || doc != excludeSpans.docID()) {
++          return AcceptStatus.YES;
+         }
+-        if (includeSpans.docID() != excludeSpans.docID()) {
+-          return true;
++        
++        if (excludeSpans.startPosition() == -1) { // init exclude start position if needed
++          excludeSpans.nextStartPosition();
+         }
+-        // at same doc
+-        if (excludeStart == -1) { // init exclude start position if needed
+-          excludeStart = excludeSpans.nextStartPosition();
+-          assert excludeStart != NO_MORE_POSITIONS;
+-        }
+-        while (excludeSpans.endPosition() <= includeStart - pre) {
++        
++        while (excludeSpans.endPosition() <= candidate.startPosition() - pre) {
+           // exclude end position is before a possible exclusion
+-          excludeStart = excludeSpans.nextStartPosition();
+-          if (excludeStart == NO_MORE_POSITIONS) {
+-            return true; // no more exclude at current doc.
++          if (excludeSpans.nextStartPosition() == NO_MORE_POSITIONS) {
++            return AcceptStatus.YES; // no more exclude at current doc.
+           }
+         }
++        
+         // exclude end position far enough in current doc, check start position:
+-        boolean res = includeSpans.endPosition() + post <= excludeStart;
+-        return res;
+-      }
+-
+-      @Override
+-      public int advance(int target) throws IOException {
+-        if (moreInclude) {
+-          assert target > includeSpans.docID() : "target="+target+", includeSpans.docID()="+includeSpans.docID();
+-          moreInclude = includeSpans.advance(target) != NO_MORE_DOCS;
+-          if (moreInclude) {
+-            atFirstInCurrentDoc = true;
+-            includeStart = includeSpans.nextStartPosition();
+-            assert includeStart != NO_MORE_POSITIONS;
+-          }
++        if (candidate.endPosition() + post <= excludeSpans.startPosition()) {
++          return AcceptStatus.YES;
++        } else {
++          return AcceptStatus.NO;
+         }
+-        toNextIncluded();
+-        int res = moreInclude ? includeSpans.docID() : NO_MORE_DOCS;
+-        return res;
+       }
+-
+-      @Override
+-      public int docID() {
+-        int res = includeSpans.docID();
+-        return res;
+-      }
+-
+-      @Override
+-      public int nextStartPosition() throws IOException {
+-        assert moreInclude;
+-
+-        if (atFirstInCurrentDoc) {
+-          atFirstInCurrentDoc = false;
+-          assert includeStart != NO_MORE_POSITIONS;
+-          return includeStart;
+-        }
+-
+-        includeStart = includeSpans.nextStartPosition();
+-        while ((includeStart != NO_MORE_POSITIONS)
+-            && (! excludeForwardInCurrentDocAndAtMatch()))
+-        {
+-          includeStart = includeSpans.nextStartPosition();
+-        }
+-
+-        return includeStart;
+-      }
+-
+-      @Override
+-      public int startPosition() {
+-        assert includeStart == includeSpans.startPosition();
+-        return atFirstInCurrentDoc ? -1 : includeStart;
+-      }
+-
+-      @Override
+-      public int endPosition() {
+-        return atFirstInCurrentDoc ? -1 : includeSpans.endPosition();
+-      }
+-
+-      @Override
+-      public Collection<byte[]> getPayload() throws IOException {
+-        ArrayList<byte[]> result = null;
+-        if (includeSpans.isPayloadAvailable()) {
+-          result = new ArrayList<>(includeSpans.getPayload());
+-        }
+-        return result;
+-      }
+-
+-      @Override
+-      public boolean isPayloadAvailable() throws IOException {
+-        return includeSpans.isPayloadAvailable();
+-      }
+-
+-      @Override
+-      public long cost() {
+-        return includeSpans.cost();
+-      }
+-
+-      @Override
+-      public String toString() {
+-        return "spans(" + SpanNotQuery.this.toString() + ")";
+-      }
+     };
+   }
+ 
+Index: lucene/core/src/java/org/apache/lucene/search/spans/SpanPayloadCheckQuery.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/search/spans/SpanPayloadCheckQuery.java	(revision 1671331)
++++ lucene/core/src/java/org/apache/lucene/search/spans/SpanPayloadCheckQuery.java	(working copy)
+@@ -16,6 +16,7 @@
+  * limitations under the License.
+  */
+ 
++import org.apache.lucene.search.spans.FilterSpans.AcceptStatus;
+ import org.apache.lucene.util.ToStringUtils;
+ 
+ import java.io.IOException;
+Index: lucene/core/src/java/org/apache/lucene/search/spans/SpanPositionCheckQuery.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/search/spans/SpanPositionCheckQuery.java	(revision 1671420)
++++ lucene/core/src/java/org/apache/lucene/search/spans/SpanPositionCheckQuery.java	(working copy)
+@@ -22,6 +22,7 @@
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.index.TermContext;
+ import org.apache.lucene.search.Query;
++import org.apache.lucene.search.spans.FilterSpans.AcceptStatus;
+ import org.apache.lucene.util.Bits;
+ 
+ import java.io.IOException;
+@@ -59,23 +60,6 @@
+   }
+ 
+   /**
+-   * Return value for {@link SpanPositionCheckQuery#acceptPosition(Spans)}.
+-   */
+-  protected static enum AcceptStatus {
+-    /** Indicates the match should be accepted */
+-    YES,
+-
+-    /** Indicates the match should be rejected */
+-    NO,
+-
+-    /**
+-     * Indicates the match should be rejected, and the enumeration may continue
+-     * with the next document.
+-     */
+-    NO_MORE_IN_CURRENT_DOC
+-  };
+-
+-  /**
+    * Implementing classes are required to return whether the current position is a match for the passed in
+    * "match" {@link SpanQuery}.
+    *
+@@ -95,10 +79,14 @@
+   @Override
+   public Spans getSpans(final LeafReaderContext context, Bits acceptDocs, Map<Term,TermContext> termContexts) throws IOException {
+     Spans matchSpans = match.getSpans(context, acceptDocs, termContexts);
+-    return (matchSpans == null) ? null : new PositionCheckSpans(matchSpans);
++    return (matchSpans == null) ? null : new FilterSpans(matchSpans) {
++      @Override
++      protected AcceptStatus accept(Spans candidate) throws IOException {
++        return acceptPosition(candidate);
++      }
++    };
+   }
+ 
+-
+   @Override
+   public Query rewrite(IndexReader reader) throws IOException {
+     SpanPositionCheckQuery clone = null;
+@@ -116,104 +104,6 @@
+     }
+   }
+ 
+-  protected class PositionCheckSpans extends FilterSpans {
+-
+-    private boolean atFirstInCurrentDoc = false;
+-    private int startPos = -1;
+-
+-    public PositionCheckSpans(Spans matchSpans) throws IOException {
+-      super(matchSpans);
+-    }
+-
+-    @Override
+-    public int nextDoc() throws IOException {
+-      while (true) {
+-        int doc = in.nextDoc();
+-        if (doc == NO_MORE_DOCS) {
+-          return NO_MORE_DOCS;
+-        } else if (twoPhaseCurrentDocMatches()) {
+-          return doc;
+-        }
+-      }
+-    }
+-
+-    @Override
+-    public int advance(int target) throws IOException {
+-      int doc = in.advance(target);
+-      while (doc != NO_MORE_DOCS) {
+-        if (twoPhaseCurrentDocMatches()) {
+-          break;
+-        }
+-        doc = in.nextDoc();
+-      }
+-
+-      return doc;
+-    }
+-
+-    @Override
+-    public int nextStartPosition() throws IOException {
+-      if (atFirstInCurrentDoc) {
+-        atFirstInCurrentDoc = false;
+-        return startPos;
+-      }
+-
+-      for (;;) {
+-        startPos = in.nextStartPosition();
+-        if (startPos == NO_MORE_POSITIONS) {
+-          return NO_MORE_POSITIONS;
+-        }
+-        switch(acceptPosition(in)) {
+-          case YES:
+-            return startPos;
+-          case NO:
+-            break;
+-          case NO_MORE_IN_CURRENT_DOC:
+-            return startPos = NO_MORE_POSITIONS; // startPos ahead for the current doc.
+-        }
+-      }
+-    }
+-    
+-    // return true if the current document matches
+-    @SuppressWarnings("fallthrough")
+-    public boolean twoPhaseCurrentDocMatches() throws IOException {
+-      atFirstInCurrentDoc = false;
+-      startPos = in.nextStartPosition();
+-      assert startPos != NO_MORE_POSITIONS;
+-      for (;;) {
+-        switch(acceptPosition(in)) {
+-          case YES:
+-            atFirstInCurrentDoc = true;
+-            return true;
+-          case NO:
+-            startPos = in.nextStartPosition();
+-            if (startPos != NO_MORE_POSITIONS) {
+-              break;
+-            }
+-            // else fallthrough
+-          case NO_MORE_IN_CURRENT_DOC:
+-            startPos = -1;
+-            return false;
+-        }
+-      }
+-    }
+-
+-    @Override
+-    public int startPosition() {
+-      return atFirstInCurrentDoc ? -1 : startPos;
+-    }
+-
+-    @Override
+-    public int endPosition() {
+-      return atFirstInCurrentDoc ? -1
+-            : (startPos != NO_MORE_POSITIONS) ? in.endPosition() : NO_MORE_POSITIONS;
+-    }
+-
+-    @Override
+-    public String toString() {
+-      return "spans(" + SpanPositionCheckQuery.this.toString() + ")";
+-    }
+-  }
+-
+   /** Returns true iff <code>o</code> is equal to this. */
+   @Override
+   public boolean equals(Object o) {
+Index: lucene/core/src/java/org/apache/lucene/search/spans/SpanPositionRangeQuery.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/search/spans/SpanPositionRangeQuery.java	(revision 1671331)
++++ lucene/core/src/java/org/apache/lucene/search/spans/SpanPositionRangeQuery.java	(working copy)
+@@ -17,6 +17,7 @@
+  */
+ 
+ 
++import org.apache.lucene.search.spans.FilterSpans.AcceptStatus;
+ import org.apache.lucene.util.ToStringUtils;
+ 
+ import java.io.IOException;

@@ -1,0 +1,399 @@
+Index: modules/analysis/common/src/test/org/apache/lucene/analysis/hunspell/HunspellDictionaryTest.java
+===================================================================
+--- modules/analysis/common/src/test/org/apache/lucene/analysis/hunspell/HunspellDictionaryTest.java	(revision 1214804)
++++ modules/analysis/common/src/test/org/apache/lucene/analysis/hunspell/HunspellDictionaryTest.java	(working copy)
+@@ -17,6 +17,8 @@
+  * limitations under the License.
+  */
+ 
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.LuceneTestCase;
+ import org.apache.lucene.util.Version;
+ import org.junit.Test;
+ 
+@@ -24,10 +26,8 @@
+ import java.io.InputStream;
+ import java.text.ParseException;
+ 
+-import static junit.framework.Assert.assertEquals;
++public class HunspellDictionaryTest extends LuceneTestCase {
+ 
+-public class HunspellDictionaryTest {
+-
+   @Test
+   public void testHunspellDictionary_loadDicAff() throws IOException, ParseException {
+     InputStream affixStream = getClass().getResourceAsStream("test.aff");
+@@ -36,7 +36,7 @@
+     HunspellDictionary dictionary = new HunspellDictionary(affixStream, dictStream, Version.LUCENE_40);
+     assertEquals(3, dictionary.lookupSuffix(new char[]{'e'}, 0, 1).size());
+     assertEquals(1, dictionary.lookupPrefix(new char[]{'s'}, 0, 1).size());
+-    assertEquals(1, dictionary.lookupWord(new char[]{'o', 'l', 'r'}, 0, 3).size());
++    assertNotNull(dictionary.lookupWord(new char[]{'o', 'l', 'r'}, 0, 3, new BytesRef()));
+ 
+     affixStream.close();
+     dictStream.close();
+Index: modules/analysis/common/src/java/org/apache/lucene/analysis/hunspell/HunspellDictionary.java
+===================================================================
+--- modules/analysis/common/src/java/org/apache/lucene/analysis/hunspell/HunspellDictionary.java	(revision 1214804)
++++ modules/analysis/common/src/java/org/apache/lucene/analysis/hunspell/HunspellDictionary.java	(working copy)
+@@ -18,7 +18,14 @@
+  */
+ 
+ import org.apache.lucene.analysis.util.CharArrayMap;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.BytesRefHash;
++import org.apache.lucene.util.IntsRef;
++import org.apache.lucene.util.UnicodeUtil;
+ import org.apache.lucene.util.Version;
++import org.apache.lucene.util.fst.Builder;
++import org.apache.lucene.util.fst.FST;
++import org.apache.lucene.util.fst.PositiveIntOutputs;
+ 
+ import java.io.*;
+ import java.nio.charset.Charset;
+@@ -28,10 +35,14 @@
+ import java.util.Arrays;
+ import java.util.List;
+ import java.util.Locale;
++import java.util.Map;
++import java.util.SortedSet;
++import java.util.TreeMap;
++import java.util.TreeSet;
+ 
+ public class HunspellDictionary {
+ 
+-  static final HunspellWord NOFLAGS = new HunspellWord();
++  static final char[] NOFLAGS = new char[0];
+   
+   private static final String PREFIX_KEY = "PFX";
+   private static final String SUFFIX_KEY = "SFX";
+@@ -46,9 +57,15 @@
+ 
+   private static final boolean IGNORE_CASE_DEFAULT = false;
+ 
+-  private CharArrayMap<List<HunspellWord>> words;
+   private CharArrayMap<List<HunspellAffix>> prefixes;
+   private CharArrayMap<List<HunspellAffix>> suffixes;
++  
++  // the entries in the .dic file, mapping to their set of flags.
++  // the fst output is the ordinal for flagLookup
++  private FST<Long> words;
++  // the list of unique flagsets (wordforms). theoretically huge, but practically
++  // small (e.g. for polish this is 756), otherwise humans wouldn't be able to deal with it either.
++  private BytesRefHash flagLookup = new BytesRefHash();
+ 
+   private FlagParsingStrategy flagParsingStrategy = new SimpleFlagParsingStrategy(); // Default flag parsing strategy
+   private boolean ignoreCase = IGNORE_CASE_DEFAULT;
+@@ -101,10 +118,19 @@
+     String encoding = getDictionaryEncoding(affix);
+     CharsetDecoder decoder = getJavaEncoding(encoding);
+     readAffixFile(affix, decoder);
+-    words = new CharArrayMap<List<HunspellWord>>(version, 65535 /* guess */, this.ignoreCase);
++    TreeMap<BytesRef,Integer> tempWords = new TreeMap<BytesRef,Integer>();
++    flagLookup.add(new BytesRef()); // no flags -> ord 0
+     for (InputStream dictionary : dictionaries) {
+-      readDictionaryFile(dictionary, decoder);
++      readDictionaryFile(dictionary, decoder, tempWords);
+     }
++    PositiveIntOutputs o = PositiveIntOutputs.getSingleton(true);
++    Builder<Long> b = new Builder<Long>(FST.INPUT_TYPE.BYTE4, o);
++    IntsRef scratchInts = new IntsRef();
++    for (Map.Entry<BytesRef,Integer> e : tempWords.entrySet()) {
++      UnicodeUtil.UTF8toUTF32(e.getKey(), scratchInts);
++      b.add(scratchInts, o.get(e.getValue().longValue()));
++    }
++    words = b.finish();
+   }
+ 
+   /**
+@@ -115,9 +141,43 @@
+    * @param length Length from the offset that the String is
+    * @return List of HunspellWords that match the generated String, or {@code null} if none are found
+    */
+-  public List<HunspellWord> lookupWord(char word[], int offset, int length) {
+-    return words.get(word, offset, length);
++  public char [] lookupWord(char word[], int offset, int length, BytesRef scratch) {
++    Integer ord = null;
++    try {
++      ord = lookupOrd(word, offset, length);
++    } catch (IOException ex) { /* bogus */ }
++    if (ord == null) {
++      return null;
++    }
++    return decodeFlags(flagLookup.get(ord, scratch));
+   }
++  
++  public Integer lookupOrd(char word[], int offset, int length) throws IOException {
++    final FST.Arc<Long> arc = words.getFirstArc(new FST.Arc<Long>());
++    // Accumulate output as we go
++    final Long NO_OUTPUT = words.outputs.getNoOutput();
++    Long output = NO_OUTPUT;
++    
++    int l = offset + length;
++    for (int i = offset, cp = 0; i < l; i += Character.charCount(cp)) {
++      cp = Character.codePointAt(word, i, l);
++      if (ignoreCase) {
++        cp = Character.toLowerCase(cp);
++      }
++      if (words.findTargetArc(cp, arc, arc) == null) {
++        return null;
++      } else if (arc.output != NO_OUTPUT) {
++        output = words.outputs.add(output, arc.output);
++      }
++    }
++    if (words.findTargetArc(FST.END_LABEL, arc, arc) == null) {
++      return null;
++    } else if (arc.output != NO_OUTPUT) {
++      return words.outputs.add(output, arc.output).intValue();
++    } else {
++      return output.intValue();
++    }
++  }
+ 
+   /**
+    * Looks up HunspellAffix prefixes that have an append that matches the String created from the given char array, offset and length
+@@ -277,7 +337,7 @@
+   }
+ 
+   /**
+-   * Determines the appropriate {@link FlagParsingStrategy} based on the FLAG definition line taken from the affix file
++   * Determines the approHunspellWordpriate {@link FlagParsingStrategy} based on the FLAG definition line taken from the affix file
+    *
+    * @param flagLine Line containing the flag information
+    * @return FlagParsingStrategy that handles parsing flags in the way specified in the FLAG definition
+@@ -303,7 +363,10 @@
+    * @param decoder CharsetDecoder used to decode the contents of the file
+    * @throws IOException Can be thrown while reading from the file
+    */
+-  private void readDictionaryFile(InputStream dictionary, CharsetDecoder decoder) throws IOException {
++  private void readDictionaryFile(InputStream dictionary, CharsetDecoder decoder, TreeMap<BytesRef,Integer> words) throws IOException {
++    BytesRef flagsScratch = new BytesRef();
++    BytesRef flagsScratch2 = new BytesRef();
++    
+     BufferedReader reader = new BufferedReader(new InputStreamReader(dictionary, decoder));
+     // TODO: don't create millions of strings.
+     String line = reader.readLine(); // first line is number of entries
+@@ -313,7 +376,7 @@
+     // either way the trick is to encode them as char... but they must be parsed differently
+     while ((line = reader.readLine()) != null) {
+       String entry;
+-      HunspellWord wordForm;
++      char wordForm[];
+       
+       int flagSep = line.lastIndexOf('/');
+       if (flagSep == -1) {
+@@ -327,22 +390,59 @@
+           end = line.length();
+         
+         
+-        wordForm = new HunspellWord(flagParsingStrategy.parseFlags(line.substring(flagSep + 1, end)));
+-        Arrays.sort(wordForm.getFlags());
++        wordForm = flagParsingStrategy.parseFlags(line.substring(flagSep + 1, end));
++        Arrays.sort(wordForm);
+         entry = line.substring(0, flagSep);
+         if(ignoreCase) {
+           entry = entry.toLowerCase(Locale.ENGLISH);
+         }
+       }
++
++      BytesRef scratch = new BytesRef(entry);
++      Integer existingOrd = words.get(scratch);
++      final char mergedEntries[];
++      if (existingOrd == null || existingOrd == 0) {
++        mergedEntries = wordForm;
++      } else {
++        flagLookup.get(existingOrd, flagsScratch2);
++        mergedEntries = merge(decodeFlags(flagsScratch2), wordForm);
++      }
++
++      final int hashCode = encodeFlagsWithHash(flagsScratch, mergedEntries);
++      int ord = flagLookup.add(flagsScratch, hashCode);
++      if (ord < 0) {
++        // already exists in our hash
++        ord = (-ord)-1;
++      }
+       
+-      List<HunspellWord> entries = words.get(entry);
+-      if (entries == null) {
+-        entries = new ArrayList<HunspellWord>();
+-        words.put(entry, entries);
+-      }
+-      entries.add(wordForm);
++      words.put(scratch, ord);
+     }
+   }
++  
++  public static char[] decodeFlags(BytesRef b) {
++    int len = b.length >>> 1;
++    char flags[] = new char[len];
++    int upto = 0;
++    int end = b.offset + b.length;
++    for (int i = b.offset; i < end; i += 2) {
++      flags[upto++] = (char)((b.bytes[i] << 8) | (b.bytes[i+1] & 0xff));
++    }
++    return flags;
++  }
++  
++  public static int encodeFlagsWithHash(BytesRef b, char flags[]) {
++    int hash = 0;
++    int len = flags.length << 1;
++    b.grow(len);
++    b.length = len;
++    int upto = b.offset;
++    for (int i = 0; i < flags.length; i++) {
++      int flag = flags[i];
++      hash = 31*hash + (b.bytes[upto++] = (byte) ((flag >> 8) & 0xff));
++      hash = 31*hash + (b.bytes[upto++] = (byte) (flag & 0xff));
++    }
++    return hash;
++  }
+ 
+   public Version getVersion() {
+     return version;
+@@ -437,4 +537,26 @@
+   public boolean isIgnoreCase() {
+     return ignoreCase;
+   }
++  
++  static boolean hasFlag(char flags[], char flag) {
++    // TODO: i think we can remove the null check now.
++    return Arrays.binarySearch(flags, flag) >= 0;
++  }
++  
++  static char[] merge(char[] flags1, char[] flags2) {
++    // nocommit: inefficient
++    SortedSet<Character> mergedFlags = new TreeSet<Character>();
++    for (int i = 0; i < flags1.length; i++) {
++      mergedFlags.add(flags1[i]);
++    }
++    for (int i = 0; i < flags2.length; i++) {
++      mergedFlags.add(flags2[i]);
++    }
++    char merged[] = new char[mergedFlags.size()];
++    int upto = 0;
++    for (Character c : mergedFlags) {
++      merged[upto++] = c;
++    }
++    return merged;
++  }
+ }
+Index: modules/analysis/common/src/java/org/apache/lucene/analysis/hunspell/HunspellWord.java
+===================================================================
+--- modules/analysis/common/src/java/org/apache/lucene/analysis/hunspell/HunspellWord.java	(revision 1214804)
++++ modules/analysis/common/src/java/org/apache/lucene/analysis/hunspell/HunspellWord.java	(working copy)
+@@ -1,60 +0,0 @@
+-package org.apache.lucene.analysis.hunspell;
+-
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-import java.util.Arrays;
+-
+-public class HunspellWord {
+-  
+-  private final char flags[]; // sorted, can we represent more concisely?
+-
+-  /**
+-   * Creates a new HunspellWord with no associated flags
+-   */
+-  public HunspellWord() {
+-    flags = null;
+-  }
+-
+-  /**
+-   * Constructs a new HunspellWord with the given flags
+-   *
+-   * @param flags Flags to associate with the word
+-   */
+-  public HunspellWord(char[] flags) {
+-    this.flags = flags;
+-  }
+-
+-  /**
+-   * Checks whether the word has the given flag associated with it
+-   *
+-   * @param flag Flag to check whether it is associated with the word
+-   * @return {@code true} if the flag is associated, {@code false} otherwise
+-   */
+-  public boolean hasFlag(char flag) {
+-    return flags != null && Arrays.binarySearch(flags, flag) >= 0;
+-  }
+-
+-  /**
+-   * Returns the flags associated with the word
+-   *
+-   * @return Flags associated with the word
+-   */
+-  public char[] getFlags() {
+-    return flags;
+-  }
+-}
+Index: modules/analysis/common/src/java/org/apache/lucene/analysis/hunspell/HunspellStemmer.java
+===================================================================
+--- modules/analysis/common/src/java/org/apache/lucene/analysis/hunspell/HunspellStemmer.java	(revision 1214804)
++++ modules/analysis/common/src/java/org/apache/lucene/analysis/hunspell/HunspellStemmer.java	(working copy)
+@@ -29,6 +29,7 @@
+ 
+ import org.apache.lucene.analysis.util.CharArraySet;
+ import org.apache.lucene.analysis.util.CharacterUtils;
++import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.Version;
+ 
+ /**
+@@ -40,6 +41,7 @@
+   private static final int RECURSION_CAP = 2;
+   
+   private final HunspellDictionary dictionary;
++  private BytesRef scratch = new BytesRef();
+   private final StringBuilder segment = new StringBuilder();
+   private CharacterUtils charUtils = CharacterUtils.getInstance(Version.LUCENE_40);
+ 
+@@ -70,7 +72,7 @@
+    */
+   public List<Stem> stem(char word[], int length) {
+     List<Stem> stems = new ArrayList<Stem>();
+-    if (dictionary.lookupWord(word, 0, length) != null) {
++    if (dictionary.lookupWord(word, 0, length, scratch) != null) {
+       stems.add(new Stem(word, length));
+     }
+     stems.addAll(stem(word, length, null, 0));
+@@ -86,7 +88,7 @@
+   public List<Stem> uniqueStems(char word[], int length) {
+     List<Stem> stems = new ArrayList<Stem>();
+     CharArraySet terms = new CharArraySet(dictionary.getVersion(), 8, dictionary.isIgnoreCase());
+-    if (dictionary.lookupWord(word, 0, length) != null) {
++    if (dictionary.lookupWord(word, 0, length, scratch) != null) {
+       stems.add(new Stem(word, length));
+       terms.add(word);
+     }
+@@ -187,13 +189,9 @@
+ 
+     List<Stem> stems = new ArrayList<Stem>();
+ 
+-    List<HunspellWord> words = dictionary.lookupWord(strippedWord, 0, length);
+-    if (words != null) {
+-      for (HunspellWord hunspellWord : words) {
+-        if (hunspellWord.hasFlag(affix.getFlag())) {
+-          stems.add(new Stem(strippedWord, length));
+-        }
+-      }
++    char wordFlags[] = dictionary.lookupWord(strippedWord, 0, length, scratch);
++    if (wordFlags != null && HunspellDictionary.hasFlag(wordFlags, affix.getFlag())) {
++      stems.add(new Stem(strippedWord, length));
+     }
+ 
+     if (affix.isCrossProduct() && recursionDepth < RECURSION_CAP) {

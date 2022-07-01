@@ -1,0 +1,227 @@
+Index: CHANGES.txt
+===================================================================
+--- CHANGES.txt	(revision 825137)
++++ CHANGES.txt	(working copy)
+@@ -87,6 +87,10 @@
+   BooleanScorer for scoring), whereby some matching documents fail to
+   be collected.  (Fulin Tang via Mike McCandless)
+ 
++* LUCENE-1976: Fix IndexReader.isCurrent() to return the right thing
++  when the reader is a near real-time reader.  (Jake Mannix via Mike
++  McCandless)
++
+ New features
+ 
+ * LUCENE-1933: Provide a convenience AttributeFactory that creates a
+Index: src/test/org/apache/lucene/index/TestIndexWriterReader.java
+===================================================================
+--- src/test/org/apache/lucene/index/TestIndexWriterReader.java	(revision 825137)
++++ src/test/org/apache/lucene/index/TestIndexWriterReader.java	(working copy)
+@@ -85,6 +85,7 @@
+ 
+     // get a reader
+     IndexReader r1 = writer.getReader();
++    assertTrue(r1.isCurrent());
+ 
+     String id10 = r1.document(10).getField("id").stringValue();
+     
+@@ -92,8 +93,10 @@
+     newDoc.removeField("id");
+     newDoc.add(new Field("id", Integer.toString(8000), Store.YES, Index.NOT_ANALYZED));
+     writer.updateDocument(new Term("id", id10), newDoc);
++    assertFalse(r1.isCurrent());
+ 
+     IndexReader r2 = writer.getReader();
++    assertTrue(r2.isCurrent());
+     assertEquals(0, count(new Term("id", id10), r2));
+     assertEquals(1, count(new Term("id", Integer.toString(8000)), r2));
+     
+@@ -102,6 +105,7 @@
+     writer.close();
+     
+     IndexReader r3 = IndexReader.open(dir1, true);
++    assertTrue(r3.isCurrent());
+     assertEquals(0, count(new Term("id", id10), r3));
+     assertEquals(1, count(new Term("id", Integer.toString(8000)), r3));
+     r3.close();
+@@ -133,9 +137,18 @@
+     createIndexNoClose(!optimize, "index2", writer2);
+     writer2.close();
+ 
++    IndexReader r0 = writer.getReader();
++    assertTrue(r0.isCurrent());
+     writer.addIndexesNoOptimize(new Directory[] { dir2 });
++    assertFalse(r0.isCurrent());
++    r0.close();
+ 
+     IndexReader r1 = writer.getReader();
++    assertTrue(r1.isCurrent());
++
++    writer.commit();
++    assertTrue(r1.isCurrent());
++
+     assertEquals(200, r1.maxDoc());
+ 
+     int index2df = r1.docFreq(new Term("indexname", "index2"));
+Index: src/java/org/apache/lucene/index/DirectoryReader.java
+===================================================================
+--- src/java/org/apache/lucene/index/DirectoryReader.java	(revision 825137)
++++ src/java/org/apache/lucene/index/DirectoryReader.java	(working copy)
+@@ -50,6 +50,7 @@
+   private final HashSet synced = new HashSet();
+   private Lock writeLock;
+   private SegmentInfos segmentInfos;
++  private SegmentInfos segmentInfosStart;
+   private boolean stale;
+   private final int termInfosIndexDivisor;
+ 
+@@ -124,6 +125,7 @@
+     this.directory = writer.getDirectory();
+     this.readOnly = true;
+     this.segmentInfos = infos;
++    segmentInfosStart = (SegmentInfos) infos.clone();
+     this.termInfosIndexDivisor = termInfosIndexDivisor;
+     if (!readOnly) {
+       // We assume that this segments_N was previously
+@@ -769,19 +771,14 @@
+     return segmentInfos.getUserData();
+   }
+ 
+-  /**
+-   * Check whether this IndexReader is still using the current (i.e., most recently committed) version of the index.  If
+-   * a writer has committed any changes to the index since this reader was opened, this will return <code>false</code>,
+-   * in which case you must open a new IndexReader in order
+-   * to see the changes.  Use {@link IndexWriter#commit} to
+-   * commit changes to the index.
+-   *
+-   * @throws CorruptIndexException if the index is corrupt
+-   * @throws IOException           if there is a low-level IO error
+-   */
+   public boolean isCurrent() throws CorruptIndexException, IOException {
+     ensureOpen();
+-    return SegmentInfos.readCurrentVersion(directory) == segmentInfos.getVersion();
++    if (writer == null) {
++      // we loaded SegmentInfos from the directory
++      return SegmentInfos.readCurrentVersion(directory) == segmentInfos.getVersion();
++    } else {
++      return writer.nrtIsCurrent(segmentInfosStart);
++    }
+   }
+ 
+   protected synchronized void doClose() throws IOException {
+Index: src/java/org/apache/lucene/index/IndexReader.java
+===================================================================
+--- src/java/org/apache/lucene/index/IndexReader.java	(revision 825137)
++++ src/java/org/apache/lucene/index/IndexReader.java	(working copy)
+@@ -468,7 +468,27 @@
+   }
+ 
+   /**
+-   * Version number when this IndexReader was opened. Not implemented in the IndexReader base class.
++   * Version number when this IndexReader was opened. Not
++   * implemented in the IndexReader base class.
++   *
++   * <p>If this reader is based on a Directory (ie, was
++   * created by calling {@link #open}, or {@link #reopen} on
++   * a reader based on a Directory), then this method
++   * returns the version recorded in the commit that the
++   * reader opened.  This version is advanced every time
++   * {@link IndexWriter#commit} is called.</p>
++   *
++   * <p>If instead this reader is a near real-time reader
++   * (ie, obtained by a call to {@link
++   * IndexWriter#getReader}, or by calling {@link #reopen}
++   * on a near real-time reader), then this method returns
++   * the version of the last commit done by the writer.
++   * Note that even as further changes are made with the
++   * writer, the version will not changed until a commit is
++   * completed.  Thus, you should not rely on this method to
++   * determine when a near real-time reader should be
++   * opened.  Use {@link #isCurrent} instead.</p>
++   *
+    * @throws UnsupportedOperationException unless overridden in subclass
+    */
+   public long getVersion() {
+@@ -518,21 +538,32 @@
+     throw new UnsupportedOperationException("This reader does not support this method.");
+   }
+ 
++
+   /**
+-   * Check whether this IndexReader is still using the
+-   * current (i.e., most recently committed) version of the
+-   * index.  If a writer has committed any changes to the
+-   * index since this reader was opened, this will return
+-   * <code>false</code>, in which case you must open a new
+-   * IndexReader in order to see the changes.  Changes must
+-   * be committed using  {@link IndexWriter#commit} to be
+-   * visible to readers.
+-   * 
+-   * <p>
+-   * Not implemented in the IndexReader base class.
+-   * </p>
++   * Check whether any new changes have occurred to the
++   * index since this reader was opened.
++   *
++   * <p>If this reader is based on a Directory (ie, was
++   * created by calling {@link #open}, or {@link #reopen} on
++   * a reader based on a Directory), then this method checks
++   * if any further commits (see {@link IndexWriter#commit}
++   * have occurred in that directory).</p>
++   *
++   * <p>If instead this reader is a near real-time reader
++   * (ie, obtained by a call to {@link
++   * IndexWriter#getReader}, or by calling {@link #reopen}
++   * on a near real-time reader), then this method checks if
++   * either a new commmit has occurred, or any new
++   * uncommitted changes have taken place via the writer.
++   * Note that even if the writer has only performed
++   * merging, this method will still return false.</p>
++   *
++   * <p>In any event, if this returns false, you should call
++   * {@link #reopen} to get a new reader that sees the
++   * changes.</p>
++   *
+    * @throws CorruptIndexException if the index is corrupt
+-   * @throws IOException if there is a low-level IO error
++   * @throws IOException           if there is a low-level IO error
+    * @throws UnsupportedOperationException unless overridden in subclass
+    */
+   public boolean isCurrent() throws CorruptIndexException, IOException {
+Index: src/java/org/apache/lucene/index/DocumentsWriter.java
+===================================================================
+--- src/java/org/apache/lucene/index/DocumentsWriter.java	(revision 825137)
++++ src/java/org/apache/lucene/index/DocumentsWriter.java	(working copy)
+@@ -543,6 +543,13 @@
+     return true;
+   }
+ 
++  synchronized boolean anyChanges() {
++    return numDocsInRAM != 0 ||
++      deletesInRAM.numTerms != 0 ||
++      deletesInRAM.docIDs.size() != 0 ||
++      deletesInRAM.queries.size() != 0;
++  }
++
+   synchronized private void initFlushState(boolean onlyDocStore) {
+     initSegmentName(onlyDocStore);
+     flushState = new SegmentWriteState(this, directory, segment, docStoreSegment, numDocsInRAM, numDocsInStore, writer.getTermIndexInterval());
+Index: src/java/org/apache/lucene/index/IndexWriter.java
+===================================================================
+--- src/java/org/apache/lucene/index/IndexWriter.java	(revision 825137)
++++ src/java/org/apache/lucene/index/IndexWriter.java	(working copy)
+@@ -4961,4 +4961,14 @@
+   boolean testPoint(String name) {
+     return true;
+   }
++
++  synchronized boolean nrtIsCurrent(SegmentInfos infos) {
++    if (!infos.equals(segmentInfos)) {
++      // if any structural changes (new segments), we are
++      // stale
++      return false;
++    } else {
++      return !docWriter.anyChanges();
++    }
++  }
+ }

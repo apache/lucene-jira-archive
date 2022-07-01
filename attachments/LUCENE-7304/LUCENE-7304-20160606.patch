@@ -1,0 +1,2887 @@
+diff --git a/lucene/core/src/java/org/apache/lucene/util/eliasfano/BitSelect.java b/lucene/core/src/java/org/apache/lucene/util/eliasfano/BitSelect.java
+new file mode 100644
+index 0000000..3673ab8
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/util/eliasfano/BitSelect.java
+@@ -0,0 +1,85 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.lucene.util.eliasfano;
++
++/**  Select a 1-bit from a long. See also LUCENE-6040 and LUCENE-6484.
++ */
++public final class BitSelect {
++
++  private BitSelect() {} // no instance
++
++  /** Select a 1-bit from a long.
++   * @return The index of the r-th 1 bit in x. This bit must exist.
++   */
++  public static int select(long x, int r) {
++    long s = x - ((x & 0xAAAAAAAAAAAAAAAAL) >>> 1); // pairwise bitsums
++    s = (s & 0x3333333333333333L) + ((s >>> 2) & 0x3333333333333333L); // nibblewise bitsums
++    s = ((s + (s >>> 4)) & 0x0F0F0F0F0F0F0F0FL) * L8_L; // bytewise bitsums, cumulative
++
++    int b = (Long.numberOfTrailingZeros((s + psOverflow[r-1]) & (L8_L << 7)) >> 3) << 3; // bit position of byte with r-th 1 bit.
++    long l = r - (((s << 8) >>> b) & 0xFFL); // bit rank in byte at b
++
++    // Select bit l from byte (x >>> b):
++    int selectIndex = (int) (((x >>> b) & 0xFFL) | ((l-1) << 8));
++    int res = b + select256[selectIndex];
++    return res;
++  }
++
++  private final static long L8_L = 0x0101010101010101L;
++
++  private static final long[] psOverflow = new long[64];
++  static {
++    for (int s = 1; s <= 64; s++) {
++      psOverflow[s-1] = (128-s) * L8_L;
++    }
++  }
++
++  private static final byte[] select256 = new byte[8 * 256];
++  static {
++    for (int b = 0; b <= 0xFF; b++) {
++      for (int s = 1; s <= 8; s++) {
++        int byteIndex = b | ((s-1) << 8);
++        int bitIndex = selectNaive(b, s);
++        if (bitIndex < 0) {
++          bitIndex = 127; // positive as byte
++        }
++        assert bitIndex >= 0;
++        assert ((byte) bitIndex) >= 0; // non negative as byte, no need to mask the sign
++        select256[byteIndex] = (byte) bitIndex;
++      }
++    }
++  }
++
++  /**
++   * Naive implementation of {@link #select(long,int)}, using {@link Long#numberOfTrailingZeros} repetitively.
++   * Works relatively fast for low ranks.
++   * @return The index of the r-th 1 bit in x, or -1 if no such bit exists.
++   */
++  public static int selectNaive(long x, int r) {
++    assert r >= 1;
++    int s = -1;
++    while ((x != 0L) && (r > 0)) {
++      int ntz = Long.numberOfTrailingZeros(x);
++      x >>>= (ntz + 1);
++      s += (ntz + 1);
++      r -= 1;
++    }
++    int res = (r > 0) ? -1 : s;
++    return res;
++  }
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/util/eliasfano/EliasFanoBytes.java b/lucene/core/src/java/org/apache/lucene/util/eliasfano/EliasFanoBytes.java
+new file mode 100644
+index 0000000..8dc9c4a
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/util/eliasfano/EliasFanoBytes.java
+@@ -0,0 +1,291 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.lucene.util.eliasfano;
++
++import java.util.Objects;
++import java.io.IOException;
++
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.store.ByteArrayDataInput;
++import org.apache.lucene.store.ByteArrayDataOutput;
++
++/** An EliasFanoSequence implemented on a {@link BytesRef}.
++ * The following format is used in a byte[] bytesRef.bytes from bytesRef.offset:
++ * <ol>
++ * <li>the actual numValues of the sequence as a VLong in bytes,
++ * <li>the actual maxValue of the sequence encoded value as a VLong in bytes,
++ * <li>lb bytes for the low bits,
++ * <li>vib bytes for the value index bits,
++ * <li>hb bytes for the high bits.
++ * </ol>
++ * The low bits, the value index bits and the high bits are encoded in little endian byte order,
++ * i.e. the bytes of a multibyte value are ordered from least significant to most significant.
++ * <br>lb, vib and hb depend on <code>numValues</code> and <code>maxValue</code>, and may be zero.
++ * <br>The number of value index bytes vib also depends on {@link EliasFanoSequence#DEFAULT_VALUE_INDEX_INTERVAL}.
++ * <br>In each of the last bytes of the low bits, the value index bits and the high bits,
++ *     the highest up to 7 unused bits are ignored and should be zero.
++ */
++public class EliasFanoBytes extends EliasFanoSequence {
++  BytesRef bytesRef;
++  int numHeaderBytes;
++  int startLowBitsByte;
++  int startValueIndexByte;
++  int startHighBitsByte;
++  static final int LOG2_BYTE_SIZE = Integer.numberOfTrailingZeros(Byte.SIZE);
++  static final long LONG_BYTE_MASK = 0xFFL;
++  private static final int MAX_HEADER_SIZE = 18;
++
++
++  /** Initialize to encode a sequence into a new BytesRef using {@link EliasFanoSequence#DEFAULT_VALUE_INDEX_INTERVAL}. */
++  public EliasFanoBytes(long maxNumValues, long upperBound) {
++    super(maxNumValues, upperBound);
++    BytesRef bytesRef = initialBytesRef();
++    this.numHeaderBytes = encodeHeader(bytesRef);
++    reInit(bytesRef);
++  }
++
++  /** Create a new EliasFanoBytes using the given BytesRef and {@link EliasFanoSequence#DEFAULT_VALUE_INDEX_INTERVAL} */
++  public static EliasFanoBytes createFromBytesRef(BytesRef bytesRef) {
++    Objects.requireNonNull(bytesRef, "bytesRef");
++    ByteArrayDataInput badi = new ByteArrayDataInput(bytesRef.bytes, bytesRef.offset, bytesRef.length);
++    long maxNumValues = badi.readVLong(); // decode header
++    long upperBound = badi.readVLong();
++    EliasFanoBytes res = new EliasFanoBytes(maxNumValues, upperBound);
++    res.numHeaderBytes = badi.getPosition() - bytesRef.offset;
++    res.reInitSizes(bytesRef);
++    return res;
++  }
++
++  /** Reinitialize to decode a sequence encoded in a given BytesRef. */
++  public void reInit(BytesRef bytesRef) {
++    ByteArrayDataInput badi = new ByteArrayDataInput(bytesRef.bytes, bytesRef.offset, bytesRef.length);
++    maxNumValues = badi.readVLong(); // decode header
++    upperBound = badi.readVLong();
++    numHeaderBytes = badi.getPosition() - bytesRef.offset;
++    valueIndexInterval = DEFAULT_VALUE_INDEX_INTERVAL;
++    reInitSizes(bytesRef);
++  }
++
++  /** Create a new EliasFanoBytes, using {@link EliasFanoSequence#DEFAULT_VALUE_INDEX_INTERVAL} instead of the given valueIndexInterval */
++  @Override
++  EliasFanoBytes newSequence(long maxNumValues, long upperBound, long valueIndexInterval) {
++    return new EliasFanoBytes(maxNumValues, upperBound);
++  }
++
++  private BytesRef initialBytesRef() {
++    BytesRef tempHeader = new BytesRef(MAX_HEADER_SIZE);
++    int tempHeaderOffset = tempHeader.offset;
++    tempHeader.length = tempHeader.bytes.length;
++    numHeaderBytes = encodeHeader(tempHeader);
++
++    BytesRef bytesRef = new BytesRef(numHeaderBytes + numLowBytes() + numValueIndexBytes() + numHighBytes() );
++    System.arraycopy(tempHeader.bytes, tempHeaderOffset, bytesRef.bytes, 0, numHeaderBytes);
++    bytesRef.offset = 0;
++    bytesRef.length = bytesRef.bytes.length;
++    return bytesRef;
++  }
++
++  private int encodeHeader(BytesRef bytesRef) {
++    ByteArrayDataOutput bado = new ByteArrayDataOutput(bytesRef.bytes, bytesRef.offset, bytesRef.length);
++    try {
++      bado.writeVLong(maxNumValues);
++      bado.writeVLong((upperBound < 0) ? 0 : upperBound);
++    } catch (IOException ioe) { // unlikely from byte[]
++      throw new Error(ioe);
++    }
++    int headerBytes = bado.getPosition() - bytesRef.offset;
++    return headerBytes;
++  }
++
++  private void reInitSizes(BytesRef bytesRef) {
++    // bytesRef.offset is directly before the header with maxNumValues and upperBound, numHeaderBytes has been initialized.
++    checkBounds(maxNumValues, upperBound, valueIndexInterval);
++    this.numLowBits = numLowBits(maxNumValues, upperBound);
++    this.lowerBitsMask = lowerBitsMask(numLowBits);
++    this.numValueIndexEntryBits = numValueIndexEntryBits(maxNumValues, upperBound);
++    this.valueIndexBitsMask = (1L << numValueIndexEntryBits) - 1;
++    this.bytesRef = bytesRef;
++    this.startLowBitsByte = bytesRef.offset + numHeaderBytes;
++    this.startValueIndexByte = startLowBitsByte + numLowBytes();
++    this.startHighBitsByte = startValueIndexByte + numValueIndexBytes();
++    long numBytesForHighBits = numHighBytes();
++    if ((startHighBitsByte + numBytesForHighBits) > (bytesRef.offset + bytesRef.length)) {
++      throw new IllegalArgumentException("bytesRef should have at least "
++         + (startHighBitsByte + numBytesForHighBits - bytesRef.offset) + " bytes, but it has only "
++         + bytesRef.length);
++    }
++  }
++
++
++  /** Return the BytesRef that is encoded and/or decoded. */
++  public BytesRef getBytesRef() {
++    return bytesRef;
++  }
++
++  private int numLowBytes() {
++    int res = (int) numBytesForBits(maxNumValues * numLowBits);
++    return res;
++  }
++
++  private int numValueIndexBytes() {
++    int res =  (int) numBytesForBits(maxNumValueIndexEntries() * numValueIndexEntryBits(maxNumValues, upperBound));
++    return res;
++  }
++
++  private int numHighBytes() {
++    int res = (int) numBytesForBits(maxNumValues + maxHighValue());
++    return res;
++  }
++
++  private static long numBytesForBits(long numBits) {
++    assert numBits >= 0 : numBits;
++    return (numBits + (Byte.SIZE-1)) >>> LOG2_BYTE_SIZE;
++  }
++
++  private void packValue(long value, int numBits, long packIndex, int startByte) {
++    if (numBits != 0) {
++      byte[] bytes = bytesRef.bytes;
++      long bitPos = numBits * packIndex;
++      int byteIndex = startByte + (int) (bitPos >>> LOG2_BYTE_SIZE); // little endian
++      int bitPosAtIndex = (int) (bitPos & (Byte.SIZE-1));
++      bytes[byteIndex] |= (byte) (value << bitPosAtIndex); 
++      int rightShift = (Byte.SIZE - bitPosAtIndex);
++      int remainingBits = numBits - rightShift;
++      while (remainingBits > 0) {
++        bytes[++byteIndex] = (byte) (value >>> rightShift);
++        rightShift += Byte.SIZE;
++        remainingBits -= Byte.SIZE;
++      }
++    }
++  }
++
++  private long unPackValue(int numBits, long packIndex, long bitsMask, int startByte) {
++    if (numBits == 0) {
++      return 0;
++    }
++    byte[] bytes = bytesRef.bytes;
++    long bitPos = packIndex * numBits;
++    int byteIndex = startByte + (int) (bitPos >>> LOG2_BYTE_SIZE); // little endian
++    int bitPosAtIndex = (int) (bitPos & (Byte.SIZE-1));
++    long value = (bytes[byteIndex] & LONG_BYTE_MASK) >>> bitPosAtIndex;
++    int leftShift = Byte.SIZE - bitPosAtIndex;
++    int remainingBits = numBits - leftShift;
++    while (remainingBits > 0) {
++      value |= ((bytes[++byteIndex] & LONG_BYTE_MASK) << leftShift);
++      leftShift += Byte.SIZE;
++      remainingBits -= Byte.SIZE;
++    }
++    value &= bitsMask;
++    return value;
++  }
++
++
++  @Override
++  public EliasFanoEncoder<EliasFanoBytes> getEncoder() {
++    return new EliasFanoEncoder<>(this);
++  }
++
++  @Override
++  void setHighBit(long highBitNum) { 
++    int b = startHighBitsByte + (int)(highBitNum >>> LOG2_BYTE_SIZE); // little endian
++    bytesRef.bytes[b] |= (byte) (1 << (highBitNum & (Byte.SIZE-1)));
++  }
++
++  @Override
++  void setLowValue(long efPosition, long value) {
++    packValue(value & lowerBitsMask, numLowBits, efPosition, startLowBitsByte);
++  }
++
++  @Override
++  void setValueIndexEntry(long afterZeroBitPosition, long entryIndex) {
++    packValue(afterZeroBitPosition & valueIndexBitsMask, numValueIndexEntryBits, entryIndex, startValueIndexByte);
++    numValueIndexEntries = entryIndex + 1;
++  }
++
++  @Override
++  public EliasFanoDecoder<EliasFanoBytes> getDecoder() {
++    return new EliasFanoDecoder<>(this, maxNumValues);
++  }
++
++  @Override
++  long getHighLong(int highIndex) { 
++    int b = 8 * highIndex + startHighBitsByte;
++    final int e = bytesRef.offset + bytesRef.length;
++    final byte[] bytes = bytesRef.bytes;
++    if ((b + 7) < e) {
++      return ( (bytes[b] & LONG_BYTE_MASK) // little endian
++            + ((bytes[b+1] & LONG_BYTE_MASK) << 8)
++            + ((bytes[b+2] & LONG_BYTE_MASK) << 16)
++            + ((bytes[b+3] & LONG_BYTE_MASK) << 24))
++            +(((bytes[b+4] & LONG_BYTE_MASK) << 32) // extra bracket: allow parallel evaluation
++            + ((bytes[b+5] & LONG_BYTE_MASK) << 40)
++            + ((bytes[b+6] & LONG_BYTE_MASK) << 48)
++            + ((bytes[b+7] & LONG_BYTE_MASK) << 56));
++    }
++    else { // must have at least 1 byte, does not have all 8 bytes
++      long r = (bytes[b] & LONG_BYTE_MASK);
++      int s = 8;
++      while (++b < e) {
++        r += (bytes[b] & LONG_BYTE_MASK) << s;
++        s += 8;
++      }
++      return r;
++    }
++  }
++
++  @Override
++  long getLowValue(long efPosition) {
++    return unPackValue(numLowBits, efPosition, lowerBitsMask, startLowBitsByte);
++  }
++
++  @Override
++  long getValueIndexEntry(long entryIndex) {
++    long res = unPackValue(numValueIndexEntryBits, entryIndex, valueIndexBitsMask, startValueIndexByte);
++    return res;
++  }
++
++
++  @Override
++  public String toString() {
++    StringBuilder s = new StringBuilder("EliasFanoBytes: ");
++    s.append(super.toString());
++
++    s.append("\nstartLowBitsByte " + startLowBitsByte);
++    s.append(" startValueIndexByte " + startValueIndexByte);
++    s.append(" startHighBitsByte " + startHighBitsByte);
++
++    s.append("\nbytesRef.offset " + bytesRef.offset);
++    s.append(" bytesRef.length " + bytesRef.length);
++    s.append("\nbytesRef " + bytesRef.toString()); // [hex encoded bytes]
++    s.append("\n");
++    return s.toString();
++  }
++
++  @Override
++  public boolean equals(Object other) {
++    return super.equals(other)
++        && bytesRef.equals(((EliasFanoBytes)other).bytesRef);
++  }
++
++  @Override
++  public int hashCode() {
++    return super.hashCode()
++          ^ bytesRef.hashCode();
++  }
++}
++
+diff --git a/lucene/core/src/java/org/apache/lucene/util/eliasfano/EliasFanoDecoder.java b/lucene/core/src/java/org/apache/lucene/util/eliasfano/EliasFanoDecoder.java
+new file mode 100644
+index 0000000..78874fc
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/util/eliasfano/EliasFanoDecoder.java
+@@ -0,0 +1,493 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.lucene.util.eliasfano;
++
++import java.util.Objects;
++
++import org.apache.lucene.util.eliasfano.BitSelect;
++
++
++/** A decoder for an {@link EliasFanoSequence}.
++ * @lucene.internal
++ */
++public class EliasFanoDecoder<EFSeq extends EliasFanoSequence> {
++  private static final int LOG2_LONG_SIZE = Integer.numberOfTrailingZeros(Long.SIZE);
++
++  private final long numEncoded;
++  private final long numValueIndexEntries;
++  private final long numLowBits;
++  final EFSeq efSeq;
++
++  private long efPosition = -1; // the decoding position.
++  private long setHighBitForPos = -1; // the index of the high bit at the decoding position.
++
++  public final static long NO_MORE_VALUES = -1L;
++
++
++
++  /** Construct a decoder for a given {@link EliasFanoSequence}.
++   * The decoding position is set to just before the first encoded value.
++   */
++  public EliasFanoDecoder(EFSeq efSeq, long numEncoded) {
++    this.efSeq = Objects.requireNonNull(efSeq, "efSeq");
++    this.numEncoded = numEncoded;
++    this.numValueIndexEntries = this.efSeq.numValueIndexEntries;
++    this.numLowBits = this.efSeq.numLowBits;
++  }
++
++  /** Return the Elias-Fano sequence that is decoded. */
++  public EFSeq getEliasFanoSequence() {
++    return efSeq;
++  }
++  
++  @Override
++  public String toString() {
++    return "EliasFanoDecoder<" + efSeq.getClass().getName() + ">(efIndex=" + efPosition + ", setHighBitForPos=" + setHighBitForPos + "\nefSeq=" + efSeq + ")";
++  }
++  
++  @Override
++  public boolean equals(Object other) {
++    if (other == null) {
++      return false;
++    }
++    if (getClass() != other.getClass()) {
++      return false;
++    }
++    EliasFanoDecoder<?> oefd = (EliasFanoDecoder<?>) other;
++    return this.efSeq.equals(oefd.efSeq)
++        && (this.efPosition == oefd.efPosition)
++        && (this.setHighBitForPos == oefd.setHighBitForPos);
++  }
++
++  @Override
++  public int hashCode() {
++    return getClass().hashCode() ^ efSeq.hashCode() ^ (int) (efPosition ^ setHighBitForPos);
++  }
++
++
++  /** Return the number of values in the decoded sequence. */
++  public long numEncoded() { 
++    return numEncoded;
++  }
++
++
++  /** The current decoding position in the sequence.
++   * The first value encoded by {@link EliasFanoEncoder#encodeNext} has position 0.
++   * Only valid directly after
++   * {@link #nextValue}, {@link #advanceToValue},
++   * {@link #previousValue}, or {@link #backToValue}
++   * returned another value than {@link #NO_MORE_VALUES},
++   * or {@link #advanceToPosition} returned true.
++   * @return The decoding position of the last decoded value, or as last set by {@link #advanceToPosition}.
++   */
++  public long currentPosition() {
++    if (efPosition < 0) {
++      throw new IllegalStateException("position before sequence");
++    }
++    if (efPosition >= numEncoded) {
++      throw new IllegalStateException("position after sequence");
++    }
++    return efPosition;
++  }
++
++  /** The value at the current decoding position.
++   * Only valid when {@link #currentPosition} would return a valid result.
++   * <br>This is only intended for use after {@link #advanceToPosition} returned true.
++   * @return The value encoded at {@link #currentPosition}.
++   */
++  public long currentValue() {
++    return combineHighLowValues(currentHighValue(), currentLowValue());
++  }
++
++  /**  @return The high value for the current decoding position. */
++  private long currentHighValue() {
++    return setHighBitForPos - efPosition; // sequence of unary gaps
++  }
++
++  /**  @return The low value for the current decoding position. */
++  private long currentLowValue() {
++    assert ((efPosition >= 0) && (efPosition < numEncoded)) : "efPosition " + efPosition;
++    long res = efSeq.getLowValue(efPosition);
++    return res;
++  }
++
++  /**  @return The given highValue shifted left by the number of low bits from by the EliasFanoSequence,
++   *           logically OR-ed with the given lowValue.
++   */
++  private long combineHighLowValues(long highValue, long lowValue) {
++    return (highValue << numLowBits) | lowValue;
++  }
++
++  private long highLongShifted;
++
++
++  /* The implementation of forward decoding and backward decoding is done by the following method pairs.
++   *
++   * toBeforeSequence - toAfterSequence
++   * getCurrentRightShift - getCurrentLeftShift
++   * toAfterCurrentHighBit - toBeforeCurrentHighBit
++   * toNextHighLong - toPreviousHighLong
++   * nextHighValue - previousHighValue
++   * nextValue - previousValue
++   * advanceToValue - backToValue
++   *
++   */
++
++  /* Forward decoding section */
++
++
++  /** Set the decoding position to just before the first encoded value.
++   */
++  public void toBeforeSequence() {
++    efPosition = -1;
++    setHighBitForPos = -1;
++  }
++
++  /** @return the number of bits in a long after (setHighBitForPos modulo Long.SIZE) */
++  private int getCurrentRightShift() {
++    int s = (int) (setHighBitForPos & (Long.SIZE-1));
++    return s;
++  }
++
++  /** Increment efPosition and setHighBitForPos and
++   * set highLongShifted so that it does not contain the high bits before setHighBitForPos.
++   * @return true iff efPosition still smaller than numEncoded.
++   */
++  private boolean toAfterCurrentHighBit() {
++    efPosition += 1;
++    if (efPosition >= numEncoded) {
++      return false;
++    }
++    setHighBitForPos += 1;
++    int highIndex = (int)(setHighBitForPos >>> LOG2_LONG_SIZE);
++    highLongShifted = efSeq.getHighLong(highIndex) >>> getCurrentRightShift();
++    return true;
++  }
++
++  /** The current high long has been determined to not contain the set bit that is needed.
++   *  Increment setHighBitForPos to the next high long and set highLongShifted accordingly.
++   */
++  private void toNextHighLong() {
++    setHighBitForPos += Long.SIZE - (setHighBitForPos & (Long.SIZE-1));
++    //assert getCurrentRightShift() == 0;
++    int highIndex = (int)(setHighBitForPos >>> LOG2_LONG_SIZE);
++    highLongShifted = efSeq.getHighLong(highIndex);
++  }
++
++  /** setHighBitForPos and efPosition have just been incremented, scan to the next high set bit
++   *  by incrementing setHighBitForPos, and by setting highLongShifted accordingly.
++   */
++  private void toNextHighValue() {
++    while (highLongShifted == 0L) {
++      toNextHighLong(); // inlining and unrolling would simplify somewhat
++    }
++    setHighBitForPos += Long.numberOfTrailingZeros(highLongShifted);
++  }
++
++  /** setHighBitForPos and efPosition have just been incremented, scan to the next high set bit
++   *  by incrementing setHighBitForPos, and by setting highLongShifted accordingly.
++   *  @return the next encoded high value.
++   */
++  private long nextHighValue() {
++    toNextHighValue();
++    return currentHighValue();
++  }
++
++  /** If another value is available after the current decoding position, return this value and
++   * and increase the decoding position by 1. Otherwise return {@link #NO_MORE_VALUES}.
++   */
++  public long nextValue() {
++    if (! toAfterCurrentHighBit()) {
++      return NO_MORE_VALUES;
++    }
++    long highValue = nextHighValue();
++    return combineHighLowValues(highValue, currentLowValue());
++  }
++
++  /** Advance the decoding position to a given position.
++   * and return <code>true</code> iff this position is in the sequence.
++   * <br>See also {@link #currentValue}.
++   * <br>The current implementation does not use a value index on the high bit zero bit positions.
++   * <br>Note: there is currently no implementation of <code>backToPosition</code>.
++   */
++  public boolean advanceToPosition(long newPosition) {
++    assert newPosition > efPosition;
++    if (newPosition >= numEncoded) {
++      toAfterSequence();
++      return false;
++    }
++    if (! toAfterCurrentHighBit()) {
++      throw new IllegalStateException();
++    }
++    /* FIXME: Use a value index here. */
++    int curSetBits = Long.bitCount(highLongShifted);
++    while ((efPosition + curSetBits) < newPosition) { // highLongShifted has not enough set bits to reach index
++      efPosition += curSetBits;
++      toNextHighLong();
++      curSetBits = Long.bitCount(highLongShifted);
++    }
++    // highLongShifted has enough set bits to reach newPosition
++    while (efPosition < newPosition) {
++      /* FIXME: Instead of the linear search here, use (forward) broadword selection from
++       * "Broadword Implementation of Rank/Select Queries", Sebastiano Vigna, January 30, 2012.
++       */
++      toNextHighValue();
++      if (! toAfterCurrentHighBit()) {
++        throw new IllegalStateException();
++      }
++    }
++    toNextHighValue();
++    return true;
++  }
++
++
++
++  /** Given a target value, advance the decoding position to the first bigger or equal value
++   * and return that if it is available. Otherwise return {@link #NO_MORE_VALUES}.
++   * <br>The current implementation uses the value index on the high zero bit positions.
++   */
++  public long advanceToValue(long target) {
++    efPosition += 1;
++    if (efPosition >= numEncoded) {
++      return NO_MORE_VALUES;
++    }
++    setHighBitForPos += 1; // the high bit at setHighBitForPos belongs to the unary code for efPosition
++
++    int highIndex = (int)(setHighBitForPos >>> LOG2_LONG_SIZE);
++    long highLong = efSeq.getHighLong(highIndex);
++    highLongShifted = highLong >>> ((int) (setHighBitForPos & (Long.SIZE-1))); // may contain the unary 1 bit for efPosition
++
++    // determine value index entry to advance to
++    long highTarget = target >>> numLowBits;
++
++    long indexEntryIndex = (highTarget / efSeq.valueIndexInterval) - 1;
++    if (indexEntryIndex >= 0) { // not before first value index entry
++      if (indexEntryIndex >= numValueIndexEntries) {
++        indexEntryIndex = numValueIndexEntries - 1; // no further than last value index entry, if any
++      }
++      long indexHighValue = (indexEntryIndex + 1) * efSeq.valueIndexInterval;
++      assert indexHighValue <= highTarget;
++      if (indexHighValue > (setHighBitForPos - efPosition)) { // advance to just after zero bit position of value index entry.
++        setHighBitForPos = efSeq.getValueIndexEntry(indexEntryIndex);
++        efPosition = setHighBitForPos - indexHighValue; // the high bit at setHighBitForPos belongs to the unary code for efPosition
++        highIndex = (int)(setHighBitForPos >>> LOG2_LONG_SIZE);
++        highLong = efSeq.getHighLong(highIndex);
++        highLongShifted = highLong >>> ((int) (setHighBitForPos & (Long.SIZE-1))); // may contain the unary 1 bit for efPosition
++      }
++      assert efPosition < numEncoded; // there is a high value to be found.
++    }
++
++    int curSetBits = Long.bitCount(highLongShifted); // shifted right.
++    int curClearBits = Long.SIZE - curSetBits - ((int) (setHighBitForPos & (Long.SIZE-1))); // subtract right shift, may be more than encoded
++
++    while (((setHighBitForPos - efPosition) + curClearBits) < highTarget) {
++      // highLongShifted has not enough clear bits to reach highTarget
++      efPosition += curSetBits;
++      if (efPosition >= numEncoded) {
++        return NO_MORE_VALUES;
++      }
++      setHighBitForPos += Long.SIZE - (setHighBitForPos & (Long.SIZE-1));
++      assert (highIndex + 1) == (int)(setHighBitForPos >>> LOG2_LONG_SIZE);
++      highIndex += 1;
++      highLong = efSeq.getHighLong(highIndex);
++      highLongShifted = highLong;
++      curSetBits = Long.bitCount(highLongShifted);
++      curClearBits = Long.SIZE - curSetBits;
++    }
++    // highLongShifted has enough clear bits to reach highTarget, and may not have enough set bits.
++    while (highLongShifted == 0L) {
++      setHighBitForPos += Long.SIZE - (setHighBitForPos & (Long.SIZE-1));
++      assert (highIndex + 1) == (int)(setHighBitForPos >>> LOG2_LONG_SIZE);
++      highIndex += 1;
++      highLong = efSeq.getHighLong(highIndex);
++      highLongShifted = highLong;
++    }
++
++    // highLongShifted has enough clear bits to reach highTarget, has at least 1 set bit, and may not have enough set bits.
++    int rank = (int) (highTarget - (setHighBitForPos - efPosition)); // the rank of the zero bit for highValue.
++    assert (rank <= Long.SIZE) : ("rank " + rank);
++    if (rank >= 1) {
++      long invCurHighLong = ~highLongShifted;
++      int clearBitForValue = (rank <= 8)
++                              ? BitSelect.selectNaive(invCurHighLong, rank)
++                              : BitSelect.select(invCurHighLong, rank);
++      assert clearBitForValue <= (Long.SIZE-1);
++      setHighBitForPos += clearBitForValue + 1; // the high bit just before setHighBitForPos is zero
++      int oneBitsBeforeClearBit = clearBitForValue - rank + 1;
++      efPosition += oneBitsBeforeClearBit; // the high bit at setHighBitForPos and belongs to the unary code for efPosition
++      if (efPosition >= numEncoded) {
++        return NO_MORE_VALUES;
++      }
++
++      if ((setHighBitForPos & (Long.SIZE - 1)) == 0L) { // exhausted highLongShifted
++        assert (highIndex + 1) == (int)(setHighBitForPos >>> LOG2_LONG_SIZE);
++        highIndex += 1;
++        highLong = efSeq.getHighLong(highIndex);
++        highLongShifted = highLong;
++      }
++      else {
++        assert highIndex == (int)(setHighBitForPos >>> LOG2_LONG_SIZE);
++        highLongShifted = highLong >>> ((int) (setHighBitForPos & (Long.SIZE-1)));
++      }
++      // highLongShifted has enough clear bits to reach highTarget, and may not have enough set bits.
++ 
++      while (highLongShifted == 0L) {
++        setHighBitForPos += Long.SIZE - (setHighBitForPos & (Long.SIZE-1));
++        assert (highIndex + 1) == (int)(setHighBitForPos >>> LOG2_LONG_SIZE);
++        highIndex += 1;
++        highLong = efSeq.getHighLong(highIndex);
++        highLongShifted = highLong;
++      }
++    }
++    setHighBitForPos += Long.numberOfTrailingZeros(highLongShifted);
++    assert (setHighBitForPos - efPosition) >= highTarget; // highTarget reached
++
++    // Linear search also with low values
++    long currentValue = combineHighLowValues((setHighBitForPos - efPosition), currentLowValue());
++    while (currentValue < target) {
++      currentValue = nextValue();
++      if (currentValue == NO_MORE_VALUES) {
++        return NO_MORE_VALUES;
++      }
++    }
++    return currentValue;
++  }
++
++
++  /* Backward decoding section */
++
++  /** Set the decoding position to just after the last encoded value.
++   */
++  public void toAfterSequence() {
++    efPosition = numEncoded; // just after last position
++    setHighBitForPos = efSeq.maxHighValue() + numEncoded;
++  }
++
++  /** @return the number of bits in a long before (setHighBitForPos modulo Long.SIZE) */
++  private int getCurrentLeftShift() {
++    int s = Long.SIZE - 1 - (int) (setHighBitForPos & (Long.SIZE-1));
++    return s;
++  }
++
++  /** Decrement efPosition and setHighBitForPos and
++   * shift highLongShifted so that it does not contain the high bits after setHighBitForPos.
++   * @return true iff efPosition still >= 0
++   */
++  private boolean toBeforeCurrentHighBit() {
++    efPosition -= 1;
++    if (efPosition < 0) {
++      return false;
++    }
++    setHighBitForPos -= 1;
++    int highIndex = (int)(setHighBitForPos >>> LOG2_LONG_SIZE);
++    highLongShifted = efSeq.getHighLong(highIndex) << getCurrentLeftShift();
++    return true;
++  }
++
++  /** The current high long has been determined to not contain the set bit that is needed.
++   *  Decrement setHighBitForPos to the previous high long and set highLongShifted accordingly.
++   */
++  private void toPreviousHighLong() {
++    setHighBitForPos -= (setHighBitForPos & (Long.SIZE-1)) + 1;
++    //assert getCurrentLeftShift() == 0;
++    int highIndex = (int)(setHighBitForPos >>> LOG2_LONG_SIZE);
++    highLongShifted = efSeq.getHighLong(highIndex);
++  }
++
++  /** setHighBitForPos and efPosition have just been decremented, scan to the previous high set bit
++   *  by decrementing setHighBitForPos and by setting highLongShifted accordingly.
++   *  @return the previous encoded high value.
++   */
++  private long previousHighValue() {
++    while (highLongShifted == 0L) {
++      toPreviousHighLong(); // inlining and unrolling would simplify somewhat
++    }
++    setHighBitForPos -= Long.numberOfLeadingZeros(highLongShifted);
++    return currentHighValue();
++  }
++
++  /** If another value is available right before the current decoding position, return this value
++   * and decrease the decoding position by 1. Otherwise return {@link #NO_MORE_VALUES}.
++   */
++  public long previousValue() {
++    if (! toBeforeCurrentHighBit()) {
++      return NO_MORE_VALUES;
++    }
++    long highValue = previousHighValue();
++    return combineHighLowValues(highValue, currentLowValue());
++  }
++
++
++  /** setHighBitForPos and efPosition have just been decremented, scan backward to the high set bit
++   *  of at most a given high value
++   *  by decrementing setHighBitForPos and by setting highLongShifted accordingly.
++   * <br>The current implementation does not use the value index on the high zero bit positions.
++   *  @return the largest encoded high value that is at most the given one.
++   */
++  private long backToHighValue(long highTarget) {
++    /* CHECKME: Add using the value index as in advanceToHighValue */
++    int curSetBits = Long.bitCount(highLongShifted); // is shifted by getCurrentLeftShift()
++    int curClearBits = Long.SIZE - curSetBits - getCurrentLeftShift();
++    while ((currentHighValue() - curClearBits) > highTarget) {
++      // highLongShifted has not enough clear bits to reach highTarget
++      efPosition -= curSetBits;
++      if (efPosition < 0) {
++        return NO_MORE_VALUES;
++      }
++      toPreviousHighLong();
++      //assert getCurrentLeftShift() == 0;
++      curSetBits = Long.bitCount(highLongShifted);
++      curClearBits = Long.SIZE - curSetBits;
++    }
++    // highLongShifted has enough clear bits to reach highTarget, but may not have enough set bits.
++    long highValue = previousHighValue();
++    while (highValue > highTarget) {
++      /* CHECKME: See at advanceToHighValue on using broadword bit selection. */
++      if (! toBeforeCurrentHighBit()) {
++        return NO_MORE_VALUES;
++      }
++      highValue = previousHighValue();
++    }
++    return highValue;
++  }
++
++  /** Given a target value, move the decoding position to the first smaller or equal value
++   * and return that value if it is available. Otherwise return {@link #NO_MORE_VALUES}.
++   * <br>The current implementation does not use the value index on the high zero bit positions.
++   */
++  public long backToValue(long target) {
++    if (! toBeforeCurrentHighBit()) {
++      return NO_MORE_VALUES;
++    }
++    long highTarget = target >>> numLowBits;
++    long highValue = backToHighValue(highTarget);
++    if (highValue == NO_MORE_VALUES) {
++      return NO_MORE_VALUES;
++    }
++    // Linear search with low values:
++    long currentValue = combineHighLowValues(highValue, currentLowValue());
++    while (currentValue > target) {
++      currentValue = previousValue();
++      if (currentValue == NO_MORE_VALUES) {
++        return NO_MORE_VALUES;
++      }
++    }
++    return currentValue;
++  }
++}
++
+diff --git a/lucene/core/src/java/org/apache/lucene/util/eliasfano/EliasFanoDocIdSet.java b/lucene/core/src/java/org/apache/lucene/util/eliasfano/EliasFanoDocIdSet.java
+new file mode 100644
+index 0000000..4227069
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/util/eliasfano/EliasFanoDocIdSet.java
+@@ -0,0 +1,318 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.lucene.util.eliasfano;
++
++import java.io.IOException;
++import java.util.Collection;
++import java.util.ArrayList;
++
++import org.apache.lucene.search.DocIdSet;
++import org.apache.lucene.search.DocIdSetIterator;
++
++import org.apache.lucene.util.Accountable;
++import org.apache.lucene.util.BitSet;
++import org.apache.lucene.util.FixedBitSet;
++import org.apache.lucene.util.BitSetIterator;
++
++import org.apache.lucene.util.RamUsageEstimator;
++
++
++/** A DocIdSet that chooses Elias-Fano encoding or bit set encoding.
++ * <br> CHECKME: name ok?
++ * @lucene.internal
++ */
++public class EliasFanoDocIdSet extends DocIdSet {
++
++  private static final long BASE_RAM_BYTES_USED = RamUsageEstimator.shallowSizeOfInstance(EliasFanoDocIdSet.class);
++
++  private final int maxNumDocIds; // given
++  private final int upperBound; // given
++  private int numDocIds; // actual
++  private FixedBitSet fbs = null;
++  private EliasFanoLongs efLongs = null;
++  private EliasFanoEncoderUpperBound efEncoderUb = null;
++
++  /**
++   * Construct an EliasFanoDocIdSet.
++   * @param maxNumDocIds When non negative, at least the number of document ids that will be encoded.
++   *                  When the number of doc ids not known in advance, use a negative value.
++   *                  For efficient encoding this should be chosen non negative,
++   *                  and as little as possible bigger than the number of docs.
++   * @param upperBound  At least the highest document id that will be encoded.
++   *                    Should be chosen as low as possible for efficient encoding.
++   */
++  public EliasFanoDocIdSet(int maxNumDocIds, int upperBound) {
++    this.upperBound = (upperBound < 0) ? 0 : upperBound;
++    this.maxNumDocIds = maxNumDocIds;
++    if (maxNumDocIds >= 0) {
++      if (maxNumDocIds <= EliasFanoSequence.preferredMaxNumValues(upperBound)) {
++        this.efLongs = new EliasFanoLongs(maxNumDocIds, upperBound);
++      }
++      else {
++        this.fbs = newFixedBitSet();
++      }
++    }
++    else { // maxNumDocIds not known in advance, start with upper bound encoder, may be change to fixed bit set later.
++      this.efEncoderUb = new EliasFanoEncoderUpperBound(upperBound);
++    }
++    this.numDocIds = 0;
++  }
++
++  private FixedBitSet newFixedBitSet() {
++    return new FixedBitSet(upperBound + 1);
++  }
++
++  /** Encode the document ids from a DocIdSetIterator. Call this method only once.
++   *  @param disi This DocIdSetIterator should provide document ids that are consistent
++   *              with <code>numValues</code> (when non negative) and <code>upperBound</code> as provided to the constructor.
++   */
++  public void encodeFromDisi(DocIdSetIterator disi) throws IOException {
++    if (fbs != null) { // encode directly into fixed bit set
++      encodeFromDisi(fbs, disi);
++    }
++    else if (efLongs != null) { // given num doc ids at most EliasFanoSequence.preferredMaxNumValues(upperBound)
++      EliasFanoEncoder<EliasFanoLongs> encodeNextNdUb = new EliasFanoEncoder<>(efLongs);
++      encodeFromDisi(encodeNextNdUb, disi);
++      efLongs.freeze(numDocIds);
++    }
++    else if (efEncoderUb != null) { // start with upper bound encoder, may be change to fixed bit set later.
++      long maxNumDocIdsEF = EliasFanoSequence.preferredMaxNumValues(upperBound);
++      int docId = disi.nextDoc();
++      while ((docId != DocIdSetIterator.NO_MORE_DOCS) && (numDocIds < maxNumDocIdsEF)) {
++        efEncoderUb.encodeNext(docId);
++        numDocIds++;
++        docId = disi.nextDoc();
++      }
++      if (docId != DocIdSetIterator.NO_MORE_DOCS) { // more than preferred number of values, change to FixedBitSet
++        assert numDocIds == maxNumDocIdsEF;
++        fbs = newFixedBitSet();
++        encodeFromEfDecoder(fbs, efEncoderUb.getEliasFanoSequence().getDecoder(numDocIds));
++        efEncoderUb = null;
++        fbs.set(docId);
++        numDocIds++;
++        encodeFromDisi(fbs, disi);
++      } else {
++        efEncoderUb.freeze();
++        efLongs = efEncoderUb.getEliasFanoSequence();
++      }
++    }
++    else throw new IllegalStateException("no encoder for encoding");
++  }
++
++  private void encodeFromDisi(EliasFanoEncoder<?> efEncoder, DocIdSetIterator disi) throws IOException {
++    int docId = disi.nextDoc();
++    while (docId != DocIdSetIterator.NO_MORE_DOCS) {
++      efEncoder.encodeNext(docId);
++      numDocIds++;
++      docId = disi.nextDoc();
++    }
++  }
++
++  private void encodeFromDisi(FixedBitSet fbs, DocIdSetIterator disi) throws IOException {
++    int docId = disi.nextDoc();
++    while (docId != DocIdSetIterator.NO_MORE_DOCS) {
++      if (docId > upperBound) {
++        throw new IllegalArgumentException("docId " + docId + " higher than upperBound " + upperBound);
++      }
++      fbs.set(docId);
++      numDocIds++;
++      docId = disi.nextDoc();
++    }
++  }
++
++  private void encodeFromEfDecoder(FixedBitSet fbs, EliasFanoDecoder<?> efDecoder) {
++    long docId = efDecoder.nextValue();
++    while (docId != EliasFanoDecoder.NO_MORE_VALUES) {
++      assert docId <= upperBound;
++      fbs.set((int) docId); // do not increase numDocIds, already counted
++      docId = efDecoder.nextValue();
++    }
++  }
++
++  /**
++   * Provides a {@link DocIdSetIterator} to access encoded document ids.
++   */
++  @Override
++  public DocIdSetIterator iterator() {
++    if (fbs != null) {
++      return new BitSetIterator(fbs, numDocIds);
++    }
++
++    if (efLongs == null) {
++      throw new IllegalStateException("no encoded data available");
++    }
++
++    final EliasFanoDecoder<EliasFanoLongs> efDecoder;
++    efDecoder = efLongs.getDecoder(numDocIds);
++
++    return new DocIdSetIterator() {
++      private int curDocId = -1;
++
++      @Override
++      public int docID() {
++        return curDocId;
++      }
++
++      private int setCurDocID(long value) {
++        curDocId = (value == EliasFanoDecoder.NO_MORE_VALUES)
++                  ?  NO_MORE_DOCS
++                  : (int) value;
++        return curDocId;
++      }
++
++      @Override
++      public int nextDoc() {
++        return setCurDocID(efDecoder.nextValue());
++      }
++
++      @Override
++      public int advance(int target) {
++        return setCurDocID(efDecoder.advanceToValue(target));
++      }
++
++      @Override
++      public long cost() {
++        return efDecoder.numEncoded();
++      }
++    };
++  }
++
++  /** Return the underlying doc ids as a BitSet */
++  public BitSet getBitSet() {
++    if (fbs != null) {
++      return fbs;
++    }
++
++    if (efLongs == null) {
++      throw new IllegalStateException("no encoded data available");
++    }
++
++    final EliasFanoDecoder<EliasFanoLongs> efDecoder;
++    efDecoder = efLongs.getDecoder(numDocIds);
++
++    return new BitSet() {
++      private int curDocId = -1;
++
++      @Override
++      public void set(int i) {
++        throw new UnsupportedOperationException();
++      }
++
++      @Override
++      public void clear(int startIndex, int endIndex) {
++        throw new UnsupportedOperationException();
++      }
++
++      @Override
++      public void clear(int i) {
++        throw new UnsupportedOperationException();
++      }
++
++      @Override
++      public int cardinality() {
++        return (int) efDecoder.numEncoded();
++      }
++
++      @Override
++      public int length() {
++        return cardinality();
++      }
++
++      @Override
++      public long ramBytesUsed() {
++        return EliasFanoDocIdSet.this.ramBytesUsed();
++      }
++
++      @Override
++      public Collection<Accountable> getChildResources() {
++        return EliasFanoDocIdSet.this.getChildResources();
++      }
++
++      private int setCurDocID(long value) {
++        curDocId = (value == EliasFanoDecoder.NO_MORE_VALUES)
++                  ?  DocIdSetIterator.NO_MORE_DOCS
++                  : (int) value;
++        return curDocId;
++      }
++
++      @Override
++      public boolean get(int index) {
++        if (curDocId < index) {
++          return nextSetBit(index) == index;
++        }
++        if (curDocId > index) {
++          return prevSetBit(index) == index;
++        }
++        return (curDocId >= 0) && (curDocId < upperBound);
++      }
++
++      @Override
++      public int prevSetBit(int index) {
++        return setCurDocID(efDecoder.backToValue(index));
++      }
++
++      @Override
++      public int nextSetBit(int index) {
++        return setCurDocID(efDecoder.advanceToValue(index));
++      }
++
++    };
++  }
++
++  @Override
++  public boolean equals(Object other) {
++    return (other instanceof EliasFanoDocIdSet)
++        && ( ((efLongs != null) && efLongs.equals(((EliasFanoDocIdSet) other).efLongs))
++            || ((fbs != null) && fbs.equals(((EliasFanoDocIdSet) other).fbs))
++           );
++  }
++
++  @Override
++  public int hashCode() {
++    return getClass().hashCode()
++            ^ ( (efLongs != null) ? efLongs.hashCode()
++             : (fbs != null) ? fbs.hashCode()
++             : 0 );
++  }
++
++  public String toString() {
++    StringBuilder sb = new StringBuilder("EliasFanoDocIdSet(");
++    sb.append(", efLongs = " + ((efLongs != null) ? efLongs.getClass() : efLongs) );
++    sb.append(", fbs = " + ((fbs != null) ? fbs.getClass() : fbs) );
++    sb.append(", upperBound = " + upperBound);
++    sb.append(")");
++    return sb.toString();
++  }
++
++  @Override
++  public long ramBytesUsed() {
++    return BASE_RAM_BYTES_USED;
++  }
++
++  @Override
++  public Collection<Accountable> getChildResources() {
++    ArrayList<Accountable> resources = new ArrayList<>();
++    if (fbs != null) {
++      resources.add(fbs);
++    } else if (efLongs != null) {
++      resources.add(efLongs);
++    }
++    return resources;
++  }
++}
++
+diff --git a/lucene/core/src/java/org/apache/lucene/util/eliasfano/EliasFanoEncoder.java b/lucene/core/src/java/org/apache/lucene/util/eliasfano/EliasFanoEncoder.java
+new file mode 100644
+index 0000000..e4bae78
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/util/eliasfano/EliasFanoEncoder.java
+@@ -0,0 +1,158 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.lucene.util.eliasfano;
++
++import java.util.Arrays;
++
++import org.apache.lucene.util.Accountable;
++import org.apache.lucene.util.FixedBitSet; // for javadocs
++import org.apache.lucene.util.RamUsageEstimator;
++import org.apache.lucene.util.ToStringUtils;
++
++
++/** Encode an {@link EliasFanoSequence}.
++ *
++ * @lucene.internal
++ */
++
++public class EliasFanoEncoder<EFSeq extends EliasFanoSequence> { 
++
++  long numEncoded = 0L;
++  long lastEncoded = 0L; // initially x[-1]
++
++  long currentEntryIndex; // also indicates how many entries in the index are valid.
++  final long valueIndexInterval;
++  
++  EFSeq efSeq; // holds the actual encoded values.
++
++  /**
++   * Construct an Elias-Fano encoder for an EliasFanoSequence.
++   * @param efSeq The storage for the sequence that is to be encoded.
++   *        This also provides:
++   *        <ul>
++   *        <li><code>maxNumValues</code>, after construction, call {@link #encodeNext} <code>maxNumValues</code> times to encode
++   *            a non decreasing sequence of non negative numbers.
++   *        <li><code>upperBound</code> at least the highest value that will be encoded.
++   *        <li><code>valueIndexInterval</code> the number of high zero bits for which a single value index entry is built.
++   *            The value index will have at most <code>2 * maxNumValues / valueIndexInterval</code> entries
++   *            and each value index entry will use at most <code>ceil(log2(3 * maxNumValues))</code> bits,
++   *            see also {@link EliasFanoSequence}.
++   *        </ul>
++   * @throws IllegalArgumentException when:
++   *        <ul>
++   *        <li><code>maxNumValues</code> is negative, or
++   *        <li><code>maxNumValues</code> is non negative and <code>upperBound</code> is negative, or
++   *        <li>constructing the <code>EliasFanoSequence</code> throws this exception.
++   *        </ul>
++   */
++  
++  public EliasFanoEncoder(EFSeq efSeq) {
++    this.efSeq = efSeq;
++    this.currentEntryIndex = 0;
++    this.valueIndexInterval = efSeq.valueIndexInterval;
++  }
++
++
++  /** Call at most <code>maxNumValues</code> times to encode a non decreasing sequence of non negative numbers.
++   * @param x The next number to be encoded.
++   * @throws IllegalStateException when called more than <code>maxNumValues</code> times.
++   * @throws IllegalArgumentException when:
++   *         <ul>
++   *         <li><code>x</code> is smaller than an earlier encoded value, or
++   *         <li><code>x</code> is larger than <code>upperBound</code>.
++   *         </ul>
++   */
++  public void encodeNext(long x) {
++    if (numEncoded >= efSeq.maxNumValues) {
++      throw new IllegalStateException("encodeNext called more than " + efSeq.maxNumValues + " times.");
++    }
++    if (lastEncoded > x) {
++      throw new IllegalArgumentException(x + " smaller than previous " + lastEncoded);
++    }
++    if (x > efSeq.upperBound) {
++      throw new IllegalArgumentException(x + " larger than upperBound " + efSeq.upperBound);
++    }
++    long highValue = x >>> efSeq.numLowBits;
++    long nextHighBitNum = numEncoded + highValue; // sequence of unary gaps
++    efSeq.setHighBit(nextHighBitNum);
++    efSeq.setLowValue(numEncoded, x);
++    lastEncoded = x;
++
++    // Add value index entries:
++    long indexValue = (currentEntryIndex + 1) * valueIndexInterval;
++    while (indexValue <= highValue) { 
++      long afterZeroBitPosition = indexValue + numEncoded;
++      efSeq.setValueIndexEntry(afterZeroBitPosition, currentEntryIndex);
++      currentEntryIndex += 1;
++      indexValue += valueIndexInterval;
++    }
++    numEncoded++;
++  }
++
++  /**
++   * Returns the number of encoded values.
++   */
++  public long numEncoded() {
++    return numEncoded;
++  }
++  
++  /**
++   * Returns the last encoded value.
++   */
++  public long lastEncoded() {
++    return lastEncoded;
++  }
++
++  /**
++   * Returns the encoded sequence.
++   */
++  public EFSeq getEFSequence() {
++    return efSeq;
++  }
++
++  @Override
++  public String toString() {
++    StringBuilder s = new StringBuilder("EliasFanoEncoder");
++    s.append(" numEncoded " + numEncoded);
++    s.append(" lastEncoded " + lastEncoded);
++    s.append(" valueIndexInterval " + valueIndexInterval);
++    s.append(" currentEntryIndex " + currentEntryIndex);
++    s.append("\nefSeq "); s.append(efSeq.toString());
++    return s.toString();
++  }
++
++  @Override
++  public boolean equals(Object other) {
++    if (! (other instanceof EliasFanoEncoder<?>)) {
++      return false;
++    }
++    EliasFanoEncoder<?> oefs = (EliasFanoEncoder<?>) other;
++    // no equality needed for upperBound
++    return (this.numEncoded == oefs.numEncoded)
++        && (this.valueIndexInterval == oefs.valueIndexInterval)
++        && this.efSeq.equals(oefs.efSeq);
++  }
++
++  @Override
++  public int hashCode() {
++    int h = ((int) (7*(numEncoded + 5*valueIndexInterval))) ^ efSeq.hashCode();
++    return h;
++  }
++
++}
++
+diff --git a/lucene/core/src/java/org/apache/lucene/util/eliasfano/EliasFanoEncoderUpperBound.java b/lucene/core/src/java/org/apache/lucene/util/eliasfano/EliasFanoEncoderUpperBound.java
+new file mode 100644
+index 0000000..6d5224f
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/util/eliasfano/EliasFanoEncoderUpperBound.java
+@@ -0,0 +1,129 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.lucene.util.eliasfano;
++
++/** An EliasFanoEncoder that only needs a given upperbound for the values to be encoded.
++ *  <br>The current implementation delegates to one ore more {@link EliasFanoEncoder}s,
++ *  each encoding an {@link EliasFanoLongs},
++ *  by choosing maximum numbers of encoded values appropriately.
++ *  When compared to {@link EliasFanoLongs} this uses at most twice the memory
++ *  and has a slightly reduced performance for {@link EliasFanoDecoder#nextValue}
++ *  and {@link EliasFanoDecoder#advanceToValue}.
++ * @lucene.internal
++ */
++public class EliasFanoEncoderUpperBound {
++
++  static final long MAX_UPPER_INITIAL_SIZE = 1L << 8; // 256, power of 2, see also oversize comment at end of constructor.
++  EliasFanoLongs efSeq;
++  EliasFanoEncoder<EliasFanoLongs> efEncoder;
++  long currentNumValues;
++  final long upperBound;
++
++  /**
++   * Construct an Elias-Fano encoder that only needs an upperbound.
++   * After construction, call {@link #encodeNext} to encode
++   * a non decreasing sequence of non negative numbers.
++   * @param upperBound  At least the highest value that will be encoded.
++   */
++  public EliasFanoEncoderUpperBound(long upperBound) {
++    if (upperBound <= 0) {
++      upperBound = 0;
++    }
++    this.upperBound = upperBound;
++    // Choose initial currentNumValues so that when repeatedly multiplied by 2
++    // it will be just bigger than the max preferred size for Elias-Fano.
++    // This minimizes the reEncoding memory allocation before a bit set is preferable.
++    if (this.upperBound <= MAX_UPPER_INITIAL_SIZE) { // Small upperBound, may prefer a bit set, but anyway
++      this.currentNumValues = this.upperBound;
++    }
++    else { // this.upperBound > MAX_UPPER_INITIAL_SIZE
++      long workNumValues = EliasFanoSequence.preferredMaxNumValues(this.upperBound);
++      if (workNumValues <= 1) { // not likely
++        workNumValues = 1;
++      }
++      int rightShift = Long.numberOfLeadingZeros(MAX_UPPER_INITIAL_SIZE) - Long.numberOfLeadingZeros(workNumValues) + 1;
++      if (rightShift > 0) {
++        workNumValues >>>= rightShift; // divide by 2 until smaller than MAX_UPPER_INITIAL_SIZE (power of 2)
++      }
++      assert workNumValues < MAX_UPPER_INITIAL_SIZE;
++      assert workNumValues >= 1;
++      this.currentNumValues = workNumValues + 1;
++      // Add 1 so repeated multiplication by 2 will oversize this to just bigger than the preferred maximum,
++      // but normally by no more than a factor 2/MAX_UPPER_INITIAL_SIZE, i.e. at most 1/128 bigger for 256.
++      // The normal case is when the preferred maximum value is at least MAX_UPPER_INITIAL_SIZE.
++      assert this.currentNumValues < this.upperBound; // because this.upperBound > MAX_UPPER_INITIAL_SIZE
++    }
++    efSeq = new EliasFanoLongs(this.currentNumValues, this.upperBound);
++    efEncoder = efSeq.getEncoder();
++  }
++
++  private void reEncode() {
++    EliasFanoLongs nextEfSeq = new EliasFanoLongs(currentNumValues, upperBound);
++    EliasFanoEncoder<EliasFanoLongs> nextEfEncoder = nextEfSeq.getEncoder();
++    efSeq.reEncode(nextEfEncoder);
++    efSeq = nextEfSeq;
++    efEncoder = nextEfEncoder;
++  }
++
++  /** Call to encode a non decreasing sequence of non negative numbers.
++   * @param x The next number to be encoded, this should not exceed <code>upperBound</code>.
++   */
++  public void encodeNext(long x) {
++    if (efEncoder.numEncoded() == currentNumValues) {
++      currentNumValues *= 2;
++      reEncode();
++    }
++    efEncoder.encodeNext(x);
++  }
++
++  /**
++   * Returns the number of encoded values.
++   */
++  public long numEncoded() {
++    return efEncoder.numEncoded();
++  }
++
++  /** Reallocate as small as possible to fit the last encoded value.
++   * Do not call {@link #encodeNext} afterwards.
++   */
++  public void freeze() {
++    efSeq.freeze(efEncoder.numEncoded());
++  }
++
++  /**
++   * Returns an {@link EliasFanoLongs} with the encoded values.
++   * Do not call {@link #encodeNext} afterwards.
++   */
++  public EliasFanoLongs getEliasFanoSequence() {
++    return efEncoder.getEFSequence();
++  }
++
++  @Override
++  public boolean equals(Object other) {
++    if (! (other instanceof EliasFanoEncoderUpperBound)) {
++      return false;
++    }
++    return efEncoder.equals(((EliasFanoEncoderUpperBound)other).efEncoder);
++  }
++
++  @Override
++  public int hashCode() {
++    return getClass().hashCode() ^ efEncoder.hashCode();
++  }
++}
++
+diff --git a/lucene/core/src/java/org/apache/lucene/util/eliasfano/EliasFanoLongs.java b/lucene/core/src/java/org/apache/lucene/util/eliasfano/EliasFanoLongs.java
+new file mode 100644
+index 0000000..36c31d2
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/util/eliasfano/EliasFanoLongs.java
+@@ -0,0 +1,293 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.lucene.util.eliasfano;
++
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.Collections;
++
++import org.apache.lucene.util.ToStringUtils;
++
++import org.apache.lucene.util.Accountable;
++import org.apache.lucene.util.RamUsageEstimator;
++
++/** An EliasFanoSequence implemented on long arrays */
++public class EliasFanoLongs extends EliasFanoSequence implements Accountable {
++
++  private static final long BASE_RAM_BYTES_USED = RamUsageEstimator.shallowSizeOfInstance(EliasFanoDocIdSet.class);
++
++  long[] highLongs;
++
++  long[] lowLongs;
++  static final int LOG2_LONG_SIZE = Integer.numberOfTrailingZeros(Long.SIZE);
++
++  /** highZeroBitPositionIndex[i] (filled using packValue) will contain the bit position
++   *  just after the zero bit ((i+1) * valueIndexInterval) in the high bits.
++   */
++  long[] highZeroBitPositionIndex;
++  
++  boolean frozen;
++  long numEncoded; // only set at freezing.
++
++  /**
++   * Construct an <code>EliasFanoLongs</code> for given bounds and value index interval.
++   * @throws IllegalArgumentException when:
++   * <ul>
++   * <li>the high bits do not fit in a <code>long[]</code>:
++   *     {@code >(2 * maxNumValues / 64) > Integer.MAX_VALUE}, or
++   * <li>the low bits do not fit in a <code>long[]</code>:
++   *     {@code (numLowBits * maxNumValues / 64) > Integer.MAX_VALUE}, or
++   * <li><code>valueIndexInterval &lt; 2</code>, or
++   * <li>the index bits do not fit in a <code>long[]</code>:
++   *     {@code (maxNumValues / valueIndexInterval * ceil(2log(3 * maxNumValues)) / 64) > Integer.MAX_VALUE}.
++   * </ul>
++   */
++  public EliasFanoLongs(long maxNumValues, long upperBound, long valueIndexInterval) {
++    super(maxNumValues, upperBound, valueIndexInterval);
++
++    long numLongsForHighBits = numLongsForBits( maxNumHighBits());
++    if (numLongsForHighBits > Integer.MAX_VALUE) {
++      throw new IllegalArgumentException("numLongsForHighBits too large to index a long array: " + numLongsForHighBits);
++    }
++    this.highLongs = new long[(int) numLongsForHighBits];
++
++    if (numLowBits >= Long.SIZE) { // getLowValue inspects at most two longs:
++      throw new IllegalArgumentException("numLowBits larger than 63: " + numLowBits);
++    }
++
++    long numLongsForLowBits = numLongsForBits(maxNumValues * numLowBits);
++    if (numLongsForLowBits > Integer.MAX_VALUE) {
++      throw new IllegalArgumentException("numLongsForLowBits too large to index a long array: " + numLongsForLowBits);
++    }
++    this.lowLongs = new long[(int) numLongsForLowBits];
++
++    long numValueIndexBits = maxNumValueIndexEntries() * numValueIndexEntryBits;
++    long numLongsForValueIndexBits = numLongsForBits(numValueIndexBits);
++    if (numLongsForValueIndexBits > Integer.MAX_VALUE) {
++      throw new IllegalArgumentException("numLongsForValueIndexBits too large to index a long array: " + numLongsForValueIndexBits);
++    }
++    this.highZeroBitPositionIndex = new long[(int) numLongsForValueIndexBits];
++    this.frozen = false;
++    this.numEncoded = 0; 
++  }
++
++  /** Call {@link #EliasFanoLongs(long, long, long)} using {@link #DEFAULT_VALUE_INDEX_INTERVAL}. */
++  public EliasFanoLongs(long maxNumValues, long upperBound) {
++    this(maxNumValues, upperBound, DEFAULT_VALUE_INDEX_INTERVAL);
++  }
++
++  @Override
++  EliasFanoLongs newSequence(long maxNumValues, long upperBound, long valueIndexInterval) {
++    return new EliasFanoLongs(maxNumValues, upperBound, valueIndexInterval);
++  }
++
++
++  /** Expert. The low bits. */
++  public long[] getLowBits() {
++    return lowLongs;
++  }
++
++  /** Expert. The high bits. */
++  public long[] getHighBits() {
++    return highLongs;
++  }
++
++  /** Expert. The value index bits. */
++  public long[] getValueIndexBits() {
++    return highZeroBitPositionIndex;
++  }
++
++  private static long numLongsForBits(long numBits) { // Note: int version in FixedBitSet.bits2words()
++    assert numBits >= 0 : numBits;
++    return (numBits + (Long.SIZE-1)) >>> LOG2_LONG_SIZE;
++  }
++
++  private static void packValue(long value, long[] longArray, int numBits, long packIndex) {
++    if (numBits != 0) {
++      long bitPos = numBits * packIndex;
++      int longIndex = (int) (bitPos >>> LOG2_LONG_SIZE);
++      int bitPosAtIndex = (int) (bitPos & (Long.SIZE-1));
++      longArray[longIndex] |= (value << bitPosAtIndex);
++      if ((bitPosAtIndex + numBits) > Long.SIZE) {
++        longArray[longIndex+1] = (value >>> (Long.SIZE - bitPosAtIndex));
++      }
++    }
++  }
++
++  private static long unPackValue(long[] longArray, int numBits, long packIndex, long bitsMask) {
++    if (numBits == 0) {
++      return 0;
++    }
++    long bitPos = packIndex * numBits;
++    int longIndex = (int) (bitPos >>> LOG2_LONG_SIZE);
++    int bitPosAtIndex = (int) (bitPos & (Long.SIZE-1));
++    long value = longArray[longIndex] >>> bitPosAtIndex;
++    if ((bitPosAtIndex + numBits) > Long.SIZE) {
++      value |= (longArray[longIndex + 1] << (Long.SIZE - bitPosAtIndex));
++    }
++    value &= bitsMask;
++    return value;
++  }
++
++  @Override
++  public EliasFanoEncoder<EliasFanoLongs> getEncoder() {
++    return new EliasFanoEncoder<>(this);
++  }
++
++  @Override
++  void setHighBit(long highBitNum) {
++    highLongs[(int)(highBitNum >>> LOG2_LONG_SIZE)] |= (1L << (highBitNum & (Long.SIZE-1)));
++  }
++
++  @Override
++  void setLowValue(long efPosition, long value) {
++    packValue(value & lowerBitsMask, lowLongs, numLowBits, efPosition);
++  }
++
++  @Override
++  void setValueIndexEntry(long afterZeroBitPosition, long entryIndex) {
++    assert afterZeroBitPosition > 0;
++    assert afterZeroBitPosition <= valueIndexBitsMask;
++    packValue(afterZeroBitPosition, highZeroBitPositionIndex, numValueIndexEntryBits, entryIndex);
++    numValueIndexEntries = entryIndex + 1;
++  }
++
++
++  /**
++   * Reduce the allocated size to the minimal size needed for the given number of encoded values.
++   * Only use this method once after encoding.
++   * <br>This method does not change the number of low bits per encoded value <code>L</code>.
++   */
++  public void freeze(long numEncoded) {
++    if (frozen) {
++      return;
++    }
++    if (numEncoded < 0) {
++      throw new IllegalArgumentException("numEncoded must not be negative");
++    }
++    if (numEncoded > maxNumValues) {
++      throw new IllegalArgumentException("numEncoded=" + numEncoded + " is larger than maxNumValues=" + maxNumValues);
++    }
++    if (numEncoded == maxNumValues) {
++      frozen = true;
++      return;
++    }
++    this.numEncoded = numEncoded;
++    highLongs = reallocSmaller(highLongs, (int) numLongsForBits(numEncoded + maxHighValue())); // might use last encoded to determine maxHighValue()
++    lowLongs = reallocSmaller(lowLongs, (int) numLongsForBits(numEncoded * numLowBits));
++    // do not realloc highZeroBitPositionIndex, it's size depends on maxHighValue(), might use last encoded value for this.
++    frozen = true;
++  }
++
++  private static long[] reallocSmaller(long[] ar, int newLength) {
++    if (newLength > ar.length) {
++      throw new IllegalArgumentException("newLength " + newLength + " should be at most " + ar.length);
++    }
++    return (newLength < ar.length) ? Arrays.copyOf(ar, newLength) : /* newLength == ar.length */ ar;
++  }
++
++  /**
++   * Returns an {@link EliasFanoDecoder} to access the sequence.
++   * Only use this method after encoding and freezing.
++   * <p>
++   * When the actual last encoded value divided by the actual number of encoded values
++   * differs from the given <code>upperBound</code> divided by the given <code>maxNumValues</code>
++   * by at least a factor of 2, a better compression would have been possible and the decoding speed may be reduced.
++   */
++  @Override
++  public EliasFanoDecoder<EliasFanoLongs> getDecoder() {
++    return getDecoder(maxNumValues);
++  }
++
++  /** Decoder when encoded but not frozen. */
++  public EliasFanoDecoder<EliasFanoLongs> getDecoder(long numEncoded) {
++    return new EliasFanoDecoder<>(this, numEncoded);
++  }
++
++  @Override
++  long getHighLong(int highIndex) {
++    return highLongs[highIndex];
++  }
++
++  @Override
++  long getLowValue(long efPosition) {
++    return unPackValue(lowLongs, numLowBits, efPosition, lowerBitsMask);
++  }
++
++  @Override
++  long getValueIndexEntry(long entryIndex) {
++    return unPackValue(highZeroBitPositionIndex, numValueIndexEntryBits, entryIndex, valueIndexBitsMask);
++  }
++
++
++  private static void dumpLongArray(String name, long[] la, StringBuilder s) {
++    s.append(name);
++    if (la != null) {
++      s.append("[");
++      s.append(la.length);
++      s.append("]");
++      for (int i = 0; i < la.length; i++) {
++        s.append(" ");
++        s.append(ToStringUtils.longHex(la[i]));
++      }
++    } else {
++      s.append("(null)");
++    }
++  }
++
++  @Override
++  public String toString() {
++    StringBuilder s = new StringBuilder("EliasFanoLongs\n");
++    s.append(super.toString()); s.append("\n");
++    dumpLongArray("highLongs", highLongs, s); s.append("\n");
++    dumpLongArray("lowLongs", lowLongs, s); s.append("\n");
++    dumpLongArray("highZeroBitPositionIndex", highZeroBitPositionIndex, s); s.append("\n");
++    return s.toString();
++  }
++
++  @Override
++  public boolean equals(Object other) {
++    return super.equals(other)
++      && (this.numValueIndexEntries == ((EliasFanoLongs)other).numValueIndexEntries) // no need to check index content
++      && Arrays.equals(this.highLongs, ((EliasFanoLongs)other).highLongs)
++      && Arrays.equals(this.lowLongs, ((EliasFanoLongs)other).lowLongs);
++  }
++
++  @Override
++  public int hashCode() {
++    return super.hashCode()
++      ^ Arrays.hashCode(highLongs)
++      ^ Arrays.hashCode(lowLongs)
++      ^ (3 * (int) numValueIndexEntries);
++  }
++
++  @Override
++  public long ramBytesUsed() {
++    return BASE_RAM_BYTES_USED
++        + RamUsageEstimator.sizeOf(lowLongs)
++        + RamUsageEstimator.sizeOf(highLongs)
++        + RamUsageEstimator.sizeOf(highZeroBitPositionIndex);
++  }
++
++  @Override
++  public Collection<Accountable> getChildResources() {
++    return Collections.emptyList();
++  }
++}
++
++
+diff --git a/lucene/core/src/java/org/apache/lucene/util/eliasfano/EliasFanoSequence.java b/lucene/core/src/java/org/apache/lucene/util/eliasfano/EliasFanoSequence.java
+new file mode 100644
+index 0000000..4a722a4
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/util/eliasfano/EliasFanoSequence.java
+@@ -0,0 +1,263 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.lucene.util.eliasfano;
++
++/** Store the encoding and index(es) for an Elias-Fano encoded sequence of non decreasing and non negative whole numbers.
++ * This encoding was introduced in the 1970's by Peter Elias and Robert Fano.
++ * <p>
++ * The Elias-Fano encoding is a high bits / low bits representation of
++ * a monotonically increasing sequence of {@code numValues > 0} natural numbers <code>x[i]</code>
++ * <p>
++ * {@code 0 <= x[0] <= x[1] <= ... <= x[numValues-2] <= x[numValues-1] <= upperBound}
++ * <p>
++ * where {@code upperBound > 0} is an upper bound on the last value.
++ * <br>
++ * The Elias-Fano encoding uses less than half a bit per encoded number more
++ * than the smallest representation
++ * that can encode any monotone sequence with the same bounds.
++ * <p>
++ * The lower <code>L</code> bits of each <code>x[i]</code> are stored explicitly and contiguously
++ * in the lower-bits array, with <code>L</code> chosen as (<code>log()</code> base 2):
++ * <p>
++ * <code>L = max(0, floor(log(upperBound/numValues)))</code>
++ * <p>
++ * The upper bits are stored in the upper-bits array as a sequence of unary-coded gaps (<code>x[-1] = 0</code>):
++ * <p>
++ * <code>(x[i]/2**L) - (x[i-1]/2**L)</code>
++ * <p>
++ * The unary code encodes a natural number <code>n</code> by <code>n</code> 0 bits followed by a 1 bit:
++ * <code>0...01</code>. <br>
++ * In the upper bits the total the number of 1 bits is <code>numValues</code>
++ * and the total number of 0 bits is:<p>
++ * {@code floor(x[numValues-1]/2**L) <= upperBound/(2**max(0, floor(log(upperBound/numValues)))) <= 2*numValues}
++ * <p>
++ * The Elias-Fano encoding uses at most
++ * <p>
++ * <code>2 + ceil(log(upperBound/numValues))</code>
++ * <p>
++ * bits per encoded number. With <code>upperBound</code> in these bounds (<code>p</code> is an integer):
++ * <p>
++ * {@code 2**p < x[numValues-1] <= upperBound <= 2**(p+1)}
++ * <p>
++ * the number of bits per encoded number is minimized.
++ * <p>
++ * In this implementation the values in the sequence can be given as <code>long</code>,
++ * <code>numValues = 0</code> and <code>upperBound = 0</code> are allowed,
++ * and each of the upper and lower bit arrays should fit in a <code>long[]</code>.
++ * <br>
++ * An index of positions of zero's in the upper bits is also built.
++ * <p>
++ * This implementation is based on this article:
++ * <br>
++ * Sebastiano Vigna, "Quasi Succinct Indices", June 19, 2012, sections 3, 4 and 9.
++ * Retrieved from http://arxiv.org/pdf/1206.4300 .
++ *
++ * <p>The articles originally describing the Elias-Fano representation are:
++ * <br>Peter Elias, "Efficient storage and retrieval by content and address of static files",
++ * J. Assoc. Comput. Mach., 21(2):246–260, 1974.
++ * <br>Robert M. Fano, "On the number of bits required to implement an associative memory",
++ *  Memorandum 61, Computer Structures Group, Project MAC, MIT, Cambridge, Mass., 1971.
++ *
++ * @lucene.internal
++ */
++public abstract class EliasFanoSequence {
++  long maxNumValues;
++  long upperBound;
++  long valueIndexInterval;
++  int numLowBits;
++  long lowerBitsMask;
++
++  /** The default value index interval for zero high bits. */
++  public static final long DEFAULT_VALUE_INDEX_INTERVAL = 256;
++
++  long numValueIndexEntries;
++  int numValueIndexEntryBits;
++  long valueIndexBitsMask;
++
++  /**
++   * @throws IllegalArgumentException when:
++   *         <ul>
++   *         <li><code>maxNumValues</code> is negative, or
++   *         <li><code>upperBound</code> is non negative, or
++   *         <li><code>valueIndexInterval</code> is smaller than 2.
++   *         </ul>
++   */
++  public EliasFanoSequence(long maxNumValues, long upperBound, long valueIndexInterval) {
++    this.numLowBits = numLowBits(maxNumValues, upperBound);
++    checkBounds(maxNumValues, upperBound, valueIndexInterval);
++    this.maxNumValues = maxNumValues;
++    this.upperBound = (maxNumValues == 0) ? 0 : (upperBound > 0) ? upperBound : 0;
++    this.valueIndexInterval = valueIndexInterval;
++    this.lowerBitsMask = Long.MAX_VALUE >>> (Long.SIZE - 1 - this.numLowBits);
++    // For the index:
++    this.numValueIndexEntryBits = numValueIndexEntryBits(maxNumValues, upperBound);
++    this.valueIndexBitsMask = (1L << numValueIndexEntryBits) - 1;
++  }
++  
++  public EliasFanoSequence(long maxNumValues, long upperBound) {
++    this(maxNumValues, upperBound, DEFAULT_VALUE_INDEX_INTERVAL);
++  }
++  
++  static void checkBounds(long maxNumValues, long upperBound, long valueIndexInterval) {
++    if (maxNumValues < 0) {
++      throw new IllegalArgumentException("maxNumValues should be non negative: " + maxNumValues);
++    }
++    if ((maxNumValues > 0) && (upperBound < 0)) {
++      throw new IllegalArgumentException("upperBound should be non negative for non empty sequence: " + upperBound);
++    }
++    if (valueIndexInterval < 2) {
++      throw new IllegalArgumentException("valueIndexInterval should be at least 2: " + valueIndexInterval);
++    }
++  }
++
++  static int numLowBits(long maxNumValues, long upperBound) {
++    int nLowBits = 0;
++    if (maxNumValues > 0) { // nLowBits = max(0; floor(2log(upperBound/maxNumValues)))
++      long lowBitsFac = upperBound / maxNumValues;
++      if (lowBitsFac > 0) {
++        nLowBits = 63 - Long.numberOfLeadingZeros(lowBitsFac); // see Long.numberOfLeadingZeros javadocs
++      }
++    }
++    return nLowBits;
++  }
++  
++  static long lowerBitsMask(int numLowBits) {
++    return Long.MAX_VALUE >>> (Long.SIZE - 1 - numLowBits);
++  }
++
++  static int numValueIndexEntryBits(long maxNumValues, long upperBound) {
++    int numLowBits = numLowBits(maxNumValues, upperBound);
++    long maxHighValue = upperBound >>> numLowBits;
++    long maxValueIndexEntry = maxHighValue + maxNumValues - 1; // 0 high bits plus 1 high bits, start at zero
++    // ceil(2log(maxValueIndexEntry+1)) :
++    int res = (maxValueIndexEntry <= 0) ? 0 : (Long.SIZE - Long.numberOfLeadingZeros(maxValueIndexEntry));
++    return res;
++  }
++
++  long maxHighValue() {
++    long maxH = upperBound >>> numLowBits;
++    //assert maxH <= (2 * maxNumValues); // Can fail when freezing with too low maxNumValues
++    return maxH;
++  }
++
++  long maxNumHighBits() {
++    long numHighBitsClear = maxHighValue();
++    long numHighBitsSet = this.maxNumValues;  
++    return numHighBitsClear + numHighBitsSet;
++  }
++
++  long maxNumValueIndexEntries() {
++    long maxNum = maxHighValue() / valueIndexInterval; // no zero value index entry
++    return (maxNum >= 0) ? maxNum : 0;
++  }
++  
++
++  /** Return a new EliasFanoSequence of the same type */
++  abstract EliasFanoSequence newSequence(long maxNumValues, long upperBound, long valueIndexInterval);
++
++  /** Reencode the values encoded in this sequence into an EliasFanoEncoder */
++  void reEncode(EliasFanoEncoder<?> efEncoder) {
++    EliasFanoDecoder<?> efDecoder = getDecoder();
++    while (true) {
++      long value = efDecoder.nextValue();
++      if (value == EliasFanoDecoder.NO_MORE_VALUES)
++        break;
++      efEncoder.encodeNext(value);
++    }
++  }
++
++  abstract public EliasFanoEncoder<? extends EliasFanoSequence> getEncoder();
++
++  abstract void setHighBit(long highBitNum); // encode unary by bit
++
++  abstract void setLowValue(long efIndex, long value);
++
++  /** Should be called with increasing values for entryIndex, starting at 0 */
++  abstract void setValueIndexEntry(long afterZeroBitPosition, long entryIndex);
++
++
++  /** Provide a maximum number of values above which it is better to use a {@link org.apache.lucene.util.FixedBitSet}
++   *  than an {@link EliasFanoSequence} to encode and decode a strictly monotone sequence with a given upperBound.
++   *  This indication is not precise and may change in the future.
++   *  <br>It is assumed the value index uses {@link #DEFAULT_VALUE_INDEX_INTERVAL}.
++   *  <br>A bit set is always preferred when <code>upperbound &lt; 256</code>.
++   *  <br>Note that when <code>numValues &gt;= (upperBound/3)</code> a {@link org.apache.lucene.util.FixedBitSet}
++   *  will take less space however this is not the only criterion used here.
++   *  Normally a value smaller than <code>(upperBound/3)</code> is returned.
++   *  @param upperBound The maximum possible value in the sequence.
++   */
++   public static long preferredMaxNumValues(long upperBound) {
++    /* When (upperBound / 6) == maxNumValues,
++     * the number of bits per entry for the EliasFanoEncoder is 2 + ceil(2log(upperBound/maxNumValues)) == 5.
++     * For intersecting two bit sets upperBound bits are accessed, roughly half of one, half of the other.
++     * For intersecting two EliasFano sequences without value index on the high bits,
++     * all (2 * 3 * maxNumValues) high bits are accessed.
++     */
++    return (upperBound < (4 * Long.SIZE))
++          ? 0 // prefer a bitset when it takes no more than 4 longs.
++          : (upperBound / 7); // 6 for intersection as above, + 1 to allow room for the index.
++  }
++
++  /**
++   * Returns an {@link EliasFanoDecoder} to access the sequence.
++   * Only use this method after encoding.
++   */
++  public abstract EliasFanoDecoder<? extends EliasFanoSequence> getDecoder();
++
++  abstract long getHighLong(int highIndex); // decoder always uses high long for broadword efficiency
++
++  abstract long getLowValue(long efPosition);
++
++  abstract long getValueIndexEntry(long entryIndex);
++
++
++  @Override
++  public String toString() {
++    StringBuilder s = new StringBuilder("EliasFanoSequence(");
++    s.append("maxNumValues=" + maxNumValues);
++    s.append(", upperBound=" + upperBound);
++    s.append(", numLowBits=" + numLowBits);
++    s.append(", valueIndexInterval=" + valueIndexInterval);
++    s.append(", numValueIndexEntryBits=" + numValueIndexEntryBits);
++    s.append(")");
++    return s.toString();
++  }
++  
++  @Override
++  public boolean equals(Object other) {
++    if (other == null) {
++      return false;
++    }
++    if (getClass() != other.getClass()) {
++      return false;
++    }
++    EliasFanoSequence oefs = (EliasFanoSequence) other;
++    return (this.numLowBits == oefs.numLowBits)
++        && (this.maxNumValues == oefs.maxNumValues)
++        && (this.upperBound == oefs.upperBound)
++        && (this.valueIndexInterval == oefs.valueIndexInterval);
++  }
++
++  @Override
++  public int hashCode() {
++    return getClass().hashCode() 
++          ^ (3 * numLowBits + (int) (maxNumValues ^ upperBound ^ valueIndexInterval));
++  }
++  
++}
++
+diff --git a/lucene/core/src/test/org/apache/lucene/util/eliasfano/BaseEliasFanoSequenceTestCase.java b/lucene/core/src/test/org/apache/lucene/util/eliasfano/BaseEliasFanoSequenceTestCase.java
+new file mode 100644
+index 0000000..9436503
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/util/eliasfano/BaseEliasFanoSequenceTestCase.java
+@@ -0,0 +1,212 @@
++package org.apache.lucene.util.eliasfano;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.util.LuceneTestCase;
++
++/** Base test class for {@link EliasFanoSequence}s. */
++public abstract class BaseEliasFanoSequenceTestCase<EFSeq extends EliasFanoSequence> extends LuceneTestCase {
++
++  abstract EliasFanoSequence makeSequence(long[] values, long valueIndexInterval);
++
++  static void encodeSequence(long[] values, EliasFanoSequence efSeq) {
++    long upperBound = 0L;
++    for (long value: values) {
++      assertTrue(value >= upperBound); // test data ok
++      upperBound = value;
++    }
++    EliasFanoEncoder<?> efEncoder = efSeq.getEncoder();
++    for (long value: values) {
++      efEncoder.encodeNext(value);
++    }
++  }
++
++  static void tstDecodeAllNext(long[] values, EliasFanoDecoder<?> efd) {
++    efd.toBeforeSequence();
++    long nextValue = efd.nextValue();
++    for (long expValue: values) {
++      assertFalse("nextValue at end too early", EliasFanoDecoder.NO_MORE_VALUES == nextValue);
++      assertEquals(expValue, nextValue);
++      nextValue = efd.nextValue();
++    }
++    assertEquals(EliasFanoDecoder.NO_MORE_VALUES, nextValue);
++  }
++
++  static void tstDecodeAllPrev(long[] values, EliasFanoDecoder<?> efd) {
++    efd.toAfterSequence();
++    for (int i = values.length - 1; i >= 0; i--) {
++      long previousValue = efd.previousValue();
++      assertFalse("previousValue at end too early", EliasFanoDecoder.NO_MORE_VALUES == previousValue);
++      assertEquals(values[i], previousValue);
++    }
++    assertEquals(EliasFanoDecoder.NO_MORE_VALUES, efd.previousValue());
++  }
++
++  static void tstDecodeAllAdvanceToExpected(long[] values, EliasFanoDecoder<?> efd) {
++    efd.toBeforeSequence();
++    long previousValue = -1L;
++    long position = 0;
++    for (long expValue: values) {
++      if (expValue > previousValue) {
++        long advanceValue = efd.advanceToValue(expValue);
++        assertFalse("advanceValue at end too early", EliasFanoDecoder.NO_MORE_VALUES == advanceValue);
++        assertEquals(expValue, advanceValue);
++        assertEquals(position, efd.currentPosition());
++        previousValue = expValue;
++      }
++      position++;
++    }
++    long advanceValue = efd.advanceToValue(previousValue+1);
++    assertEquals("at end", EliasFanoDecoder.NO_MORE_VALUES, advanceValue);
++  }
++
++  static void tstDecodeAdvanceToMultiples(long[] values, EliasFanoDecoder<?> efd, final long m) {
++    // test advancing to multiples of m
++    assert m > 0;
++    long previousValue = -1L;
++    long position = 0;
++    long mm = m;
++    efd.toBeforeSequence();
++    for (long expValue: values) {
++      // mm > previousValue
++      if (expValue >= mm) {
++        long advanceValue = efd.advanceToValue(mm);
++        assertFalse("advanceValue at end too early", EliasFanoDecoder.NO_MORE_VALUES == advanceValue);
++        assertEquals(expValue, advanceValue);
++        assertEquals(position, efd.currentPosition());
++        previousValue = expValue;
++        do {
++          mm += m;
++        } while (mm <= previousValue);
++      }
++      position++;
++    }
++    long advanceValue = efd.advanceToValue(mm);
++    assertEquals(EliasFanoDecoder.NO_MORE_VALUES, advanceValue);
++  }
++
++  static void tstDecodeBackToMultiples(long[] values, EliasFanoDecoder<?> efd, final long m) {
++    // test backing to multiples of m
++    assert m > 0;
++    efd.toAfterSequence();
++    int position = values.length - 1;
++    if (position < 0) {
++      long advanceValue = efd.backToValue(0);
++      assertEquals(EliasFanoDecoder.NO_MORE_VALUES, advanceValue);
++      return; // empty values, nothing to go back to/from
++    }
++    long expValue = values[position];
++    long previousValue = expValue + 1;
++    long mm = (expValue / m) * m;
++    while (position >= 0) {
++      expValue = values[position];
++      assert mm < previousValue;
++      if (expValue <= mm) {
++        long backValue = efd.backToValue(mm);
++        assertFalse("backToValue at end too early", EliasFanoDecoder.NO_MORE_VALUES == backValue);
++        assertEquals(expValue, backValue);
++        assertEquals(position, efd.currentPosition());
++        previousValue = expValue;
++        do {
++          mm -= m;
++        } while (mm >= previousValue);
++      }
++      position--;
++    }
++    long backValue = efd.backToValue(mm);
++    assertEquals(EliasFanoDecoder.NO_MORE_VALUES, backValue);
++  }
++
++  static void tstDecodeAll(EliasFanoSequence efSeq, long[] values) {
++    tstDecodeAllNext(values, efSeq.getDecoder());
++    tstDecodeAllPrev(values, efSeq.getDecoder());
++    tstDecodeAllAdvanceToExpected(values, efSeq.getDecoder());
++  }
++
++  void tstEFS2(long[] values) {
++    EliasFanoSequence efSeqB = makeSequence(values, EliasFanoSequence.DEFAULT_VALUE_INDEX_INTERVAL);
++    tstDecodeAll(efSeqB, values);
++  }
++
++
++  public void testHashCodeEquals() {
++    long[] values = new long[] {5,8,8,15,32};
++    EliasFanoSequence efSeq1 = makeSequence(values, EliasFanoSequence.DEFAULT_VALUE_INDEX_INTERVAL);
++    EliasFanoSequence efSeq2 = makeSequence(values, EliasFanoSequence.DEFAULT_VALUE_INDEX_INTERVAL);
++    assertEquals(efSeq1, efSeq2);
++    assertEquals(efSeq1.hashCode(), efSeq2.hashCode());
++
++    long[] values3 = new long[] {1,2,3};
++    EliasFanoSequence efSeq3 = makeSequence(values3, EliasFanoSequence.DEFAULT_VALUE_INDEX_INTERVAL);
++    assertFalse(efSeq1.equals(efSeq3));
++    assertFalse(efSeq3.equals(efSeq1));
++    assertFalse(efSeq1.hashCode() == efSeq3.hashCode()); // Might fail, passes for test data.
++  }
++
++  public void testMonotoneSequences() {
++    for (int s = 2; s < 4422; s++) {
++      long[] values = new long[s];
++      for (int i = 0; i < s; i++) {
++        values[i] = (i/2); // upperbound smaller than number of values, only upper bits encoded
++      }
++      tstEFS2(values);
++    }
++  }
++
++  public void testStrictMonotoneSequences() {
++    for (int s = 2; s < 4422; s++) {
++      long[] values = new long[s];
++      for (int i = 0; i < s; i++) {
++        values[i] = i * ((long) i - 1) / 2; // Add a gap of (s-1) to previous
++        // s = (s*(s+1) - (s-1)*s)/2
++      }
++      tstEFS2(values);
++    }
++  }
++
++  public void testAdvanceToAndBackToMultiples() {
++    for (int s = 2; s < 130; s++) {
++      long[] values = new long[s];
++      for (int i = 0; i < s; i++) {
++        values[i] = i * ((long) i + 1) / 2; // Add a gap of s to previous
++        // s = (s*(s+1) - (s-1)*s)/2
++      }
++      EliasFanoSequence efSeq = makeSequence(values, EliasFanoSequence.DEFAULT_VALUE_INDEX_INTERVAL);
++      long maxValue = values[s-1];
++      long minAdvanceMultiple = 10;
++      for (long m = minAdvanceMultiple; m <= maxValue; m += 1) {
++        tstDecodeAdvanceToMultiples(values, efSeq.getDecoder(), m);
++        tstDecodeBackToMultiples(values, efSeq.getDecoder(), m);
++      }
++    }
++  }
++
++  public void testAdvanceToPosition1() {
++    long[] values = new long[] {0,2};
++    EliasFanoSequence efSeq1 = makeSequence(values, EliasFanoSequence.DEFAULT_VALUE_INDEX_INTERVAL);
++    EliasFanoDecoder<?> efd = efSeq1.getDecoder();
++    assertTrue(efd.advanceToPosition(0));
++    assertEquals("position", 0, efd.currentPosition());
++    assertEquals("value", 0, efd.currentValue());
++    assertTrue(efd.advanceToPosition(1));
++    assertEquals("position", 1, efd.currentPosition());
++    assertEquals("value", 2, efd.currentValue());
++    assertFalse(efd.advanceToPosition(2));
++  }
++
++}
+diff --git a/lucene/core/src/test/org/apache/lucene/util/eliasfano/TestBitSelect.java b/lucene/core/src/test/org/apache/lucene/util/eliasfano/TestBitSelect.java
+new file mode 100644
+index 0000000..a1246a4
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/util/eliasfano/TestBitSelect.java
+@@ -0,0 +1,88 @@
++package org.apache.lucene.util.eliasfano;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.util.LuceneTestCase;
++
++public class TestBitSelect extends LuceneTestCase {
++
++  private void tstSelect(long x, int r, int exp) {
++    if ((0 <= exp) && (exp <= 63)) {
++      assertEquals("selectNaive(" + x + "," + r + ")", exp, BitSelect.selectNaive(x, r));
++      assertEquals("select(" + x + "," + r + ")", exp, BitSelect.select(x, r));
++    } else {
++      int act = BitSelect.selectNaive(x, r);
++      assertTrue("selectNaive(" + x + "," + r + ")", act < 0 || act > 63);
++      act = BitSelect.select(x, r);
++      assertTrue("select(" + x + "," + r + ")", act < 0 || act > 63);
++    }
++  }
++
++  public void testSelectFromZero() {
++    tstSelect(0L,1,72);
++  }
++  public void testSelectSingleBit() {
++    for (int i = 0; i < 64; i++) {
++      tstSelect((1L << i),1,i);
++    }
++  }
++  public void testSelectTwoBits() {
++    for (int i = 0; i < 64; i++) {
++      for (int j = i+1; j < 64; j++) {
++        long x = (1L << i) | (1L << j);
++        //System.out.println(getName() + " i: " + i + " j: " + j);
++        tstSelect(x,1,i);
++        tstSelect(x,2,j);
++        tstSelect(x,3,72);
++      }
++    }
++  }
++  public void testSelectThreeBits() {
++    for (int i = 0; i < 64; i++) {
++      for (int j = i+1; j < 64; j++) {
++        for (int k = j+1; k < 64; k++) {
++          long x = (1L << i) | (1L << j) | (1L << k);
++          tstSelect(x,1,i);
++          tstSelect(x,2,j);
++          tstSelect(x,3,k);
++          tstSelect(x,4,72);
++        }
++      }
++    }
++  }
++  public void testSelectAllBits() {
++    for (int i = 0; i < 64; i++) {
++      tstSelect(0xFFFFFFFFFFFFFFFFL,i+1,i);
++    }
++  }
++  public void testPerfSelectAllBits() {
++    for (int j = 0; j < 100000; j++) { // 1000000 for real perf test
++      for (int i = 0; i < 64; i++) {
++        assertEquals(i, BitSelect.select(0xFFFFFFFFFFFFFFFFL, i+1));
++      }
++    }
++  }
++  public void testPerfSelectAllBitsNaive() {
++    for (int j = 0; j < 10000; j++) { // real perftest: 1000000
++      for (int i = 0; i < 64; i++) {
++        assertEquals(i, BitSelect.selectNaive(0xFFFFFFFFFFFFFFFFL, i+1));
++      }
++    }
++  }
++}
++
+diff --git a/lucene/core/src/test/org/apache/lucene/util/eliasfano/TestEliasFanoBytes.java b/lucene/core/src/test/org/apache/lucene/util/eliasfano/TestEliasFanoBytes.java
+new file mode 100644
+index 0000000..6b88853
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/util/eliasfano/TestEliasFanoBytes.java
+@@ -0,0 +1,140 @@
++package org.apache.lucene.util.eliasfano;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.util.BytesRef;
++
++import org.apache.lucene.util.LuceneTestCase;
++
++public class TestEliasFanoBytes extends BaseEliasFanoSequenceTestCase<EliasFanoBytes> {
++
++  EliasFanoBytes makeSequence(long[] values, long valueIndexInterval) {
++    assert valueIndexInterval == EliasFanoSequence.DEFAULT_VALUE_INDEX_INTERVAL;
++    long upperBound = values.length > 0 ? values[values.length-1] : -1;
++    EliasFanoBytes efSeq = new EliasFanoBytes(values.length, upperBound);
++    encodeSequence(values, efSeq);
++    return efSeq;
++  }
++
++  private void checkEquals(String mes, byte[] exp, byte[] act) {
++    assertEquals(mes + ".length", exp.length, act.length);
++    for (int i = 0; i < exp.length; i++) {
++      assertEquals(mes + " at " + i, (exp[i] & 0xFF), (act[i] & 0xFF));
++    }
++  }
++  
++  private void tstEFS(long[] values, BytesRef expBytes) {
++    EliasFanoBytes efSeqB = makeSequence(values, EliasFanoSequence.DEFAULT_VALUE_INDEX_INTERVAL);
++    tstDecodeAll(efSeqB, values);
++    BytesRef actBytes = efSeqB.getBytesRef();
++    if (! actBytes.bytesEquals(expBytes)) {
++      System.out.println("expected BytesRef: " + expBytes);
++      System.out.println("  actual BytesRef: " + actBytes);
++      checkEquals("bytes", expBytes.bytes, actBytes.bytes);
++    }
++    assertEquals("offset", expBytes.offset, actBytes.offset);
++    assertEquals("length", expBytes.length, actBytes.length);
++
++    EliasFanoBytes efSeqB2 = EliasFanoBytes.createFromBytesRef(expBytes);
++    tstDecodeAll(efSeqB2, values);
++
++    EliasFanoBytes efSeqB3 = new EliasFanoBytes(7, 9);
++    efSeqB3.reInit(expBytes);
++    tstDecodeAll(efSeqB3, values);
++  }
++
++  private BytesRef newBytesRef(byte[] bytes) {
++    return new BytesRef(bytes, 0, bytes.length);
++  }
++
++  public void testEmptySequence() {
++    long[] values = new long[0];
++    byte[] bytes = new byte[] {0,0};
++    tstEFS(values, newBytesRef(bytes));
++  }
++
++  public void testOneValue1() {
++    long[] values = new long[] {0};
++    tstEFS(values, newBytesRef(new byte[] {1,0,1}));
++  }
++
++  public void testTwoValues1() {
++    long[] values = new long[] {0,0};
++    tstEFS(values, newBytesRef(new byte[] {2,0,3}));
++  }
++
++  public void testOneValue2() {
++    long[] values = new long[] {63};
++    tstEFS(values, newBytesRef(new byte[] {1, 63, 31, 2}));
++  }
++
++  public void testOneMaxValue() {
++    long[] values = new long[] {Long.MAX_VALUE};
++    tstEFS(values, newBytesRef(new byte[] {1, -1,-1,-1,-1,-1,-1,-1,-1,127, -1,-1,-1,-1,-1,-1,-1,63, 2}));
++  }
++
++  public void testTwoMinMaxValues() {
++    long[] values = new long[] {0, Long.MAX_VALUE};
++    tstEFS(values, newBytesRef(new byte[] {2, -1,-1,-1,-1,-1,-1,-1,-1,127, 0,0,0,0,0,0,0,-32,-1,-1,-1,-1,-1,-1,-1, 0x03, 0x11}));
++  }
++
++
++  public void testMaxContentEmptyValueIndex() {
++    long[] values = new long[256];
++    for (int i = 0; i < values.length; i++) {
++      values[i] = i;
++    }
++    tstEFS(values, newBytesRef(new byte[]
++                        {-128, 2, // header 256 numValues
++                         -1, 1, // header 255 maxValue
++                         // no low bits, no index
++                         0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 
++                         0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 
++                         0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 
++                         0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 
++                         0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 
++                         0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 
++                         0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 
++                         0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55 // 64 bytes for high bits, no low bits, no index bits
++                        }));
++  }
++
++
++  public void testMinContentNonEmptyValueIndex() {
++    long[] values = new long[257];
++    for (int i = 0; i < values.length; i++) { // Note: there may be smaller content, starting at value 127 or so.
++      values[i] = i;
++    }
++    tstEFS(values, newBytesRef(new byte[]
++                        {-127, 2, // header 257 numValues
++                         -128, 2, // header 256 maxValue
++                         // no low bits.
++                         0, 2, // index entry 512
++                         0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 
++                         0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 
++                         0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 
++                         0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 
++                         0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 
++                         0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 
++                         0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 
++                         0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 1 // 65 bytes for high bits
++                        }));
++  }
++
++}
++
+diff --git a/lucene/core/src/test/org/apache/lucene/util/eliasfano/TestEliasFanoDocIdSet.java b/lucene/core/src/test/org/apache/lucene/util/eliasfano/TestEliasFanoDocIdSet.java
+new file mode 100644
+index 0000000..52900da
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/util/eliasfano/TestEliasFanoDocIdSet.java
+@@ -0,0 +1,85 @@
++package org.apache.lucene.util.eliasfano;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.BitSet;
++
++import org.apache.lucene.search.DocIdSetIterator;
++import org.apache.lucene.util.BaseDocIdSetTestCase;
++
++public class TestEliasFanoDocIdSet extends BaseDocIdSetTestCase<EliasFanoDocIdSet> {
++
++  @Override
++  public EliasFanoDocIdSet copyOf(final BitSet bs, final int numBits) throws IOException {
++    int numDocIds = random().nextBoolean() ? bs.cardinality() : -1;
++    final EliasFanoDocIdSet set = new EliasFanoDocIdSet(numDocIds, numBits - 1);
++
++    set.encodeFromDisi(new DocIdSetIterator() {
++      int doc = -1;
++
++      @Override
++      public int nextDoc() throws IOException {
++        doc = bs.nextSetBit(doc + 1);
++        if (doc == -1) {
++          doc = NO_MORE_DOCS;
++        }
++        else {
++          assert doc < numBits;
++        }
++        return doc;
++      }
++
++      @Override
++      public int docID() {
++        return doc;
++      }
++
++      @Override
++      public long cost() {
++        return bs.cardinality();
++      }
++
++      @Override
++      public int advance(int target) throws IOException {
++        throw new UnsupportedOperationException();
++      }
++    });
++    return set;
++  }
++
++  @Override
++  /** Test ram usage estimation. */
++  public void testRamBytesUsed() throws IOException {
++    // NOCOMMIT: what is the good way to implement Accountable on EliasFanoDocIdSet?
++/*  // code from BaseDocIdSetTestCase:
++    final int iters = 100;
++    for (int i = 0; i < iters; ++i) {
++      final int pow = random().nextInt(20);
++      final int maxDoc = TestUtil.nextInt(random(), 1, 1 << pow);
++      final int numDocs = TestUtil.nextInt(random(), 0, Math.min(maxDoc, 1 << TestUtil.nextInt(random(), 0, pow)));
++      final BitSet set = randomSet(maxDoc, numDocs);
++      final DocIdSet copy = copyOf(set, maxDoc);
++      final long actualBytes = ramBytesUsed(copy, maxDoc);
++      final long expectedBytes = copy.ramBytesUsed();
++      assertEquals(expectedBytes, actualBytes);
++    }
++ */
++  }
++
++}
+\ No newline at end of file
+diff --git a/lucene/core/src/test/org/apache/lucene/util/eliasfano/TestEliasFanoLongs.java b/lucene/core/src/test/org/apache/lucene/util/eliasfano/TestEliasFanoLongs.java
+new file mode 100644
+index 0000000..e221b8e
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/util/eliasfano/TestEliasFanoLongs.java
+@@ -0,0 +1,217 @@
++package org.apache.lucene.util.eliasfano;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.util.LuceneTestCase;
++
++public class TestEliasFanoLongs extends BaseEliasFanoSequenceTestCase<EliasFanoLongs> {
++
++  EliasFanoLongs makeSequence(long[] values, long indexInterval) {
++    long upperBound = values.length > 0 ? values[values.length-1] : -1;
++    EliasFanoLongs efSeq = new EliasFanoLongs(values.length, upperBound, indexInterval);
++    encodeSequence(values, efSeq);
++    efSeq.freeze(values.length);
++    return efSeq;
++  }
++
++  private static void tstEqual(String mes, long[] exp, long[] act) {
++    assertEquals(mes + ".length", exp.length, act.length);
++    for (int i = 0; i < exp.length; i++) {
++      if (exp[i] != act[i]) {
++        fail(mes + "[" + i + "] " + exp[i] + " != " + act[i]);
++      }
++    }
++  }
++
++  private void tstEFS(long[] values, long[] expHighLongs, long[] expLowLongs) {
++    EliasFanoLongs efSeqL = makeSequence(values, EliasFanoSequence.DEFAULT_VALUE_INDEX_INTERVAL);
++    tstEqual("high bits", expHighLongs, efSeqL.getHighBits());
++    tstEqual("low bits", expLowLongs, efSeqL.getLowBits());
++    tstDecodeAll(efSeqL, values);
++  }
++
++
++  private EliasFanoLongs tstEFVI(long[] values, long indexInterval, long[] expIndexBits) {
++    EliasFanoLongs efSeq = makeSequence(values, indexInterval);
++    tstEqual("index bits", expIndexBits, efSeq.getValueIndexBits());
++    return efSeq;
++  }
++
++  public void testEmptySequence() {
++    long[] values = new long[0];
++    long[] expHighBits = new long[0];
++    long[] expLowBits = new long[0];
++    tstEFS(values, expHighBits, expLowBits);
++  }
++
++  public void testOneValue1() {
++    long[] values = new long[] {0};
++    long[] expHighBits = new long[] {0x1L};
++    long[] expLowBits = new long[] {};
++    tstEFS(values, expHighBits, expLowBits);
++  }
++
++  public void testTwoValues1() {
++    long[] values = new long[] {0,0};
++    long[] expHighBits = new long[] {0x3L};
++    long[] expLowBits = new long[] {};
++    tstEFS(values, expHighBits, expLowBits);
++  }
++
++  public void testOneValue2() {
++    long[] values = new long[] {63};
++    long[] expHighBits = new long[] {2};
++    long[] expLowBits = new long[] {31};
++    tstEFS(values, expHighBits, expLowBits);
++  }
++
++  public void testOneMaxValue() {
++    long[] values = new long[] {Long.MAX_VALUE};
++    long[] expHighBits = new long[] {2};
++    long[] expLowBits = new long[] {Long.MAX_VALUE/2};
++    tstEFS(values, expHighBits, expLowBits);
++  }
++
++  public void testTwoMinMaxValues() {
++    long[] values = new long[] {0, Long.MAX_VALUE};
++    long[] expHighBits = new long[] {0x11};
++    long[] expLowBits = new long[] {0xE000000000000000L, 0x03FFFFFFFFFFFFFFL};
++    tstEFS(values, expHighBits, expLowBits);
++  }
++
++  public void testTwoMaxValues() {
++    long[] values = new long[] {Long.MAX_VALUE, Long.MAX_VALUE};
++    long[] expHighBits = new long[] {0x18};
++    long[] expLowBits = new long[] {-1L, 0x03FFFFFFFFFFFFFFL};
++    tstEFS(values, expHighBits, expLowBits);
++  }
++
++  public void testExample1() { // Figure 1 from Vigna 2012 paper
++    long[] values = new long[] {5,8,8,15,32};
++    long[] expLowBits = new long[] {Long.parseLong("0011000001", 2)}; // reverse block and bit order
++    long[] expHighBits = new long[] {Long.parseLong("1000001011010", 2)}; // reverse block and bit order
++    tstEFS(values, expHighBits, expLowBits);
++  }
++
++  public void testEmptyValueIndex() {
++    long indexInterval = 2;
++    long[] emptyLongs = new long[0];
++    tstEFVI(emptyLongs, indexInterval, emptyLongs);
++  }
++
++  public void testMaxContentEmptyValueIndex() {
++    long indexInterval = 2;
++    long[] twoLongs = new long[] {0,1};
++    long[] emptyLongs = new long[0];
++    tstEFVI(twoLongs, indexInterval, emptyLongs);
++  }
++
++  public void testMinContentNonEmptyValueIndex() {
++    long indexInterval = 2;
++    long[] twoLongs = new long[] {0,2};
++    long[] indexLongs = new long[] {3}; // high bits 1001, index position after zero bit.
++    tstEFVI(twoLongs, indexInterval, indexLongs);
++  }
++
++  public void testIndexAdvanceToLast() {
++    long indexInterval = 2;
++    long[] twoLongs = new long[] {0,2};
++    long[] indexLongs = new long[] {3}; // high bits 1001
++    EliasFanoSequence efSeqVI = tstEFVI(twoLongs, indexInterval, indexLongs);
++    assertEquals(2, efSeqVI.getDecoder().advanceToValue(2));
++  }
++
++  public void testIndexAdvanceToAfterLast() {
++    long indexInterval = 2;
++    long[] twoLongs = new long[] {0,2};
++    long[] indexLongs = new long[] {3}; // high bits 1001
++    EliasFanoSequence efSeqVI = tstEFVI(twoLongs, indexInterval, indexLongs);
++    assertEquals(EliasFanoDecoder.NO_MORE_VALUES, efSeqVI.getDecoder().advanceToValue(3));
++  }
++
++  public void testIndexAdvanceToFirst() {
++    long indexInterval = 2;
++    long[] twoLongs = new long[] {0,2};
++    long[] indexLongs = new long[] {3}; // high bits 1001
++    EliasFanoSequence efSeqVI = tstEFVI(twoLongs, indexInterval, indexLongs);
++    assertEquals(0, efSeqVI.getDecoder().advanceToValue(0));
++  }
++  
++  public void testTwoIndexEntries() {
++    long indexInterval = 2;
++    long[] twoLongs = new long[] {0,1,2,3,4,5};
++    long[] indexLongs = new long[] {4 + 8*16}; // high bits 0b10101010101
++    EliasFanoSequence efSeqVI = tstEFVI(twoLongs, indexInterval, indexLongs);
++    EliasFanoDecoder<?> efDecVI = efSeqVI.getDecoder();
++    assertEquals("advance 0", 0, efDecVI.advanceToValue(0));
++    assertEquals("advance 5", 5, efDecVI.advanceToValue(5));
++    assertEquals("advance 6", EliasFanoDecoder.NO_MORE_VALUES, efDecVI.advanceToValue(5));
++  }
++
++  public void testExample2a() { // Figure 2 from Vigna 2012 paper
++    long indexInterval = 4;
++    long[] values = new long[] {5,8,8,15,32}; // two low bits, high values 1,2,2,3,8.
++    long[] indexLongs = new long[] {8 + 12*16}; // high bits 0b 0001 0000 0101 1010
++    EliasFanoSequence efSeqVI = tstEFVI(values, indexInterval, indexLongs);
++    EliasFanoDecoder<?> efDecVI = efSeqVI.getDecoder();
++    assertEquals("advance 22", 32, efDecVI.advanceToValue(22));
++  }
++
++  public void testExample2b() { // Figure 2 from Vigna 2012 paper
++    long indexInterval = 4;
++    long[] values = new long[] {5,8,8,15,32}; // two low bits, high values 1,2,2,3,8.
++    long[] indexLongs = new long[] {8 + 12*16}; // high bits 0b 0001 0000 0101 1010
++    EliasFanoSequence efSeqVI = tstEFVI(values, indexInterval, indexLongs);
++    EliasFanoDecoder<?> efDecVI = efSeqVI.getDecoder();
++    assertEquals("initial next", 5, efDecVI.nextValue());
++    assertEquals("advance 22", 32, efDecVI.advanceToValue(22));
++  }
++
++  public void testExample2NoIndex1() { // Figure 2 from Vigna 2012 paper, no index, test broadword selection.
++    long indexInterval = 16;
++    long[] values = new long[] {5,8,8,15,32}; // two low bits, high values 1,2,2,3,8.
++    long[] indexLongs = new long[0]; // high bits 0b 0001 0000 0101 1010
++    EliasFanoSequence efSeqVI = tstEFVI(values, indexInterval, indexLongs);
++    EliasFanoDecoder<?> efDecVI = efSeqVI.getDecoder();
++    assertEquals("advance 22", 32, efDecVI.advanceToValue(22));
++  }
++
++  public void testExample2NoIndex2() { // Figure 2 from Vigna 2012 paper, no index, test broadword selection.
++    long indexInterval = 16;
++    long[] values = new long[] {5,8,8,15,32}; // two low bits, high values 1,2,2,3,8.
++    long[] indexLongs = new long[0]; // high bits 0b 0001 0000 0101 1010
++    EliasFanoSequence efSeqVI = tstEFVI(values, indexInterval, indexLongs);
++    EliasFanoDecoder<?> efDecVI = efSeqVI.getDecoder();
++    assertEquals("initial next", 5, efDecVI.nextValue());
++    assertEquals("advance 22", 32, efDecVI.advanceToValue(22));
++  }
++
++  public void testHighBitLongZero() {
++    final int s = 65;
++    long[] values = new long[s];
++    for (int i = 0; i < s-1; i++) {
++      values[i] = 0;
++    }
++    values[s-1] = 128;
++    long[] expHighBits = new long[] {-1,0,0,1};
++    long[] expLowBits = new long[0];
++    tstEFS(values, expHighBits, expLowBits);
++  }
++
++}
++
+diff --git a/lucene/posjoin/src/java/org/apache/lucene/util/eliasfano/package.html b/lucene/posjoin/src/java/org/apache/lucene/util/eliasfano/package.html
+new file mode 100644
+index 0000000..4ac82d6
+--- /dev/null
++++ b/lucene/posjoin/src/java/org/apache/lucene/util/eliasfano/package.html
+@@ -0,0 +1,30 @@
++<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
++<!--
++ Licensed to the Apache Software Foundation (ASF) under one or more
++ contributor license agreements.  See the NOTICE file distributed with
++ this work for additional information regarding copyright ownership.
++ The ASF licenses this file to You under the Apache License, Version 2.0
++ (the "License"); you may not use this file except in compliance with
++ the License.  You may obtain a copy of the License at
++
++     http://www.apache.org/licenses/LICENSE-2.0
++
++ Unless required by applicable law or agreed to in writing, software
++ distributed under the License is distributed on an "AS IS" BASIS,
++ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ See the License for the specific language governing permissions and
++ limitations under the License.
++-->
++<html>
++<head></head>
++<body bgcolor="white">
++
++<h2>Package for Elias Fano code</h2>
++
++These classes were taken from a development version of package org.apache.lucene.util.packed in July 2014.
++<br>
++When the Elias Fano classes here are acceptable, they may be moved back into package org.apache.lucene.util.packed
++or the versions there may be deleted.
++
++</body>
++</html>

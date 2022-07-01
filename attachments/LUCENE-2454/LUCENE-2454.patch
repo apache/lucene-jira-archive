@@ -1,0 +1,396 @@
+Index: lucene/contrib/queries/src/java/org/apache/lucene/search/nested/NestedDocumentQuery.java
+===================================================================
+--- lucene/contrib/queries/src/java/org/apache/lucene/search/nested/NestedDocumentQuery.java	(revision 0)
++++ lucene/contrib/queries/src/java/org/apache/lucene/search/nested/NestedDocumentQuery.java	(revision 0)
+@@ -0,0 +1,284 @@
++package org.apache.lucene.search.nested;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.Set;
++
++import org.apache.lucene.index.IndexReader.AtomicReaderContext;
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.Term;
++import org.apache.lucene.search.DocIdSet;
++import org.apache.lucene.search.Explanation;
++import org.apache.lucene.search.Filter;
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.Query;
++import org.apache.lucene.search.Scorer;
++import org.apache.lucene.search.Weight;
++import org.apache.lucene.util.OpenBitSet;
++import org.apache.lucene.util.OpenBitSetDISI;
++
++/**
++ * Remaps matches on "child" documents to their preceding "parent" document.
++ * Parents' locations in the index are defined using a Filter.
++ *
++ * See http://www.slideshare.net/MarkHarwood/proposal-for-nested-document-support-in-lucene
++ */
++
++public class NestedDocumentQuery extends Query {
++
++  // not private so that we avoid access checks when inner
++  // classes uses these:
++  final Filter parentsFilter;
++  final Query childQuery;
++  final int scoreMode;
++
++  // nocommit: enum
++  public static final int SCORE_MODE_AVG=1;
++  public static final int SCORE_MODE_MAX=2;
++  public static final int SCORE_MODE_TOTAL=3;
++
++  public NestedDocumentQuery(Query query, Filter parentsFilter, int scoreMode) {
++    childQuery = query;
++    this.parentsFilter = parentsFilter;
++    this.scoreMode = scoreMode;
++  }
++
++  @Override
++  public void extractTerms(Set<Term> terms) {
++    childQuery.extractTerms(terms);
++  }
++
++  @Override
++  public String toString(String field) {
++    return "NestedDocumentQuery( childQuery: " + childQuery.toString()
++      + ", parentsFilter: " + parentsFilter.toString()
++      + ", scoreMode: " + scoreMode + ")";
++  }
++  
++  @Override
++  public int hashCode() {
++    return getClass().hashCode()
++	  ^ childQuery.hashCode()
++	  ^ parentsFilter.hashCode()
++	  ^ (scoreMode << scoreMode);
++  }
++
++  @Override
++  public boolean equals(Object obj) {
++    if (obj == null)
++      return false;
++    if (! getClass().equals(obj.getClass()))
++      return false;
++    NestedDocumentQuery other = (NestedDocumentQuery)obj;
++    return childQuery.equals(other.childQuery)
++	&& parentsFilter.equals(other.parentsFilter)
++	&& (scoreMode == other.scoreMode);
++  }
++
++  @Override
++  public Query rewrite(IndexReader reader) throws IOException {
++    Query rewrittenChildQuery = childQuery.rewrite(reader);
++    return (rewrittenChildQuery == childQuery) ? this
++      : new NestedDocumentQuery(rewrittenChildQuery, parentsFilter, scoreMode);
++  }
++
++  @Override
++  public Weight createWeight(IndexSearcher searcher) throws IOException {
++    return new NestedDocumentQueryWeight(childQuery.createWeight(searcher));
++  }
++
++  class NestedDocumentQueryWeight extends Weight {
++    Weight delegateWeight;
++
++    public NestedDocumentQueryWeight(Weight weight) {
++      super();
++      delegateWeight = weight;
++    }
++
++    @Override
++    public Query getQuery() {
++      return delegateWeight.getQuery();
++    }
++
++    @Override
++    public float getValue() {
++      return delegateWeight.getValue();
++    }
++
++    @Override
++    public float sumOfSquaredWeights() throws IOException {
++      return delegateWeight.sumOfSquaredWeights();
++    }
++
++    @Override
++    public void normalize(float norm) {
++      delegateWeight.normalize(norm);
++    }
++
++    @Override
++    public Scorer scorer(AtomicReaderContext readerContext, ScorerContext context) throws IOException {
++      // Pass scoreDocsInOrder true, topScorer false to our sub:
++      Scorer delegateScorer = delegateWeight.scorer(readerContext, ScorerContext.def().scoreDocsInOrder(true).topScorer(false));
++
++      final DocIdSet pset = parentsFilter.getDocIdSet(readerContext);
++
++      final OpenBitSet parentBits;
++      if (pset instanceof OpenBitSet) {
++        parentBits = (OpenBitSet) pset;
++      } else {
++        parentBits = new OpenBitSetDISI(pset.iterator(), readerContext.reader.maxDoc());
++      }
++
++      return new NestedDocumentScorer(this, delegateScorer, parentBits);
++    }
++
++    @Override
++    public Explanation explain(AtomicReaderContext reader, int doc) throws IOException {
++      // TODO
++      throw new UnsupportedOperationException(getClass().getName() +
++                                              " cannot explain match on parent document");
++    }
++
++    @Override
++    public boolean scoresDocsOutOfOrder() {
++      return false;
++    }
++  }
++
++  class NestedDocumentScorer extends Scorer {
++    private final Scorer childScorer;
++    private final OpenBitSet parentBits;
++    private int currentDoc = -1;
++    private float currentScore = 0;
++    private int nextDoc = -1;
++    private int currentChild = -1;
++    private float nextScore = 0;
++
++    public NestedDocumentScorer(Weight weight, Scorer scorer, OpenBitSet parentBits) {
++      super(weight);
++      childScorer = scorer;
++      this.parentBits = parentBits;
++    }
++
++    @Override
++    public int nextDoc() throws IOException {
++      if (nextDoc == NO_MORE_DOCS) { //no more docs to be had
++        currentDoc = NO_MORE_DOCS;
++        currentScore = 0;
++        return NO_MORE_DOCS;
++      }
++
++      if (nextDoc == -1) { // first time in
++        int nd = childScorer.nextDoc();
++        if (nd == NO_MORE_DOCS) {
++          return NO_MORE_DOCS;
++        }
++        currentChild = nd;
++
++        nextDoc = getParentDoc(currentChild);
++        nextScore = childScorer.score();
++      }
++
++      return analyseChildren();
++    }
++
++    private int analyseChildren() throws IOException {
++
++      // assume that in each call to next() we have already previewed the first child
++      // in nextDoc
++      currentDoc = nextDoc;
++      currentScore = nextScore;
++
++      int numSiblingsOrParents = 1;
++      float totalScore = currentScore;
++      float maxScore = currentScore;
++
++      // now wind forward through any potential "sibling" docs to find the
++      // best child score for the current parent
++      while (nextDoc == currentDoc) {
++        int nd = childScorer.nextDoc();
++        if (nd == NO_MORE_DOCS) {
++          nextDoc = NO_MORE_DOCS;
++          break;
++        }
++        currentChild = nd;
++        nextDoc = getParentDoc(currentChild);
++        nextScore = childScorer.score();
++        if (nextDoc == currentDoc) { //if still on same parent
++          // take the best score for all children encountered
++          maxScore = Math.max(nextScore, maxScore);
++          numSiblingsOrParents++;
++          totalScore += nextScore;
++        }
++      }
++
++      // finished evaluating current parent's children - determine choice of score
++
++      // TODO: maybe specialize these cases:
++      if (scoreMode == SCORE_MODE_AVG) {
++        currentScore = totalScore / (float) numSiblingsOrParents;
++      } else if (scoreMode == SCORE_MODE_TOTAL) {
++        currentScore = totalScore;
++      } else if (scoreMode == SCORE_MODE_MAX) {
++        currentScore = maxScore;
++      }
++
++      return currentDoc;
++    }
++
++    public int getParentDoc(int possibleChildDoc) {
++      int result = parentBits.prevSetBit(possibleChildDoc);
++      assert (result >= 0) : "No parent for doc #" + possibleChildDoc;
++      return result;
++    }
++
++    @Override
++    public int docID() {
++      return currentDoc;
++    }
++
++    @Override
++    public float score() throws IOException {
++      return currentScore;
++    }
++
++    @Override
++    public int advance(int target) throws IOException {
++
++      if (nextDoc == NO_MORE_DOCS) {//no more docs to be had
++        currentDoc = NO_MORE_DOCS;
++        currentScore = 0;
++        return NO_MORE_DOCS;
++      }
++
++      if (nextDoc < target) {// first time in
++        int nextParent = parentBits.nextSetBit(target);
++        if ((nextParent < 0) || (childScorer.advance(nextParent) == NO_MORE_DOCS)) {
++          return NO_MORE_DOCS;
++        }
++        currentChild = childScorer.docID();
++        nextDoc = getParentDoc(currentChild);
++        nextScore = childScorer.score();
++      }
++
++      return analyseChildren();
++    }
++  }
++
++}
+Index: lucene/contrib/queries/src/test/org/apache/lucene/search/TestNestedDocumentQuery.java
+===================================================================
+--- lucene/contrib/queries/src/test/org/apache/lucene/search/TestNestedDocumentQuery.java	(revision 0)
++++ lucene/contrib/queries/src/test/org/apache/lucene/search/TestNestedDocumentQuery.java	(revision 0)
+@@ -0,0 +1,102 @@
++package org.apache.lucene.search;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.util.ArrayList;
++import java.util.List;
++
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.Field;
++import org.apache.lucene.document.NumericField;
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.RandomIndexWriter;
++import org.apache.lucene.index.Term;
++import org.apache.lucene.search.BooleanClause.Occur;
++import org.apache.lucene.search.nested.NestedDocumentQuery;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.LuceneTestCase;
++
++public class TestNestedDocumentQuery extends LuceneTestCase {
++
++  private Document makeResume(String name, String country) {
++    Document resume = new Document();
++    resume.add(newField("docType", "resume", Field.Index.NOT_ANALYZED));
++    resume.add(newField("name", name, Field.Store.YES, Field.Index.NOT_ANALYZED));
++    resume.add(newField("country", country, Field.Index.NOT_ANALYZED));
++    return resume;
++  }
++
++  private Document makeJob(String skill, int year) {
++    Document job = new Document();
++    job.add(newField("skill", skill, Field.Index.NOT_ANALYZED));
++    job.add(new NumericField("year").setIntValue(year));
++    return job;
++  }
++
++  public void testSimple() throws Exception {
++
++    final Directory dir = newDirectory();
++    final RandomIndexWriter w = new RandomIndexWriter(random, dir);
++
++    final List<Document> docs = new ArrayList<Document>();
++
++    docs.add(makeResume("Lisa", "United Kingdom"));
++    docs.add(makeJob("java", 2006));
++    docs.add(makeJob("python", 2010));
++    w.addDocuments(docs);
++
++    docs.clear();
++    docs.add(makeResume("Frank", "United States"));
++    docs.add(makeJob("ruby", 2005));
++    docs.add(makeJob("java", 2007));
++    w.addDocuments(docs);
++
++    IndexReader r = w.getReader();
++    w.close();
++    IndexSearcher s = new IndexSearcher(r);
++
++    // Create a filter that defines "parent" documents in the index - in this case resumes
++    Filter parentsFilter = new QueryWrapperFilter(new TermQuery(new Term("docType", "resume")));
++
++    // Define child document criteria (finds an example of relevant work experience)
++    BooleanQuery childExperienceQuery = new BooleanQuery();
++    childExperienceQuery.add(new BooleanClause(new TermQuery(new Term("skill", "java")), Occur.MUST));
++    childExperienceQuery.add(new BooleanClause(NumericRangeQuery.newIntRange("year", 2006, 2011, true, true), Occur.MUST));
++
++    // Define parent document criteria (find a person resident in the UK)
++    Query parentQuery = new TermQuery(new Term("country", "United Kingdom"));
++
++    // Wrap the child document query to attribute any matches to the containing parent
++    NestedDocumentQuery childQuery = new NestedDocumentQuery(childExperienceQuery, parentsFilter, NestedDocumentQuery.SCORE_MODE_AVG);
++
++    // Combine the parent and nested child queries into a single query for a candidate
++    BooleanQuery fullQuery = new BooleanQuery();
++    fullQuery.add(new BooleanClause(parentQuery, Occur.MUST));
++    fullQuery.add(new BooleanClause(childQuery, Occur.MUST));
++
++    TopDocs results = s.search(fullQuery, 1);
++    assertEquals(1, results.totalHits);
++
++    Document topDoc = s.doc(results.scoreDocs[0].doc);
++
++    assertEquals("Lisa", topDoc.get("name"));
++
++    r.close();
++    dir.close();
++  }
++}

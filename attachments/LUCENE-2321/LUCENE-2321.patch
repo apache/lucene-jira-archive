@@ -1,0 +1,1169 @@
+Index: src/test/org/apache/lucene/index/TestStressIndexing2.java
+===================================================================
+--- src/test/org/apache/lucene/index/TestStressIndexing2.java	(revision 926738)
++++ src/test/org/apache/lucene/index/TestStressIndexing2.java	(working copy)
+@@ -286,14 +286,20 @@
+ 
+     // create mapping from id2 space to id2 based on idField
+     idField = StringHelper.intern(idField);
+-    final TermsEnum termsEnum = MultiFields.getFields(r1).terms(idField).iterator();
++    final Fields f1 = MultiFields.getFields(r1);
++    if (f1 == null) {
++      // make sure r2 is empty
++      assertNull(MultiFields.getFields(r2));
++      return;
++    }
++    final TermsEnum termsEnum = f1.terms(idField).iterator();
+ 
+     final Bits delDocs1 = MultiFields.getDeletedDocs(r1);
+     final Bits delDocs2 = MultiFields.getDeletedDocs(r2);
+     
+     Fields fields = MultiFields.getFields(r2);
+     if (fields == null) {
+-      // make sure r1 is in fract empty (eg has only all
++      // make sure r1 is in fact empty (eg has only all
+       // deleted docs):
+       DocsEnum docs = null;
+       while(termsEnum.next() != null) {
+Index: src/test/org/apache/lucene/index/FlexTestUtil.java
+===================================================================
+--- src/test/org/apache/lucene/index/FlexTestUtil.java	(revision 926738)
++++ src/test/org/apache/lucene/index/FlexTestUtil.java	(working copy)
+@@ -110,6 +110,9 @@
+ 
+   private static void testBogusFieldTerms(Random rand, IndexReader r) throws Exception {
+     final Fields fields = MultiFields.getFields(r);
++    if (fields == null) {
++      return;
++    }
+     for(int i=0;i<10;i++) {
+       final String f = "bogus" + rand.nextInt() + "reallybogus";
+       Terms terms = fields.terms(f);
+Index: src/test/org/apache/lucene/util/packed/TestPackedInts.java
+===================================================================
+--- src/test/org/apache/lucene/util/packed/TestPackedInts.java	(revision 926738)
++++ src/test/org/apache/lucene/util/packed/TestPackedInts.java	(working copy)
+@@ -71,16 +71,28 @@
+           w.add(values[i]);
+         }
+         w.finish();
++        final long fp = out.getFilePointer();
+         out.close();
+ 
+         IndexInput in = d.openInput("out.bin");
+         PackedInts.Reader r = PackedInts.getReader(in);
++        assertEquals(fp, in.getFilePointer());
+         for(int i=0;i<valueCount;i++) {
+           assertEquals("index=" + i + " ceil=" + ceil + " valueCount="
+                   + valueCount + " nbits=" + nbits + " for "
+                   + r.getClass().getSimpleName(), values[i], r.get(i));
+         }
+         in.close();
++
++        in = d.openInput("out.bin");
++        PackedInts.ReaderIterator r2 = PackedInts.getReaderIterator(in);
++        for(int i=0;i<valueCount;i++) {
++          assertEquals("index=" + i + " ceil=" + ceil + " valueCount="
++                  + valueCount + " nbits=" + nbits + " for "
++                  + r.getClass().getSimpleName(), values[i], r2.next());
++        }
++        assertEquals(fp, in.getFilePointer());
++        in.close();
+         ceil *= 2;
+       }
+     }
+@@ -193,4 +205,21 @@
+       }
+     }
+   }
++
++  public void testSingleValue() throws Exception {
++    Directory dir = new MockRAMDirectory();
++    IndexOutput out = dir.createOutput("out");
++    PackedInts.Writer w = PackedInts.getWriter(out, 1, 8);
++    w.add(17);
++    w.finish();
++    final long end = out.getFilePointer();
++    out.close();
++
++    IndexInput in = dir.openInput("out");
++    PackedInts.Reader r = PackedInts.getReader(in);
++    assertEquals(end, in.getFilePointer());
++    in.close();
++
++    dir.close();
++  }
+ }
+Index: src/java/org/apache/lucene/index/codecs/TermsConsumer.java
+===================================================================
+--- src/java/org/apache/lucene/index/codecs/TermsConsumer.java	(revision 926738)
++++ src/java/org/apache/lucene/index/codecs/TermsConsumer.java	(working copy)
+@@ -93,5 +93,7 @@
+         }
+       }
+     }
++
++    finish();
+   }
+ }
+Index: src/java/org/apache/lucene/index/codecs/standard/SimpleStandardTermsIndexReader.java
+===================================================================
+--- src/java/org/apache/lucene/index/codecs/standard/SimpleStandardTermsIndexReader.java	(revision 926738)
++++ src/java/org/apache/lucene/index/codecs/standard/SimpleStandardTermsIndexReader.java	(working copy)
+@@ -28,6 +28,7 @@
+ import org.apache.lucene.index.IndexWriter;
+ import org.apache.lucene.util.ArrayUtil;
+ import org.apache.lucene.util.CodecUtil;
++import org.apache.lucene.util.packed.PackedInts;
+ 
+ import java.util.HashMap;
+ import java.util.Iterator;
+@@ -63,7 +64,7 @@
+ /** @lucene.experimental */
+ public class SimpleStandardTermsIndexReader extends StandardTermsIndexReader {
+ 
+-  final private int totalIndexInterval;
++  private int totalIndexInterval;
+   private int indexDivisor;
+   final private int indexInterval;
+ 
+@@ -72,7 +73,13 @@
+   private volatile boolean indexLoaded;
+ 
+   private final Comparator<BytesRef> termComp;
++  private final String segment;
+ 
++  private final static int PAGED_BYTES_BITS = 15;
++
++  // all fields share this single logical byte[]
++  private final PagedBytes termBytes = new PagedBytes(PAGED_BYTES_BITS);
++
+   final HashMap<FieldInfo,FieldIndexReader> fields = new HashMap<FieldInfo,FieldIndexReader>();
+ 
+   public SimpleStandardTermsIndexReader(Directory dir, FieldInfos fieldInfos, String segment, int indexDivisor, Comparator<BytesRef> termComp)
+@@ -80,6 +87,8 @@
+ 
+     this.termComp = termComp;
+ 
++    this.segment = segment;
++
+     IndexInput in = dir.openInput(IndexFileNames.segmentFileName(segment, StandardCodec.TERMS_INDEX_EXTENSION));
+     
+     boolean success = false;
+@@ -118,10 +127,14 @@
+           System.out.println("  read field number=" + field);
+         }
+         final int numIndexTerms = in.readInt();
++        final long termsStart = in.readLong();
+         final long indexStart = in.readLong();
++        final long packedIndexStart = in.readLong();
++        final long packedOffsetsStart = in.readLong();
++        assert packedIndexStart >= indexStart: "packedStart=" + packedIndexStart + " indexStart=" + indexStart + " numIndexTerms=" + numIndexTerms + " seg=" + segment;
+         if (numIndexTerms > 0) {
+           final FieldInfo fieldInfo = fieldInfos.fieldInfo(field);
+-          fields.put(fieldInfo, new FieldIndexReader(in, fieldInfo, numIndexTerms, indexStart));
++          fields.put(fieldInfo, new FieldIndexReader(in, fieldInfo, numIndexTerms, indexStart, termsStart, packedIndexStart, packedOffsetsStart));
+         }
+       }
+       success = true;
+@@ -130,57 +143,15 @@
+         in.close();
+         this.in = null;
+         if (success) {
+-          trimByteBlock();
+           indexLoaded = true;
+         }
++        termBytes.finish();
+       } else {
+         this.in = in;
+       }
+     }
+   }
+ 
+-  /* Called when index is fully loaded.  We know we will use
+-   * no more bytes in the final byte[], so trim it down to
+-   * its actual usagee.  This substantially reduces memory
+-   * usage of SegmentReader searching a tiny segment. */
+-  private final void trimByteBlock() {
+-    if (blockOffset == 0) {
+-      // There were no fields in this segment:
+-      if (blocks != null) {
+-        blocks[blockUpto] = null;
+-      }
+-    } else {
+-      byte[] last = new byte[blockOffset];
+-      System.arraycopy(blocks[blockUpto], 0, last, 0, blockOffset);
+-      blocks[blockUpto] = last;
+-    }
+-  }
+-
+-  // TODO: we can record precisely how many bytes are
+-  // required during indexing, save that into file, and be
+-  // precise when we allocate the blocks; we even don't need
+-  // to use blocks anymore (though my still want to, to
+-  // prevent allocation failure due to mem fragmentation on
+-  // 32bit)
+-
+-  // Fixed size byte blocks, to hold all term bytes; these
+-  // blocks are shared across fields
+-  private byte[][] blocks;
+-  int blockUpto;
+-  int blockOffset;
+-
+-  private static final int BYTE_BLOCK_SHIFT = 15;
+-  private static final int BYTE_BLOCK_SIZE = 1 << BYTE_BLOCK_SHIFT;
+-  private static final int BYTE_BLOCK_MASK = BYTE_BLOCK_SIZE - 1;
+-
+-  static {
+-    // Make sure DW can't ever write a term whose length
+-    // cannot be encoded with short (because we use short[]
+-    // to hold the length of each term).
+-    assert IndexWriter.MAX_TERM_LENGTH < Short.MAX_VALUE;
+-    assert BYTE_BLOCK_SIZE >= IndexWriter.MAX_TERM_LENGTH;
+-  }
+-
+   private final class FieldIndexReader extends FieldReader {
+ 
+     final private FieldInfo fieldInfo;
+@@ -190,14 +161,21 @@
+     private final IndexInput in;
+ 
+     private final long indexStart;
++    private final long termsStart;
++    private final long packedIndexStart;
++    private final long packedOffsetsStart;
+ 
+     private final int numIndexTerms;
+ 
+-    public FieldIndexReader(IndexInput in, FieldInfo fieldInfo, int numIndexTerms, long indexStart) throws IOException {
++    public FieldIndexReader(IndexInput in, FieldInfo fieldInfo, int numIndexTerms, long indexStart, long termsStart, long packedIndexStart,
++                            long packedOffsetsStart) throws IOException {
+ 
+       this.fieldInfo = fieldInfo;
+       this.in = in;
++      this.termsStart = termsStart;
+       this.indexStart = indexStart;
++      this.packedIndexStart = packedIndexStart;
++      this.packedOffsetsStart = packedOffsetsStart;
+       this.numIndexTerms = numIndexTerms;
+ 
+       // We still create the indexReader when indexDivisor
+@@ -210,6 +188,9 @@
+         }
+ 
+         coreIndex = new CoreFieldIndex(indexStart,
++                                       termsStart,
++                                       packedIndexStart,
++                                       packedOffsetsStart,
+                                        numIndexTerms);
+       
+       } else {
+@@ -221,7 +202,7 @@
+ 
+     public void loadTermsIndex() throws IOException {
+       if (coreIndex == null) {
+-        coreIndex = new CoreFieldIndex(indexStart, numIndexTerms);
++        coreIndex = new CoreFieldIndex(indexStart, termsStart, packedIndexStart, packedOffsetsStart, numIndexTerms);
+       }
+     }
+ 
+@@ -263,150 +244,115 @@
+ 
+     private final class CoreFieldIndex {
+ 
+-      // TODO: used packed ints here
+-      // Pointer into terms dict file that we are indexing
+-      final long[] fileOffset;
++      final private long termBytesStart;
+ 
+-      // TODO: used packed ints here
+-      // For each term, points to start of term's bytes within
+-      // block.
+-      // TODO: wasteful that this is always long; many terms
+-      // dict indexes obviously don't require so much address
+-      // space; since we know up front during indexing how
+-      // much space is needed we could pack this to the
+-      // precise # bits
+-      final long[] blockPointer;
+-    
+-      // TODO: used packed ints here: we know max term
+-      // length; often its small
++      // offset into index termBytes
++      final PackedInts.Reader termOffsets;
+ 
+-      // TODO: can we inline this w/ the bytes?  like
+-      // DW.  vast majority of terms only need 1 byte, not 2
++      // index pointers into main terms dict
++      final PackedInts.Reader termsDictOffsets;
+ 
+-      // Length of each term
+-      final short[] termLength;
+-
+       final int numIndexTerms;
+ 
+-      CoreFieldIndex(long indexStart, int numIndexTerms) throws IOException {
++      final long termsStart;
+ 
++      public CoreFieldIndex(long indexStart, long termsStart, long packedIndexStart, long packedOffsetsStart, int numIndexTerms) throws IOException {
++
++        this.termsStart = termsStart;
++        termBytesStart = termBytes.getPointer();
++
+         IndexInput clone = (IndexInput) in.clone();
+         clone.seek(indexStart);
+ 
+-        if (indexDivisor == -1) {
+-          // Special case: we are being loaded inside
+-          // IndexWriter because a SegmentReader that at
+-          // first was opened for merging, is now being
+-          // opened to perform deletes or for an NRT reader
+-          this.numIndexTerms = numIndexTerms;
+-        } else {
+-          this.numIndexTerms = 1+(numIndexTerms-1) / indexDivisor;
+-        }
++        // -1 is passed to mean "don't load term index", but
++        // if we are then later loaded it's overwritten with
++        // a real value
++        assert indexDivisor > 0;
+ 
++        this.numIndexTerms = 1+(numIndexTerms-1) / indexDivisor;
++
+         assert this.numIndexTerms  > 0: "numIndexTerms=" + numIndexTerms + " indexDivisor=" + indexDivisor;
+ 
+-        if (blocks == null) {
+-          blocks = new byte[1][];
+-          blocks[0] = new byte[BYTE_BLOCK_SIZE];
+-        }
++        if (indexDivisor == 1) {
++          // Default (load all index terms) is fast -- slurp in the images from disk:
++          
++          try {
++            final long numTermBytes = packedIndexStart - indexStart;
++            termBytes.copy(clone, numTermBytes);
+ 
+-        byte[] lastBlock = blocks[blockUpto];
+-        int lastBlockOffset = blockOffset;
++            // records offsets into main terms dict file
++            termsDictOffsets = PackedInts.getReader(clone);
++            assert termsDictOffsets.size() == numIndexTerms;
+ 
+-        fileOffset = new long[this.numIndexTerms];
+-        blockPointer = new long[this.numIndexTerms];
+-        termLength = new short[this.numIndexTerms];
+-        
+-        final byte[] skipBytes;
+-        if (indexDivisor != 1) {
+-          // only need skipBytes (below) if we are not
+-          // loading all index terms
+-          skipBytes = new byte[128];
++            // records offsets into byte[] term data
++            termOffsets = PackedInts.getReader(clone);
++            assert termOffsets.size() == 1+numIndexTerms;
++          } finally {
++            clone.close();
++          }
+         } else {
+-          skipBytes = null;
+-        }
++          // Get packed iterators
++          final IndexInput clone1 = (IndexInput) in.clone();
++          final IndexInput clone2 = (IndexInput) in.clone();
+ 
+-        int upto = 0;
+-        long pointer = 0;
+-      
+-        for(int i=0;i<numIndexTerms;i++) {
+-          final int start = clone.readVInt();
+-          final int suffix = clone.readVInt();
+-          final int thisTermLength = start + suffix;
++          try {
++            // Subsample the index terms
++            clone1.seek(packedIndexStart);
++            final PackedInts.ReaderIterator termsDictOffsetsIter = PackedInts.getReaderIterator(clone1);
+ 
+-          assert thisTermLength <= BYTE_BLOCK_SIZE;
++            clone2.seek(packedOffsetsStart);
++            final PackedInts.ReaderIterator termOffsetsIter = PackedInts.getReaderIterator(clone2);
+ 
+-          if (i%indexDivisor == 0) {
+-            // Keeper
+-            if (blockOffset + thisTermLength > BYTE_BLOCK_SIZE) {
+-              // New block
+-              final byte[] newBlock = new byte[BYTE_BLOCK_SIZE];
+-              if (blocks.length == blockUpto+1) {
+-                final int newSize = ArrayUtil.oversize(blockUpto+2, RamUsageEstimator.NUM_BYTES_OBJECT_REF);
+-                final byte[][] newBlocks = new byte[newSize][];
+-                System.arraycopy(blocks, 0, newBlocks, 0, blocks.length);
+-                blocks = newBlocks;
+-              }
+-              blockUpto++;
+-              blocks[blockUpto] = newBlock;
+-              blockOffset = 0;
+-            }
++            // TODO: often we can get by w/ fewer bits per
++            // value, below.. .but this'd be more complex:
++            // we'd have to try @ fewer bits and then grow
++            // if we overflowed it.
+ 
+-            final byte[] block = blocks[blockUpto];
++            PackedInts.Mutable termsDictOffsetsM = PackedInts.getMutable(this.numIndexTerms, termsDictOffsetsIter.getBitsPerValue());
++            PackedInts.Mutable termOffsetsM = PackedInts.getMutable(this.numIndexTerms+1, termOffsetsIter.getBitsPerValue());
+ 
+-            // Copy old prefix
+-            assert lastBlock != null || start == 0;
+-            assert block != null;
+-            System.arraycopy(lastBlock, lastBlockOffset, block, blockOffset, start);
++            termsDictOffsets = termsDictOffsetsM;
++            termOffsets = termOffsetsM;
+ 
+-            // Read new suffix
+-            clone.readBytes(block, blockOffset+start, suffix);
++            int upto = 0;
+ 
+-            // Advance file offset
+-            pointer += clone.readVLong();
++            long lastTermOffset = 0;
++            long termOffsetUpto = 0;
+ 
+-            assert thisTermLength < Short.MAX_VALUE;
++            while(upto < this.numIndexTerms) {
++              // main file offset copies straight over
++              termsDictOffsetsM.set(upto, termsDictOffsetsIter.next());
+ 
+-            termLength[upto] = (short) thisTermLength;
+-            fileOffset[upto] = pointer;
+-            blockPointer[upto] = blockUpto * BYTE_BLOCK_SIZE + blockOffset;
++              termOffsetsM.set(upto, termOffsetUpto);
++              upto++;
+ 
+-            /*
+-            BytesRef tr = new BytesRef();
+-            tr.bytes = blocks[blockUpto];
+-            tr.offset = blockOffset;
+-            tr.length = thisTermLength;
++              long termOffset = termOffsetsIter.next();
++              long nextTermOffset = termOffsetsIter.next();
++              final int numTermBytes = (int) (nextTermOffset - termOffset);
+ 
+-            //System.out.println("    read index term=" + new String(blocks[blockUpto], blockOffset, thisTermLength, "UTF-8") + " this=" + this + " bytes=" + block + " (vs=" + blocks[blockUpto] + ") offset=" + blockOffset);
+-            //System.out.println("    read index term=" + tr.toBytesString() + " this=" + this + " bytes=" + block + " (vs=" + blocks[blockUpto] + ") offset=" + blockOffset);
+-            */
++              clone.seek(indexStart + termOffset);
++              assert indexStart + termOffset < clone.length() : "indexStart=" + indexStart + " termOffset=" + termOffset + " len=" + clone.length();
++              assert indexStart + termOffset + numTermBytes < clone.length();
+ 
+-            lastBlock = block;
+-            lastBlockOffset = blockOffset;
+-            blockOffset += thisTermLength;
+-            upto++;
+-          } else {
+-            // Skip bytes
+-            int toSkip = suffix;
+-            while(true) {
+-              if (toSkip > skipBytes.length) {
+-                clone.readBytes(skipBytes, 0, skipBytes.length);
+-                toSkip -= skipBytes.length;
+-              } else {
+-                clone.readBytes(skipBytes, 0, toSkip);
+-                break;
++              termBytes.copy(clone, numTermBytes);
++              termOffsetUpto += numTermBytes;
++
++              // skip terms:
++              termsDictOffsetsIter.next();
++              for(int i=0;i<indexDivisor-2;i++) {
++                termOffsetsIter.next();
++                termsDictOffsetsIter.next();
+               }
+             }
++            termOffsetsM.set(upto, termOffsetUpto);
+ 
+-            // Advance file offset
+-            pointer += clone.readVLong();
++          } finally {
++            clone1.close();
++            clone2.close();
++            clone.close();
+           }
+         }
+ 
+-        clone.close();
+-
+-        assert upto == this.numIndexTerms;
+-
+         if (Codec.DEBUG) {
+           System.out.println("  done read");
+         }
+@@ -423,30 +369,28 @@
+       }
+ 
+       private final void fillResult(int idx, TermsIndexResult result) {
+-        final long loc = blockPointer[idx];
+-        result.term.bytes = blocks[(int) (loc >> BYTE_BLOCK_SHIFT)];
+-        result.term.offset = (int) (loc & BYTE_BLOCK_MASK);
+-        result.term.length = termLength[idx];
++        final long offset = termOffsets.get(idx);
++        final int length = (int) (termOffsets.get(1+idx) - offset);
++        termBytes.fill(result.term, termBytesStart + offset, length);
+         result.position = idx * totalIndexInterval;
+-        result.offset = fileOffset[idx];
++        result.offset = termsStart + termsDictOffsets.get(idx);
+       }
+ 
+       public final void getIndexOffset(BytesRef term, TermsIndexResult result) throws IOException {
+ 
+         if (Codec.DEBUG) {
+-          System.out.println("getIndexOffset field=" + fieldInfo.name + " term=" + term + " indexLen = " + blockPointer.length + " numIndexTerms=" + fileOffset.length + " numIndexedTerms=" + fileOffset.length);
++          System.out.println("getIndexOffset field=" + fieldInfo.name + " term=" + term.utf8ToString());
+         }
+ 
+         int lo = 0;					  // binary search
+-        int hi = fileOffset.length - 1;
++        int hi = numIndexTerms - 1;
+ 
+         while (hi >= lo) {
+           int mid = (lo + hi) >>> 1;
+ 
+-          final long loc = blockPointer[mid];
+-          result.term.bytes = blocks[(int) (loc >> BYTE_BLOCK_SHIFT)];
+-          result.term.offset = (int) (loc & BYTE_BLOCK_MASK);
+-          result.term.length = termLength[mid];
++          final long offset = termOffsets.get(mid);
++          final int length = (int) (termOffsets.get(1+mid) - offset);
++          termBytes.fill(result.term, termBytesStart + offset, length);
+ 
+           int delta = termComp.compare(term, result.term);
+           if (delta < 0) {
+@@ -456,7 +400,7 @@
+           } else {
+             assert mid >= 0;
+             result.position = mid*totalIndexInterval;
+-            result.offset = fileOffset[mid];
++            result.offset = termsStart + termsDictOffsets.get(mid);
+             return;
+           }
+         }
+@@ -465,13 +409,12 @@
+           hi = 0;
+         }
+ 
+-        final long loc = blockPointer[hi];
+-        result.term.bytes = blocks[(int) (loc >> BYTE_BLOCK_SHIFT)];
+-        result.term.offset = (int) (loc & BYTE_BLOCK_MASK);
+-        result.term.length = termLength[hi];
++        final long offset = termOffsets.get(hi);
++        final int length = (int) (termOffsets.get(1+hi) - offset);
++        termBytes.fill(result.term, termBytesStart + offset, length);
+ 
+         result.position = hi*totalIndexInterval;
+-        result.offset = fileOffset[hi];
++        result.offset = termsStart + termsDictOffsets.get(hi);
+       }
+ 
+       public final void getIndexOffset(long ord, TermsIndexResult result) throws IOException {
+@@ -488,6 +431,7 @@
+     if (!indexLoaded) {
+ 
+       this.indexDivisor = indexDivisor;
++      this.totalIndexInterval = indexInterval * indexDivisor;
+ 
+       // mxx
+       if (Codec.DEBUG) {
+@@ -498,10 +442,10 @@
+       while(it.hasNext()) {
+         it.next().loadTermsIndex();
+       }
+-      trimByteBlock();
+ 
+       indexLoaded = true;
+       in.close();
++      termBytes.finish();
+     }
+   }
+ 
+Index: src/java/org/apache/lucene/index/codecs/standard/StandardTermsIndexWriter.java
+===================================================================
+--- src/java/org/apache/lucene/index/codecs/standard/StandardTermsIndexWriter.java	(revision 926738)
++++ src/java/org/apache/lucene/index/codecs/standard/StandardTermsIndexWriter.java	(working copy)
+@@ -29,6 +29,7 @@
+ 
+   public abstract class FieldWriter {
+     public abstract boolean checkIndexTerm(BytesRef text, int docFreq) throws IOException;
++    public abstract void finish() throws IOException;
+   }
+ 
+   public abstract FieldWriter addField(FieldInfo fieldInfo);
+Index: src/java/org/apache/lucene/index/codecs/standard/StandardTermsDictReader.java
+===================================================================
+--- src/java/org/apache/lucene/index/codecs/standard/StandardTermsDictReader.java	(revision 926738)
++++ src/java/org/apache/lucene/index/codecs/standard/StandardTermsDictReader.java	(working copy)
+@@ -372,7 +372,7 @@
+           indexReader.getIndexOffset(term, indexResult);
+ 
+           if (Codec.DEBUG) {
+-            Codec.debug(" index pos=" + indexResult.position + " termFP=" + indexResult.offset + " term=" + indexResult.term + " this=" + this);
++            Codec.debug(" index pos=" + indexResult.position + " termFP=" + indexResult.offset + " term=" + indexResult.term.utf8ToString() + " this=" + this);
+           }
+ 
+           in.seek(indexResult.offset);
+@@ -507,6 +507,9 @@
+         }
+         
+         if (state.ord >= numTerms-1) {
++          if (Codec.DEBUG) {
++            Codec.debug("  return null ord=" + state.ord + " vs numTerms-1=" + (numTerms-1));
++          }
+           return null;
+         }
+ 
+@@ -514,7 +517,7 @@
+         state.docFreq = in.readVInt();
+ 
+         if (Codec.DEBUG) {
+-          Codec.debug("  text=" + bytesReader.term + " freq=" + state.docFreq + " tis=" + in);
++          Codec.debug("  text=" + bytesReader.term.utf8ToString() + " freq=" + state.docFreq + " tis=" + in);
+         }
+ 
+         // TODO: would be cleaner, but space-wasting, to
+Index: src/java/org/apache/lucene/index/codecs/standard/SimpleStandardTermsIndexWriter.java
+===================================================================
+--- src/java/org/apache/lucene/index/codecs/standard/SimpleStandardTermsIndexWriter.java	(revision 926738)
++++ src/java/org/apache/lucene/index/codecs/standard/SimpleStandardTermsIndexWriter.java	(working copy)
+@@ -25,6 +25,8 @@
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.index.codecs.Codec;
+ import org.apache.lucene.util.CodecUtil;
++import org.apache.lucene.util.ArrayUtil;
++import org.apache.lucene.util.packed.PackedInts;
+ 
+ import java.util.List;
+ import java.util.ArrayList;
+@@ -58,7 +60,6 @@
+     // Placeholder for dir offset
+     out.writeLong(0);
+     out.writeInt(termIndexInterval);
+-    termWriter = new DeltaBytesWriter(out);
+   }
+ 
+   @Override
+@@ -66,8 +67,6 @@
+     this.termsOut = termsOut;
+   }
+   
+-  final private DeltaBytesWriter termWriter;
+-
+   @Override
+   public FieldWriter addField(FieldInfo field) {
+     SimpleFieldWriter writer = new SimpleFieldWriter(field);
+@@ -78,33 +77,99 @@
+   private class SimpleFieldWriter extends FieldWriter {
+     final FieldInfo fieldInfo;
+     int numIndexTerms;
+-    private long lastTermsPointer;
+     final long indexStart;
++    final long termsStart;
++    long packedIndexStart;
++    long packedOffsetsStart;
+     private int numTerms;
+ 
++    // TODO: we could conceivably make a PackedInts wrapper
++    // that auto-grows... then we wouldn't force 6 bytes RAM
++    // per index term:
++    private short[] termLengths;
++    private int[] termsPointerDeltas;
++    private long lastTermsPointer;
++    private long totTermLength;
++
+     SimpleFieldWriter(FieldInfo fieldInfo) {
+       this.fieldInfo = fieldInfo;
+       indexStart = out.getFilePointer();
+-      termWriter.reset();
++      termsStart = lastTermsPointer = termsOut.getFilePointer();
++      termLengths = new short[0];
++      termsPointerDeltas = new int[0];
+     }
+ 
+     @Override
+     public boolean checkIndexTerm(BytesRef text, int docFreq) throws IOException {
+       // First term is first indexed term:
+       if (0 == (numTerms++ % termIndexInterval)) {
+-        final long termsPointer = termsOut.getFilePointer();
++
+         if (Codec.DEBUG) {
+-          Codec.debug("sstiw.checkIndexTerm write index field=" + fieldInfo.name + " term=" + text + " termsFP=" + termsPointer + " numIndexTerms=" + numIndexTerms + " outFP=" + out.getFilePointer());
++          Codec.debug("sstiw.checkIndexTerm write index field=" + fieldInfo.name + " term=" + text.utf8ToString() + " numIndexTerms=" + numIndexTerms + " outFP=" + out.getFilePointer());
+         }
+-        termWriter.write(text);
+-        out.writeVLong(termsPointer - lastTermsPointer);
+-        lastTermsPointer = termsPointer;
++
++        // write full bytes
++        out.writeBytes(text.bytes, text.offset, text.length);
++
++        if (termLengths.length == numIndexTerms) {
++          termLengths = ArrayUtil.grow(termLengths);
++        }
++        if (termsPointerDeltas.length == numIndexTerms) {
++          termsPointerDeltas = ArrayUtil.grow(termsPointerDeltas);
++        }
++
++        // save delta terms pointer
++        final long fp = termsOut.getFilePointer();
++        termsPointerDeltas[numIndexTerms] = (int) (fp - lastTermsPointer);
++        lastTermsPointer = fp;
++
++        // save term length (in bytes)
++        assert text.length <= Short.MAX_VALUE;
++        termLengths[numIndexTerms] = (short) text.length;
++
++        totTermLength += text.length;
++
+         numIndexTerms++;
+         return true;
+       } else {
+         return false;
+       }
+     }
++
++    @Override
++    public void finish() throws IOException {
++
++      // write primary terms dict offsets
++      packedIndexStart = out.getFilePointer();
++
++      final long maxValue = termsOut.getFilePointer();
++      PackedInts.Writer w = PackedInts.getWriter(out, numIndexTerms, PackedInts.bitsRequired(maxValue));
++
++      // relative to our indexStart
++      long upto = 0;
++      for(int i=0;i<numIndexTerms;i++) {
++        upto += termsPointerDeltas[i];
++        w.add(upto);
++      }
++      w.finish();
++
++      packedOffsetsStart = out.getFilePointer();
++
++      // write offsets into the byte[] terms
++      w = PackedInts.getWriter(out, 1+numIndexTerms, PackedInts.bitsRequired(totTermLength));
++      upto = 0;
++      for(int i=0;i<numIndexTerms;i++) {
++        w.add(upto);
++        upto += termLengths[i];
++      }
++      w.add(upto);
++      w.finish();
++
++      // our referrer holds onto us, while other fields are
++      // being written, so don't tie up this RAM:
++      termLengths = null;
++      termsPointerDeltas = null;
++    }
+   }
+ 
+   @Override
+@@ -123,7 +188,10 @@
+       }
+       out.writeInt(field.fieldInfo.number);
+       out.writeInt(field.numIndexTerms);
++      out.writeLong(field.termsStart);
+       out.writeLong(field.indexStart);
++      out.writeLong(field.packedIndexStart);
++      out.writeLong(field.packedOffsetsStart);
+     }
+     out.seek(CodecUtil.headerLength(CODEC_NAME));
+     out.writeLong(dirStart);
+Index: src/java/org/apache/lucene/index/codecs/standard/StandardTermsDictWriter.java
+===================================================================
+--- src/java/org/apache/lucene/index/codecs/standard/StandardTermsDictWriter.java	(revision 926738)
++++ src/java/org/apache/lucene/index/codecs/standard/StandardTermsDictWriter.java	(working copy)
+@@ -205,7 +205,8 @@
+ 
+     // Finishes all terms in this field
+     @Override
+-    public void finish() {
++    public void finish() throws IOException {
++      fieldIndexWriter.finish();
+     }
+   }
+-}
+\ No newline at end of file
++}
+Index: src/java/org/apache/lucene/index/codecs/standard/PagedBytes.java
+===================================================================
+--- src/java/org/apache/lucene/index/codecs/standard/PagedBytes.java	(revision 0)
++++ src/java/org/apache/lucene/index/codecs/standard/PagedBytes.java	(revision 0)
+@@ -0,0 +1,129 @@
++package org.apache.lucene.index.codecs.standard;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.util.CloseableThreadLocal;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.ArrayUtil;
++import org.apache.lucene.store.IndexInput;
++
++import java.util.List;
++import java.util.ArrayList;
++import java.io.Closeable;
++import java.io.IOException;
++
++/** Represents a logical byte[] as a series of pages.  You
++ *  can write-once into the logical byte[], using copy, and
++ *  then retrieve slices (BytesRef) into it using fill. */
++class PagedBytes implements Closeable {
++  private final List<byte[]> blocks = new ArrayList<byte[]>();
++  private final int blockSize;
++  private final int blockBits;
++  private final int blockMask;
++  private int upto;
++  private byte[] currentBlock;
++  private final CloseableThreadLocal<byte[]> threadBuffers = new CloseableThreadLocal();
++
++  private static final byte[] EMPTY_BYTES = new byte[0];
++
++  /** 1<<blockBits must be bigger than biggest single
++   *  BytesRef slice that will be pulled */
++  public PagedBytes(int blockBits) {
++    this.blockSize = 1 << blockBits;
++    this.blockBits = blockBits;
++    blockMask = blockSize-1;
++    upto = blockSize;
++  }
++
++  /** Read this many bytes from in */
++  public void copy(IndexInput in, long byteCount) throws IOException {
++    while (byteCount > 0) {
++      int left = blockSize - upto;
++      if (left == 0) {
++        if (currentBlock != null) {
++          blocks.add(currentBlock);
++        }
++        currentBlock = new byte[blockSize];
++        upto = 0;
++        left = blockSize;
++      }
++      if (left < byteCount) {
++        in.readBytes(currentBlock, upto, left, false);
++        upto = blockSize;
++        byteCount -= left;
++      } else {
++        in.readBytes(currentBlock, upto, (int) byteCount, false);
++        upto += byteCount;
++        byteCount = 0;
++      }
++    }
++  }
++
++  /** Commits final byte[], trimming it if necessary. */
++  public void finish() {
++    if (upto < blockSize) {
++      final byte[] newBlock = new byte[upto];
++      System.arraycopy(currentBlock, 0, newBlock, 0, upto);
++      currentBlock = newBlock;
++    }
++    if (currentBlock == null) {
++      currentBlock = EMPTY_BYTES;
++    }
++    blocks.add(currentBlock);
++    currentBlock = null;
++  }
++
++  public long getPointer() {
++    if (currentBlock == null) {
++      return 0;
++    } else {
++      return (blocks.size() * ((long) blockSize)) + upto;
++    }
++  }
++
++  /** Get a slice out of the byte array. */
++  public void fill(BytesRef b, long start, int length) {
++    assert length >= 0: "length=" + length;
++    final int index = (int) (start >> blockBits);
++    final int offset = (int) (start & blockMask);
++    b.length = length;
++    if (blockSize - offset >= length) {
++      // Within block
++      b.bytes = blocks.get(index);
++      b.offset = offset;
++    } else {
++      // Split
++      byte[] buffer = threadBuffers.get();
++      if (buffer == null) {
++        buffer = new byte[length];
++        threadBuffers.set(buffer);
++      } else if (buffer.length < length) {
++        buffer = ArrayUtil.grow(buffer, length);
++        threadBuffers.set(buffer);
++      }
++      b.bytes = buffer;
++      b.offset = 0;
++      System.arraycopy(blocks.get(index), offset, buffer, 0, blockSize-offset);
++      System.arraycopy(blocks.get(1+index), 0, buffer, blockSize-offset, length-(blockSize-offset));
++    }
++  }
++
++  public void close() {
++    threadBuffers.close();
++  }
++}
+
+Property changes on: src/java/org/apache/lucene/index/codecs/standard/PagedBytes.java
+___________________________________________________________________
+Added: svn:eol-style
+   + native
+
+Index: src/java/org/apache/lucene/util/packed/Packed64.java
+===================================================================
+--- src/java/org/apache/lucene/util/packed/Packed64.java	(revision 926738)
++++ src/java/org/apache/lucene/util/packed/Packed64.java	(working copy)
+@@ -148,6 +148,7 @@
+     super(valueCount, bitsPerValue);
+     int size = size(valueCount, bitsPerValue);
+     blocks = new long[size+1]; // +1 due to non-conditional tricks
++    // TODO: find a faster way to bulk-read longs...
+     for(int i=0;i<size;i++) {
+       blocks[i] = in.readLong();
+     }
+Index: src/java/org/apache/lucene/util/packed/PackedWriter.java
+===================================================================
+--- src/java/org/apache/lucene/util/packed/PackedWriter.java	(revision 926738)
++++ src/java/org/apache/lucene/util/packed/PackedWriter.java	(working copy)
+@@ -45,7 +45,7 @@
+     pendingBitPos = 64;
+     masks = new long[bitsPerValue - 1];
+ 
+-    int v = 1;
++    long v = 1;
+     for (int i = 0; i < bitsPerValue - 1; i++) {
+       v *= 2;
+       masks[i] = v - 1;
+@@ -104,7 +104,6 @@
+     if (pendingBitPos != 64) {
+       out.writeLong(pending);
+     }
+-    out.writeLong(0L); // Dummy to compensate for not using conditionals
+   }
+ 
+   public String toString() {
+Index: src/java/org/apache/lucene/util/packed/PackedReaderIterator.java
+===================================================================
+--- src/java/org/apache/lucene/util/packed/PackedReaderIterator.java	(revision 0)
++++ src/java/org/apache/lucene/util/packed/PackedReaderIterator.java	(revision 0)
+@@ -0,0 +1,84 @@
++package org.apache.lucene.util.packed;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.store.IndexInput;
++
++import java.io.IOException;
++
++class PackedReaderIterator implements PackedInts.ReaderIterator {
++  private long pending;
++  private int pendingBitsLeft;
++  private final IndexInput in;
++  private final int bitsPerValue;
++  private final int valueCount;
++
++  // masks[n-1] masks for bottom n bits
++  private final long[] masks;
++
++  public PackedReaderIterator(int bitsPerValue, int valueCount, IndexInput in)
++    throws IOException {
++
++    this.valueCount = valueCount;
++    this.bitsPerValue = bitsPerValue;
++    
++    this.in = in;
++
++    masks = new long[bitsPerValue];
++
++    long v = 1;
++    for (int i = 0; i < bitsPerValue; i++) {
++      v *= 2;
++      masks[i] = v - 1;
++    }
++  }
++
++  public int getBitsPerValue() {
++    return bitsPerValue;
++  }
++
++  public int size() {
++    return valueCount;
++  }
++
++  public long next() throws IOException {
++    if (pendingBitsLeft == 0) {
++      pending = in.readLong();
++      pendingBitsLeft = 64;
++    }
++
++    if (pendingBitsLeft >= bitsPerValue) {
++      // not split
++      final long result = (pending >> (pendingBitsLeft - bitsPerValue)) & masks[bitsPerValue-1];
++      pendingBitsLeft -= bitsPerValue;
++      return result;
++    } else {
++      // split
++      final int bits1 = bitsPerValue - pendingBitsLeft;
++      final long result1 = (pending & masks[pendingBitsLeft-1]) << bits1;
++      pending = in.readLong();
++      final long result2 = (pending >> (64 - bits1)) & masks[bits1-1];
++      pendingBitsLeft = 64 + pendingBitsLeft - bitsPerValue;
++      return result1 | result2;
++    }
++  }
++
++  public void close() throws IOException {
++    in.close();
++  }
++}
+
+Property changes on: src/java/org/apache/lucene/util/packed/PackedReaderIterator.java
+___________________________________________________________________
+Added: svn:eol-style
+   + native
+
+Index: src/java/org/apache/lucene/util/packed/PackedInts.java
+===================================================================
+--- src/java/org/apache/lucene/util/packed/PackedInts.java	(revision 926738)
++++ src/java/org/apache/lucene/util/packed/PackedInts.java	(working copy)
+@@ -17,6 +17,8 @@
+  * limitations under the License.
+  */
+ 
++import java.io.Closeable;
++
+ import org.apache.lucene.store.IndexOutput;
+ import org.apache.lucene.store.IndexInput;
+ import org.apache.lucene.util.CodecUtil;
+@@ -65,6 +67,18 @@
+   }
+ 
+   /**
++   * Run-once iterator interface, to decode previously saved PackedInts.
++   */
++  public static interface ReaderIterator extends Closeable {
++    /** Returns next value */
++    long next() throws IOException;
++    /** Returns number of bits per value */
++    int getBitsPerValue();
++    /** Returns number of values */
++    int size();
++  }
++
++  /**
+    * A packed integer array that can be modified.
+    * @lucene.internal
+    */
+@@ -167,6 +181,22 @@
+   }
+ 
+   /**
++   * Retrieve PackedInts as a {@link ReaderIterator}
++   * @param in positioned at the beginning of a stored packed int structure.
++   * @return an iterator to access the values
++   * @throws IOException if the structure could not be retrieved.
++   * @lucene.internal
++   */
++  public static ReaderIterator getReaderIterator(IndexInput in) throws IOException {
++    CodecUtil.checkHeader(in, CODEC_NAME, VERSION_START);
++    final int bitsPerValue = in.readVInt();
++    assert bitsPerValue > 0 && bitsPerValue <= 64: "bitsPerValue=" + bitsPerValue;
++    final int valueCount = in.readVInt();
++
++    return new PackedReaderIterator(bitsPerValue, valueCount, in);
++  }
++
++  /**
+    * Create a packed integer array with the given amount of values initialized
+    * to 0. the valueCount and the bitsPerValue cannot be changed after creation.
+    * All Mutables known by this factory are kept fully in RAM.
+@@ -228,7 +258,7 @@
+     } if (maxValue > 0x1FFFFFFFFFFFFFFFL) {
+       return 62;
+     }
+-    return (int) Math.ceil(Math.log(1+maxValue)/Math.log(2.0));
++    return Math.max(1, (int) Math.ceil(Math.log(1+maxValue)/Math.log(2.0)));
+   }
+ 
+   /**
+Index: src/java/org/apache/lucene/util/packed/Packed32.java
+===================================================================
+--- src/java/org/apache/lucene/util/packed/Packed32.java	(revision 926738)
++++ src/java/org/apache/lucene/util/packed/Packed32.java	(working copy)
+@@ -129,6 +129,7 @@
+     super(valueCount, bitsPerValue);
+     int size = size(bitsPerValue, valueCount);
+     blocks = new int[size + 1]; // +1 due to non-conditional tricks
++    // TODO: find a faster way to bulk-read ints...
+     for(int i = 0 ; i < size ; i++) {
+       blocks[i] = in.readInt();
+     }
+Index: src/java/org/apache/lucene/util/ArrayUtil.java
+===================================================================
+--- src/java/org/apache/lucene/util/ArrayUtil.java	(revision 926738)
++++ src/java/org/apache/lucene/util/ArrayUtil.java	(working copy)
+@@ -232,6 +232,29 @@
+       return currentSize;
+   }
+ 
++  public static short[] grow(short[] array, int minSize) {
++    if (array.length < minSize) {
++      short[] newArray = new short[oversize(minSize, RamUsageEstimator.NUM_BYTES_SHORT)];
++      System.arraycopy(array, 0, newArray, 0, array.length);
++      return newArray;
++    } else
++      return array;
++  }
++
++  public static short[] grow(short[] array) {
++    return grow(array, 1 + array.length);
++  }
++
++  public static short[] shrink(short[] array, int targetSize) {
++    final int newSize = getShrinkSize(array.length, targetSize, RamUsageEstimator.NUM_BYTES_SHORT);
++    if (newSize != array.length) {
++      short[] newArray = new short[newSize];
++      System.arraycopy(array, 0, newArray, 0, newSize);
++      return newArray;
++    } else
++      return array;
++  }
++
+   public static int[] grow(int[] array, int minSize) {
+     if (array.length < minSize) {
+       int[] newArray = new int[oversize(minSize, RamUsageEstimator.NUM_BYTES_INT)];

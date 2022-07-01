@@ -1,0 +1,240 @@
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index 88b09e9bad..fc43d1d83d 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -92,6 +92,10 @@ API Changes
+   methods.  This decouples normalization from tokenization entirely.
+   (Mayya Sharipova, Alan Woodward)
+ 
++* LUCENE-8542: CollectorManager.newCollector has additional parameter
++  leafSlice to enable optimizations for small slices.
++  (Christoph Kaser via )
++
+ Changes in Runtime Behavior
+ 
+ * LUCENE-8333: Switch MoreLikeThis.setMaxDocFreqPct to use maxDoc instead of
+diff --git a/lucene/core/src/java/org/apache/lucene/search/CollectorManager.java b/lucene/core/src/java/org/apache/lucene/search/CollectorManager.java
+index 6a2e9a6ede..94f8d4fc7a 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/CollectorManager.java
++++ b/lucene/core/src/java/org/apache/lucene/search/CollectorManager.java
+@@ -24,7 +24,7 @@ import java.util.Collection;
+  * A manager of collectors. This class is useful to parallelize execution of
+  * search requests and has two main methods:
+  * <ul>
+- *   <li>{@link #newCollector()} which must return a NEW collector which
++ *   <li>{@link #newCollector(IndexSearcher.LeafSlice)} which must return a NEW collector which
+  *       will be used to collect a certain set of leaves.</li>
+  *   <li>{@link #reduce(Collection)} which will be used to reduce the
+  *       results of individual collections into a meaningful result.
+@@ -40,8 +40,12 @@ public interface CollectorManager<C extends Collector, T> {
+   /**
+    * Return a new {@link Collector}. This must return a different instance on
+    * each call.
++   * @param leafSlice the leafslice on which the new collector will be called on.
++   *                  This can be used to optimize the collector for this LeafSlice,
++   *                  e. g. by using the {@link IndexSearcher.LeafSlice#maxDoc()} - information
++   *                  of the slice to save memory
+    */
+-  C newCollector() throws IOException;
++  C newCollector(IndexSearcher.LeafSlice leafSlice) throws IOException;
+ 
+   /**
+    * Reduce the results of individual collectors into a meaningful result.
+diff --git a/lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java b/lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java
+index 689409f5cc..c02a5ef2b2 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java
++++ b/lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java
+@@ -352,7 +352,7 @@ public class IndexSearcher {
+     final CollectorManager<TotalHitCountCollector, Integer> collectorManager = new CollectorManager<TotalHitCountCollector, Integer>() {
+ 
+       @Override
+-      public TotalHitCountCollector newCollector() throws IOException {
++      public TotalHitCountCollector newCollector(LeafSlice leafSlice) throws IOException {
+         return new TotalHitCountCollector();
+       }
+ 
+@@ -400,8 +400,9 @@ public class IndexSearcher {
+     final CollectorManager<TopScoreDocCollector, TopDocs> manager = new CollectorManager<TopScoreDocCollector, TopDocs>() {
+ 
+       @Override
+-      public TopScoreDocCollector newCollector() throws IOException {
+-        return TopScoreDocCollector.create(cappedNumHits, after, TOTAL_HITS_THRESHOLD);
++      public TopScoreDocCollector newCollector(LeafSlice leafSlice) throws IOException {
++        final int sliceCappedNumHits = Math.min(cappedNumHits, Math.max(1, leafSlice.maxDoc()));
++        return TopScoreDocCollector.create(sliceCappedNumHits, after, TOTAL_HITS_THRESHOLD);
+       }
+ 
+       @Override
+@@ -528,9 +529,10 @@ public class IndexSearcher {
+     final CollectorManager<TopFieldCollector, TopFieldDocs> manager = new CollectorManager<TopFieldCollector, TopFieldDocs>() {
+ 
+       @Override
+-      public TopFieldCollector newCollector() throws IOException {
++      public TopFieldCollector newCollector(LeafSlice leafSlice) throws IOException {
++        final int sliceCappedNumHits = Math.min(cappedNumHits, Math.max(1, leafSlice.maxDoc()));
+         // TODO: don't pay the price for accurate hit counts by default
+-        return TopFieldCollector.create(rewrittenSort, cappedNumHits, after, TOTAL_HITS_THRESHOLD);
++        return TopFieldCollector.create(rewrittenSort, sliceCappedNumHits, after, TOTAL_HITS_THRESHOLD);
+       }
+ 
+       @Override
+@@ -563,14 +565,14 @@ public class IndexSearcher {
+   */
+   public <C extends Collector, T> T search(Query query, CollectorManager<C, T> collectorManager) throws IOException {
+     if (executor == null) {
+-      final C collector = collectorManager.newCollector();
++      final C collector = collectorManager.newCollector(new LeafSlice(leafContexts));
+       search(query, collector);
+       return collectorManager.reduce(Collections.singletonList(collector));
+     } else {
+       final List<C> collectors = new ArrayList<>(leafSlices.length);
+       ScoreMode scoreMode = null;
+       for (int i = 0; i < leafSlices.length; ++i) {
+-        final C collector = collectorManager.newCollector();
++        final C collector = collectorManager.newCollector(leafSlices[i]);
+         collectors.add(collector);
+         if (scoreMode == null) {
+           scoreMode = collector.scoreMode();
+@@ -586,12 +588,12 @@ public class IndexSearcher {
+       final Weight weight = createWeight(query, scoreMode, 1);
+       final List<Future<C>> topDocsFutures = new ArrayList<>(leafSlices.length);
+       for (int i = 0; i < leafSlices.length; ++i) {
+-        final LeafReaderContext[] leaves = leafSlices[i].leaves;
++        final List<LeafReaderContext> leaves = leafSlices[i].leaves;
+         final C collector = collectors.get(i);
+         topDocsFutures.add(executor.submit(new Callable<C>() {
+           @Override
+           public C call() throws Exception {
+-            search(Arrays.asList(leaves), weight, collector);
++            search(leaves, weight, collector);
+             return collector;
+           }
+         }));
+@@ -741,10 +743,33 @@ public class IndexSearcher {
+     /** The leaves that make up this slice.
+      *
+      *  @lucene.experimental */
+-    public final LeafReaderContext[] leaves;
+-    
++    public final List<LeafReaderContext> leaves;
++
++    /**
++     * an upper bound for the total number of documents in this slice
++     */
++    private final int maxDoc;
++
+     public LeafSlice(LeafReaderContext... leaves) {
++      this(Arrays.asList(leaves));
++    }
++
++    public LeafSlice(List<LeafReaderContext> leaves) {
+       this.leaves = leaves;
++      int totalMaxDoc = 0;
++      for (LeafReaderContext leaf : leaves) {
++        totalMaxDoc += leaf.reader().maxDoc();
++      }
++      this.maxDoc = totalMaxDoc;
++    }
++
++    /**
++     * @return an upper bound for the total number of documents in this slice
++     *
++     * @lucene.experimental
++     */
++    public int maxDoc() {
++      return maxDoc;
+     }
+   }
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/search/MultiCollectorManager.java b/lucene/core/src/java/org/apache/lucene/search/MultiCollectorManager.java
+index 6e73c543c1..87e02d9f2a 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/MultiCollectorManager.java
++++ b/lucene/core/src/java/org/apache/lucene/search/MultiCollectorManager.java
+@@ -41,8 +41,8 @@ public class MultiCollectorManager implements CollectorManager<MultiCollectorMan
+   }
+ 
+   @Override
+-  public Collectors newCollector() throws IOException {
+-    return new Collectors();
++  public Collectors newCollector(IndexSearcher.LeafSlice leafSlice) throws IOException {
++    return new Collectors(leafSlice);
+   }
+ 
+   @Override
+@@ -62,10 +62,10 @@ public class MultiCollectorManager implements CollectorManager<MultiCollectorMan
+ 
+     private final Collector[] collectors;
+ 
+-    private Collectors() throws IOException {
++    private Collectors(IndexSearcher.LeafSlice leafSlice) throws IOException {
+       collectors = new Collector[collectorManagers.length];
+       for (int i = 0; i < collectors.length; i++)
+-        collectors[i] = collectorManagers[i].newCollector();
++        collectors[i] = collectorManagers[i].newCollector(leafSlice);
+     }
+ 
+     @Override
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestIndexSearcher.java b/lucene/core/src/test/org/apache/lucene/search/TestIndexSearcher.java
+index 7e4c3c22d9..790c331a32 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestIndexSearcher.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestIndexSearcher.java
+@@ -232,8 +232,8 @@ public class TestIndexSearcher extends LuceneTestCase {
+     IndexSearcher.LeafSlice[] slices = s.getSlices();
+     assertNotNull(slices);
+     assertEquals(1, slices.length);
+-    assertEquals(1, slices[0].leaves.length);
+-    assertTrue(slices[0].leaves[0] == r.leaves().get(0));
++    assertEquals(1, slices[0].leaves.size());
++    assertTrue(slices[0].leaves.get(0) == r.leaves().get(0));
+     service.shutdown();
+     IOUtils.close(r, dir);
+   }
+diff --git a/lucene/facet/src/java/org/apache/lucene/facet/DrillSideways.java b/lucene/facet/src/java/org/apache/lucene/facet/DrillSideways.java
+index 15df7e3d95..2aa91e9bf1 100644
+--- a/lucene/facet/src/java/org/apache/lucene/facet/DrillSideways.java
++++ b/lucene/facet/src/java/org/apache/lucene/facet/DrillSideways.java
+@@ -240,8 +240,9 @@ public class DrillSideways {
+                 new CollectorManager<TopFieldCollector, TopFieldDocs>() {
+ 
+                   @Override
+-                  public TopFieldCollector newCollector() throws IOException {
+-                    return TopFieldCollector.create(sort, fTopN, after, Integer.MAX_VALUE);
++                  public TopFieldCollector newCollector(IndexSearcher.LeafSlice leafSlice) throws IOException {
++                    final int sliceTopN = Math.min(fTopN, Math.max(1, leafSlice.maxDoc()));
++                    return TopFieldCollector.create(sort, sliceTopN, after, Integer.MAX_VALUE);
+                   }
+ 
+                   @Override
+@@ -302,8 +303,9 @@ public class DrillSideways {
+               new CollectorManager<TopScoreDocCollector, TopDocs>() {
+ 
+                 @Override
+-                public TopScoreDocCollector newCollector() throws IOException {
+-                  return TopScoreDocCollector.create(fTopN, after, Integer.MAX_VALUE);
++                public TopScoreDocCollector newCollector(IndexSearcher.LeafSlice leafSlice) throws IOException {
++                  final int sliceTopN = Math.min(fTopN, Math.max(1, leafSlice.maxDoc()));
++                  return TopScoreDocCollector.create(sliceTopN, after, Integer.MAX_VALUE);
+                 }
+ 
+                 @Override
+diff --git a/lucene/facet/src/java/org/apache/lucene/facet/FacetsCollectorManager.java b/lucene/facet/src/java/org/apache/lucene/facet/FacetsCollectorManager.java
+index 385a8973b3..d88fd91610 100644
+--- a/lucene/facet/src/java/org/apache/lucene/facet/FacetsCollectorManager.java
++++ b/lucene/facet/src/java/org/apache/lucene/facet/FacetsCollectorManager.java
+@@ -17,6 +17,7 @@
+ package org.apache.lucene.facet;
+ 
+ import org.apache.lucene.search.CollectorManager;
++import org.apache.lucene.search.IndexSearcher;
+ 
+ import java.io.IOException;
+ import java.util.Collection;
+@@ -33,7 +34,7 @@ public class FacetsCollectorManager implements CollectorManager<FacetsCollector,
+   }
+ 
+   @Override
+-  public FacetsCollector newCollector() throws IOException {
++  public FacetsCollector newCollector(IndexSearcher.LeafSlice leafSlice) throws IOException {
+     return new FacetsCollector();
+   }
+ 

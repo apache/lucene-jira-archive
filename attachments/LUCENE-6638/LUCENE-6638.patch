@@ -1,0 +1,441 @@
+Index: lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/FlattenGraphFilter.java
+===================================================================
+--- lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/FlattenGraphFilter.java	(revision 0)
++++ lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/FlattenGraphFilter.java	(working copy)
+@@ -0,0 +1,269 @@
++package org.apache.lucene.analysis.synonym;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * This filter "casts" token graphs down into a "flat sausage" form,
++ * for indexing.   This is an inherently lossy process: nodes (positions)
++ * along side paths are forcefully merged.
++ *
++ * <p>In general this means the output graph will accept token sequences
++ * that the input graph did not accept, and will also fail to accept
++ * token sequences that the input graph did accept.
++ *
++ * <p>This is only necessary at indexing time because Lucene cannot yet index
++ * an arbitrary token graph.  At search time there are better options, e.g.
++ * the experimental <code>TermAutomatonQuery</code> in sandbox.
++ *
++ * @lucene.experimental
++ */
++
++import org.apache.lucene.analysis.TokenFilter;
++import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
++import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
++import org.apache.lucene.analysis.tokenattributes.PositionLengthAttribute;
++import org.apache.lucene.util.AttributeSource;
++import org.apache.lucene.util.RollingBuffer;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++
++public final class FlattenGraphFilter extends TokenFilter {
++
++  /** Holds all tokens leaving a given input position. */
++  private final static class InputNode implements RollingBuffer.Resettable {
++    private final List<AttributeSource.State> tokens = new ArrayList<>();
++
++    /** Our input node, or -1 if we haven't been assigned yet */
++    int node = -1;
++
++    /** Maximum to input node for all tokens leaving here; we use this
++     *  to know when we can freeze. */
++    int maxToNode;
++
++    /** Where we currently map to; this changes (can only
++     *  increase as we see more input tokens), until we are finished
++     *  with this position. */
++    int outputNode = -1;
++
++    int nextOut;
++
++    @Override
++    public void reset() {
++      tokens.clear();
++      node = -1;
++      outputNode = -1;
++      nextOut = 0;
++    }
++  }
++
++  /** Gathers up merged input positions into a single output position,
++   *  only for the current "frontier" of nodes we've seen but can't yet
++   *  output because they are not frozen. */
++  private final static class OutputNode implements RollingBuffer.Resettable {
++    private final List<Integer> inputNodes = new ArrayList<>();
++
++    int node = -1;
++    int nextOut;
++
++    @Override
++    public void reset() {
++      inputNodes.clear();
++      node = -1;
++      nextOut = 0;
++    }
++  }
++
++  private final RollingBuffer<InputNode> inputNodes = new RollingBuffer<InputNode>() {
++    @Override
++    protected InputNode newInstance() {
++      return new InputNode();
++    }
++  };
++
++  private final RollingBuffer<OutputNode> outputNodes = new RollingBuffer<OutputNode>() {
++    @Override
++    protected OutputNode newInstance() {
++      return new OutputNode();
++    }
++  };
++
++  private final PositionIncrementAttribute posIncAtt = addAttribute(PositionIncrementAttribute.class);
++  private final PositionLengthAttribute posLenAtt = addAttribute(PositionLengthAttribute.class);
++  private final OffsetAttribute offsetAtt = addAttribute(OffsetAttribute.class);
++
++  /** Which input node the last seen token leaves from */
++  private int inputFrom;
++
++  /** We are currently releasing tokens leaving from this output node */
++  private int outputFrom;
++
++  private boolean done;
++
++  private int lastOutputFrom;
++
++  private int finalOffset;
++
++  private int finalPosInc;
++
++  public FlattenGraphFilter(TokenStream in) {
++    super(in);
++  }
++
++  private boolean releaseBufferedToken() {
++    OutputNode output = outputNodes.get(outputFrom);
++    int maxToNode = -1;
++    for(int inputNodeID : output.inputNodes) {
++      InputNode inputNode = inputNodes.get(inputNodeID);
++      assert inputNode.outputNode == outputFrom;
++      maxToNode = Math.max(maxToNode, inputNode.maxToNode);
++    }
++    System.out.println("  release maxToNode=" + maxToNode + " vs inputFrom=" + inputFrom);
++
++    // TODO: we could shrink the frontier here somewhat if we
++    // always output posLen=1 as part of our "sausagizing":
++    if (maxToNode <= inputFrom || done) {
++      System.out.println("  output node merged these inputs: " + output.inputNodes);
++      // These tokens are now frozen
++      assert output.nextOut < output.inputNodes.size();
++      InputNode inputNode = inputNodes.get(output.inputNodes.get(output.nextOut));
++      if (done && inputNode.tokens.size() == 0) {
++        return false;
++      }
++      assert inputNode.nextOut < inputNode.tokens.size();
++      restoreState(inputNode.tokens.get(inputNode.nextOut));
++
++      // Correct posInc
++      assert outputFrom >= lastOutputFrom;
++      posIncAtt.setPositionIncrement(outputFrom - lastOutputFrom);
++      int toInputNodeID = inputNode.node + posLenAtt.getPositionLength();
++      InputNode toInputNode = inputNodes.get(toInputNodeID);
++
++      // Correct posLen
++      assert toInputNode.outputNode > outputFrom;
++      posLenAtt.setPositionLength(toInputNode.outputNode - outputFrom);
++      lastOutputFrom = outputFrom;
++      inputNode.nextOut++;
++      System.out.println("  ret " + this);
++
++      if (inputNode.nextOut == inputNode.tokens.size()) {
++        output.nextOut++;
++        if (output.nextOut == output.inputNodes.size()) {
++          outputFrom++;
++          // nocommit is that right?  the 0th one should always be smallest?
++          inputNodes.freeBefore(output.inputNodes.get(0));
++          outputNodes.freeBefore(outputFrom);
++        }
++      }
++
++      return true;
++    } else {
++      return false;
++    }
++  }
++
++  @Override
++  public boolean incrementToken() throws IOException {
++    // nocommit emit any "frozen" buffered tokens
++    // nocommit what to do about holes?  make sure we test ...
++    System.out.println("\nF.increment inputFrom=" + inputFrom + " outputFrom=" + outputFrom);
++
++    while (true) {
++      if (releaseBufferedToken()) {
++        return true;
++      } else if (done) {
++        return false;
++      }
++
++      if (input.incrementToken()) {
++        System.out.println("  input.inc token=" + this);
++        // Input node this token leaves from:
++        inputFrom += posIncAtt.getPositionIncrement();
++
++        // Input node this token goes to:
++        int inputTo = inputFrom + posLenAtt.getPositionLength();
++
++        InputNode src = inputNodes.get(inputFrom);
++        if (src.node == -1) {
++          // nocommit this should only be the hole case
++          src.node = inputFrom;
++        }
++
++        // Buffer this token:
++        src.tokens.add(captureState());
++        src.maxToNode = Math.max(src.maxToNode, inputTo);
++
++        InputNode dest = inputNodes.get(inputTo);
++        if (dest.node == -1) {
++          // Common case: first time a token is arriving to this input position:
++          dest.node = inputTo;
++        }
++
++        // Always number output nodes sequentially:
++        int outputEndNode = src.outputNode + 1;
++
++        if (dest.outputNode != outputEndNode) {
++          // This should only increase as we see new "evidence" (tokens),
++          // i.e. a side path "completes" and joins back to the main path
++          // so the node it arrives to is bumped forward to a later output
++          // position:
++          assert dest.outputNode < outputEndNode;
++          if (dest.outputNode != -1) {
++            boolean removed = outputNodes.get(dest.outputNode).inputNodes.remove(Integer.valueOf(inputTo));
++            assert removed;
++          }
++          // nocommit test w/ weirdly numbered but legal graphs, e.g. skipping positions (NOT holes):
++          outputNodes.get(outputEndNode).inputNodes.add(inputTo);      
++          dest.outputNode = outputEndNode;
++        }
++      } else {
++        input.end();
++        finalPosInc = posIncAtt.getPositionIncrement();
++        finalOffset = offsetAtt.endOffset();
++        done = true;
++        // Don't return false here: we need to force release any buffered tokens now
++        // nocommit set final end offset
++      }
++    }
++  }
++
++  @Override
++  public void end() throws IOException {
++    super.end();
++    posIncAtt.setPositionIncrement(finalPosInc);
++    offsetAtt.setOffset(finalOffset, finalOffset);
++  }
++  
++  @Override
++  public void reset() throws IOException {
++    inputFrom = -1;
++    InputNode in = inputNodes.get(0);
++    in.node = 0;
++    in.outputNode = 0;
++
++    OutputNode out = outputNodes.get(0);
++    out.node = 0;
++    out.inputNodes.add(0);
++    outputFrom = 0;
++    lastOutputFrom = -1;
++    done = false;
++    finalOffset = -1;
++  }
++}
+
+Property changes on: lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/FlattenGraphFilter.java
+___________________________________________________________________
+Added: svn:eol-style
+## -0,0 +1 ##
++native
+\ No newline at end of property
+Index: lucene/analysis/common/src/java/org/apache/lucene/analysis/util/CharTokenizer.java
+===================================================================
+--- lucene/analysis/common/src/java/org/apache/lucene/analysis/util/CharTokenizer.java	(revision 1688306)
++++ lucene/analysis/common/src/java/org/apache/lucene/analysis/util/CharTokenizer.java	(working copy)
+@@ -141,4 +141,4 @@
+     finalOffset = 0;
+     ioBuffer.reset(); // make sure to reset the IO buffer!!
+   }
+-}
+\ No newline at end of file
++}
+Index: lucene/analysis/common/src/test/org/apache/lucene/analysis/synonym/TestFlattenGraphFilter.java
+===================================================================
+--- lucene/analysis/common/src/test/org/apache/lucene/analysis/synonym/TestFlattenGraphFilter.java	(revision 0)
++++ lucene/analysis/common/src/test/org/apache/lucene/analysis/synonym/TestFlattenGraphFilter.java	(working copy)
+@@ -0,0 +1,137 @@
++package org.apache.lucene.analysis.synonym;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.analysis.BaseTokenStreamTestCase;
++import org.apache.lucene.analysis.CannedTokenStream;
++import org.apache.lucene.analysis.Token;
++import org.apache.lucene.analysis.TokenStream;
++
++public class TestFlattenGraphFilter extends BaseTokenStreamTestCase {
++  
++  private static Token token(String term, int posInc, int posLength, int startOffset, int endOffset) {
++    final Token t = new Token(term, startOffset, endOffset);
++    t.setPositionIncrement(posInc);
++    t.setPositionLength(posLength);
++    return t;
++  }
++
++  // Make sure graph is unchanged if it's already a sausage
++  public void testAlreadySausage() throws Exception {
++    TokenStream in = new CannedTokenStream(0, 12, new Token[] {
++        token("wtf", 1, 1, 0, 3),
++        token("what", 0, 1, 0, 3),
++        token("wow", 0, 1, 0, 3),
++        token("the", 1, 1, 0, 3),
++        token("that's", 0, 1, 0, 3),
++        token("fudge", 1, 1, 0, 3),
++        token("funny", 0, 1, 0, 3),
++        token("happened", 1, 1, 4, 12)
++      });
++
++    TokenStream out = new FlattenGraphFilter(in);
++
++    // ... but on output, it's flattened to wtf/what/wow that's/the fudge/funny happened:
++    assertTokenStreamContents(out,
++                              new String[] {"wtf", "what", "wow", "the", "that's", "fudge", "funny", "happened"},
++                              new int[] {0, 0, 0, 0, 0, 0, 0, 4},
++                              new int[] {3, 3, 3, 3, 3, 3, 3, 12},
++                              new int[] {1, 0, 0, 1, 0, 1, 0, 1},
++                              new int[] {1, 1, 1, 1, 1, 1, 1, 1},
++                              12);
++  }
++
++  public void testWTF() throws Exception {
++
++    // "wow that's funny" and "what the fudge" are separate side paths, in parallel with "wtf", on input:
++    TokenStream in = new CannedTokenStream(0, 12, new Token[] {
++        token("wtf", 1, 5, 0, 3),
++        token("what", 0, 1, 0, 3),
++        token("wow", 0, 3, 0, 3),
++        token("the", 1, 1, 0, 3),
++        token("fudge", 1, 3, 0, 3),
++        token("that's", 1, 1, 0, 3),
++        token("funny", 1, 1, 0, 3),
++        token("happened", 1, 1, 4, 12)
++      });
++
++
++    TokenStream out = new FlattenGraphFilter(in);
++
++    // ... but on output, it's flattened to wtf/what/wow that's/the fudge/funny happened:
++    assertTokenStreamContents(out,
++                              new String[] {"wtf", "what", "wow", "the", "that's", "fudge", "funny", "happened"},
++                              new int[] {0, 0, 0, 0, 0, 0, 0, 4},
++                              new int[] {3, 3, 3, 3, 3, 3, 3, 12},
++                              new int[] {1, 0, 0, 1, 0, 1, 0, 1},
++                              new int[] {3, 1, 1, 1, 1, 1, 1, 1},
++                              12);
++    
++  }
++
++  public void testNonGreedySynonyms() throws Exception {
++    // This is just "hypothetical" for Lucene today, because SynFilter is
++    // greedy: when two syn rules match on overlapping tokens, only one
++    // (greedily) wins.  This test pretends all syn matches could match:
++
++    // "wow that's funny" and "what the fudge" are separate side paths, in parallel with "wtf", on input:
++    TokenStream in = new CannedTokenStream(0, 20, new Token[] {
++        token("wizard", 1, 1, 0, 6),
++        token("wizard_of_oz", 0, 3, 0, 12),
++        token("of", 1, 1, 7, 9),
++        token("oz", 1, 1, 10, 12),
++        token("oz_screams", 0, 2, 10, 20),
++        token("screams", 1, 1, 13, 20),
++      });
++
++
++    TokenStream out = new FlattenGraphFilter(in);
++
++    // ... but on output, it's flattened to wtf/what/wow that's/the fudge/funny happened:
++    assertTokenStreamContents(out,
++                              new String[] {"wizard", "wizard_of_oz", "of", "oz", "oz_screams", "screams"},
++                              new int[] {0, 0, 7, 10, 10, 13},
++                              new int[] {6, 12, 9, 12, 20, 20},
++                              new int[] {1, 0, 1, 1, 0, 1},
++                              new int[] {1, 3, 1, 1, 2, 1},
++                              20);
++    
++  }
++
++  public void testNonGraph() throws Exception {
++    // "wow that's funny" and "what the fudge" are separate side paths, in parallel with "wtf", on input:
++    TokenStream in = new CannedTokenStream(0, 22, new Token[] {
++        token("hello", 1, 1, 0, 5),
++        token("pseudo", 1, 1, 6, 12),
++        token("world", 1, 1, 13, 18),
++        token("fun", 1, 1, 19, 22),
++      });
++
++
++    TokenStream out = new FlattenGraphFilter(in);
++
++    // ... but on output, it's flattened to wtf/what/wow that's/the fudge/funny happened:
++    assertTokenStreamContents(out,
++                              new String[] {"hello", "pseudo", "world", "fun"},
++                              new int[] {0, 6, 13, 19},
++                              new int[] {5, 12, 18, 22},
++                              new int[] {1, 1, 1, 1},
++                              new int[] {1, 1, 1, 1},
++                              22);
++  }
++}
+
+Property changes on: lucene/analysis/common/src/test/org/apache/lucene/analysis/synonym/TestFlattenGraphFilter.java
+___________________________________________________________________
+Added: svn:eol-style
+## -0,0 +1 ##
++native
+\ No newline at end of property

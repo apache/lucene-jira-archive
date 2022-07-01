@@ -1,0 +1,571 @@
+Index: lucene/core/src/java/org/apache/lucene/index/DocumentsWriter.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/index/DocumentsWriter.java	(revision 1617893)
++++ lucene/core/src/java/org/apache/lucene/index/DocumentsWriter.java	(working copy)
+@@ -410,9 +410,12 @@
+       final DocumentsWriterPerThread dwpt = perThread.dwpt;
+       final int dwptNumDocs = dwpt.getNumDocsInRAM();
+       try {
+-        final int docCount = dwpt.updateDocuments(docs, analyzer, delTerm);
+-        numDocsInRAM.addAndGet(docCount);
++        dwpt.updateDocuments(docs, analyzer, delTerm);
+       } finally {
++        // We don't know how many documents were actually
++        // counted as indexed, so we must subtract here to
++        // accumulate our separate counter:
++        numDocsInRAM.addAndGet(dwpt.getNumDocsInRAM() - dwptNumDocs);
+         if (dwpt.checkAndResetHasAborted()) {
+           if (!dwpt.pendingFilesToDelete().isEmpty()) {
+             putEvent(new DeleteNewFilesEvent(dwpt.pendingFilesToDelete()));
+@@ -449,8 +452,11 @@
+       final int dwptNumDocs = dwpt.getNumDocsInRAM();
+       try {
+         dwpt.updateDocument(doc, analyzer, delTerm); 
+-        numDocsInRAM.incrementAndGet();
+       } finally {
++        // We don't know whether the document actually
++        // counted as being indexed, so we must subtract here to
++        // accumulate our separate counter:
++        numDocsInRAM.addAndGet(dwpt.getNumDocsInRAM() - dwptNumDocs);
+         if (dwpt.checkAndResetHasAborted()) {
+           if (!dwpt.pendingFilesToDelete().isEmpty()) {
+             putEvent(new DeleteNewFilesEvent(dwpt.pendingFilesToDelete()));
+@@ -571,6 +577,7 @@
+     while (!numDocsInRAM.compareAndSet(oldValue, oldValue - numFlushed)) {
+       oldValue = numDocsInRAM.get();
+     }
++    assert numDocsInRAM.get() >= 0;
+   }
+   
+   // for asserts
+Index: lucene/core/src/java/org/apache/lucene/index/IndexWriter.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/index/IndexWriter.java	(revision 1617893)
++++ lucene/core/src/java/org/apache/lucene/index/IndexWriter.java	(working copy)
+@@ -892,52 +892,61 @@
+   }
+ 
+   /**
++   * Gracefully closes (commits, waits for merges), but calls rollback
++   * if there's an exc so the IndexWriter is always closed.
++   */
++  private void shutdown(boolean waitForMerges) throws IOException {
++    if (pendingCommit != null) {
++      throw new IllegalStateException("cannot close: prepareCommit was already called with no corresponding call to commit");
++    }
++    // Ensure that only one thread actually gets to do the
++    // closing
++    if (shouldClose()) {
++      boolean success = false;
++      try {
++        if (infoStream.isEnabled("IW")) {
++          infoStream.message("IW", "now flush at close");
++        }
++        flush(true, true);
++        finishMerges(waitForMerges);
++        commitInternal();
++        rollbackInternal(); // ie close, since we just committed
++        success = true;
++      } finally {
++        if (success == false) {
++          // Be certain to close the index on any exception
++          try {
++            rollbackInternal();
++          } catch (Throwable t) {
++            // Suppress so we keep throwing original exception
++          }
++        }
++      }
++    }
++  }
++
++  /**
+    * Commits all changes to an index, waits for pending merges
+-   * to complete, and closes all associated files.  
++   * to complete, closes all associated files and releases the
++   * write lock.  
++   *
++   * <p>Note that:
++   * <ul>
++   *   <li>If you called prepareCommit but failed to call commit, this
++   *       method will throw {@code IllegalStateException} and the {@code IndexWriter}
++   *       will not be closed.</li>
++   *   <li>If this method throws any other exception, the {@code IndexWriter}
++   *       will be closed, but changes may have been lost.</li>
++   * </ul>
++   *
+    * <p>
+-   * This is a "slow graceful shutdown" which may take a long time
+-   * especially if a big merge is pending: If you only want to close
+-   * resources use {@link #rollback()}. If you only want to commit
+-   * pending changes and close resources see {@link #close(boolean)}.
+-   * <p>
+    * Note that this may be a costly
+    * operation, so, try to re-use a single writer instead of
+    * closing and opening a new one.  See {@link #commit()} for
+    * caveats about write caching done by some IO devices.
+    *
+-   * <p> If an Exception is hit during close, eg due to disk
+-   * full or some other reason, then both the on-disk index
+-   * and the internal state of the IndexWriter instance will
+-   * be consistent.  However, the close will not be complete
+-   * even though part of it (flushing buffered documents)
+-   * may have succeeded, so the write lock will still be
+-   * held.</p>
+-   *
+-   * <p> If you can correct the underlying cause (eg free up
+-   * some disk space) then you can call close() again.
+-   * Failing that, if you want to force the write lock to be
+-   * released (dangerous, because you may then lose buffered
+-   * docs in the IndexWriter instance) then you can do
+-   * something like this:</p>
+-   *
+-   * <pre class="prettyprint">
+-   * try {
+-   *   writer.close();
+-   * } finally {
+-   *   if (IndexWriter.isLocked(directory)) {
+-   *     IndexWriter.unlock(directory);
+-   *   }
+-   * }
+-   * </pre>
+-   *
+-   * after which, you must be certain not to use the writer
+-   * instance anymore.</p>
+-   *
+-   * <p><b>NOTE</b>: if this method hits an OutOfMemoryError
+-   * you should immediately close the writer, again.  See <a
+-   * href="#OOME">above</a> for details.</p>
+-   *
+-   * @throws IOException if there is a low-level IO error
++   * <p><b>NOTE</b>: You must ensure no other threads are still making
++   * changes at the same time that this method is invoked.</p>
+    */
+   @Override
+   public void close() throws IOException {
+@@ -948,18 +957,17 @@
+    * Closes the index with or without waiting for currently
+    * running merges to finish.  This is only meaningful when
+    * using a MergeScheduler that runs merges in background
+-   * threads.
++   * threads.  See {@link #close()} for details on behavior
++   * when exceptions are thrown.
+    *
+-   * <p><b>NOTE</b>: if this method hits an OutOfMemoryError
+-   * you should immediately close the writer, again.  See <a
+-   * href="#OOME">above</a> for details.</p>
+-   *
+    * <p><b>NOTE</b>: it is dangerous to always call
+    * close(false), especially when IndexWriter is not open
+    * for very long, because this can result in "merge
+    * starvation" whereby long merges will never have a
+    * chance to finish.  This will cause too many segments in
+-   * your index over time.</p>
++   * your index over time, which leads to all sorts of
++   * problems like slow searches, too much RAM and too
++   * many file descriptors used by readers, etc. </p>
+    *
+    * @param waitForMerges if true, this call will block
+    * until all merges complete; else, it will ask all
+@@ -966,24 +974,13 @@
+    * running merges to abort, wait until those merges have
+    * finished (which should be at most a few seconds), and
+    * then return.
++   *
++   * @deprecated To abort merges and then close, call
++   * {@link #commit} and then {@link #rollback} instead.
+    */
++  @Deprecated
+   public void close(boolean waitForMerges) throws IOException {
+-
+-    // Ensure that only one thread actually gets to do the
+-    // closing, and make sure no commit is also in progress:
+-    synchronized(commitLock) {
+-      if (shouldClose()) {
+-        // If any methods have hit OutOfMemoryError, then abort
+-        // on close, in case the internal state of IndexWriter
+-        // or DocumentsWriter is corrupt
+-        if (hitOOM) {
+-          rollbackInternal();
+-        } else {
+-          closeInternal(waitForMerges, true);
+-          assert assertEventQueueAfterClose();
+-        }
+-      }
+-    }
++    shutdown(waitForMerges);
+   }
+ 
+   private boolean assertEventQueueAfterClose() {
+Index: lucene/core/src/test/org/apache/lucene/index/TestIndexWriter.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/index/TestIndexWriter.java	(revision 1617893)
++++ lucene/core/src/test/org/apache/lucene/index/TestIndexWriter.java	(working copy)
+@@ -32,6 +32,7 @@
+ import java.util.Random;
+ import java.util.Set;
+ import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import org.apache.lucene.analysis.Analyzer;
+ import org.apache.lucene.analysis.MockAnalyzer;
+@@ -80,13 +81,14 @@
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.Constants;
+ import org.apache.lucene.util.IOUtils;
++import org.apache.lucene.util.InfoStream;
+ import org.apache.lucene.util.LuceneTestCase;
+ import org.apache.lucene.util.SetOnce;
+ import org.apache.lucene.util.TestUtil;
+ import org.apache.lucene.util.ThreadInterruptedException;
+ import org.apache.lucene.util.automaton.Automata;
++import org.apache.lucene.util.automaton.Automaton;
+ import org.apache.lucene.util.automaton.CharacterRunAutomaton;
+-import org.apache.lucene.util.automaton.Automaton;
+ import org.apache.lucene.util.packed.PackedInts;
+ import org.junit.Test;
+ 
+@@ -1059,10 +1061,10 @@
+       // LUCENE-2239: won't work with NIOFS/MMAP
+       MockDirectoryWrapper dir = new MockDirectoryWrapper(random, new RAMDirectory());
+ 
+-      // When interrupt arrives in w.close(), when it's
+-      // writing liveDocs, this can lead to double-write of
+-      // _X_N.del:
+-      //dir.setPreventDoubleWrite(false);
++      // When interrupt arrives in w.close(), this can
++      // lead to double-write of files:
++      dir.setPreventDoubleWrite(false);
++
+       IndexWriter w = null;
+       while(!finish) {
+         try {
+@@ -2087,32 +2089,6 @@
+     ir.close();
+     dir.close();
+   }
+-  
+-  // here we do better, there is no current segments file, so we don't delete anything.
+-  // however, if you actually go and make a commit, the next time you run indexwriter
+-  // this file will be gone.
+-  public void testOtherFiles2() throws Throwable {
+-    Directory dir = newDirectory();
+-    try {
+-      // Create my own random file:
+-      IndexOutput out = dir.createOutput("_a.frq", newIOContext(random()));
+-      out.writeByte((byte) 42);
+-      out.close();
+-      
+-      new IndexWriter(dir, newIndexWriterConfig(new MockAnalyzer(random()))).close();
+-      
+-      assertTrue(slowFileExists(dir, "_a.frq"));
+-      
+-      IndexWriter iw = new IndexWriter(dir, 
+-          newIndexWriterConfig(new MockAnalyzer(random())));
+-      iw.addDocument(new Document());
+-      iw.close();
+-      
+-      assertFalse(slowFileExists(dir, "_a.frq"));
+-    } finally {
+-      dir.close();
+-    }
+-  }
+ 
+   // LUCENE-4398
+   public void testRotatingFieldNames() throws Exception {
+@@ -2604,6 +2580,121 @@
+     dir.close();
+   }
+ 
++  public void testHasUncommittedChangesAfterException() throws IOException {
++    Analyzer analyzer = new MockAnalyzer(random());
++
++    Directory directory = newDirectory();
++    // we don't use RandomIndexWriter because it might add more docvalues than we expect !!!!
++    IndexWriterConfig iwc = newIndexWriterConfig(analyzer);
++    iwc.setMergePolicy(newLogMergePolicy());
++    IndexWriter iwriter = new IndexWriter(directory, iwc);
++    Document doc = new Document();
++    doc.add(new SortedDocValuesField("dv", new BytesRef("foo!")));
++    doc.add(new SortedDocValuesField("dv", new BytesRef("bar!")));
++    try {
++      iwriter.addDocument(doc);
++      fail("didn't hit expected exception");
++    } catch (IllegalArgumentException expected) {
++      // expected
++    }
++    iwriter.commit();
++    assertFalse(iwriter.hasUncommittedChanges());
++    iwriter.close();
++    directory.close();
++  }
++
++  public void testDoubleClose() throws IOException {
++    Directory dir = newDirectory();
++    IndexWriter w = new IndexWriter(dir, newIndexWriterConfig(new MockAnalyzer(random())));
++    Document doc = new Document();
++    doc.add(new SortedDocValuesField("dv", new BytesRef("foo!")));
++    w.addDocument(doc);
++    w.close();
++    // Close again should have no effect
++    w.close();
++    dir.close();
++  }
++
++  public void testRollbackThenClose() throws IOException {
++    Directory dir = newDirectory();
++    IndexWriter w = new IndexWriter(dir, newIndexWriterConfig(new MockAnalyzer(random())));
++    Document doc = new Document();
++    doc.add(new SortedDocValuesField("dv", new BytesRef("foo!")));
++    w.addDocument(doc);
++    w.rollback();
++    // Close after rollback should have no effect
++    w.close();
++    dir.close();
++  }
++
++  public void testCloseThenRollback() throws IOException {
++    Directory dir = newDirectory();
++    IndexWriter w = new IndexWriter(dir, newIndexWriterConfig(new MockAnalyzer(random())));
++    Document doc = new Document();
++    doc.add(new SortedDocValuesField("dv", new BytesRef("foo!")));
++    w.addDocument(doc);
++    w.close();
++    // Rollback after close should have no effect
++    w.rollback();
++    dir.close();
++  }
++
++  public void testRollbackWhileMergeIsRunning() throws IOException {
++    Directory dir = newDirectory();
++
++    final CountDownLatch mergeStarted = new CountDownLatch(1);
++    final CountDownLatch closeStarted = new CountDownLatch(1);
++
++    IndexWriterConfig iwc = newIndexWriterConfig(random(), TEST_VERSION_CURRENT, new MockAnalyzer(random()));
++    LogDocMergePolicy mp = new LogDocMergePolicy();
++    mp.setMergeFactor(2);
++    iwc.setMergePolicy(mp);
++    iwc.setInfoStream(new InfoStream() {
++        @Override
++        public boolean isEnabled(String component) {
++          return true;
++        }
++
++        @Override
++        public void message(String component, String message) {
++          if (message.equals("rollback")) {
++            closeStarted.countDown();
++          }
++        }
++
++        @Override
++        public void close() {
++        }
++      });
++
++    iwc.setMergeScheduler(new ConcurrentMergeScheduler() {
++        @Override
++        public void doMerge(MergePolicy.OneMerge merge) throws IOException {
++          mergeStarted.countDown();
++          try {
++            closeStarted.await();
++          } catch (InterruptedException ie) {
++            Thread.currentThread().interrupt();
++            throw new RuntimeException(ie);
++          }
++          super.doMerge(merge);
++        }
++
++        @Override
++        public void close() {
++        }
++      });
++    IndexWriter w = new IndexWriter(dir, iwc);
++    Document doc = new Document();
++    doc.add(new SortedDocValuesField("dv", new BytesRef("foo!")));
++    w.addDocument(doc);
++    w.commit();
++    w.addDocument(doc);
++    w.commit();
++    w.rollback();
++    dir.close();
++  }
++
+   // LUCENE-5574
+   public void testClosingNRTReaderDoesNotCorruptYourIndex() throws IOException {
+ 
+@@ -2646,4 +2737,61 @@
+     r.close();
+     dir.close();
+   }
++
++  /** Make sure that close waits for any still-running commits. */
++  public void testCloseDuringCommit() throws Exception {
++
++    final CountDownLatch startCommit = new CountDownLatch(1);
++    final CountDownLatch finishCommit = new CountDownLatch(1);
++
++    // infostream that "takes a long time" to commit
++    InfoStream slowCommittingInfoStream = new InfoStream() {
++      @Override
++      public void message(String component, String message) {
++        if (message.equals("finishStartCommit")) {
++          startCommit.countDown();
++          try {
++            Thread.sleep(10);
++          } catch (InterruptedException ie) {
++            throw new ThreadInterruptedException(ie);
++          }
++        }
++      }
++
++      @Override
++      public boolean isEnabled(String component) {
++        return true;
++      }
++      
++      @Override
++      public void close() throws IOException {}
++    };
++    
++    Directory dir = newDirectory();
++    IndexWriterConfig iwc = new IndexWriterConfig(TEST_VERSION_CURRENT, null);
++    iwc.setInfoStream(slowCommittingInfoStream);
++    final IndexWriter iw = new IndexWriter(dir, iwc);
++    Document doc = new Document();
++    new Thread() {
++      @Override
++      public void run() {
++        try {
++          iw.commit();
++          finishCommit.countDown();
++        } catch (IOException ioe) {
++          throw new RuntimeException(ioe);
++        }
++      }
++    }.start();
++    startCommit.await();
++    try {
++      iw.close();
++      fail("didn't hit exception");
++    } catch (IllegalStateException ise) {
++      // expected
++    }
++    finishCommit.await();
++    iw.close();
++    dir.close();
++  }
+ }
+Index: lucene/core/src/test/org/apache/lucene/index/TestIndexWriterCommit.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/index/TestIndexWriterCommit.java	(revision 1617893)
++++ lucene/core/src/test/org/apache/lucene/index/TestIndexWriterCommit.java	(working copy)
+@@ -659,4 +659,23 @@
+ 
+     dir.close();
+   }
++
++  public void testPrepareCommitThenClose() throws Exception {
++    Directory dir = newDirectory();
++    IndexWriter w = new IndexWriter(dir, newIndexWriterConfig(new MockAnalyzer(random())));
++    w.addDocument(new Document());
++    w.prepareCommit();
++    try {
++      w.close();
++      fail("didn't hit exception");
++    } catch (IllegalStateException ise) {
++      // expected
++    }
++    w.commit();
++    w.close();
++    DirectoryReader r = DirectoryReader.open(dir);
++    assertEquals(1, r.maxDoc());
++    r.close();
++    dir.close();
++  }
+ }
+Index: lucene/core/src/test/org/apache/lucene/index/TestIndexWriterExceptions.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/index/TestIndexWriterExceptions.java	(revision 1617893)
++++ lucene/core/src/test/org/apache/lucene/index/TestIndexWriterExceptions.java	(working copy)
+@@ -51,13 +51,14 @@
+ import org.apache.lucene.search.DocIdSetIterator;
+ import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.PhraseQuery;
++import org.apache.lucene.store.AlreadyClosedException;
+ import org.apache.lucene.store.BaseDirectoryWrapper;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.IOContext;
+ import org.apache.lucene.store.IndexInput;
+ import org.apache.lucene.store.IndexOutput;
++import org.apache.lucene.store.MockDirectoryWrapper.FakeIOException;
+ import org.apache.lucene.store.MockDirectoryWrapper;
+-import org.apache.lucene.store.MockDirectoryWrapper.FakeIOException;
+ import org.apache.lucene.store.RAMDirectory;
+ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.BytesRef;
+@@ -1039,6 +1040,55 @@
+     dir.close();
+   }
+ 
++  /** If IW hits OOME during indexing, it should refuse to commit any further changes. */
++  public void testOutOfMemoryErrorRollback() throws Exception {
++
++    final AtomicBoolean thrown = new AtomicBoolean(false);
++    final Directory dir = newDirectory();
++    final IndexWriter writer = new IndexWriter(dir,
++        newIndexWriterConfig(new MockAnalyzer(random()))
++          .setInfoStream(new InfoStream() {
++        @Override
++        public void message(String component, final String message) {
++          if (message.contains("startFullFlush") && thrown.compareAndSet(false, true)) {
++            throw new OutOfMemoryError("fake OOME at " + message);
++          }
++        }
++
++        @Override
++        public boolean isEnabled(String component) {
++          return true;
++        }
++        
++        @Override
++        public void close() {}
++      }));
++    writer.addDocument(new Document());
++
++    try {
++      writer.commit();
++      fail("OutOfMemoryError expected");
++    }
++    catch (final OutOfMemoryError expected) {}
++
++    try {
++      writer.close();
++    } catch (IllegalStateException ise) {
++      // expected
++    }
++
++    try {
++      writer.addDocument(new Document());
++    } catch (AlreadyClosedException ace) {
++      // expected
++    }
++
++    // IW should have done rollback() during close, since it hit OOME, and so no index should exist:
++    assertFalse(DirectoryReader.indexExists(dir));
++
++    dir.close();
++  }
++
+   // LUCENE-1347
+   private static final class TestPoint4 implements RandomIndexWriter.TestPoint {
+ 
+@@ -2059,6 +2109,7 @@
+             System.out.println("  now close writer");
+           }
+           doClose = true;
++          w.commit();
+           w.close();
+           w = null;
+         }

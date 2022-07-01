@@ -1,0 +1,488 @@
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/hunspell/Dictionary.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/hunspell/Dictionary.java
+index 7885daa..115d85d 100644
+--- a/lucene/analysis/common/src/java/org/apache/lucene/analysis/hunspell/Dictionary.java
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/hunspell/Dictionary.java
+@@ -46,11 +46,9 @@ import java.util.TreeMap;
+ import java.util.regex.Matcher;
+ import java.util.regex.Pattern;
+ 
+-import org.apache.lucene.codecs.CodecUtil;
+ import org.apache.lucene.store.ByteArrayDataOutput;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.IOContext;
+-import org.apache.lucene.store.IndexOutput;
+ import org.apache.lucene.util.ArrayUtil;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.BytesRefBuilder;
+@@ -789,8 +787,45 @@ public class Dictionary {
+     
+     StringBuilder sb = new StringBuilder();
+ 
+-    IndexOutput unsorted = tempDir.createTempOutput(tempFileNamePrefix, "dat", IOContext.DEFAULT);
+-    try (ByteSequencesWriter writer = new ByteSequencesWriter(unsorted)) {
++    OfflineSorter sorter = new OfflineSorter(tempDir, tempFileNamePrefix, new Comparator<BytesRef>() {
++      BytesRef scratch1 = new BytesRef();
++      BytesRef scratch2 = new BytesRef();
++      
++      @Override
++      public int compare(BytesRef o1, BytesRef o2) {
++        scratch1.bytes = o1.bytes;
++        scratch1.offset = o1.offset;
++        scratch1.length = o1.length;
++        
++        for (int i = scratch1.length - 1; i >= 0; i--) {
++          if (scratch1.bytes[scratch1.offset + i] == FLAG_SEPARATOR || scratch1.bytes[scratch1.offset + i] == MORPH_SEPARATOR) {
++            scratch1.length = i;
++            break;
++          }
++        }
++        
++        scratch2.bytes = o2.bytes;
++        scratch2.offset = o2.offset;
++        scratch2.length = o2.length;
++        
++        for (int i = scratch2.length - 1; i >= 0; i--) {
++          if (scratch2.bytes[scratch2.offset + i] == FLAG_SEPARATOR || scratch2.bytes[scratch2.offset + i] == MORPH_SEPARATOR) {
++            scratch2.length = i;
++            break;
++          }
++        }
++        
++        int cmp = scratch1.compareTo(scratch2);
++        if (cmp == 0) {
++          // tie break on whole row
++          return o1.compareTo(o2);
++        } else {
++          return cmp;
++        }
++      }
++    });
++
++    try (ByteSequencesWriter writer = sorter.newUnsortedPartition()) {
+       for (InputStream dictionary : dictionaries) {
+         BufferedReader lines = new BufferedReader(new InputStreamReader(dictionary, decoder));
+         String line = lines.readLine(); // first line is number of entries (approximately, sometimes)
+@@ -831,57 +866,16 @@ public class Dictionary {
+           }
+         }
+       }
+-      CodecUtil.writeFooter(unsorted);
+     }
+ 
+-    OfflineSorter sorter = new OfflineSorter(tempDir, tempFileNamePrefix, new Comparator<BytesRef>() {
+-      BytesRef scratch1 = new BytesRef();
+-      BytesRef scratch2 = new BytesRef();
+-      
+-      @Override
+-      public int compare(BytesRef o1, BytesRef o2) {
+-        scratch1.bytes = o1.bytes;
+-        scratch1.offset = o1.offset;
+-        scratch1.length = o1.length;
+-        
+-        for (int i = scratch1.length - 1; i >= 0; i--) {
+-          if (scratch1.bytes[scratch1.offset + i] == FLAG_SEPARATOR || scratch1.bytes[scratch1.offset + i] == MORPH_SEPARATOR) {
+-            scratch1.length = i;
+-            break;
+-          }
+-        }
+-        
+-        scratch2.bytes = o2.bytes;
+-        scratch2.offset = o2.offset;
+-        scratch2.length = o2.length;
+-        
+-        for (int i = scratch2.length - 1; i >= 0; i--) {
+-          if (scratch2.bytes[scratch2.offset + i] == FLAG_SEPARATOR || scratch2.bytes[scratch2.offset + i] == MORPH_SEPARATOR) {
+-            scratch2.length = i;
+-            break;
+-          }
+-        }
+-        
+-        int cmp = scratch1.compareTo(scratch2);
+-        if (cmp == 0) {
+-          // tie break on whole row
+-          return o1.compareTo(o2);
+-        } else {
+-          return cmp;
+-        }
+-      }
+-    });
+-
+     String sorted;
+     boolean success = false;
+     try {
+-      sorted = sorter.sort(unsorted.getName());
++      sorted = sorter.sort();
+       success = true;
+     } finally {
+-      if (success) {
+-        tempDir.deleteFile(unsorted.getName());
+-      } else {
+-        IOUtils.deleteFilesIgnoringExceptions(tempDir, unsorted.getName());
++      if (!success) {
++        IOUtils.deleteFilesIgnoringExceptions(tempDir);
+       }
+     }
+     
+diff --git a/lucene/core/src/java/org/apache/lucene/util/OfflineSorter.java b/lucene/core/src/java/org/apache/lucene/util/OfflineSorter.java
+index fa22320..70f43f5 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/OfflineSorter.java
++++ b/lucene/core/src/java/org/apache/lucene/util/OfflineSorter.java
+@@ -16,7 +16,6 @@
+  */
+ package org.apache.lucene.util;
+ 
+-
+ import java.io.Closeable;
+ import java.io.EOFException;
+ import java.io.IOException;
+@@ -41,7 +40,7 @@ import org.apache.lucene.store.TrackingDirectoryWrapper;
+  *   <li>exactly the above count of bytes for the sequence to be sorted.
+  * </ul>
+  * 
+- * @see #sort(String)
++ * @see #sort
+  * @lucene.experimental
+  * @lucene.internal
+  */
+@@ -174,6 +173,8 @@ public class OfflineSorter {
+   SortInfo sortInfo;
+   private int maxTempFiles;
+   private final Comparator<BytesRef> comparator;
++
++  private String inputFileName;
+   
+   /** Default comparator: sorts in binary (codepoint) order */
+   public static final Comparator<BytesRef> DEFAULT_COMPARATOR = Comparator.naturalOrder();
+@@ -229,19 +230,31 @@ public class OfflineSorter {
+     return dir;
+   }
+ 
+-  /** Returns the temp file name prefix passed to {@link Directory#createTempOutput} to generate temporary files. */
+-  public String getTempFileNamePrefix() {
+-    return tempFileNamePrefix;
++  /**
++   * Creates a new unsorted output partition writer.
++   */
++  public ByteSequencesWriter newUnsortedPartition() throws IOException {
++    if (inputFileName != null) {
++      throw new IOException("Only one output partition can be created (for now).");
++    }
++
++    IndexOutput tempInput = this.dir.createTempOutput(tempFileNamePrefix, "unsorted", IOContext.DEFAULT);
++    inputFileName = tempInput.getName();
++    ByteSequencesWriter writer = getWriter(tempInput);
++    return writer;
+   }
+ 
+   /** 
+    * Sort input to a new temp file, returning its name.
+    */
+-  public String sort(String inputFileName) throws IOException {
+-    
++  public String sort() throws IOException {
+     sortInfo = new SortInfo();
+     sortInfo.totalTime = System.currentTimeMillis();
+ 
++    if (inputFileName == null) {
++      throw new IOException("No data on input?");
++    }
++
+     List<String> segments = new ArrayList<>();
+     int[] levelCounts = new int[1];
+ 
+@@ -533,7 +546,8 @@ public class OfflineSorter {
+      * Closes the provided {@link IndexOutput}.
+      */
+     @Override
+-    public void close() throws IOException {
++    public final void close() throws IOException {
++      CodecUtil.writeFooter(out);
+       out.close();
+     }    
+   }
+@@ -587,5 +601,5 @@ public class OfflineSorter {
+   /** Returns the comparator in use to sort entries */
+   public Comparator<BytesRef> getComparator() {
+     return comparator;
+-  }  
++  }
+ }
+diff --git a/lucene/core/src/test/org/apache/lucene/util/TestOfflineSorter.java b/lucene/core/src/test/org/apache/lucene/util/TestOfflineSorter.java
+index 49ed110..205fb6d 100644
+--- a/lucene/core/src/test/org/apache/lucene/util/TestOfflineSorter.java
++++ b/lucene/core/src/test/org/apache/lucene/util/TestOfflineSorter.java
+@@ -153,14 +153,13 @@ public class TestOfflineSorter extends LuceneTestCase {
+    */
+   private SortInfo checkSort(Directory dir, OfflineSorter sorter, byte[][] data) throws IOException {
+ 
+-    IndexOutput unsorted = dir.createTempOutput("unsorted", "tmp", IOContext.DEFAULT);
+-    writeAll(unsorted, data);
++    writeAll(sorter.newUnsortedPartition(), data);
+ 
+     IndexOutput golden = dir.createTempOutput("golden", "tmp", IOContext.DEFAULT);
+     Arrays.sort(data, unsignedByteOrderComparator);
+     writeAll(golden, data);
+ 
+-    String sorted = sorter.sort(unsorted.getName());
++    String sorted = sorter.sort();
+     //System.out.println("Input size [MB]: " + unsorted.length() / (1024 * 1024));
+     //System.out.println(sortInfo);
+     assertFilesIdentical(dir, golden.getName(), sorted);
+@@ -203,7 +202,15 @@ public class TestOfflineSorter extends LuceneTestCase {
+       CodecUtil.writeFooter(out);
+     }
+   }
+-  
++
++  /** NOTE: closes the provided {@link IndexOutput} */
++  private void writeAll(ByteSequencesWriter out, byte[][] data) throws IOException {
++    for (byte [] datum : data) {
++      out.write(datum);
++    }
++    out.close();
++  }
++
+   public void testRamBuffer() {
+     int numIters = atLeast(10000);
+     for (int i = 0; i < numIters; i++) {
+diff --git a/lucene/suggest/src/java/org/apache/lucene/search/suggest/SortedInputIterator.java b/lucene/suggest/src/java/org/apache/lucene/search/suggest/SortedInputIterator.java
+index 977df37..5585b90 100644
+--- a/lucene/suggest/src/java/org/apache/lucene/search/suggest/SortedInputIterator.java
++++ b/lucene/suggest/src/java/org/apache/lucene/search/suggest/SortedInputIterator.java
+@@ -21,12 +21,10 @@ import java.util.Comparator;
+ import java.util.HashSet;
+ import java.util.Set;
+ 
+-import org.apache.lucene.codecs.CodecUtil;
+ import org.apache.lucene.store.ByteArrayDataInput;
+ import org.apache.lucene.store.ByteArrayDataOutput;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.IOContext;
+-import org.apache.lucene.store.IndexOutput;
+ import org.apache.lucene.util.ArrayUtil;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.IOUtils;
+@@ -41,7 +39,6 @@ import org.apache.lucene.util.OfflineSorter;
+ public class SortedInputIterator implements InputIterator {
+   
+   private final InputIterator source;
+-  private IndexOutput tempInput;
+   private String tempSortedFileName;
+   private final ByteSequencesReader reader;
+   private final Comparator<BytesRef> comparator;
+@@ -171,11 +168,9 @@ public class SortedInputIterator implements InputIterator {
+   };
+   
+   private ByteSequencesReader sort() throws IOException {
+-
+     OfflineSorter sorter = new OfflineSorter(tempDir, tempFileNamePrefix, tieBreakByCostComparator);
+-    tempInput = tempDir.createTempOutput(tempFileNamePrefix, "input", IOContext.DEFAULT);
+     
+-    try (OfflineSorter.ByteSequencesWriter writer = new OfflineSorter.ByteSequencesWriter(tempInput)) {
++    try (OfflineSorter.ByteSequencesWriter writer = sorter.newUnsortedPartition()) {
+       BytesRef spare;
+       byte[] buffer = new byte[0];
+       ByteArrayDataOutput output = new ByteArrayDataOutput(buffer);
+@@ -183,10 +178,10 @@ public class SortedInputIterator implements InputIterator {
+       while ((spare = source.next()) != null) {
+         encode(writer, output, buffer, spare, source.payload(), source.contexts(), source.weight());
+       }
+-      CodecUtil.writeFooter(tempInput);
+     }
+ 
+-    tempSortedFileName = sorter.sort(tempInput.getName());
++    // NOCOMMIT: we should keep the sorter open and close it later!
++    tempSortedFileName = sorter.sort();
+     return new OfflineSorter.ByteSequencesReader(tempDir.openChecksumInput(tempSortedFileName, IOContext.READONCE), tempSortedFileName);
+   }
+   
+@@ -195,7 +190,6 @@ public class SortedInputIterator implements InputIterator {
+       IOUtils.close(reader);
+     } finally {
+       IOUtils.deleteFilesIgnoringExceptions(tempDir,
+-                                            tempInput == null ? null : tempInput.getName(),
+                                             tempSortedFileName);
+     }
+   }
+diff --git a/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/AnalyzingSuggester.java b/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/AnalyzingSuggester.java
+index 19982a5..300c55f 100644
+--- a/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/AnalyzingSuggester.java
++++ b/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/AnalyzingSuggester.java
+@@ -28,7 +28,6 @@ import java.util.Set;
+ import org.apache.lucene.analysis.Analyzer;
+ import org.apache.lucene.analysis.TokenStream;
+ import org.apache.lucene.analysis.TokenStreamToAutomaton;
+-import org.apache.lucene.codecs.CodecUtil;
+ import org.apache.lucene.search.suggest.InputIterator;
+ import org.apache.lucene.search.suggest.Lookup;
+ import org.apache.lucene.store.ByteArrayDataInput;
+@@ -37,7 +36,6 @@ import org.apache.lucene.store.DataInput;
+ import org.apache.lucene.store.DataOutput;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.IOContext;
+-import org.apache.lucene.store.IndexOutput;
+ import org.apache.lucene.util.Accountable;
+ import org.apache.lucene.util.Accountables;
+ import org.apache.lucene.util.ArrayUtil;
+@@ -407,9 +405,7 @@ public class AnalyzingSuggester extends Lookup implements Accountable {
+ 
+     OfflineSorter sorter = new OfflineSorter(tempDir, tempFileNamePrefix, new AnalyzingComparator(hasPayloads));
+ 
+-    IndexOutput tempInput = tempDir.createTempOutput(tempFileNamePrefix, "input", IOContext.DEFAULT);
+-
+-    OfflineSorter.ByteSequencesWriter writer = new OfflineSorter.ByteSequencesWriter(tempInput);
++    OfflineSorter.ByteSequencesWriter writer = sorter.newUnsortedPartition();
+     OfflineSorter.ByteSequencesReader reader = null;
+     BytesRefBuilder scratch = new BytesRefBuilder();
+ 
+@@ -481,14 +477,10 @@ public class AnalyzingSuggester extends Lookup implements Accountable {
+ 
+         maxAnalyzedPathsForOneInput = Math.max(maxAnalyzedPathsForOneInput, finiteStrings.size());
+       }
+-      CodecUtil.writeFooter(tempInput);
+       writer.close();
+ 
+       // Sort all input/output pairs (required by FST.Builder):
+-      tempSortedFileName = sorter.sort(tempInput.getName());
+-
+-      // Free disk space:
+-      tempDir.deleteFile(tempInput.getName());
++      tempSortedFileName = sorter.sort();
+ 
+       reader = new OfflineSorter.ByteSequencesReader(tempDir.openChecksumInput(tempSortedFileName, IOContext.READONCE), tempSortedFileName);
+      
+@@ -584,7 +576,7 @@ public class AnalyzingSuggester extends Lookup implements Accountable {
+       //Util.dotToFile(fst, "/tmp/suggest.dot");
+     } finally {
+       IOUtils.closeWhileHandlingException(reader, writer);
+-      IOUtils.deleteFilesIgnoringExceptions(tempDir, tempInput.getName(), tempSortedFileName);
++      IOUtils.deleteFilesIgnoringExceptions(tempDir, tempSortedFileName);
+     }
+   }
+ 
+diff --git a/lucene/suggest/src/java/org/apache/lucene/search/suggest/fst/ExternalRefSorter.java b/lucene/suggest/src/java/org/apache/lucene/search/suggest/fst/ExternalRefSorter.java
+index fb876d2..16d4816 100644
+--- a/lucene/suggest/src/java/org/apache/lucene/search/suggest/fst/ExternalRefSorter.java
++++ b/lucene/suggest/src/java/org/apache/lucene/search/suggest/fst/ExternalRefSorter.java
+@@ -20,9 +20,7 @@ import java.io.Closeable;
+ import java.io.IOException;
+ import java.util.Comparator;
+ 
+-import org.apache.lucene.codecs.CodecUtil;
+ import org.apache.lucene.store.IOContext;
+-import org.apache.lucene.store.IndexOutput;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.BytesRefIterator;
+ import org.apache.lucene.util.IOUtils;
+@@ -36,7 +34,6 @@ import org.apache.lucene.util.OfflineSorter;
+ public class ExternalRefSorter implements BytesRefSorter, Closeable {
+   private final OfflineSorter sorter;
+   private OfflineSorter.ByteSequencesWriter writer;
+-  private IndexOutput input;
+   private String sortedFileName;
+   
+   /**
+@@ -44,8 +41,7 @@ public class ExternalRefSorter implements BytesRefSorter, Closeable {
+    */
+   public ExternalRefSorter(OfflineSorter sorter) throws IOException {
+     this.sorter = sorter;
+-    this.input = sorter.getDirectory().createTempOutput(sorter.getTempFileNamePrefix(), "RefSorterRaw", IOContext.DEFAULT);
+-    this.writer = new OfflineSorter.ByteSequencesWriter(this.input);
++    this.writer = sorter.newUnsortedPartition();
+   }
+   
+   @Override
+@@ -63,25 +59,20 @@ public class ExternalRefSorter implements BytesRefSorter, Closeable {
+       
+       boolean success = false;
+       try {
+-        sortedFileName = sorter.sort(input.getName());
++        sortedFileName = sorter.sort();
+         success = true;
+       } finally {
+-        if (success) {
+-          sorter.getDirectory().deleteFile(input.getName());
+-        } else {
+-          IOUtils.deleteFilesIgnoringExceptions(sorter.getDirectory(), input.getName());
++        if (!success) {
++          IOUtils.deleteFilesIgnoringExceptions(sorter.getDirectory());
+         }
+       }
+-      
+-      input = null;
+     }
+-    
++
+     return new ByteSequenceIterator(new OfflineSorter.ByteSequencesReader(sorter.getDirectory().openChecksumInput(sortedFileName, IOContext.READONCE), sortedFileName));
+   }
+   
+   private void closeWriter() throws IOException {
+     if (writer != null) {
+-      CodecUtil.writeFooter(input);
+       writer.close();
+       writer = null;
+     }
+@@ -96,7 +87,6 @@ public class ExternalRefSorter implements BytesRefSorter, Closeable {
+       closeWriter();
+     } finally {
+       IOUtils.deleteFilesIgnoringExceptions(sorter.getDirectory(),
+-                                            input == null ? null : input.getName(),
+                                             sortedFileName);
+     }
+   }
+diff --git a/lucene/suggest/src/java/org/apache/lucene/search/suggest/fst/FSTCompletionLookup.java b/lucene/suggest/src/java/org/apache/lucene/search/suggest/fst/FSTCompletionLookup.java
+index 7db97a8..e48a252 100644
+--- a/lucene/suggest/src/java/org/apache/lucene/search/suggest/fst/FSTCompletionLookup.java
++++ b/lucene/suggest/src/java/org/apache/lucene/search/suggest/fst/FSTCompletionLookup.java
+@@ -23,7 +23,6 @@ import java.util.Collections;
+ import java.util.List;
+ import java.util.Set;
+ 
+-import org.apache.lucene.codecs.CodecUtil;
+ import org.apache.lucene.search.suggest.InputIterator;
+ import org.apache.lucene.search.suggest.Lookup;
+ import org.apache.lucene.search.suggest.fst.FSTCompletion.Completion;
+@@ -34,7 +33,6 @@ import org.apache.lucene.store.DataInput;
+ import org.apache.lucene.store.DataOutput;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.IOContext;
+-import org.apache.lucene.store.IndexOutput;
+ import org.apache.lucene.util.Accountable;
+ import org.apache.lucene.util.Accountables;
+ import org.apache.lucene.util.ArrayUtil;
+@@ -173,10 +171,9 @@ public class FSTCompletionLookup extends Lookup implements Accountable {
+ 
+     OfflineSorter sorter = new OfflineSorter(tempDir, tempFileNamePrefix);
+     ExternalRefSorter externalSorter = new ExternalRefSorter(sorter);
+-    IndexOutput tempInput = tempDir.createTempOutput(tempFileNamePrefix, "input", IOContext.DEFAULT);
+     String tempSortedFileName = null;
+ 
+-    OfflineSorter.ByteSequencesWriter writer = new OfflineSorter.ByteSequencesWriter(tempInput);
++    OfflineSorter.ByteSequencesWriter writer = sorter.newUnsortedPartition();
+     OfflineSorter.ByteSequencesReader reader = null;
+ 
+     // Push floats up front before sequences to sort them. For now, assume they are non-negative.
+@@ -198,13 +195,11 @@ public class FSTCompletionLookup extends Lookup implements Accountable {
+         writer.write(buffer, 0, output.getPosition());
+         inputLineCount++;
+       }
+-      CodecUtil.writeFooter(tempInput);
+       writer.close();
+ 
+       // We don't know the distribution of scores and we need to bucket them, so we'll sort
+       // and divide into equal buckets.
+-      tempSortedFileName = sorter.sort(tempInput.getName());
+-      tempDir.deleteFile(tempInput.getName());
++      tempSortedFileName = sorter.sort();
+ 
+       FSTCompletionBuilder builder = new FSTCompletionBuilder(
+           buckets, externalSorter, sharedTailLength);
+@@ -249,7 +244,7 @@ public class FSTCompletionLookup extends Lookup implements Accountable {
+       
+     } finally {
+       IOUtils.closeWhileHandlingException(reader, writer, externalSorter);
+-      IOUtils.deleteFilesIgnoringExceptions(tempDir, tempInput.getName(), tempSortedFileName);
++      IOUtils.deleteFilesIgnoringExceptions(tempDir, tempSortedFileName);
+     }
+   }
+   

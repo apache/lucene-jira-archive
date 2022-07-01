@@ -1,0 +1,1376 @@
+From b8401a549289489618d5d78bcf963826a602ab43 Mon Sep 17 00:00:00 2001
+From: Atri Sharma <atri@apache.org>
+Date: Fri, 7 Jun 2019 19:06:00 +0530
+Subject: [PATCH] LUCENE-8811: Introduce IndexSearcher Level Checks For Clause
+ Count
+
+This commit introduces a new QueryVisitor in IndexSearcher which
+checks for a query's clause count (including nested clauses).
+This allows stronger checks and more generic application across
+different query types, not just BooleanQuery
+---
+ lucene/MIGRATE.txt                            |   4 +
+ .../lucene/search/BlendedTermQuery.java       |   4 +-
+ .../apache/lucene/search/BooleanQuery.java    |  42 +-----
+ .../org/apache/lucene/search/FuzzyQuery.java  |   2 +-
+ .../apache/lucene/search/IndexSearcher.java   | 104 +++++++++++---
+ .../apache/lucene/search/MultiTermQuery.java  |  26 ++--
+ .../MultiTermQueryConstantScoreWrapper.java   |   2 +-
+ .../apache/lucene/search/ScoringRewrite.java  |  12 +-
+ .../apache/lucene/search/SynonymQuery.java    |   4 +-
+ .../apache/lucene/search/TermInSetQuery.java  |   4 +-
+ .../apache/lucene/search/TopTermsRewrite.java |   2 +-
+ .../apache/lucene/search/package-info.java    |   4 +-
+ .../org/apache/lucene/util/QueryBuilder.java  |   9 +-
+ .../lucene/search/TestBooleanQuery.java       |   2 +-
+ .../lucene/search/TestMaxClauseLimit.java     | 132 ++++++++++++++++++
+ .../search/TestMultiTermQueryRewrites.java    |  14 +-
+ .../lucene/search/TestTermRangeQuery.java     |   6 +-
+ .../apache/lucene/util/TestQueryBuilder.java  |   7 +-
+ .../lucene/queries/mlt/MoreLikeThis.java      |   5 +-
+ .../queryparser/classic/QueryParserBase.java  |   4 +-
+ .../builders/AnyQueryNodeBuilder.java         |   2 +-
+ .../builders/BooleanQueryNodeBuilder.java     |   5 +-
+ .../precedence/TestPrecedenceQueryParser.java |   7 +-
+ .../flexible/standard/TestQPHelper.java       |   6 +-
+ .../queryparser/util/QueryParserTestBase.java |   6 +-
+ .../org/apache/lucene/search/BM25FQuery.java  |  12 +-
+ .../apache/lucene/search/CoveringQuery.java   |   4 +-
+ .../lucene/search/intervals/Disjunctions.java |   4 +-
+ .../TestRuleSetupAndRestoreInstanceEnv.java   |   6 +-
+ .../org/apache/solr/core/CoreContainer.java   |   4 +-
+ .../java/org/apache/solr/core/NodeConfig.java |   3 +-
+ .../java/org/apache/solr/core/SolrConfig.java |   8 +-
+ .../solr/parser/SolrQueryParserBase.java      |   3 +-
+ .../org/apache/solr/query/SolrRangeQuery.java |   2 +-
+ .../org/apache/solr/search/QueryUtils.java    |   3 +-
+ .../solr/legacy/TestNumericRangeQuery32.java  |   3 +-
+ .../solr/legacy/TestNumericRangeQuery64.java  |   3 +-
+ .../solr/search/TestSolrQueryParser.java      |   5 +-
+ 38 files changed, 329 insertions(+), 146 deletions(-)
+ create mode 100644 lucene/core/src/test/org/apache/lucene/search/TestMaxClauseLimit.java
+
+diff --git a/lucene/MIGRATE.txt b/lucene/MIGRATE.txt
+index 4e4a16a8f3..4752787b99 100644
+--- a/lucene/MIGRATE.txt
++++ b/lucene/MIGRATE.txt
+@@ -178,3 +178,7 @@ by the LegacyBM25Similarity class which can be found in the lucene-misc jar.
+ IndexWriter#getDocStats() should be used instead of #maxDoc() / #numDocs() which offers a consistent 
+ view on document stats. Previously calling two methods in order ot get point in time stats was subject
+ to concurrent changes.
++
++## maxClausesCount moved from BooleanQuery To IndexSearcher (LUCENE-8811) ##
++IndexSearcher now performs max clause count checks on all types of queries (including BooleanQueries).
++This led to a logical move of the clauses count from BooleanQuery to IndexSearcher.
+diff --git a/lucene/core/src/java/org/apache/lucene/search/BlendedTermQuery.java b/lucene/core/src/java/org/apache/lucene/search/BlendedTermQuery.java
+index 00ba5a13fd..c307d78ca9 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/BlendedTermQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/BlendedTermQuery.java
+@@ -86,8 +86,8 @@ public final class BlendedTermQuery extends Query {
+      * object constructed for the given term.
+      */
+     public Builder add(Term term, float boost, TermStates context) {
+-      if (numTerms >= BooleanQuery.getMaxClauseCount()) {
+-        throw new BooleanQuery.TooManyClauses();
++      if (numTerms >= IndexSearcher.getMaxClauseCount()) {
++        throw new IndexSearcher.TooManyClauses();
+       }
+       terms = ArrayUtil.grow(terms, numTerms + 1);
+       boosts = ArrayUtil.grow(boosts, numTerms + 1);
+diff --git a/lucene/core/src/java/org/apache/lucene/search/BooleanQuery.java b/lucene/core/src/java/org/apache/lucene/search/BooleanQuery.java
+index 80924a9dd2..60348fa767 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/BooleanQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/BooleanQuery.java
+@@ -41,37 +41,6 @@ import org.apache.lucene.search.BooleanClause.Occur;
+   */
+ public class BooleanQuery extends Query implements Iterable<BooleanClause> {
+ 
+-  private static int maxClauseCount = 1024;
+-
+-  /** Thrown when an attempt is made to add more than {@link
+-   * #getMaxClauseCount()} clauses. This typically happens if
+-   * a PrefixQuery, FuzzyQuery, WildcardQuery, or TermRangeQuery 
+-   * is expanded to many terms during search. 
+-   */
+-  public static class TooManyClauses extends RuntimeException {
+-    public TooManyClauses() {
+-      super("maxClauseCount is set to " + maxClauseCount);
+-    }
+-  }
+-
+-  /** Return the maximum number of clauses permitted, 1024 by default.
+-   * Attempts to add more than the permitted number of clauses cause {@link
+-   * TooManyClauses} to be thrown.
+-   * @see #setMaxClauseCount(int)
+-   */
+-  public static int getMaxClauseCount() { return maxClauseCount; }
+-
+-  /** 
+-   * Set the maximum number of clauses permitted per BooleanQuery.
+-   * Default value is 1024.
+-   */
+-  public static void setMaxClauseCount(int maxClauseCount) {
+-    if (maxClauseCount < 1) {
+-      throw new IllegalArgumentException("maxClauseCount must be >= 1");
+-    }
+-    BooleanQuery.maxClauseCount = maxClauseCount;
+-  }
+-
+   /** A builder for boolean queries. */
+   public static class Builder {
+ 
+@@ -107,11 +76,14 @@ public class BooleanQuery extends Query implements Iterable<BooleanClause> {
+      * Add a new clause to this {@link Builder}. Note that the order in which
+      * clauses are added does not have any impact on matching documents or query
+      * performance.
+-     * @throws TooManyClauses if the new number of clauses exceeds the maximum clause number
++     * @throws IndexSearcher.TooManyClauses if the new number of clauses exceeds the maximum clause number
+      */
+     public Builder add(BooleanClause clause) {
+-      if (clauses.size() >= maxClauseCount) {
+-        throw new TooManyClauses();
++      // We do the final deep check for max clauses count limit during
++      //<code>IndexSearcher.rewrite</code> but do this check to short
++      // circuit in case a single query holds more than numClauses
++      if (clauses.size() >= IndexSearcher.maxClauseCount) {
++        throw new IndexSearcher.TooManyClauses();
+       }
+       clauses.add(clause);
+       return this;
+@@ -121,7 +93,7 @@ public class BooleanQuery extends Query implements Iterable<BooleanClause> {
+      * Add a new clause to this {@link Builder}. Note that the order in which
+      * clauses are added does not have any impact on matching documents or query
+      * performance.
+-     * @throws TooManyClauses if the new number of clauses exceeds the maximum clause number
++     * @throws IndexSearcher.TooManyClauses if the new number of clauses exceeds the maximum clause number
+      */
+     public Builder add(Query query, Occur occur) {
+       return add(new BooleanClause(query, occur));
+diff --git a/lucene/core/src/java/org/apache/lucene/search/FuzzyQuery.java b/lucene/core/src/java/org/apache/lucene/search/FuzzyQuery.java
+index 344f921f64..f136f7e958 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/FuzzyQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/FuzzyQuery.java
+@@ -74,7 +74,7 @@ public class FuzzyQuery extends MultiTermQuery {
+    * @param maxEdits must be {@code >= 0} and {@code <=} {@link LevenshteinAutomata#MAXIMUM_SUPPORTED_DISTANCE}.
+    * @param prefixLength length of common (non-fuzzy) prefix
+    * @param maxExpansions the maximum number of terms to match. If this number is
+-   *  greater than {@link BooleanQuery#getMaxClauseCount} when the query is rewritten, 
++   *  greater than {@link IndexSearcher#getMaxClauseCount} when the query is rewritten,
+    *  then the maxClauseCount will be used instead.
+    * @param transpositions true if transpositions should be treated as a primitive
+    *        edit operation. If this is false, comparisons will implement the classic
+diff --git a/lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java b/lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java
+index 1748dd4821..fd8a2c9ce4 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java
++++ b/lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java
+@@ -87,6 +87,7 @@ import org.apache.lucene.util.ThreadInterruptedException;
+  */
+ public class IndexSearcher {
+ 
++  static int maxClauseCount = 1024;
+   private static QueryCache DEFAULT_QUERY_CACHE;
+   private static QueryCachingPolicy DEFAULT_CACHING_POLICY = new UsageTrackingQueryCachingPolicy();
+   static {
+@@ -114,6 +115,7 @@ public class IndexSearcher {
+   // in the next release
+   protected final IndexReaderContext readerContext;
+   protected final List<LeafReaderContext> leafContexts;
++
+   /** used with executor - each slice holds a set of leafs executed within one thread */
+   private final LeafSlice[] leafSlices;
+ 
+@@ -228,6 +230,24 @@ public class IndexSearcher {
+     this(context, null);
+   }
+ 
++  /** Return the maximum number of clauses permitted, 1024 by default.
++   * Attempts to add more than the permitted number of clauses cause {@link
++   * TooManyClauses} to be thrown.
++   * @see #setMaxClauseCount(int)
++   */
++  public static int getMaxClauseCount() { return maxClauseCount; }
++
++  /**
++   * Set the maximum number of clauses permitted per Query.
++   * Default value is 1024.
++   */
++  public static void setMaxClauseCount(int value)  {
++    if (maxClauseCount < 1) {
++      throw new IllegalArgumentException("maxClauseCount must be >= 1");
++    }
++    maxClauseCount = value;
++  }
++
+   /**
+    * Set the {@link QueryCache} to use when scores are not needed.
+    * A value of {@code null} indicates that query matches should never be
+@@ -436,8 +456,8 @@ public class IndexSearcher {
+    * this method can be used for efficient 'deep-paging' across potentially
+    * large result sets.
+    *
+-   * @throws BooleanQuery.TooManyClauses If a query would exceed 
+-   *         {@link BooleanQuery#getMaxClauseCount()} clauses.
++   * @throws TooManyClauses If a query would exceed
++   *         {@link IndexSearcher#getMaxClauseCount()} clauses.
+    */
+   public TopDocs searchAfter(ScoreDoc after, Query query, int numHits) throws IOException {
+     final int limit = Math.max(1, reader.maxDoc());
+@@ -473,8 +493,8 @@ public class IndexSearcher {
+   /** Finds the top <code>n</code>
+    * hits for <code>query</code>.
+    *
+-   * @throws BooleanQuery.TooManyClauses If a query would exceed 
+-   *         {@link BooleanQuery#getMaxClauseCount()} clauses.
++   * @throws TooManyClauses If a query would exceed
++   *         {@link IndexSearcher#getMaxClauseCount()} clauses.
+    */
+   public TopDocs search(Query query, int n)
+     throws IOException {
+@@ -485,8 +505,8 @@ public class IndexSearcher {
+    *
+    * <p>{@link LeafCollector#collect(int)} is called for every matching document.
+    *
+-   * @throws BooleanQuery.TooManyClauses If a query would exceed 
+-   *         {@link BooleanQuery#getMaxClauseCount()} clauses.
++   * @throws TooManyClauses If a query would exceed
++   *         {@link IndexSearcher#getMaxClauseCount()} clauses.
+    */
+   public void search(Query query, Collector results)
+     throws IOException {
+@@ -505,8 +525,8 @@ public class IndexSearcher {
+    * <code>true</code> then the maximum score over all
+    * collected hits will be computed.
+    * 
+-   * @throws BooleanQuery.TooManyClauses If a query would exceed 
+-   *         {@link BooleanQuery#getMaxClauseCount()} clauses.
++   * @throws TooManyClauses If a query would exceed
++   *         {@link IndexSearcher#getMaxClauseCount()} clauses.
+    */
+   public TopFieldDocs search(Query query, int n,
+       Sort sort, boolean doDocScores) throws IOException {
+@@ -533,8 +553,8 @@ public class IndexSearcher {
+    * this method can be used for efficient 'deep-paging' across potentially
+    * large result sets.
+    *
+-   * @throws BooleanQuery.TooManyClauses If a query would exceed 
+-   *         {@link BooleanQuery#getMaxClauseCount()} clauses.
++   * @throws TooManyClauses If a query would exceed
++   *         {@link IndexSearcher#getMaxClauseCount()} clauses.
+    */
+   public TopDocs searchAfter(ScoreDoc after, Query query, int n, Sort sort) throws IOException {
+     return searchAfter(after, query, n, sort, false);
+@@ -553,8 +573,8 @@ public class IndexSearcher {
+    * <code>true</code> then the maximum score over all
+    * collected hits will be computed.
+    *
+-   * @throws BooleanQuery.TooManyClauses If a query would exceed 
+-   *         {@link BooleanQuery#getMaxClauseCount()} clauses.
++   * @throws TooManyClauses If a query would exceed
++   *         {@link IndexSearcher#getMaxClauseCount()} clauses.
+    */
+   public TopFieldDocs searchAfter(ScoreDoc after, Query query, int numHits, Sort sort,
+       boolean doDocScores) throws IOException {
+@@ -679,8 +699,8 @@ public class IndexSearcher {
+    *          to match documents
+    * @param collector
+    *          to receive hits
+-   * @throws BooleanQuery.TooManyClauses If a query would exceed 
+-   *         {@link BooleanQuery#getMaxClauseCount()} clauses.
++   * @throws TooManyClauses If a query would exceed
++   *         {@link IndexSearcher#getMaxClauseCount()} clauses.
+    */
+   protected void search(List<LeafReaderContext> leaves, Weight weight, Collector collector)
+       throws IOException {
+@@ -710,8 +730,8 @@ public class IndexSearcher {
+   }
+ 
+   /** Expert: called to re-write queries into primitive queries.
+-   * @throws BooleanQuery.TooManyClauses If a query would exceed 
+-   *         {@link BooleanQuery#getMaxClauseCount()} clauses.
++   * @throws TooManyClauses If a query would exceed
++   *         {@link IndexSearcher#getMaxClauseCount()} clauses.
+    */
+   public Query rewrite(Query original) throws IOException {
+     Query query = original;
+@@ -719,9 +739,46 @@ public class IndexSearcher {
+          rewrittenQuery = query.rewrite(reader)) {
+       query = rewrittenQuery;
+     }
++    query.visit(getNumClausesCheckVisitor());
+     return query;
+   }
+ 
++  /** Returns a QueryVisitor which recursively checks the total
++   * number of clauses that a query and its children cumulatively
++   * have and validates that the total number does not exceed
++   * the specified limit
++   */
++  private QueryVisitor getNumClausesCheckVisitor() {
++    return new QueryVisitor() {
++
++      int numClauses;
++
++      @Override
++      public QueryVisitor getSubVisitor(BooleanClause.Occur occur, Query parent) {
++        // Return this instance even for MUST_NOT and not an empty QueryVisitor
++        return this;
++      }
++
++      @Override
++      public void visitLeaf(Query query) {
++        if (numClauses > maxClauseCount) {
++          throw new TooManyClauses();
++        }
++
++        ++numClauses;
++      }
++
++      @Override
++      public void consumeTerms(Query query, Term... terms) {
++        if (numClauses > maxClauseCount) {
++          throw new TooManyClauses();
++        }
++
++        ++numClauses;
++      }
++    };
++  }
++
+   /** Returns an Explanation that describes how <code>doc</code> scored against
+    * <code>query</code>.
+    *
+@@ -744,8 +801,8 @@ public class IndexSearcher {
+    * Computing an explanation is as expensive as executing the query over the
+    * entire index.
+    * <p>Applications should call {@link IndexSearcher#explain(Query, int)}.
+-   * @throws BooleanQuery.TooManyClauses If a query would exceed 
+-   *         {@link BooleanQuery#getMaxClauseCount()} clauses.
++   * @throws TooManyClauses If a query would exceed
++   *         {@link IndexSearcher#getMaxClauseCount()} clauses.
+    */
+   protected Explanation explain(Weight weight, int doc) throws IOException {
+     int n = ReaderUtil.subIndex(doc, leafContexts);
+@@ -848,4 +905,15 @@ public class IndexSearcher {
+     }
+     return new CollectionStatistics(field, reader.maxDoc(), docCount, sumTotalTermFreq, sumDocFreq);
+   }
++
++  /** Thrown when an attempt is made to add more than {@link
++   * #getMaxClauseCount()} clauses. This typically happens if
++   * a PrefixQuery, FuzzyQuery, WildcardQuery, or TermRangeQuery
++   * is expanded to many terms during search.
++   */
++  public static class TooManyClauses extends RuntimeException {
++    public TooManyClauses() {
++      super("maxClauseCount is set to " + maxClauseCount);
++    }
++  }
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/search/MultiTermQuery.java b/lucene/core/src/java/org/apache/lucene/search/MultiTermQuery.java
+index 636a7d6757..8c96020b98 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/MultiTermQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/MultiTermQuery.java
+@@ -43,10 +43,10 @@ import org.apache.lucene.util.AttributeSource;
+  * <p><b>NOTE</b>: if {@link #setRewriteMethod} is either
+  * {@link #CONSTANT_SCORE_BOOLEAN_REWRITE} or {@link
+  * #SCORING_BOOLEAN_REWRITE}, you may encounter a
+- * {@link BooleanQuery.TooManyClauses} exception during
++ * {@link IndexSearcher.TooManyClauses} exception during
+  * searching, which happens when the number of terms to be
+  * searched exceeds {@link
+- * BooleanQuery#getMaxClauseCount()}.  Setting {@link
++ * IndexSearcher#getMaxClauseCount()}.  Setting {@link
+  * #setRewriteMethod} to {@link #CONSTANT_SCORE_REWRITE}
+  * prevents this.
+  *
+@@ -87,7 +87,7 @@ public abstract class MultiTermQuery extends Query {
+    *  <p> This method is faster than the BooleanQuery
+    *  rewrite methods when the number of matched terms or
+    *  matched documents is non-trivial. Also, it will never
+-   *  hit an errant {@link BooleanQuery.TooManyClauses}
++   *  hit an errant {@link IndexSearcher.TooManyClauses}
+    *  exception.
+    *
+    *  @see #setRewriteMethod */
+@@ -107,8 +107,8 @@ public abstract class MultiTermQuery extends Query {
+    *  #CONSTANT_SCORE_REWRITE} instead.
+    *
+    *  <p><b>NOTE</b>: This rewrite method will hit {@link
+-   *  BooleanQuery.TooManyClauses} if the number of terms
+-   *  exceeds {@link BooleanQuery#getMaxClauseCount}.
++   *  IndexSearcher.TooManyClauses} if the number of terms
++   *  exceeds {@link IndexSearcher#getMaxClauseCount}.
+    *
+    *  @see #setRewriteMethod */
+   public final static RewriteMethod SCORING_BOOLEAN_REWRITE = ScoringRewrite.SCORING_BOOLEAN_REWRITE;
+@@ -119,8 +119,8 @@ public abstract class MultiTermQuery extends Query {
+    *  query's boost.
+    * 
+    *  <p><b>NOTE</b>: This rewrite method will hit {@link
+-   *  BooleanQuery.TooManyClauses} if the number of terms
+-   *  exceeds {@link BooleanQuery#getMaxClauseCount}.
++   *  IndexSearcher.TooManyClauses} if the number of terms
++   *  exceeds {@link IndexSearcher#getMaxClauseCount}.
+    *
+    *  @see #setRewriteMethod */
+   public final static RewriteMethod CONSTANT_SCORE_BOOLEAN_REWRITE = ScoringRewrite.CONSTANT_SCORE_BOOLEAN_REWRITE;
+@@ -143,7 +143,7 @@ public abstract class MultiTermQuery extends Query {
+      * Create a TopTermsScoringBooleanQueryRewrite for 
+      * at most <code>size</code> terms.
+      * <p>
+-     * NOTE: if {@link BooleanQuery#getMaxClauseCount} is smaller than 
++     * NOTE: if {@link IndexSearcher#getMaxClauseCount} is smaller than
+      * <code>size</code>, then it will be used instead. 
+      */
+     public TopTermsScoringBooleanQueryRewrite(int size) {
+@@ -152,7 +152,7 @@ public abstract class MultiTermQuery extends Query {
+     
+     @Override
+     protected int getMaxSize() {
+-      return BooleanQuery.getMaxClauseCount();
++      return IndexSearcher.getMaxClauseCount();
+     }
+     
+     @Override
+@@ -192,7 +192,7 @@ public abstract class MultiTermQuery extends Query {
+      * Create a TopTermsBlendedScoringBooleanQueryRewrite for at most
+      * <code>size</code> terms.
+      * <p>
+-     * NOTE: if {@link BooleanQuery#getMaxClauseCount} is smaller than
++     * NOTE: if {@link IndexSearcher#getMaxClauseCount} is smaller than
+      * <code>size</code>, then it will be used instead.
+      */
+     public TopTermsBlendedFreqScoringRewrite(int size) {
+@@ -201,7 +201,7 @@ public abstract class MultiTermQuery extends Query {
+ 
+     @Override
+     protected int getMaxSize() {
+-      return BooleanQuery.getMaxClauseCount();
++      return IndexSearcher.getMaxClauseCount();
+     }
+ 
+     @Override
+@@ -239,7 +239,7 @@ public abstract class MultiTermQuery extends Query {
+      * Create a TopTermsBoostOnlyBooleanQueryRewrite for 
+      * at most <code>size</code> terms.
+      * <p>
+-     * NOTE: if {@link BooleanQuery#getMaxClauseCount} is smaller than 
++     * NOTE: if {@link IndexSearcher#getMaxClauseCount} is smaller than
+      * <code>size</code>, then it will be used instead. 
+      */
+     public TopTermsBoostOnlyBooleanQueryRewrite(int size) {
+@@ -248,7 +248,7 @@ public abstract class MultiTermQuery extends Query {
+     
+     @Override
+     protected int getMaxSize() {
+-      return BooleanQuery.getMaxClauseCount();
++      return IndexSearcher.getMaxClauseCount();
+     }
+     
+     @Override
+diff --git a/lucene/core/src/java/org/apache/lucene/search/MultiTermQueryConstantScoreWrapper.java b/lucene/core/src/java/org/apache/lucene/search/MultiTermQueryConstantScoreWrapper.java
+index 2d7ac9b4bd..6ffc1c7445 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/MultiTermQueryConstantScoreWrapper.java
++++ b/lucene/core/src/java/org/apache/lucene/search/MultiTermQueryConstantScoreWrapper.java
+@@ -115,7 +115,7 @@ final class MultiTermQueryConstantScoreWrapper<Q extends MultiTermQuery> extends
+        *  terms could be collected. If {@code false} is returned, the enum is
+        *  left positioned on the next term. */
+       private boolean collectTerms(LeafReaderContext context, TermsEnum termsEnum, List<TermAndState> terms) throws IOException {
+-        final int threshold = Math.min(BOOLEAN_REWRITE_TERM_COUNT_THRESHOLD, BooleanQuery.getMaxClauseCount());
++        final int threshold = Math.min(BOOLEAN_REWRITE_TERM_COUNT_THRESHOLD, IndexSearcher.getMaxClauseCount());
+         for (int i = 0; i < threshold; ++i) {
+           final BytesRef term = termsEnum.next();
+           if (term == null) {
+diff --git a/lucene/core/src/java/org/apache/lucene/search/ScoringRewrite.java b/lucene/core/src/java/org/apache/lucene/search/ScoringRewrite.java
+index 9d02b35e96..8739fd5844 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/ScoringRewrite.java
++++ b/lucene/core/src/java/org/apache/lucene/search/ScoringRewrite.java
+@@ -47,8 +47,8 @@ public abstract class ScoringRewrite<B> extends TermCollectingRewrite<B> {
+    *  MultiTermQuery#CONSTANT_SCORE_REWRITE} instead.
+    *
+    *  <p><b>NOTE</b>: This rewrite method will hit {@link
+-   *  BooleanQuery.TooManyClauses} if the number of terms
+-   *  exceeds {@link BooleanQuery#getMaxClauseCount}.
++   *  IndexSearcher.TooManyClauses} if the number of terms
++   *  exceeds {@link IndexSearcher#getMaxClauseCount}.
+    *
+    *  @see MultiTermQuery#setRewriteMethod */
+   public final static ScoringRewrite<BooleanQuery.Builder> SCORING_BOOLEAN_REWRITE = new ScoringRewrite<BooleanQuery.Builder>() {
+@@ -71,8 +71,8 @@ public abstract class ScoringRewrite<B> extends TermCollectingRewrite<B> {
+     
+     @Override
+     protected void checkMaxClauseCount(int count) {
+-      if (count > BooleanQuery.getMaxClauseCount())
+-        throw new BooleanQuery.TooManyClauses();
++      if (count > IndexSearcher.getMaxClauseCount())
++        throw new IndexSearcher.TooManyClauses();
+     }
+   };
+   
+@@ -82,8 +82,8 @@ public abstract class ScoringRewrite<B> extends TermCollectingRewrite<B> {
+    *  query's boost.
+    * 
+    *  <p><b>NOTE</b>: This rewrite method will hit {@link
+-   *  BooleanQuery.TooManyClauses} if the number of terms
+-   *  exceeds {@link BooleanQuery#getMaxClauseCount}.
++   *  IndexSearcher.TooManyClauses} if the number of terms
++   *  exceeds {@link IndexSearcher#getMaxClauseCount}.
+    *
+    *  @see MultiTermQuery#setRewriteMethod */
+   public final static RewriteMethod CONSTANT_SCORE_BOOLEAN_REWRITE = new RewriteMethod() {
+diff --git a/lucene/core/src/java/org/apache/lucene/search/SynonymQuery.java b/lucene/core/src/java/org/apache/lucene/search/SynonymQuery.java
+index 2d053b6d66..e45287ab85 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/SynonymQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/SynonymQuery.java
+@@ -92,8 +92,8 @@ public final class SynonymQuery extends Query {
+         throw new IllegalArgumentException("boost must be a positive float between 0 (exclusive) and 1 (inclusive)");
+       }
+       terms.add(new TermAndBoost(term, boost));
+-      if (terms.size() > BooleanQuery.getMaxClauseCount()) {
+-        throw new BooleanQuery.TooManyClauses();
++      if (terms.size() > IndexSearcher.getMaxClauseCount()) {
++        throw new IndexSearcher.TooManyClauses();
+       }
+       return this;
+     }
+diff --git a/lucene/core/src/java/org/apache/lucene/search/TermInSetQuery.java b/lucene/core/src/java/org/apache/lucene/search/TermInSetQuery.java
+index 35298a7cf3..e51a36d59f 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/TermInSetQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/TermInSetQuery.java
+@@ -109,7 +109,7 @@ public class TermInSetQuery extends Query implements Accountable {
+ 
+   @Override
+   public Query rewrite(IndexReader reader) throws IOException {
+-    final int threshold = Math.min(BOOLEAN_REWRITE_TERM_COUNT_THRESHOLD, BooleanQuery.getMaxClauseCount());
++    final int threshold = Math.min(BOOLEAN_REWRITE_TERM_COUNT_THRESHOLD, IndexSearcher.getMaxClauseCount());
+     if (termData.size() <= threshold) {
+       BooleanQuery.Builder bq = new BooleanQuery.Builder();
+       TermIterator iterator = termData.iterator();
+@@ -251,7 +251,7 @@ public class TermInSetQuery extends Query implements Accountable {
+ 
+         // We will first try to collect up to 'threshold' terms into 'matchingTerms'
+         // if there are two many terms, we will fall back to building the 'builder'
+-        final int threshold = Math.min(BOOLEAN_REWRITE_TERM_COUNT_THRESHOLD, BooleanQuery.getMaxClauseCount());
++        final int threshold = Math.min(BOOLEAN_REWRITE_TERM_COUNT_THRESHOLD, IndexSearcher.getMaxClauseCount());
+         assert termData.size() > threshold : "Query should have been rewritten";
+         List<TermAndState> matchingTerms = new ArrayList<>(threshold);
+         DocIdSetBuilder builder = null;
+diff --git a/lucene/core/src/java/org/apache/lucene/search/TopTermsRewrite.java b/lucene/core/src/java/org/apache/lucene/search/TopTermsRewrite.java
+index dea4b0e4cb..9319ab16f6 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/TopTermsRewrite.java
++++ b/lucene/core/src/java/org/apache/lucene/search/TopTermsRewrite.java
+@@ -45,7 +45,7 @@ public abstract class TopTermsRewrite<B> extends TermCollectingRewrite<B> {
+    * Create a TopTermsBooleanQueryRewrite for 
+    * at most <code>size</code> terms.
+    * <p>
+-   * NOTE: if {@link BooleanQuery#getMaxClauseCount} is smaller than 
++   * NOTE: if {@link IndexSearcher#getMaxClauseCount} is smaller than
+    * <code>size</code>, then it will be used instead. 
+    */
+   public TopTermsRewrite(int size) {
+diff --git a/lucene/core/src/java/org/apache/lucene/search/package-info.java b/lucene/core/src/java/org/apache/lucene/search/package-info.java
+index fdcd6d64ac..d6ecef8e41 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/package-info.java
++++ b/lucene/core/src/java/org/apache/lucene/search/package-info.java
+@@ -108,7 +108,7 @@
+  *     </ol>
+  *     Boolean queries are constructed by adding two or more
+  *     {@link org.apache.lucene.search.BooleanClause BooleanClause}
+- *     instances. If too many clauses are added, a {@link org.apache.lucene.search.BooleanQuery.TooManyClauses TooManyClauses}
++ *     instances. If too many clauses are added, a {@link org.apache.lucene.search.IndexSearcher.TooManyClauses TooManyClauses}
+  *     exception will be thrown during searching. This most often occurs
+  *     when a {@link org.apache.lucene.search.Query Query}
+  *     is rewritten into a {@link org.apache.lucene.search.BooleanQuery BooleanQuery} with many
+@@ -116,7 +116,7 @@
+  *     for example by {@link org.apache.lucene.search.WildcardQuery WildcardQuery}.
+  *     The default setting for the maximum number
+  *     of clauses is 1024, but this can be changed via the
+- *     static method {@link org.apache.lucene.search.BooleanQuery#setMaxClauseCount(int)}.
++ *     static method {@link org.apache.lucene.search.IndexSearcher#setMaxClauseCount(int)}.
+  * 
+  * <h3>Phrases</h3>
+  * 
+diff --git a/lucene/core/src/java/org/apache/lucene/util/QueryBuilder.java b/lucene/core/src/java/org/apache/lucene/util/QueryBuilder.java
+index 66837b799a..31da912565 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/QueryBuilder.java
++++ b/lucene/core/src/java/org/apache/lucene/util/QueryBuilder.java
+@@ -30,6 +30,7 @@ import org.apache.lucene.analysis.tokenattributes.TermToBytesRefAttribute;
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.search.BooleanClause;
+ import org.apache.lucene.search.BooleanQuery;
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.MultiPhraseQuery;
+ import org.apache.lucene.search.PhraseQuery;
+ import org.apache.lucene.search.Query;
+@@ -571,7 +572,7 @@ public class QueryBuilder {
+     List<SpanQuery> clauses = new ArrayList<>();
+     int[] articulationPoints = graph.articulationPoints();
+     int lastState = 0;
+-    int maxClauseCount = BooleanQuery.getMaxClauseCount();
++    int maxClauseCount = IndexSearcher.getMaxClauseCount();
+     for (int i = 0; i <= articulationPoints.length; i++) {
+       int start = lastState;
+       int end = -1;
+@@ -588,7 +589,7 @@ public class QueryBuilder {
+           SpanQuery q = createSpanQuery(ts, field);
+           if (q != null) {
+             if (queries.size() >= maxClauseCount) {
+-              throw new BooleanQuery.TooManyClauses();
++              throw new IndexSearcher.TooManyClauses();
+             }
+             queries.add(q);
+           }
+@@ -605,7 +606,7 @@ public class QueryBuilder {
+           queryPos = new SpanTermQuery(terms[0]);
+         } else {
+           if (terms.length >= maxClauseCount) {
+-            throw new BooleanQuery.TooManyClauses();
++            throw new IndexSearcher.TooManyClauses();
+           }
+           SpanTermQuery[] orClauses = new SpanTermQuery[terms.length];
+           for (int idx = 0; idx < terms.length; idx++) {
+@@ -618,7 +619,7 @@ public class QueryBuilder {
+ 
+       if (queryPos != null) {
+         if (clauses.size() >= maxClauseCount) {
+-          throw new BooleanQuery.TooManyClauses();
++          throw new IndexSearcher.TooManyClauses();
+         }
+         clauses.add(queryPos);
+       }
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestBooleanQuery.java b/lucene/core/src/test/org/apache/lucene/search/TestBooleanQuery.java
+index 99f36ac7ee..e1922c8a67 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestBooleanQuery.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestBooleanQuery.java
+@@ -175,7 +175,7 @@ public class TestBooleanQuery extends LuceneTestCase {
+ 
+   public void testException() {
+     expectThrows(IllegalArgumentException.class, () -> {
+-      BooleanQuery.setMaxClauseCount(0);
++      IndexSearcher.setMaxClauseCount(0);
+     });
+   }
+ 
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestMaxClauseLimit.java b/lucene/core/src/test/org/apache/lucene/search/TestMaxClauseLimit.java
+new file mode 100644
+index 0000000000..e586e28167
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/search/TestMaxClauseLimit.java
+@@ -0,0 +1,132 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.lucene.search;
++
++import java.io.IOException;
++import java.util.Arrays;
++
++import org.apache.lucene.index.MultiReader;
++import org.apache.lucene.index.Term;
++import org.apache.lucene.util.LuceneTestCase;
++
++public class TestMaxClauseLimit extends LuceneTestCase {
++  public void testFlattenInnerDisjunctionsWithMoreThan1024Terms() throws IOException {
++    IndexSearcher searcher = newSearcher(new MultiReader());
++
++    BooleanQuery.Builder builder1024 = new BooleanQuery.Builder();
++    for(int i = 0; i < 1024; i++) {
++      builder1024.add(new TermQuery(new Term("foo", "bar-" + i)), BooleanClause.Occur.SHOULD);
++    }
++    Query inner = builder1024.build();
++    Query query = new BooleanQuery.Builder()
++        .add(inner, BooleanClause.Occur.SHOULD)
++        .add(new TermQuery(new Term("foo", "baz")), BooleanClause.Occur.SHOULD)
++        .build();
++
++    expectThrows(IndexSearcher.TooManyClauses.class, () -> {
++      searcher.rewrite(query);
++    });
++  }
++
++  public void testLargeTermsNestedFirst() throws IOException {
++    IndexSearcher searcher = newSearcher(new MultiReader());
++    BooleanQuery.Builder nestedBuilder = new BooleanQuery.Builder();
++
++    nestedBuilder.setMinimumNumberShouldMatch(5);
++
++    for(int i = 0; i < 600; i++) {
++      nestedBuilder.add(new TermQuery(new Term("foo", "bar-" + i)), BooleanClause.Occur.SHOULD);
++    }
++    Query inner = nestedBuilder.build();
++    BooleanQuery.Builder builderMixed = new BooleanQuery.Builder()
++        .add(inner, BooleanClause.Occur.SHOULD);
++
++    builderMixed.setMinimumNumberShouldMatch(5);
++
++    for (int i = 0; i < 600; i++) {
++      builderMixed.add(new TermQuery(new Term("foo", "bar")), BooleanClause.Occur.SHOULD);
++    }
++
++    Query query = builderMixed.build();
++
++    expectThrows(IndexSearcher.TooManyClauses.class, () -> {
++      searcher.rewrite(query);
++    });
++  }
++
++  public void testLargeTermsNestedLast() throws IOException {
++    IndexSearcher searcher = newSearcher(new MultiReader());
++    BooleanQuery.Builder nestedBuilder = new BooleanQuery.Builder();
++
++    nestedBuilder.setMinimumNumberShouldMatch(5);
++
++    for(int i = 0; i < 600; i++) {
++      nestedBuilder.add(new TermQuery(new Term("foo", "bar-" + i)), BooleanClause.Occur.SHOULD);
++    }
++    Query inner = nestedBuilder.build();
++    BooleanQuery.Builder builderMixed = new BooleanQuery.Builder();
++
++    builderMixed.setMinimumNumberShouldMatch(5);
++
++    for (int i = 0; i < 600; i++) {
++      builderMixed.add(new TermQuery(new Term("foo", "bar")), BooleanClause.Occur.SHOULD);
++    }
++
++    builderMixed.add(inner, BooleanClause.Occur.SHOULD);
++
++    Query query = builderMixed.build();
++
++    expectThrows(IndexSearcher.TooManyClauses.class, () -> {
++      searcher.rewrite(query);
++    });
++  }
++
++  public void testLargeDisjunctionMaxQuery() throws IOException {
++    IndexSearcher searcher = newSearcher(new MultiReader());
++    Query[] clausesQueryArray = new Query[1050];
++
++    for(int i = 0; i < 1049; i++) {
++      clausesQueryArray[i] = new TermQuery(new Term("field", "a"));
++    }
++
++    PhraseQuery pq = new PhraseQuery("field", new String[0]);
++
++    clausesQueryArray[1049] = pq;
++
++    DisjunctionMaxQuery dmq = new DisjunctionMaxQuery(
++        Arrays.asList(clausesQueryArray),
++        0.5f);
++
++    expectThrows(IndexSearcher.TooManyClauses.class, () -> {
++      searcher.rewrite(dmq);
++    });
++  }
++
++  public void testMultiExactWithRepeats() throws IOException {
++    IndexSearcher searcher = newSearcher(new MultiReader());
++    MultiPhraseQuery.Builder qb = new MultiPhraseQuery.Builder();
++
++    for (int i = 0;i < 1050; i++) {
++      qb.add(new Term[]{new Term("foo", "bar-" + i), new Term("foo", "bar+" + i)}, 0);
++    }
++
++    expectThrows(IndexSearcher.TooManyClauses.class, () -> {
++      searcher.rewrite(qb.build());
++    });
++  }
++}
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestMultiTermQueryRewrites.java b/lucene/core/src/test/org/apache/lucene/search/TestMultiTermQueryRewrites.java
+index e24e62b265..1d2aea7f2a 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestMultiTermQueryRewrites.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestMultiTermQueryRewrites.java
+@@ -220,33 +220,33 @@ public class TestMultiTermQueryRewrites extends LuceneTestCase {
+   }
+   
+   private void checkMaxClauseLimitation(MultiTermQuery.RewriteMethod method) throws Exception {
+-    int savedMaxClauseCount = BooleanQuery.getMaxClauseCount();
+-    BooleanQuery.setMaxClauseCount(3);
++    int savedMaxClauseCount = IndexSearcher.getMaxClauseCount();
++    IndexSearcher.setMaxClauseCount(3);
+     
+     final MultiTermQuery mtq = TermRangeQuery.newStringRange("data", "2", "7", true, true);
+     mtq.setRewriteMethod(method);
+     try {
+-      BooleanQuery.TooManyClauses expected = expectThrows(BooleanQuery.TooManyClauses.class, () -> {
++      IndexSearcher.TooManyClauses expected = expectThrows(IndexSearcher.TooManyClauses.class, () -> {
+         multiSearcherDupls.rewrite(mtq);
+       });
+       //  Maybe remove this assert in later versions, when internal API changes:
+       assertEquals("Should throw BooleanQuery.TooManyClauses with a stacktrace containing checkMaxClauseCount()",
+         "checkMaxClauseCount", expected.getStackTrace()[0].getMethodName());
+     } finally {
+-      BooleanQuery.setMaxClauseCount(savedMaxClauseCount);
++      IndexSearcher.setMaxClauseCount(savedMaxClauseCount);
+     }
+   }
+   
+   private void checkNoMaxClauseLimitation(MultiTermQuery.RewriteMethod method) throws Exception {
+-    int savedMaxClauseCount = BooleanQuery.getMaxClauseCount();
+-    BooleanQuery.setMaxClauseCount(3);
++    int savedMaxClauseCount = IndexSearcher.getMaxClauseCount();
++    IndexSearcher.setMaxClauseCount(3);
+     
+     final MultiTermQuery mtq = TermRangeQuery.newStringRange("data", "2", "7", true, true);
+     mtq.setRewriteMethod(method);
+     try {
+       multiSearcherDupls.rewrite(mtq);
+     } finally {
+-      BooleanQuery.setMaxClauseCount(savedMaxClauseCount);
++      IndexSearcher.setMaxClauseCount(savedMaxClauseCount);
+     }
+   }
+   
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestTermRangeQuery.java b/lucene/core/src/test/org/apache/lucene/search/TestTermRangeQuery.java
+index 892508b73b..5c9ef665b3 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestTermRangeQuery.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestTermRangeQuery.java
+@@ -131,12 +131,12 @@ public class TestTermRangeQuery extends LuceneTestCase {
+     TermRangeQuery query = TermRangeQuery.newStringRange("content", "B", "J", true, true);
+     checkBooleanTerms(searcher, query, "B", "C", "D", "E", "F", "G", "H", "I", "J");
+     
+-    final int savedClauseCount = BooleanQuery.getMaxClauseCount();
++    final int savedClauseCount = IndexSearcher.getMaxClauseCount();
+     try {
+-      BooleanQuery.setMaxClauseCount(3);
++      IndexSearcher.setMaxClauseCount(3);
+       checkBooleanTerms(searcher, query, "B", "C", "D");
+     } finally {
+-      BooleanQuery.setMaxClauseCount(savedClauseCount);
++      IndexSearcher.setMaxClauseCount(savedClauseCount);
+     }
+     reader.close();
+   }
+diff --git a/lucene/core/src/test/org/apache/lucene/util/TestQueryBuilder.java b/lucene/core/src/test/org/apache/lucene/util/TestQueryBuilder.java
+index dc5468321f..7289ead38e 100644
+--- a/lucene/core/src/test/org/apache/lucene/util/TestQueryBuilder.java
++++ b/lucene/core/src/test/org/apache/lucene/util/TestQueryBuilder.java
+@@ -32,6 +32,7 @@ import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.search.BooleanClause;
+ import org.apache.lucene.search.BooleanQuery;
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.MultiPhraseQuery;
+ import org.apache.lucene.search.PhraseQuery;
+ import org.apache.lucene.search.Query;
+@@ -497,13 +498,13 @@ public class TestQueryBuilder extends LuceneTestCase {
+     }
+     QueryBuilder qb = new QueryBuilder(null);
+     try (TokenStream ts = new CannedBinaryTokenStream(tokens)) {
+-      expectThrows(BooleanQuery.TooManyClauses.class, () -> qb.analyzeGraphBoolean("", ts, BooleanClause.Occur.MUST));
++      expectThrows(IndexSearcher.TooManyClauses.class, () -> qb.analyzeGraphBoolean("", ts, BooleanClause.Occur.MUST));
+     }
+     try (TokenStream ts = new CannedBinaryTokenStream(tokens)) {
+-      expectThrows(BooleanQuery.TooManyClauses.class, () -> qb.analyzeGraphBoolean("", ts, BooleanClause.Occur.SHOULD));
++      expectThrows(IndexSearcher.TooManyClauses.class, () -> qb.analyzeGraphBoolean("", ts, BooleanClause.Occur.SHOULD));
+     }
+     try (TokenStream ts = new CannedBinaryTokenStream(tokens)) {
+-      expectThrows(BooleanQuery.TooManyClauses.class, () -> qb.analyzeGraphPhrase(ts, "", 0));
++      expectThrows(IndexSearcher.TooManyClauses.class, () -> qb.analyzeGraphPhrase(ts, "", 0));
+     }
+   }
+ }
+diff --git a/lucene/queries/src/java/org/apache/lucene/queries/mlt/MoreLikeThis.java b/lucene/queries/src/java/org/apache/lucene/queries/mlt/MoreLikeThis.java
+index 7c077e53fe..4fb6c4f410 100644
+--- a/lucene/queries/src/java/org/apache/lucene/queries/mlt/MoreLikeThis.java
++++ b/lucene/queries/src/java/org/apache/lucene/queries/mlt/MoreLikeThis.java
+@@ -40,6 +40,7 @@ import org.apache.lucene.index.TermsEnum;
+ import org.apache.lucene.search.BooleanClause;
+ import org.apache.lucene.search.BooleanQuery;
+ import org.apache.lucene.search.BoostQuery;
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.Query;
+ import org.apache.lucene.search.TermQuery;
+ import org.apache.lucene.search.similarities.ClassicSimilarity;
+@@ -220,7 +221,7 @@ public final class MoreLikeThis {
+   /**
+    * Return a Query with no more than this many terms.
+    *
+-   * @see BooleanQuery#getMaxClauseCount
++   * @see IndexSearcher#getMaxClauseCount
+    * @see #getMaxQueryTerms
+    * @see #setMaxQueryTerms
+    */
+@@ -635,7 +636,7 @@ public final class MoreLikeThis {
+       try {
+         query.add(tq, BooleanClause.Occur.SHOULD);
+       }
+-      catch (BooleanQuery.TooManyClauses ignore) {
++      catch (IndexSearcher.TooManyClauses ignore) {
+         break;
+       }
+     }
+diff --git a/lucene/queryparser/src/java/org/apache/lucene/queryparser/classic/QueryParserBase.java b/lucene/queryparser/src/java/org/apache/lucene/queryparser/classic/QueryParserBase.java
+index cff9efa698..7a03a3cefb 100644
+--- a/lucene/queryparser/src/java/org/apache/lucene/queryparser/classic/QueryParserBase.java
++++ b/lucene/queryparser/src/java/org/apache/lucene/queryparser/classic/QueryParserBase.java
+@@ -29,7 +29,7 @@ import org.apache.lucene.queryparser.classic.QueryParser.Operator;
+ import org.apache.lucene.queryparser.flexible.standard.CommonQueryParserConfiguration;
+ import org.apache.lucene.search.*;
+ import org.apache.lucene.search.BooleanClause.Occur;
+-import org.apache.lucene.search.BooleanQuery.TooManyClauses;
++import org.apache.lucene.search.IndexSearcher.TooManyClauses;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.BytesRefBuilder;
+ import org.apache.lucene.util.QueryBuilder;
+@@ -114,7 +114,7 @@ public abstract class QueryParserBase extends QueryBuilder implements CommonQuer
+       ParseException e = new ParseException("Cannot parse '" +query+ "': " + tme.getMessage());
+       e.initCause(tme);
+       throw e;
+-    } catch (BooleanQuery.TooManyClauses tmc) {
++    } catch (TooManyClauses tmc) {
+       ParseException e = new ParseException("Cannot parse '" +query+ "': too many boolean clauses");
+       e.initCause(tmc);
+       throw e;
+diff --git a/lucene/queryparser/src/java/org/apache/lucene/queryparser/flexible/standard/builders/AnyQueryNodeBuilder.java b/lucene/queryparser/src/java/org/apache/lucene/queryparser/flexible/standard/builders/AnyQueryNodeBuilder.java
+index 09d4b700c3..ee943b5dc0 100644
+--- a/lucene/queryparser/src/java/org/apache/lucene/queryparser/flexible/standard/builders/AnyQueryNodeBuilder.java
++++ b/lucene/queryparser/src/java/org/apache/lucene/queryparser/flexible/standard/builders/AnyQueryNodeBuilder.java
+@@ -27,7 +27,7 @@ import org.apache.lucene.queryparser.flexible.core.nodes.QueryNode;
+ import org.apache.lucene.search.BooleanClause;
+ import org.apache.lucene.search.BooleanQuery;
+ import org.apache.lucene.search.Query;
+-import org.apache.lucene.search.BooleanQuery.TooManyClauses;
++import org.apache.lucene.search.IndexSearcher.TooManyClauses;
+ 
+ /**
+  * Builds a BooleanQuery of SHOULD clauses, possibly with
+diff --git a/lucene/queryparser/src/java/org/apache/lucene/queryparser/flexible/standard/builders/BooleanQueryNodeBuilder.java b/lucene/queryparser/src/java/org/apache/lucene/queryparser/flexible/standard/builders/BooleanQueryNodeBuilder.java
+index 17525e428b..9f9d229e68 100644
+--- a/lucene/queryparser/src/java/org/apache/lucene/queryparser/flexible/standard/builders/BooleanQueryNodeBuilder.java
++++ b/lucene/queryparser/src/java/org/apache/lucene/queryparser/flexible/standard/builders/BooleanQueryNodeBuilder.java
+@@ -28,8 +28,9 @@ import org.apache.lucene.queryparser.flexible.core.nodes.QueryNode;
+ import org.apache.lucene.queryparser.flexible.standard.parser.EscapeQuerySyntaxImpl;
+ import org.apache.lucene.search.BooleanClause;
+ import org.apache.lucene.search.BooleanQuery;
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.Query;
+-import org.apache.lucene.search.BooleanQuery.TooManyClauses;
++import org.apache.lucene.search.IndexSearcher.TooManyClauses;
+ 
+ /**
+  * Builds a {@link BooleanQuery} object from a {@link BooleanQueryNode} object.
+@@ -67,7 +68,7 @@ public class BooleanQueryNodeBuilder implements StandardQueryBuilder {
+           } catch (TooManyClauses ex) {
+ 
+             throw new QueryNodeException(new MessageImpl(
+-                QueryParserMessages.TOO_MANY_BOOLEAN_CLAUSES, BooleanQuery
++                QueryParserMessages.TOO_MANY_BOOLEAN_CLAUSES, IndexSearcher
+                     .getMaxClauseCount(), queryNode
+                     .toQueryString(new EscapeQuerySyntaxImpl())), ex);
+ 
+diff --git a/lucene/queryparser/src/test/org/apache/lucene/queryparser/flexible/precedence/TestPrecedenceQueryParser.java b/lucene/queryparser/src/test/org/apache/lucene/queryparser/flexible/precedence/TestPrecedenceQueryParser.java
+index d2deaa6a4a..9ed7a35667 100644
+--- a/lucene/queryparser/src/test/org/apache/lucene/queryparser/flexible/precedence/TestPrecedenceQueryParser.java
++++ b/lucene/queryparser/src/test/org/apache/lucene/queryparser/flexible/precedence/TestPrecedenceQueryParser.java
+@@ -38,6 +38,7 @@ import org.apache.lucene.queryparser.util.QueryParserTestBase; // javadocs
+ import org.apache.lucene.search.BooleanQuery;
+ import org.apache.lucene.search.BoostQuery;
+ import org.apache.lucene.search.FuzzyQuery;
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.MatchNoDocsQuery;
+ import org.apache.lucene.search.PhraseQuery;
+ import org.apache.lucene.search.PrefixQuery;
+@@ -141,7 +142,7 @@ public class TestPrecedenceQueryParser extends LuceneTestCase {
+   @Override
+   public void setUp() throws Exception {
+     super.setUp();
+-    originalMaxClauses = BooleanQuery.getMaxClauseCount();
++    originalMaxClauses = IndexSearcher.getMaxClauseCount();
+   }
+ 
+   public PrecedenceQueryParser getParser(Analyzer a) throws Exception {
+@@ -572,7 +573,7 @@ public class TestPrecedenceQueryParser extends LuceneTestCase {
+ 
+   // ParseException expected due to too many boolean clauses
+   public void testBooleanQuery() throws Exception {
+-    BooleanQuery.setMaxClauseCount(2);
++    IndexSearcher.setMaxClauseCount(2);
+     expectThrows(QueryNodeException.class, () -> {
+       getParser(new MockAnalyzer(random(), MockTokenizer.WHITESPACE, false)).parse("one two three", "field");
+     });
+@@ -639,7 +640,7 @@ public class TestPrecedenceQueryParser extends LuceneTestCase {
+ 
+   @Override
+   public void tearDown() throws Exception {
+-    BooleanQuery.setMaxClauseCount(originalMaxClauses);
++    IndexSearcher.setMaxClauseCount(originalMaxClauses);
+     super.tearDown();
+   }
+ 
+diff --git a/lucene/queryparser/src/test/org/apache/lucene/queryparser/flexible/standard/TestQPHelper.java b/lucene/queryparser/src/test/org/apache/lucene/queryparser/flexible/standard/TestQPHelper.java
+index b87dc8a1fd..2a265e9170 100644
+--- a/lucene/queryparser/src/test/org/apache/lucene/queryparser/flexible/standard/TestQPHelper.java
++++ b/lucene/queryparser/src/test/org/apache/lucene/queryparser/flexible/standard/TestQPHelper.java
+@@ -210,7 +210,7 @@ public class TestQPHelper extends LuceneTestCase {
+   @Override
+   public void setUp() throws Exception {
+     super.setUp();
+-    originalMaxClauses = BooleanQuery.getMaxClauseCount();
++    originalMaxClauses = IndexSearcher.getMaxClauseCount();
+   }
+ 
+   public StandardQueryParser getParser(Analyzer a) throws Exception {
+@@ -1017,7 +1017,7 @@ public class TestQPHelper extends LuceneTestCase {
+ 
+   // too many boolean clauses, so ParseException is expected
+   public void testBooleanQuery() throws Exception {
+-    BooleanQuery.setMaxClauseCount(2);
++    IndexSearcher.setMaxClauseCount(2);
+     expectThrows(QueryNodeException.class, () -> {
+       StandardQueryParser qp = new StandardQueryParser();
+       qp.setAnalyzer(new MockAnalyzer(random(), MockTokenizer.WHITESPACE, false));
+@@ -1248,7 +1248,7 @@ public class TestQPHelper extends LuceneTestCase {
+ 
+   @Override
+   public void tearDown() throws Exception {
+-    BooleanQuery.setMaxClauseCount(originalMaxClauses);
++    IndexSearcher.setMaxClauseCount(originalMaxClauses);
+     super.tearDown();
+   }
+ 
+diff --git a/lucene/queryparser/src/test/org/apache/lucene/queryparser/util/QueryParserTestBase.java b/lucene/queryparser/src/test/org/apache/lucene/queryparser/util/QueryParserTestBase.java
+index b87ba3736c..271ccb4d59 100644
+--- a/lucene/queryparser/src/test/org/apache/lucene/queryparser/util/QueryParserTestBase.java
++++ b/lucene/queryparser/src/test/org/apache/lucene/queryparser/util/QueryParserTestBase.java
+@@ -138,7 +138,7 @@ public abstract class QueryParserTestBase extends LuceneTestCase {
+   @Override
+   public void setUp() throws Exception {
+     super.setUp();
+-    originalMaxClauses = BooleanQuery.getMaxClauseCount();
++    originalMaxClauses = IndexSearcher.getMaxClauseCount();
+   }
+ 
+   public abstract CommonQueryParserConfiguration getParserConfig(Analyzer a) throws Exception;
+@@ -960,7 +960,7 @@ public abstract class QueryParserTestBase extends LuceneTestCase {
+   }
+ 
+   public void testBooleanQuery() throws Exception {
+-    BooleanQuery.setMaxClauseCount(2);
++    IndexSearcher.setMaxClauseCount(2);
+     Analyzer purWhitespaceAnalyzer = new MockAnalyzer(random(), MockTokenizer.WHITESPACE, false);
+     assertParseException("one two three", purWhitespaceAnalyzer);
+   }
+@@ -1121,7 +1121,7 @@ public abstract class QueryParserTestBase extends LuceneTestCase {
+ 
+   @Override
+   public void tearDown() throws Exception {
+-    BooleanQuery.setMaxClauseCount(originalMaxClauses);
++    IndexSearcher.setMaxClauseCount(originalMaxClauses);
+     super.tearDown();
+   }
+ 
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/BM25FQuery.java b/lucene/sandbox/src/java/org/apache/lucene/search/BM25FQuery.java
+index 080537bd28..e5ef004787 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/search/BM25FQuery.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/search/BM25FQuery.java
+@@ -104,8 +104,8 @@ public final class BM25FQuery extends Query {
+      * Adds a term to this builder.
+      */
+     public Builder addTerm(BytesRef term) {
+-      if (termsSet.size() > BooleanQuery.getMaxClauseCount()) {
+-        throw new BooleanQuery.TooManyClauses();
++      if (termsSet.size() > IndexSearcher.getMaxClauseCount()) {
++        throw new IndexSearcher.TooManyClauses();
+       }
+       termsSet.add(term);
+       return this;
+@@ -116,8 +116,8 @@ public final class BM25FQuery extends Query {
+      */
+     public BM25FQuery build() {
+       int size = fieldAndWeights.size() * termsSet.size();
+-      if (size > BooleanQuery.getMaxClauseCount()) {
+-        throw new BooleanQuery.TooManyClauses();
++      if (size > IndexSearcher.getMaxClauseCount()) {
++        throw new IndexSearcher.TooManyClauses();
+       }
+       BytesRef[] terms = termsSet.toArray(new BytesRef[0]);
+       return new BM25FQuery(similarity, new TreeMap<>(fieldAndWeights), terms);
+@@ -148,8 +148,8 @@ public final class BM25FQuery extends Query {
+     this.fieldAndWeights = fieldAndWeights;
+     this.terms = terms;
+     int numFieldTerms = fieldAndWeights.size() * terms.length;
+-    if (numFieldTerms > BooleanQuery.getMaxClauseCount()) {
+-      throw new BooleanQuery.TooManyClauses();
++    if (numFieldTerms > IndexSearcher.getMaxClauseCount()) {
++      throw new IndexSearcher.TooManyClauses();
+     }
+     this.fieldTerms = new Term[numFieldTerms];
+     Arrays.sort(terms);
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/CoveringQuery.java b/lucene/sandbox/src/java/org/apache/lucene/search/CoveringQuery.java
+index 5d5c8f89e4..624268f5ed 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/search/CoveringQuery.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/search/CoveringQuery.java
+@@ -48,8 +48,8 @@ public final class CoveringQuery extends Query {
+    *                           do not match.
+    */
+   public CoveringQuery(Collection<Query> queries, LongValuesSource minimumNumberMatch) {
+-    if (queries.size() > BooleanQuery.getMaxClauseCount()) {
+-      throw new BooleanQuery.TooManyClauses();
++    if (queries.size() > IndexSearcher.getMaxClauseCount()) {
++      throw new IndexSearcher.TooManyClauses();
+     }
+     if (minimumNumberMatch.needsScores()) {
+       throw new IllegalArgumentException("The minimum number of matches may not depend on the score.");
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/Disjunctions.java b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/Disjunctions.java
+index d9fbeeec41..3fb7889085 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/Disjunctions.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/Disjunctions.java
+@@ -23,7 +23,7 @@ import java.util.List;
+ import java.util.function.Function;
+ import java.util.stream.Collectors;
+ 
+-import org.apache.lucene.search.BooleanQuery;
++import org.apache.lucene.search.IndexSearcher;
+ 
+ final class Disjunctions {
+ 
+@@ -43,7 +43,7 @@ final class Disjunctions {
+         rewritten.forEach(l -> l.add(disjuncts.get(0)));
+       }
+       else {
+-        if (rewritten.size() * disjuncts.size() > BooleanQuery.getMaxClauseCount()) {
++        if (rewritten.size() * disjuncts.size() > IndexSearcher.getMaxClauseCount()) {
+           throw new IllegalArgumentException("Too many disjunctions to expand");
+         }
+         List<List<IntervalsSource>> toAdd = new ArrayList<>();
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/util/TestRuleSetupAndRestoreInstanceEnv.java b/lucene/test-framework/src/java/org/apache/lucene/util/TestRuleSetupAndRestoreInstanceEnv.java
+index 62f5712868..b5128f389a 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/util/TestRuleSetupAndRestoreInstanceEnv.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/util/TestRuleSetupAndRestoreInstanceEnv.java
+@@ -16,7 +16,7 @@
+  */
+ package org.apache.lucene.util;
+ 
+-import org.apache.lucene.search.BooleanQuery;
++import org.apache.lucene.search.IndexSearcher;
+ 
+ /**
+  * Prepares and restores {@link LuceneTestCase} at instance level 
+@@ -27,11 +27,11 @@ final class TestRuleSetupAndRestoreInstanceEnv extends AbstractBeforeAfterRule {
+ 
+   @Override
+   protected void before() {
+-    savedBoolMaxClauseCount = BooleanQuery.getMaxClauseCount();
++    savedBoolMaxClauseCount = IndexSearcher.getMaxClauseCount();
+   }
+ 
+   @Override
+   protected void after() {
+-    BooleanQuery.setMaxClauseCount(savedBoolMaxClauseCount);
++    IndexSearcher.setMaxClauseCount(savedBoolMaxClauseCount);
+   }
+ }
+diff --git a/solr/core/src/java/org/apache/solr/core/CoreContainer.java b/solr/core/src/java/org/apache/solr/core/CoreContainer.java
+index abaaf92e84..cd50f29c1c 100644
+--- a/solr/core/src/java/org/apache/solr/core/CoreContainer.java
++++ b/solr/core/src/java/org/apache/solr/core/CoreContainer.java
+@@ -45,7 +45,7 @@ import org.apache.http.client.CredentialsProvider;
+ import org.apache.http.config.Lookup;
+ import org.apache.lucene.index.CorruptIndexException;
+ import org.apache.lucene.index.IndexWriter;
+-import org.apache.lucene.search.BooleanQuery;
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.store.Directory;
+ import org.apache.solr.client.solrj.SolrClient;
+ import org.apache.solr.client.solrj.cloud.SolrCloudManager;
+@@ -323,7 +323,7 @@ public class CoreContainer {
+     containerHandlers.put(PublicKeyHandler.PATH, new PublicKeyHandler());
+     this.cfg = requireNonNull(config);
+     if (null != this.cfg.getBooleanQueryMaxClauseCount()) {
+-      BooleanQuery.setMaxClauseCount(this.cfg.getBooleanQueryMaxClauseCount());
++      IndexSearcher.setMaxClauseCount(this.cfg.getBooleanQueryMaxClauseCount());
+     }
+     this.coresLocator = locator;
+     this.containerProperties = new Properties(properties);
+diff --git a/solr/core/src/java/org/apache/solr/core/NodeConfig.java b/solr/core/src/java/org/apache/solr/core/NodeConfig.java
+index 186b8e5efe..3d832c32c1 100644
+--- a/solr/core/src/java/org/apache/solr/core/NodeConfig.java
++++ b/solr/core/src/java/org/apache/solr/core/NodeConfig.java
+@@ -22,6 +22,7 @@ import java.util.HashSet;
+ import java.util.Properties;
+ import java.util.Set;
+ 
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.solr.common.SolrException;
+ import org.apache.solr.logging.LogWatcherConfig;
+ import org.apache.solr.update.UpdateShardHandlerConfig;
+@@ -133,7 +134,7 @@ public class NodeConfig {
+   /** 
+    * If null, the lucene default will not be overridden
+    *
+-   * @see org.apache.lucene.search.BooleanQuery#setMaxClauseCount
++   * @see IndexSearcher#setMaxClauseCount
+    */
+   public Integer getBooleanQueryMaxClauseCount() {
+     return booleanQueryMaxClauseCount;
+diff --git a/solr/core/src/java/org/apache/solr/core/SolrConfig.java b/solr/core/src/java/org/apache/solr/core/SolrConfig.java
+index 232543cb9c..b32f5e6eb4 100644
+--- a/solr/core/src/java/org/apache/solr/core/SolrConfig.java
++++ b/solr/core/src/java/org/apache/solr/core/SolrConfig.java
+@@ -46,7 +46,7 @@ import java.util.regex.Pattern;
+ import com.google.common.collect.ImmutableList;
+ import org.apache.commons.io.FileUtils;
+ import org.apache.lucene.index.IndexDeletionPolicy;
+-import org.apache.lucene.search.BooleanQuery;
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.util.Version;
+ import org.apache.solr.client.solrj.io.stream.expr.Expressible;
+ import org.apache.solr.cloud.RecoveryStrategy;
+@@ -234,10 +234,10 @@ public class SolrConfig extends XmlConfigFile implements MapSerializable {
+     // Parse indexConfig section, using mainIndex as backup in case old config is used
+     indexConfig = new SolrIndexConfig(this, "indexConfig", null);
+ 
+-    booleanQueryMaxClauseCount = getInt("query/maxBooleanClauses", BooleanQuery.getMaxClauseCount());
+-    if (BooleanQuery.getMaxClauseCount() < booleanQueryMaxClauseCount) {
++    booleanQueryMaxClauseCount = getInt("query/maxBooleanClauses", IndexSearcher.getMaxClauseCount());
++    if (IndexSearcher.getMaxClauseCount() < booleanQueryMaxClauseCount) {
+       log.warn("solrconfig.xml: <maxBooleanClauses> of {} is greater than global limit of {} "+
+-               "and will have no effect", booleanQueryMaxClauseCount, BooleanQuery.getMaxClauseCount());
++               "and will have no effect", booleanQueryMaxClauseCount, IndexSearcher.getMaxClauseCount());
+       log.warn("set 'maxBooleanClauses' in solr.xml to increase global limit");
+     }
+     
+diff --git a/solr/core/src/java/org/apache/solr/parser/SolrQueryParserBase.java b/solr/core/src/java/org/apache/solr/parser/SolrQueryParserBase.java
+index 0019ed67c1..d98fe09518 100644
+--- a/solr/core/src/java/org/apache/solr/parser/SolrQueryParserBase.java
++++ b/solr/core/src/java/org/apache/solr/parser/SolrQueryParserBase.java
+@@ -36,6 +36,7 @@ import org.apache.lucene.search.BoostQuery;
+ import org.apache.lucene.search.ConstantScoreQuery;
+ import org.apache.lucene.search.DisjunctionMaxQuery;
+ import org.apache.lucene.search.FuzzyQuery;
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.MatchAllDocsQuery;
+ import org.apache.lucene.search.MultiPhraseQuery;
+ import org.apache.lucene.search.MultiTermQuery;
+@@ -263,7 +264,7 @@ public abstract class SolrQueryParserBase extends QueryBuilder {
+     }
+     catch (ParseException | TokenMgrError tme) {
+       throw new SyntaxError("Cannot parse '" +query+ "': " + tme.getMessage(), tme);
+-    } catch (BooleanQuery.TooManyClauses tmc) {
++    } catch (IndexSearcher.TooManyClauses tmc) {
+       throw new SyntaxError("Cannot parse '" +query+ "': too many boolean clauses", tmc);
+     }
+   }
+diff --git a/solr/core/src/java/org/apache/solr/query/SolrRangeQuery.java b/solr/core/src/java/org/apache/solr/query/SolrRangeQuery.java
+index 40a68e54e2..03c162b42c 100644
+--- a/solr/core/src/java/org/apache/solr/query/SolrRangeQuery.java
++++ b/solr/core/src/java/org/apache/solr/query/SolrRangeQuery.java
+@@ -354,7 +354,7 @@ public final class SolrRangeQuery extends ExtendedQueryBase implements DocSetPro
+      */
+     private long collectTerms(LeafReaderContext context, TermsEnum termsEnum, List<TermAndState> terms) throws IOException {
+       long count = 0;
+-      final int threshold = Math.min(BOOLEAN_REWRITE_TERM_COUNT_THRESHOLD, BooleanQuery.getMaxClauseCount());
++      final int threshold = Math.min(BOOLEAN_REWRITE_TERM_COUNT_THRESHOLD, IndexSearcher.getMaxClauseCount());
+       for (int i = 0; i < threshold; ++i) {
+         final BytesRef term = termsEnum.next();
+         if (term == null) {
+diff --git a/solr/core/src/java/org/apache/solr/search/QueryUtils.java b/solr/core/src/java/org/apache/solr/search/QueryUtils.java
+index 3e2b6a0c22..3b6df35af2 100644
+--- a/solr/core/src/java/org/apache/solr/search/QueryUtils.java
++++ b/solr/core/src/java/org/apache/solr/search/QueryUtils.java
+@@ -20,6 +20,7 @@ import org.apache.lucene.search.BooleanClause;
+ import org.apache.lucene.search.BooleanClause.Occur;
+ import org.apache.lucene.search.BooleanQuery;
+ import org.apache.lucene.search.BoostQuery;
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.MatchAllDocsQuery;
+ import org.apache.lucene.search.Query;
+ import org.apache.solr.common.SolrException;
+@@ -132,7 +133,7 @@ public class QueryUtils {
+ 
+   /** @lucene.experimental throw exception if max boolean clauses are exceeded */
+   public static BooleanQuery build(BooleanQuery.Builder builder, QParser parser) {
+-    int configuredMax = parser != null ? parser.getReq().getCore().getSolrConfig().booleanQueryMaxClauseCount : BooleanQuery.getMaxClauseCount();
++    int configuredMax = parser != null ? parser.getReq().getCore().getSolrConfig().booleanQueryMaxClauseCount : IndexSearcher.getMaxClauseCount();
+     BooleanQuery bq = builder.build();
+     if (bq.clauses().size() > configuredMax) {
+       throw new SolrException(SolrException.ErrorCode.BAD_REQUEST,
+diff --git a/solr/core/src/test/org/apache/solr/legacy/TestNumericRangeQuery32.java b/solr/core/src/test/org/apache/solr/legacy/TestNumericRangeQuery32.java
+index a9265d15a2..09ec5befc3 100644
+--- a/solr/core/src/test/org/apache/solr/legacy/TestNumericRangeQuery32.java
++++ b/solr/core/src/test/org/apache/solr/legacy/TestNumericRangeQuery32.java
+@@ -23,7 +23,6 @@ import org.apache.lucene.document.Field;
+ import org.apache.lucene.index.DirectoryReader;
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.RandomIndexWriter;
+-import org.apache.lucene.search.BooleanQuery;
+ import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.MultiTermQuery;
+ import org.apache.lucene.search.Query;
+@@ -139,7 +138,7 @@ public class TestNumericRangeQuery32 extends SolrTestCase {
+     super.setUp();
+     // set the theoretical maximum term count for 8bit (see docs for the number)
+     // super.tearDown will restore the default
+-    BooleanQuery.setMaxClauseCount(3*255*2 + 255);
++    IndexSearcher.setMaxClauseCount(3*255*2 + 255);
+   }
+   
+   /** test for both constant score and boolean query, the other tests only use the constant score mode */
+diff --git a/solr/core/src/test/org/apache/solr/legacy/TestNumericRangeQuery64.java b/solr/core/src/test/org/apache/solr/legacy/TestNumericRangeQuery64.java
+index 71e0e67e51..b8979f3702 100644
+--- a/solr/core/src/test/org/apache/solr/legacy/TestNumericRangeQuery64.java
++++ b/solr/core/src/test/org/apache/solr/legacy/TestNumericRangeQuery64.java
+@@ -23,7 +23,6 @@ import org.apache.lucene.document.Field;
+ import org.apache.lucene.index.DirectoryReader;
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.RandomIndexWriter;
+-import org.apache.lucene.search.BooleanQuery;
+ import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.MultiTermQuery;
+ import org.apache.lucene.search.Query;
+@@ -148,7 +147,7 @@ public class TestNumericRangeQuery64 extends SolrTestCase {
+     super.setUp();
+     // set the theoretical maximum term count for 8bit (see docs for the number)
+     // super.tearDown will restore the default
+-    BooleanQuery.setMaxClauseCount(7*255*2 + 255);
++    IndexSearcher.setMaxClauseCount(7*255*2 + 255);
+   }
+   
+   /** test for constant score + boolean query + filter, the other tests only use the constant score mode */
+diff --git a/solr/core/src/test/org/apache/solr/search/TestSolrQueryParser.java b/solr/core/src/test/org/apache/solr/search/TestSolrQueryParser.java
+index 1dcc05e55c..87cbc95c9d 100644
+--- a/solr/core/src/test/org/apache/solr/search/TestSolrQueryParser.java
++++ b/solr/core/src/test/org/apache/solr/search/TestSolrQueryParser.java
+@@ -28,6 +28,7 @@ import org.apache.lucene.search.BooleanClause;
+ import org.apache.lucene.search.BooleanQuery;
+ import org.apache.lucene.search.BoostQuery;
+ import org.apache.lucene.search.ConstantScoreQuery;
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.PointInSetQuery;
+ import org.apache.lucene.search.Query;
+ import org.apache.lucene.search.TermInSetQuery;
+@@ -367,7 +368,7 @@ public class TestSolrQueryParser extends SolrTestCaseJ4 {
+     
+   @Test
+   public void testManyClauses_Lucene() throws Exception {
+-    final int numZ = BooleanQuery.getMaxClauseCount();
++    final int numZ = IndexSearcher.getMaxClauseCount();
+     
+     final String a = "1 a 2 b 3 c 10 d 11 12 "; // 10 terms
+     final StringBuilder sb = new StringBuilder("id:(");
+@@ -391,7 +392,7 @@ public class TestSolrQueryParser extends SolrTestCaseJ4 {
+     assertEquals(SyntaxError.class, e.getCause().getClass());
+     
+     assertNotNull(e.getCause().getCause());
+-    assertEquals(BooleanQuery.TooManyClauses.class, e.getCause().getCause().getClass());
++    assertEquals(IndexSearcher.TooManyClauses.class, e.getCause().getCause().getClass());
+ 
+     // but should still work as a filter query since TermsQuery can be used...
+     assertJQ(req("q","*:*", "fq", way_too_long)
+-- 
+2.17.2 (Apple Git-113)
+

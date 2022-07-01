@@ -1,0 +1,853 @@
+Index: lucene/CHANGES.txt
+===================================================================
+--- lucene/CHANGES.txt	(revision 1682391)
++++ lucene/CHANGES.txt	(working copy)
+@@ -5,6 +5,11 @@
+ 
+ ======================= Lucene 4.10.5 ======================
+ 
++Bug fixes
++
++* LUCENE-6507: Don't let NativeFSLock.close() release other locks
++  (Simon Willnauer, Robert Muir, Uwe Schindler, Mike McCandless)
++
+ ======================= Lucene 4.10.4 ======================
+ 
+ Bug fixes
+
+Property changes on: lucene/CHANGES.txt
+___________________________________________________________________
+Modified: svn:mergeinfo
+   Merged /lucene/dev/trunk/lucene/CHANGES.txt:r1682327
+Index: lucene/core/src/java/org/apache/lucene/store/NativeFSLockFactory.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/store/NativeFSLockFactory.java	(revision 1682391)
++++ lucene/core/src/java/org/apache/lucene/store/NativeFSLockFactory.java	(working copy)
+@@ -17,12 +17,11 @@
+  * limitations under the License.
+  */
+ 
++import java.io.File;
++import java.io.IOException;
+ import java.nio.channels.FileChannel;
+-import java.nio.channels.FileLock;
+ import java.nio.channels.OverlappingFileLockException;
+ import java.nio.file.StandardOpenOption;
+-import java.io.File;
+-import java.io.IOException;
+ import java.util.Collections;
+ import java.util.HashSet;
+ import java.util.Set;
+@@ -116,12 +115,12 @@
+ 
+ class NativeFSLock extends Lock {
+ 
+-  private FileChannel channel;
+-  private FileLock lock;
+-  private File path;
+-  private File lockDir;
++  private final File path;
++  private final File lockDir;
+   private static final Set<String> LOCK_HELD = Collections.synchronizedSet(new HashSet<String>());
+ 
++  private FileChannel channel; // set when we have the lock
++  private File realPath;       // unconditionally set in obtain(), for use in close()
+ 
+   public NativeFSLock(File lockDir, String lockFileName) {
+     this.lockDir = lockDir;
+@@ -128,13 +127,13 @@
+     path = new File(lockDir, lockFileName);
+   }
+ 
+-
+   @Override
+   public synchronized boolean obtain() throws IOException {
+-
+-    if (lock != null) {
++    if (channel != null) {
+       // Our instance is already locked:
+-      return false;
++      assert channel.isOpen();
++      assert realPath != null;
++      throw new LockObtainFailedException("this lock instance was already obtained");
+     }
+ 
+     // Ensure that lockDir exists and is a directory.
+@@ -147,7 +146,8 @@
+       throw new IOException("Found regular file where directory expected: " + 
+           lockDir.getAbsolutePath());
+     }
+-    final String canonicalPath = path.getCanonicalPath();
++
++    realPath = path.getCanonicalFile();
+     // Make sure nobody else in-process has this lock held
+     // already, and, mark it held if not:
+     // This is a pretty crazy workaround for some documented
+@@ -162,12 +162,15 @@
+     // is that we can't re-obtain the lock in the same JVM but from a different process if that happens. Nevertheless
+     // this is super trappy. See LUCENE-5738
+     boolean obtained = false;
+-    if (LOCK_HELD.add(canonicalPath)) {
++    if (LOCK_HELD.add(realPath.toString())) {
++      FileChannel ch = null;
+       try {
+-        channel = FileChannel.open(path.toPath(), StandardOpenOption.CREATE, StandardOpenOption.WRITE);
++        ch = FileChannel.open(realPath.toPath(), StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+         try {
+-          lock = channel.tryLock();
+-          obtained = lock != null;
++          if (ch.tryLock() != null) {
++            channel = ch;
++            obtained = true;
++          }
+         } catch (IOException | OverlappingFileLockException e) {
+           // At least on OS X, we will sometimes get an
+           // intermittent "Permission Denied" IOException,
+@@ -182,10 +185,8 @@
+         }
+       } finally {
+         if (obtained == false) { // not successful - clear up and move out
+-          clearLockHeld(path);
+-          final FileChannel toClose = channel;
+-          channel = null;
+-          IOUtils.closeWhileHandlingException(toClose);
++          IOUtils.closeWhileHandlingException(ch);
++          clearLockHeld(realPath);  // clear LOCK_HELD last 
+         }
+       }
+     }
+@@ -194,23 +195,18 @@
+ 
+   @Override
+   public synchronized void close() throws IOException {
+-    try {
+-      if (lock != null) {
+-        try {
+-          lock.release();
+-          lock = null;
+-        } finally {
+-          clearLockHeld(path);
+-        }
++    if (channel != null) {
++      try {
++        IOUtils.close(channel);
++      } finally {
++        channel = null;
++        clearLockHeld(realPath); // clear LOCK_HELD last 
+       }
+-    } finally {
+-      IOUtils.close(channel);
+-      channel = null;
+     }
+   }
+ 
+-  private static final void clearLockHeld(File path) throws IOException {
+-    boolean remove = LOCK_HELD.remove(path.getCanonicalPath());
++  private static final void clearLockHeld(File path) {
++    boolean remove = LOCK_HELD.remove(path.toString());
+     assert remove : "Lock was cleared but never marked as held";
+   }
+ 
+@@ -219,11 +215,15 @@
+     // The test for is isLocked is not directly possible with native file locks:
+     
+     // First a shortcut, if a lock reference in this instance is available
+-    if (lock != null) return true;
+-    
+-    // Look if lock file is present; if not, there can definitely be no lock!
+-    if (!path.exists()) return false;
+-    
++    if (channel != null) {
++      return true;
++    }
++      
++    // Look if lock file is definitely not present; if not, there can definitely be no lock!
++    if (path.exists() == false) { 
++      return false;
++    }
++      
+     // Try to obtain and release (if was locked) the lock
+     try {
+       boolean obtained = obtain();
+Index: lucene/core/src/java/org/apache/lucene/store/NoLockFactory.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/store/NoLockFactory.java	(revision 1682391)
++++ lucene/core/src/java/org/apache/lucene/store/NoLockFactory.java	(working copy)
+@@ -30,7 +30,8 @@
+ public class NoLockFactory extends LockFactory {
+ 
+   // Single instance returned whenever makeLock is called.
+-  private static NoLock singletonLock = new NoLock();
++  // visible for AssertingLock!
++  static final NoLock SINGLETON_LOCK = new NoLock();
+   private static NoLockFactory singleton = new NoLockFactory();
+   
+   private NoLockFactory() {}
+@@ -41,7 +42,7 @@
+ 
+   @Override
+   public Lock makeLock(String lockName) {
+-    return singletonLock;
++    return SINGLETON_LOCK;
+   }
+ 
+   @Override
+Index: lucene/core/src/java/org/apache/lucene/store/SimpleFSLockFactory.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/store/SimpleFSLockFactory.java	(revision 1682391)
++++ lucene/core/src/java/org/apache/lucene/store/SimpleFSLockFactory.java	(working copy)
+@@ -113,6 +113,7 @@
+ 
+   File lockFile;
+   File lockDir;
++  boolean obtained = false;
+ 
+   public SimpleFSLock(File lockDir, String lockFileName) {
+     this.lockDir = lockDir;
+@@ -120,8 +121,12 @@
+   }
+ 
+   @Override
+-  public boolean obtain() throws IOException {
+-
++  public synchronized boolean obtain() throws IOException {
++    if (obtained) {
++      // Our instance is already locked:
++      throw new LockObtainFailedException("this lock instance was already obtained");
++    }
++      
+     // Ensure that lockDir exists and is a directory:
+     if (!lockDir.exists()) {
+       if (!lockDir.mkdirs())
+@@ -134,7 +139,7 @@
+     }
+     
+     try {
+-      return lockFile.createNewFile();
++      obtained = lockFile.createNewFile();
+     } catch (IOException ioe) {
+       // On Windows, on concurrent createNewFile, the 2nd process gets "access denied".
+       // In that case, the lock was not aquired successfully, so return false.
+@@ -141,14 +146,22 @@
+       // We record the failure reason here; the obtain with timeout (usually the
+       // one calling us) will use this as "root cause" if it fails to get the lock.
+       failureReason = ioe;
+-      return false;
+     }
++
++    return obtained;
+   }
+ 
+   @Override
+-  public void close() throws LockReleaseFailedException {
+-    if (lockFile.exists() && !lockFile.delete()) {
+-      throw new LockReleaseFailedException("failed to delete " + lockFile);
++  public synchronized void close() throws LockReleaseFailedException {
++    // TODO: wierd that clearLock() throws the raw IOException...
++    if (obtained) {
++      try {
++        if (lockFile.exists() && !lockFile.delete()) {
++          throw new LockReleaseFailedException("failed to delete " + lockFile);
++        }
++      } finally {
++        obtained = false;
++      }
+     }
+   }
+ 
+Index: lucene/core/src/java/org/apache/lucene/store/SingleInstanceLockFactory.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/store/SingleInstanceLockFactory.java	(revision 1682391)
++++ lucene/core/src/java/org/apache/lucene/store/SingleInstanceLockFactory.java	(working copy)
+@@ -54,6 +54,7 @@
+ }
+ 
+ class SingleInstanceLock extends Lock {
++  private boolean obtained = false;
+ 
+   String lockName;
+   private HashSet<String> locks;
+@@ -66,7 +67,13 @@
+   @Override
+   public boolean obtain() throws IOException {
+     synchronized(locks) {
+-      return locks.add(lockName);
++      if (obtained) {
++        // Our instance is already locked:
++        throw new LockObtainFailedException("this lock instance was already obtained");
++      }
++      obtained = locks.add(lockName);
++
++      return obtained;
+     }
+   }
+ 
+@@ -73,7 +80,10 @@
+   @Override
+   public void close() {
+     synchronized(locks) {
+-      locks.remove(lockName);
++      if (obtained) {
++        locks.remove(lockName);
++        obtained = false;
++      }
+     }
+   }
+ 
+Index: lucene/core/src/java/org/apache/lucene/store/VerifyingLockFactory.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/store/VerifyingLockFactory.java	(revision 1682391)
++++ lucene/core/src/java/org/apache/lucene/store/VerifyingLockFactory.java	(working copy)
+@@ -43,6 +43,7 @@
+ 
+   private class CheckedLock extends Lock {
+     private final Lock lock;
++    private boolean obtained = false;
+ 
+     public CheckedLock(Lock lock) {
+       this.lock = lock;
+@@ -62,9 +63,10 @@
+ 
+     @Override
+     public synchronized boolean obtain() throws IOException {
+-      boolean obtained = lock.obtain();
+-      if (obtained)
++      obtained = lock.obtain();
++      if (obtained) {
+         verify((byte) 1);
++      }
+       return obtained;
+     }
+ 
+@@ -75,10 +77,11 @@
+ 
+     @Override
+     public synchronized void close() throws IOException {
+-      if (isLocked()) {
++      if (obtained) {
++        assert isLocked();
+         verify((byte) 0);
+-        lock.close();
+       }
++      lock.close();
+     }
+   }
+ 
+Index: lucene/core/src/test/org/apache/lucene/store/TestLock.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/store/TestLock.java	(revision 1682391)
++++ lucene/core/src/test/org/apache/lucene/store/TestLock.java	(working copy)
+@@ -19,6 +19,11 @@
+ 
+ 
+ import java.io.IOException;
++import java.util.concurrent.CyclicBarrier;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.concurrent.locks.ReentrantLock;
++
+ import org.apache.lucene.util.LuceneTestCase;
+ 
+ public class TestLock extends LuceneTestCase {
+@@ -52,4 +57,112 @@
+             return false;
+         }
+     }
++
++  public void testObtainConcurrently() throws InterruptedException, IOException {
++    final Directory directory;
++    if (random().nextBoolean()) {
++      directory = newDirectory();
++    } else {
++      LockFactory lf = random().nextBoolean() ? new SimpleFSLockFactory() : new NativeFSLockFactory();
++      directory = newFSDirectory(createTempDir(), lf);
++    }
++    final AtomicBoolean running = new AtomicBoolean(true);
++    final AtomicInteger atomicCounter = new AtomicInteger(0);
++    final ReentrantLock assertingLock = new ReentrantLock();
++    int numThreads = 2 + random().nextInt(10);
++    final int runs = 500 + random().nextInt(1000);
++    final CyclicBarrier barrier = new CyclicBarrier(numThreads);
++    Thread[] threads = new Thread[numThreads];
++    for (int i = 0; i < threads.length; i++) {
++      threads[i] = new Thread() {
++        @Override
++        public void run() {
++          try {
++            barrier.await();
++          } catch (Exception e) {
++            throw new RuntimeException(e);
++          }
++          while (running.get()) {
++            try (Lock lock = directory.makeLock("foo.lock")) {
++              if (lock.isLocked() == false && lock.obtain()) {
++                assertTrue(lock.isLocked());
++                assertFalse(assertingLock.isLocked());
++                if (assertingLock.tryLock()) {
++                  assertingLock.unlock();
++                } else {
++                  fail();
++                }
++              }
++            } catch (IOException ex) {
++              //
++            }
++            if (atomicCounter.incrementAndGet() > runs) {
++              running.set(false);
++            }
++          }
++        }
++      };
++      threads[i].start();
++    }
++
++    for (int i = 0; i < threads.length; i++) {
++      threads[i].join();
++    }
++    directory.close();
++  }
++
++  public void testSingleInstanceLockFactoryDoubleObtain() throws Exception {
++    LockFactory lf = new SingleInstanceLockFactory();
++    Directory dir = newFSDirectory(createTempDir(), lf);
++    Lock lock = dir.makeLock("foo");
++    assertTrue(lock.obtain());
++    try {
++      lock.obtain();
++      fail("did not hit double-obtain failure");
++    } catch (LockObtainFailedException lofe) {
++      // expected
++    }
++    lock.close();
++    
++    lock = dir.makeLock("foo");
++    assertTrue(lock.obtain());
++    lock.close();
++    dir.close();
++  }
++
++  public void testSimpleFSLockFactoryDoubleObtain() throws Exception {
++    Directory dir = newFSDirectory(createTempDir(), new SimpleFSLockFactory());
++    Lock lock = dir.makeLock("foo");
++    assertTrue(lock.obtain());
++    try {
++      lock.obtain();
++      fail("did not hit double-obtain failure");
++    } catch (LockObtainFailedException lofe) {
++      // expected
++    }
++    lock.close();
++    
++    lock = dir.makeLock("foo");
++    assertTrue(lock.obtain());
++    lock.close();
++    dir.close();
++  }
++
++  public void testNativeFSLockFactoryDoubleObtain() throws Exception {
++    Directory dir = newFSDirectory(createTempDir(), new NativeFSLockFactory());
++    Lock lock = dir.makeLock("foo");
++    assertTrue(lock.obtain());
++    try {
++      lock.obtain();
++      fail("did not hit double-obtain failure");
++    } catch (LockObtainFailedException lofe) {
++      // expected
++    }
++    lock.close();
++    
++    lock = dir.makeLock("foo");
++    assertTrue(lock.obtain());
++    lock.close();
++    dir.close();
++  }
+ }
+Index: lucene/core
+===================================================================
+--- lucene/core	(revision 1682391)
++++ lucene/core	(working copy)
+
+Property changes on: lucene/core
+___________________________________________________________________
+Modified: svn:mergeinfo
+   Merged /lucene/dev/trunk/lucene/core:r1682327
+Index: lucene/facet/src/test/org/apache/lucene/facet/taxonomy/TestTaxonomyCombined.java
+===================================================================
+--- lucene/facet/src/test/org/apache/lucene/facet/taxonomy/TestTaxonomyCombined.java	(revision 1682391)
++++ lucene/facet/src/test/org/apache/lucene/facet/taxonomy/TestTaxonomyCombined.java	(working copy)
+@@ -916,47 +916,6 @@
+   }
+   
+   /**
+-   * Test what happens if we try to write to a locked taxonomy writer,
+-   * and see that we can unlock it and continue.
+-   */
+-  @Test
+-  public void testWriterLock() throws Exception {
+-    // native fslock impl gets angry if we use it, so use RAMDirectory explicitly.
+-    Directory indexDir = new RAMDirectory();
+-    TaxonomyWriter tw = new DirectoryTaxonomyWriter(indexDir);
+-    tw.addCategory(new FacetLabel("hi", "there"));
+-    tw.commit();
+-    // we deliberately not close the write now, and keep it open and
+-    // locked.
+-    // Verify that the writer worked:
+-    TaxonomyReader tr = new DirectoryTaxonomyReader(indexDir);
+-    assertEquals(2, tr.getOrdinal(new FacetLabel("hi", "there")));
+-    // Try to open a second writer, with the first one locking the directory.
+-    // We expect to get a LockObtainFailedException.
+-    try {
+-      assertNull(new DirectoryTaxonomyWriter(indexDir));
+-      fail("should have failed to write in locked directory");
+-    } catch (LockObtainFailedException e) {
+-      // this is what we expect to happen.
+-    }
+-    // Remove the lock, and now the open should succeed, and we can
+-    // write to the new writer.
+-    DirectoryTaxonomyWriter.unlock(indexDir);
+-    TaxonomyWriter tw2 = new DirectoryTaxonomyWriter(indexDir);
+-    tw2.addCategory(new FacetLabel("hey"));
+-    tw2.close();
+-    // See that the writer indeed wrote:
+-    TaxonomyReader newtr = TaxonomyReader.openIfChanged(tr);
+-    assertNotNull(newtr);
+-    tr.close();
+-    tr = newtr;
+-    assertEquals(3, tr.getOrdinal(new FacetLabel("hey")));
+-    tr.close();
+-    tw.close();
+-    indexDir.close();
+-  }
+-  
+-  /**
+    * fillTaxonomyCheckPaths adds the categories in the categories[] array,
+    * and asserts that the additions return exactly paths specified in
+    * expectedPaths[]. This is the same add fillTaxonomy() but also checks
+Index: lucene/test-framework/src/java/org/apache/lucene/store/MockDirectoryWrapper.java
+===================================================================
+--- lucene/test-framework/src/java/org/apache/lucene/store/MockDirectoryWrapper.java	(revision 1682391)
++++ lucene/test-framework/src/java/org/apache/lucene/store/MockDirectoryWrapper.java	(working copy)
+@@ -34,6 +34,8 @@
+ import java.util.Random;
+ import java.util.Set;
+ import java.util.TreeSet;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentMap;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import org.apache.lucene.index.DirectoryReader;
+@@ -73,6 +75,7 @@
+   boolean assertNoDeleteOpenFile = false;
+   boolean preventDoubleWrite = true;
+   boolean trackDiskUsage = false;
++  boolean wrapLocking = true;
+   boolean wrapLockFactory = true;
+   boolean useSlowOpenClosers = true;
+   boolean enableVirusScanner = true;
+@@ -81,7 +84,7 @@
+   private Set<String> unSyncedFiles;
+   private Set<String> createdFiles;
+   private Set<String> openFilesForWrite = new HashSet<>();
+-  Map<String,Exception> openLocks = Collections.synchronizedMap(new HashMap<String,Exception>());
++  ConcurrentMap<String,RuntimeException> openLocks = new ConcurrentHashMap<>();
+   volatile boolean crashed;
+   private ThrottledIndexOutput throttledOutput;
+   private Throttling throttling = Throttling.SOMETIMES;
+@@ -682,6 +685,19 @@
+     this.wrapLockFactory = v;
+   }
+ 
++  /**
++   * Set to false if you want to return the pure {@link LockFactory} and not
++   * wrap all lock with {@code AssertingLock}.
++   * <p>
++   * Be careful if you turn this off: {@code MockDirectoryWrapper} might
++   * no longer be able to detect if you forget to close an {@link IndexWriter},
++   * and spit out horribly scary confusing exceptions instead of
++   * simply telling you that.
++   */
++  public void setAssertLocks(boolean v) {
++    this.wrapLocking = v;
++  }
++
+   @Override
+   public synchronized void close() throws IOException {
+     // files that we tried to delete, but couldn't because readers were open.
+@@ -708,7 +724,7 @@
+     }
+     if (openLocks.size() > 0) {
+       Exception cause = null;
+-      Iterator<Exception> stacktraces = openLocks.values().iterator();
++      Iterator<RuntimeException> stacktraces = openLocks.values().iterator();
+       if (stacktraces.hasNext()) {
+         cause = stacktraces.next();
+       }
+@@ -945,9 +961,13 @@
+   @Override
+   public synchronized Lock makeLock(String name) {
+     maybeYield();
+-    return getLockFactory().makeLock(name);
++    if (wrapLocking) {
++      return new AssertingLock(super.makeLock(name), name);
++    } else {
++      return super.makeLock(name);
++    }
+   }
+-
++  
+   @Override
+   public synchronized void clearLock(String name) throws IOException {
+     maybeYield();
+@@ -964,6 +984,53 @@
+     this.lockFactory = new MockLockFactoryWrapper(this, lockFactory);
+   }
+ 
++  private final class AssertingLock extends Lock {
++    private final Lock delegateLock;
++    private final String name;
++    private boolean obtained = false;
++    
++    AssertingLock(Lock delegate, String name) {
++      this.delegateLock = delegate;
++      this.name = name;
++    }
++
++    @Override
++    public boolean obtain() throws IOException {
++      if (delegateLock.obtain()) {
++        final RuntimeException exception = openLocks.putIfAbsent(name, new RuntimeException("lock \"" + name + "\" was not released: " + delegateLock));
++        if (exception != null && delegateLock != NoLockFactory.SINGLETON_LOCK) {
++          throw exception;
++        }
++        obtained = true;
++      } else {
++        obtained = false;
++      }
++
++      return obtained;
++    }
++
++    @Override
++    public void close() throws IOException {
++      if (obtained) {
++        RuntimeException remove = openLocks.remove(name);
++        // TODO: fix stupid tests like TestIndexWriter.testNoSegmentFile to not do this!
++        assert remove != null || delegateLock == NoLockFactory.SINGLETON_LOCK;
++        obtained = false;
++      }
++      delegateLock.close();
++    }
++
++    @Override
++    public boolean isLocked() throws IOException {
++      return delegateLock.isLocked();
++    }
++
++    @Override
++    public String toString() {
++      return "AssertingLock(" + delegateLock + ")";
++    }
++  }  
++  
+   @Override
+   public synchronized LockFactory getLockFactory() {
+     maybeYield();
+Index: lucene/test-framework
+===================================================================
+--- lucene/test-framework	(revision 1682391)
++++ lucene/test-framework	(working copy)
+
+Property changes on: lucene/test-framework
+___________________________________________________________________
+Modified: svn:mergeinfo
+   Merged /lucene/dev/trunk/lucene/test-framework:r1682327
+Index: lucene
+===================================================================
+--- lucene	(revision 1682391)
++++ lucene	(working copy)
+
+Property changes on: lucene
+___________________________________________________________________
+Modified: svn:mergeinfo
+   Merged /lucene/dev/trunk/lucene:r1682327
+Index: solr/core/src/java/org/apache/solr/store/hdfs/HdfsLockFactory.java
+===================================================================
+--- solr/core/src/java/org/apache/solr/store/hdfs/HdfsLockFactory.java	(revision 1682391)
++++ solr/core/src/java/org/apache/solr/store/hdfs/HdfsLockFactory.java	(working copy)
+@@ -27,6 +27,7 @@
+ import org.apache.hadoop.ipc.RemoteException;
+ import org.apache.lucene.store.Lock;
+ import org.apache.lucene.store.LockFactory;
++import org.apache.lucene.store.LockObtainFailedException;
+ import org.apache.lucene.store.LockReleaseFailedException;
+ import org.apache.solr.util.IOUtils;
+ import org.slf4j.Logger;
+@@ -105,6 +106,7 @@
+     private Path lockPath;
+     private String lockName;
+     private Configuration conf;
++    private boolean obtained;
+     
+     public HdfsLock(Path lockPath, String lockName, Configuration conf) {
+       this.lockPath = lockPath;
+@@ -114,6 +116,12 @@
+     
+     @Override
+     public boolean obtain() throws IOException {
++
++      if (obtained) {
++        // Our instance is already locked:
++        throw new LockObtainFailedException("this lock instance was already obtained");
++      }
++
+       FSDataOutputStream file = null;
+       FileSystem fs = FileSystem.newInstance(lockPath.toUri(), conf);
+       try {
+@@ -128,12 +136,11 @@
+               // just to check for safe mode
+               fs.mkdirs(lockPath);
+             }
+-
+             
+             file = fs.create(new Path(lockPath, lockName), false);
+             break;
+           } catch (FileAlreadyExistsException e) {
+-            return false;
++            return obtained = false;
+           } catch (RemoteException e) {
+             if (e.getClassName().equals(
+                 "org.apache.hadoop.hdfs.server.namenode.SafeModeException")) {
+@@ -146,10 +153,10 @@
+               continue;
+             }
+             log.error("Error creating lock file", e);
+-            return false;
++            return obtained = false;
+           } catch (IOException e) {
+             log.error("Error creating lock file", e);
+-            return false;
++            return obtained = false;
+           } finally {
+             IOUtils.closeQuietly(file);
+           }
+@@ -157,18 +164,21 @@
+       } finally {
+         IOUtils.closeQuietly(fs);
+       }
+-      return true;
++      return obtained = true;
+     }
+     
+     @Override
+     public void close() throws IOException {
+-      FileSystem fs = FileSystem.newInstance(lockPath.toUri(), conf);
+-      try {
+-        if (fs.exists(new Path(lockPath, lockName))
+-            && !fs.delete(new Path(lockPath, lockName), false)) throw new LockReleaseFailedException(
+-            "failed to delete " + new Path(lockPath, lockName));
+-      } finally {
+-        IOUtils.closeQuietly(fs);
++      if (obtained) {
++        FileSystem fs = FileSystem.newInstance(lockPath.toUri(), conf);
++        try {
++          if (fs.exists(new Path(lockPath, lockName))
++              && !fs.delete(new Path(lockPath, lockName), false)) throw new LockReleaseFailedException(
++              "failed to delete " + new Path(lockPath, lockName));
++        } finally {
++          obtained = false;
++          IOUtils.closeQuietly(fs);
++        }
+       }
+     }
+     
+@@ -183,7 +193,5 @@
+       }
+       return isLocked;
+     }
+-    
+   }
+-  
+ }
+Index: solr/core/src/test/org/apache/solr/store/hdfs/HdfsLockFactoryTest.java
+===================================================================
+--- solr/core/src/test/org/apache/solr/store/hdfs/HdfsLockFactoryTest.java	(revision 1682391)
++++ solr/core/src/test/org/apache/solr/store/hdfs/HdfsLockFactoryTest.java	(working copy)
+@@ -24,6 +24,8 @@
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hdfs.MiniDFSCluster;
+ import org.apache.lucene.store.Lock;
++import org.apache.lucene.store.LockObtainFailedException;
++import org.apache.lucene.util.IOUtils;
+ import org.apache.solr.SolrTestCaseJ4;
+ import org.apache.solr.cloud.hdfs.HdfsTestUtil;
+ import org.junit.After;
+@@ -69,14 +71,36 @@
+     Lock lock = lockFactory.makeLock("testlock");
+     boolean success = lock.obtain();
+     assertTrue("We could not get the lock when it should be available", success);
+-    success = lock.obtain();
++    Lock lock2 = lockFactory.makeLock("testlock");
++    success = lock2.obtain();
+     assertFalse("We got the lock but it should be unavailble", success);
+-    lock.close();
++    IOUtils.close(lock, lock2);
++    // now repeat after close()
++    lock = lockFactory.makeLock("testlock");
+     success = lock.obtain();
+     assertTrue("We could not get the lock when it should be available", success);
+-    success = lock.obtain();
++    lock2 = lockFactory.makeLock("testlock");
++    success = lock2.obtain();
+     assertFalse("We got the lock but it should be unavailble", success);
++    IOUtils.close(lock, lock2);
+   }
+   
+-
+-}
+\ No newline at end of file
++  public void testDoubleObtain() throws Exception {
++    URI uri = dfsCluster.getURI();
++    Path lockPath = new Path(uri.toString(), "/basedir/lock");
++    HdfsLockFactory lockFactory = new HdfsLockFactory(lockPath, new Configuration());
++    Lock lock = lockFactory.makeLock("testlock");
++    assertTrue(lock.obtain());
++    try {
++      lock.obtain();
++      fail("did not hit double-obtain failure");
++    } catch (LockObtainFailedException lofe) {
++      // expected
++    }
++    lock.close();
++    
++    lock = lockFactory.makeLock("foo");
++    assertTrue(lock.obtain());
++    lock.close();
++  }
++}
+Index: solr/core
+===================================================================
+--- solr/core	(revision 1682391)
++++ solr/core	(working copy)
+
+Property changes on: solr/core
+___________________________________________________________________
+Modified: svn:mergeinfo
+   Merged /lucene/dev/trunk/solr/core:r1682327
+Index: solr
+===================================================================
+--- solr	(revision 1682391)
++++ solr	(working copy)
+
+Property changes on: solr
+___________________________________________________________________
+Modified: svn:mergeinfo
+   Merged /lucene/dev/trunk/solr:r1682327
+Index: .
+===================================================================
+--- .	(revision 1682391)
++++ .	(working copy)
+
+Property changes on: .
+___________________________________________________________________
+Modified: svn:mergeinfo
+   Merged /lucene/dev/trunk:r1682327

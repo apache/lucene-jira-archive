@@ -1,0 +1,357 @@
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/lucene70/Lucene70NormsConsumer.java b/lucene/core/src/java/org/apache/lucene/codecs/lucene70/Lucene70NormsConsumer.java
+index d79e246..2e448b4 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/lucene70/Lucene70NormsConsumer.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/lucene70/Lucene70NormsConsumer.java
+@@ -35,6 +35,7 @@ import org.apache.lucene.util.IOUtils;
+  * Writer for {@link Lucene70NormsFormat}
+  */
+ final class Lucene70NormsConsumer extends NormsConsumer {
++  private static final int BLOCK_SIZE = 1 << 14;
+   IndexOutput data, meta;
+   final int maxDoc;
+ 
+@@ -82,13 +83,8 @@ final class Lucene70NormsConsumer extends NormsConsumer {
+   public void addNormsField(FieldInfo field, NormsProducer normsProducer) throws IOException {
+     NumericDocValues values = normsProducer.getNorms(field);
+     int numDocsWithValue = 0;
+-    long min = Long.MAX_VALUE;
+-    long max = Long.MIN_VALUE;
+     for (int doc = values.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = values.nextDoc()) {
+       numDocsWithValue++;
+-      long v = values.longValue();
+-      min = Math.min(min, v);
+-      max = Math.max(max, v);
+     }
+     assert numDocsWithValue <= maxDoc;
+ 
+@@ -109,50 +105,56 @@ final class Lucene70NormsConsumer extends NormsConsumer {
+     }
+ 
+     meta.writeInt(numDocsWithValue);
+-    int numBytesPerValue = numBytesPerValue(min, max);
++    meta.writeInt(BLOCK_SIZE);
++    meta.writeLong(data.getFilePointer());
+ 
+-    meta.writeByte((byte) numBytesPerValue);
+-    if (numBytesPerValue == 0) {
+-      meta.writeLong(min);
+-    } else {
+-      meta.writeLong(data.getFilePointer());
+-      values = normsProducer.getNorms(field);
+-      writeValues(values, numBytesPerValue, data);
++    values = normsProducer.getNorms(field);
++    long[] buffer = new long[BLOCK_SIZE];
++    int upTo = 0;
++    for (int doc = values.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = values.nextDoc()) {
++      buffer[upTo++] = values.longValue();
++      if (upTo == BLOCK_SIZE) {
++        writeBlock(buffer, BLOCK_SIZE);
++        upTo = 0;
++      }
++    }
++    if (upTo > 0) {
++      writeBlock(buffer, upTo);
+     }
++    meta.writeLong(data.getFilePointer());
+   }
+ 
+-  private int numBytesPerValue(long min, long max) {
+-    if (min >= max) {
+-      return 0;
++  private void writeBlock(long[] values, int length) throws IOException {
++    assert length > 0;
++    long min = values[0];
++    long max = values[0];
++    for (int i = 1; i < length; ++i) {
++      final long v = values[i];
++      min = Math.min(min, v);
++      max = Math.max(max, v);
++    }
++    if (min == max) {
++      data.writeByte((byte) 0);
++      data.writeLong(min);
+     } else if (min >= Byte.MIN_VALUE && max <= Byte.MAX_VALUE) {
+-      return 1;
++      data.writeByte((byte) 8);
++      for (int i = 0; i < length; ++i) {
++        data.writeByte((byte) values[i]);
++      }
+     } else if (min >= Short.MIN_VALUE && max <= Short.MAX_VALUE) {
+-      return 2;
++      data.writeByte((byte) 16);
++      for (int i = 0; i < length; ++i) {
++        data.writeShort((short) values[i]);
++      }
+     } else if (min >= Integer.MIN_VALUE && max <= Integer.MAX_VALUE) {
+-      return 4;
++      data.writeByte((byte) 32);
++      for (int i = 0; i < length; ++i) {
++        data.writeInt((int) values[i]);
++      }
+     } else {
+-      return 8;
+-    }
+-  }
+-
+-  private void writeValues(NumericDocValues values, int numBytesPerValue, IndexOutput out) throws IOException, AssertionError {
+-    for (int doc = values.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = values.nextDoc()) {
+-      long value = values.longValue();
+-      switch (numBytesPerValue) {
+-        case 1:
+-          out.writeByte((byte) value);
+-          break;
+-        case 2:
+-          out.writeShort((short) value);
+-          break;
+-        case 4:
+-          out.writeInt((int) value);
+-          break;
+-        case 8:
+-          out.writeLong(value);
+-          break;
+-        default:
+-          throw new AssertionError();
++      data.writeByte((byte) 64);
++      for (int i = 0; i < length; ++i) {
++        data.writeLong(values[i]);
+       }
+     }
+   }
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/lucene70/Lucene70NormsProducer.java b/lucene/core/src/java/org/apache/lucene/codecs/lucene70/Lucene70NormsProducer.java
+index eb7c41a..a47f7b1 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/lucene70/Lucene70NormsProducer.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/lucene70/Lucene70NormsProducer.java
+@@ -88,11 +88,12 @@ final class Lucene70NormsProducer extends NormsProducer {
+   }
+ 
+   static class NormsEntry {
+-    byte bytesPerNorm;
++    int blockSize;
+     long docsWithFieldOffset;
+     long docsWithFieldLength;
+     int numDocsWithField;
+     long normsOffset;
++    long normsEndOffset;
+   }
+ 
+   static abstract class DenseNormsIterator extends NumericDocValues {
+@@ -181,14 +182,15 @@ final class Lucene70NormsProducer extends NormsProducer {
+       entry.docsWithFieldOffset = meta.readLong();
+       entry.docsWithFieldLength = meta.readLong();
+       entry.numDocsWithField = meta.readInt();
+-      entry.bytesPerNorm = meta.readByte();
+-      switch (entry.bytesPerNorm) {
+-        case 0: case 1: case 2: case 4: case 8:
+-          break;
+-        default:
+-          throw new CorruptIndexException("Invalid bytesPerValue: " + entry.bytesPerNorm + ", field: " + info.name, meta);
++      entry.blockSize = meta.readInt();
++      if ((entry.blockSize & (entry.blockSize - 1)) != 0) {
++        throw new CorruptIndexException("Block size must be a power of 2, got " + entry.blockSize, meta);
+       }
+       entry.normsOffset = meta.readLong();
++      entry.normsEndOffset = meta.readLong();
++      if (entry.normsEndOffset < entry.normsOffset) {
++        throw new CorruptIndexException("Backward offsets", meta);
++      }
+       norms.put(info.number, entry);
+     }
+   }
+@@ -200,94 +202,114 @@ final class Lucene70NormsProducer extends NormsProducer {
+       // empty
+       return DocValues.emptyNumeric();
+     } else if (entry.docsWithFieldOffset == -1) {
+-      // dense
+-      if (entry.bytesPerNorm == 0) {
+-        return new DenseNormsIterator(maxDoc) {
+-          @Override
+-          public long longValue() throws IOException {
+-            return entry.normsOffset;
++      final RandomAccessInput slice = data.randomAccessSlice(entry.normsOffset, entry.normsEndOffset - entry.normsOffset);
++      final int mask = entry.blockSize - 1;
++      return new DenseNormsIterator(maxDoc) {
++
++        int bitsPerNorm;
++        long startOffset;
++        long endOffset;
++        int endDoc;
++        long constantValue;
++
++        {
++          readHeader();
++        }
++
++        private void readHeader() throws IOException {
++          bitsPerNorm = slice.readByte(endOffset);
++          startOffset = endOffset + 1;
++          switch (bitsPerNorm) {
++            case 0:
++              constantValue = slice.readLong(startOffset);
++              startOffset += Long.BYTES;
++              break;
++            case 8: case 16: case 32: case 64:
++              break;
++            default:
++              throw new CorruptIndexException("Illegal number of bits per value: " + bitsPerNorm, data);
+           }
+-        };
+-      }
+-      final RandomAccessInput slice = data.randomAccessSlice(entry.normsOffset, entry.numDocsWithField * (long) entry.bytesPerNorm);
+-      switch (entry.bytesPerNorm) {
+-        case 1:
+-          return new DenseNormsIterator(maxDoc) {
+-            @Override
+-            public long longValue() throws IOException {
+-              return slice.readByte(doc);
+-            }
+-          };
+-        case 2:
+-          return new DenseNormsIterator(maxDoc) {
+-            @Override
+-            public long longValue() throws IOException {
+-              return slice.readShort(((long) doc) << 1);
+-            }
+-          };
+-        case 4:
+-          return new DenseNormsIterator(maxDoc) {
+-            @Override
+-            public long longValue() throws IOException {
+-              return slice.readInt(((long) doc) << 2);
+-            }
+-          };
+-        case 8:
+-          return new DenseNormsIterator(maxDoc) {
+-            @Override
+-            public long longValue() throws IOException {
+-              return slice.readLong(((long) doc) << 3);
+-            }
+-          };
+-        default:
+-          // should not happen, we already validate bytesPerNorm in readFields
+-          throw new AssertionError();
+-      }
++          endOffset = startOffset + bitsPerNorm * entry.blockSize / 8L;
++          endDoc += entry.blockSize;
++        }
++
++        @Override
++        public long longValue() throws IOException {
++          while (doc >= endDoc) {
++            readHeader();
++          }
++          switch (bitsPerNorm) {
++            case 0:
++              return constantValue;
++            case 8:
++              return slice.readByte(startOffset + (doc & mask));
++            case 16:
++              return slice.readShort(startOffset + ((doc & mask) << 1));
++            case 32:
++              return slice.readInt(startOffset + ((doc & mask) << 2));
++            case 64:
++              return slice.readLong(startOffset + ((doc & mask) << 3));
++            default:
++              throw new AssertionError();
++          }
++        }
++      };
+     } else {
+       // sparse
+       final IndexedDISI disi = new IndexedDISI(data, entry.docsWithFieldOffset, entry.docsWithFieldLength, entry.numDocsWithField);
+-      if (entry.bytesPerNorm == 0) {
+-        return new SparseNormsIterator(disi) {
+-          @Override
+-          public long longValue() throws IOException {
+-            return entry.normsOffset;
++      final RandomAccessInput slice = data.randomAccessSlice(entry.normsOffset, entry.normsEndOffset - entry.normsOffset);
++      final int mask = entry.blockSize - 1;
++      return new SparseNormsIterator(disi) {
++
++        int bitsPerNorm;
++        long startOffset;
++        long endOffset;
++        int endDoc;
++        long constantValue;
++
++        {
++          readHeader();
++        }
++
++        private void readHeader() throws IOException {
++          bitsPerNorm = slice.readByte(endOffset);
++          startOffset = endOffset + 1;
++          switch (bitsPerNorm) {
++            case 0:
++              constantValue = slice.readLong(startOffset);
++              startOffset += Long.BYTES;
++              break;
++            case 8: case 16: case 32: case 64:
++              break;
++            default:
++              throw new CorruptIndexException("Illegal number of bits per value: " + bitsPerNorm, data);
+           }
+-        };
+-      }
+-      final RandomAccessInput slice = data.randomAccessSlice(entry.normsOffset, entry.numDocsWithField * (long) entry.bytesPerNorm);
+-      switch (entry.bytesPerNorm) {
+-        case 1:
+-          return new SparseNormsIterator(disi) {
+-            @Override
+-            public long longValue() throws IOException {
+-              return slice.readByte(disi.index());
+-            }
+-          };
+-        case 2:
+-          return new SparseNormsIterator(disi) {
+-            @Override
+-            public long longValue() throws IOException {
+-              return slice.readShort(((long) disi.index()) << 1);
+-            }
+-          };
+-        case 4:
+-          return new SparseNormsIterator(disi) {
+-            @Override
+-            public long longValue() throws IOException {
+-              return slice.readInt(((long) disi.index()) << 2);
+-            }
+-          };
+-        case 8:
+-          return new SparseNormsIterator(disi) {
+-            @Override
+-            public long longValue() throws IOException {
+-              return slice.readLong(((long) disi.index()) << 3);
+-            }
+-          };
+-        default:
+-          // should not happen, we already validate bytesPerNorm in readFields
+-          throw new AssertionError();
+-      }
++          endOffset = startOffset + bitsPerNorm * entry.blockSize / 8L;
++          endDoc += entry.blockSize;
++        }
++
++        @Override
++        public long longValue() throws IOException {
++          final int index = disi.index();
++          while (index >= endDoc) {
++            readHeader();
++          }
++          switch (bitsPerNorm) {
++            case 0:
++              return constantValue;
++            case 8:
++              return slice.readByte(startOffset + (index & mask));
++            case 16:
++              return slice.readShort(startOffset + ((index & mask) << 1));
++            case 32:
++              return slice.readInt(startOffset + ((index & mask) << 2));
++            case 64:
++              return slice.readLong(startOffset + ((index & mask) << 3));
++            default:
++              throw new AssertionError();
++          }
++        }
++      };
+     }
+   }
+ 

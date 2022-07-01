@@ -1,0 +1,218 @@
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index c3d43ad7c7..eea5bf70f7 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -283,6 +283,9 @@ Build
+ 
+ Bug fixes:
+ 
++* LUCENE-8669: Fix LatLonShape WITHIN queries that fail with Multiple search Polygons
++  that share the dateline. (Nick Knize)
++
+ * LUCENE-8603: Fix the inversion of right ids for additional nouns in the Korean user dictionary.
+   (Yoo Jeongin via Jim Ferenczi)
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/geo/EdgeTree.java b/lucene/core/src/java/org/apache/lucene/geo/EdgeTree.java
+index fc3540d914..1ce8b88cc6 100644
+--- a/lucene/core/src/java/org/apache/lucene/geo/EdgeTree.java
++++ b/lucene/core/src/java/org/apache/lucene/geo/EdgeTree.java
+@@ -22,7 +22,7 @@ import java.util.Comparator;
+ import org.apache.lucene.index.PointValues.Relation;
+ import org.apache.lucene.util.ArrayUtil;
+ 
+-import static org.apache.lucene.geo.GeoUtils.lineCrossesLine;
++import static org.apache.lucene.geo.GeoUtils.lineRelateLine;
+ import static org.apache.lucene.geo.GeoUtils.orient;
+ 
+ /**
+@@ -147,8 +147,8 @@ public abstract class EdgeTree {
+     }
+ 
+     // we cross
+-    if (tree.crossesTriangle(ax, ay, bx, by, cx, cy)) {
+-      return Relation.CELL_CROSSES_QUERY;
++    if ((shapeRelation = tree.relateTriangle(ax, ay, bx, by, cx, cy)) != Relation.CELL_OUTSIDE_QUERY) {
++      return shapeRelation;
+     }
+ 
+     if (pointInTriangle(tree.lon1, tree.lat1, ax, ay, bx, by, cx, cy) == true) {
+@@ -257,13 +257,14 @@ public abstract class EdgeTree {
+     }
+ 
+     /** Returns true if the triangle crosses any edge in this edge subtree */
+-    boolean crossesTriangle(double ax, double ay, double bx, double by, double cx, double cy) {
++    Relation relateTriangle(double ax, double ay, double bx, double by, double cx, double cy) {
+       // compute bounding box of triangle
+       double minLat = StrictMath.min(StrictMath.min(ay, by), cy);
+       double minLon = StrictMath.min(StrictMath.min(ax, bx), cx);
+       double maxLat = StrictMath.max(StrictMath.max(ay, by), cy);
+       double maxLon = StrictMath.max(StrictMath.max(ax, bx), cx);
+ 
++      Relation r = Relation.CELL_OUTSIDE_QUERY;
+       if (minLat <= max) {
+         double dy = lat1;
+         double ey = lat2;
+@@ -278,38 +279,48 @@ public abstract class EdgeTree {
+             (dx > maxLon && ex > maxLon);
+ 
+         if (outside == false) {
++          int insideEdges = 0;
+           // does triangle's first edge intersect polyline?
+           // ax, ay -> bx, by
+-          if (lineCrossesLine(ax, ay, bx, by, dx, dy, ex, ey)) {
+-            return true;
++          if ((r = lineRelateLine(ax, ay, bx, by, dx, dy, ex, ey)) == Relation.CELL_CROSSES_QUERY) {
++            return r;
++          } else if (r == Relation.CELL_INSIDE_QUERY) {
++            ++insideEdges;
+           }
+ 
+           // does triangle's second edge intersect polyline?
+           // bx, by -> cx, cy
+-          if (lineCrossesLine(bx, by, cx, cy, dx, dy, ex, ey)) {
+-            return true;
++          if ((r = lineRelateLine(bx, by, cx, cy, dx, dy, ex, ey)) == Relation.CELL_CROSSES_QUERY) {
++            return r;
++          } else if (r == Relation.CELL_INSIDE_QUERY) {
++            ++insideEdges;
+           }
+ 
+           // does triangle's third edge intersect polyline?
+           // cx, cy -> ax, ay
+-          if (lineCrossesLine(cx, cy, ax, ay, dx, dy, ex, ey)) {
+-            return true;
++          if ((r = lineRelateLine(cx, cy, ax, ay, dx, dy, ex, ey)) == Relation.CELL_CROSSES_QUERY) {
++            return r;
++          } else if (r == Relation.CELL_INSIDE_QUERY) {
++            ++insideEdges;
++          }
++          if (insideEdges == 3) {
++            return Relation.CELL_INSIDE_QUERY;
+           }
+         }
+ 
+         if (left != null) {
+-          if (left.crossesTriangle(ax, ay, bx, by, cx, cy)) {
+-            return true;
++          if ((r = left.relateTriangle(ax, ay, bx, by, cx, cy)) != Relation.CELL_OUTSIDE_QUERY) {
++            return r;
+           }
+         }
+ 
+         if (right != null && maxLat >= low) {
+-          if (right.crossesTriangle(ax, ay, bx, by, cx, cy)) {
+-            return true;
++          if ((r = right.relateTriangle(ax, ay, bx, by, cx, cy)) != Relation.CELL_OUTSIDE_QUERY) {
++            return r;
+           }
+         }
+       }
+-      return false;
++      return r;
+     }
+ 
+     /** Returns true if the box crosses any edge in this edge subtree */
+diff --git a/lucene/core/src/java/org/apache/lucene/geo/GeoUtils.java b/lucene/core/src/java/org/apache/lucene/geo/GeoUtils.java
+index 0c73032143..eb797e2580 100644
+--- a/lucene/core/src/java/org/apache/lucene/geo/GeoUtils.java
++++ b/lucene/core/src/java/org/apache/lucene/geo/GeoUtils.java
+@@ -194,18 +194,27 @@ public final class GeoUtils {
+     }
+   }
+ 
+-  /** uses orient method to compute whether two line segments cross */
+-  public static boolean lineCrossesLine(double a1x, double a1y, double b1x, double b1y, double a2x, double a2y, double b2x, double b2y) {
++  /**
++   * uses orient method to compute relation between two line segments
++   * note the following return values:
++   * CELL_CROSSES_QUERY - if the two line segments fully cross
++   * CELL_INSIDE_QUERY - if the one line segment terminates on the other
++   * CELL_OUTSIDE_QUERY - if the two segments do not cross
++   **/
++  public static Relation lineRelateLine(double a1x, double a1y, double b1x, double b1y, double a2x, double a2y, double b2x, double b2y) {
+     // shortcut: either "line" is actually a point
+     if ((a1x == b1x && a1y == b1y) || (a2x == b2x && a2y == b2y)) {
+-      return false;
++      return Relation.CELL_OUTSIDE_QUERY;
+     }
+ 
+-    if (orient(a2x, a2y, b2x, b2y, a1x, a1y) * orient(a2x, a2y, b2x, b2y, b1x, b1y) <= 0 &&
+-        orient(a1x, a1y, b1x, b1y, a2x, a2y) * orient(a1x, a1y, b1x, b1y, b2x, b2y) <= 0) {
+-      return true;
++    int a = orient(a2x, a2y, b2x, b2y, a1x, a1y) * orient(a2x, a2y, b2x, b2y, b1x, b1y);
++    int b = orient(a1x, a1y, b1x, b1y, a2x, a2y) * orient(a1x, a1y, b1x, b1y, b2x, b2y);
++
++    if (a <= 0 && b <= 0) {
++      return a == 0 || b == 0 ? Relation.CELL_INSIDE_QUERY : Relation.CELL_CROSSES_QUERY;
+     }
+-    return false;
++
++    return Relation.CELL_OUTSIDE_QUERY;
+   }
+ 
+   /**
+diff --git a/lucene/core/src/java/org/apache/lucene/geo/Polygon2D.java b/lucene/core/src/java/org/apache/lucene/geo/Polygon2D.java
+index fee23d0ed4..c90970ae44 100644
+--- a/lucene/core/src/java/org/apache/lucene/geo/Polygon2D.java
++++ b/lucene/core/src/java/org/apache/lucene/geo/Polygon2D.java
+@@ -92,7 +92,7 @@ public final class Polygon2D extends EdgeTree {
+     // check each corner: if < 3 are present, its cheaper than crossesSlowly
+     int numCorners = numberOfTriangleCorners(ax, ay, bx, by, cx, cy);
+     if (numCorners == 3) {
+-      if (tree.crossesTriangle(ax, ay, bx, by, cx, cy)) {
++      if (tree.relateTriangle(ax, ay, bx, by, cx, cy) == Relation.CELL_CROSSES_QUERY) {
+         return Relation.CELL_CROSSES_QUERY;
+       }
+       return Relation.CELL_INSIDE_QUERY;
+diff --git a/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonShape.java b/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonShape.java
+index c4e0581473..d16ec232de 100644
+--- a/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonShape.java
++++ b/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonShape.java
+@@ -800,4 +800,47 @@ public class TestLatLonShape extends LuceneTestCase {
+     assertTrue(encoded[5] == alonEnc);
+   }
+ 
++  public void testLUCENE8669() throws Exception {
++    Directory dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++    Document doc = new Document();
++
++    Polygon indexPoly1 = new Polygon(
++        new double[] {-7.5d, 15d, 15d, 0d, -7.5d},
++        new double[] {-180d, -180d, -176d, -176d, -180d}
++    );
++
++    Polygon indexPoly2 = new Polygon(
++        new double[] {15d, -7.5d, -15d, -10d, 15d, 15d},
++        new double[] {180d, 180d, 176d, 174d, 176d, 180d}
++    );
++
++    Field[] fields = LatLonShape.createIndexableFields("test", indexPoly1);
++    for (Field f : fields) {
++      doc.add(f);
++    }
++    fields = LatLonShape.createIndexableFields("test", indexPoly2);
++    for (Field f : fields) {
++      doc.add(f);
++    }
++    w.addDocument(doc);
++    w.forceMerge(1);
++
++    ///// search //////
++    IndexReader reader = w.getReader();
++    w.close();
++    IndexSearcher searcher = newSearcher(reader);
++
++    Polygon[] searchPoly = new Polygon[] {
++        new Polygon(new double[] {-20d, 20d, 20d, -20d, -20d},
++            new double[] {-180d, -180d, -170d, -170d, -180d}),
++        new Polygon(new double[] {20d, -20d, -20d, 20d, 20d},
++            new double[] {180d, 180d, 170d, 170d, 180d})
++    };
++
++    Query q = LatLonShape.newPolygonQuery("test", QueryRelation.WITHIN, searchPoly);
++    assertEquals(1, searcher.count(q));
++
++    IOUtils.close(w, reader, dir);
++  }
+ }

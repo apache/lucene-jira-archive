@@ -1,0 +1,364 @@
+Index: lucene/CHANGES.txt
+===================================================================
+--- lucene/CHANGES.txt	(revision 1183267)
++++ lucene/CHANGES.txt	(working copy)
+@@ -596,6 +596,11 @@
+   rarely cause deletions to be incorrectly applied.  (Yonik Seeley,
+   Simon Willnauer, Mike McCandless)
+ 
++* LUCENE-3515: Fix terrible merge performance versus 3.x, especially
++  when the directory isn't MMapDirectory, due to failing to reuse
++  DocsAndPositionsEnum while merging (Marc Sturlese, Erick Erickson,
++  Robert Muir, Simon Willnauer, Mike McCandless)
++
+ ======================= Lucene 3.5.0 =======================
+ 
+ Changes in backwards compatibility policy
+Index: lucene/src/test/org/apache/lucene/index/TestRollingUpdates.java
+===================================================================
+--- lucene/src/test/org/apache/lucene/index/TestRollingUpdates.java	(revision 1183267)
++++ lucene/src/test/org/apache/lucene/index/TestRollingUpdates.java	(working copy)
+@@ -42,6 +42,7 @@
+     }
+ 
+     final IndexWriter w = new IndexWriter(dir, newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random)).setCodecProvider(provider));
++    w.setInfoStream(VERBOSE ? System.out : null);
+     final int SIZE = atLeast(TEST_NIGHTLY ? 100 : 20);
+     int id = 0;
+     IndexReader r = null;
+Index: lucene/src/test/org/apache/lucene/index/TestForTooMuchCloning.java
+===================================================================
+--- lucene/src/test/org/apache/lucene/index/TestForTooMuchCloning.java	(revision 0)
++++ lucene/src/test/org/apache/lucene/index/TestForTooMuchCloning.java	(revision 0)
+@@ -0,0 +1,83 @@
++package org.apache.lucene.index;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.util.*;
++
++import org.apache.lucene.analysis.MockAnalyzer;
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.TextField;
++import org.apache.lucene.index.codecs.CodecProvider;
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.TermRangeQuery;
++import org.apache.lucene.search.TopDocs;
++import org.apache.lucene.store.MockDirectoryWrapper;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util._TestUtil;
++
++public class TestForTooMuchCloning extends LuceneTestCase {
++
++  // Make sure we don't clone IndexInputs too frequently
++  // during merging:
++  public void test() throws Exception {
++    String codec = CodecProvider.getDefault().getFieldCodec("field");
++    // TODO: once LUCENE-3517 is fixed, remove this:
++    assumeFalse("PulsingCodec fails this test because of over-cloning", codec.equals("Pulsing") || codec.equals("MockRandom"));
++    final MockDirectoryWrapper dir = newDirectory();
++    final TieredMergePolicy tmp = new TieredMergePolicy();
++    tmp.setMaxMergeAtOnce(2);
++    final RandomIndexWriter w = new RandomIndexWriter(random, dir,
++                                                      newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random)).setMaxBufferedDocs(2).setMergePolicy(tmp));
++    final int numDocs = 20;
++    for(int docs=0;docs<numDocs;docs++) {
++      StringBuilder sb = new StringBuilder();
++      for(int terms=0;terms<100;terms++) {
++        sb.append(_TestUtil.randomRealisticUnicodeString(random));
++        sb.append(' ');
++      }
++      final Document doc = new Document();
++      doc.add(new TextField("field", sb.toString()));
++      w.addDocument(doc);
++    }
++    final IndexReader r = w.getReader();
++    w.close();
++
++    final int cloneCount = dir.getInputCloneCount();
++    //System.out.println("merge clone count=" + cloneCount);
++    assertTrue("too many calls to IndexInput.clone during merging: " + dir.getInputCloneCount(), cloneCount < 500);
++
++    final IndexSearcher s = new IndexSearcher(r);
++
++    // MTQ that matches all terms so the AUTO_REWRITE should
++    // cutover to filter rewrite and reuse a single DocsEnum
++    // across all terms;
++    final TopDocs hits = s.search(new TermRangeQuery("field",
++                                                     new BytesRef(),
++                                                     new BytesRef("\uFFFF"),
++                                                     true,
++                                                     true), 10);
++    assertTrue(hits.totalHits > 0);
++    final int queryCloneCount = dir.getInputCloneCount() - cloneCount;
++    //System.out.println("query clone count=" + queryCloneCount);
++    assertTrue("too many calls to IndexInput.clone during TermRangeQuery: " + queryCloneCount, queryCloneCount < 50);
++    s.close();
++    r.close();
++    dir.close();
++  }
++}
+
+Property changes on: lucene/src/test/org/apache/lucene/index/TestForTooMuchCloning.java
+___________________________________________________________________
+Added: svn:eol-style
+   + native
+
+Index: lucene/src/java/org/apache/lucene/index/MultiDocsEnum.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/index/MultiDocsEnum.java	(revision 1183267)
++++ lucene/src/java/org/apache/lucene/index/MultiDocsEnum.java	(working copy)
+@@ -27,6 +27,8 @@
+  */
+ 
+ public final class MultiDocsEnum extends DocsEnum {
++  private final MultiTermsEnum parent;
++  final DocsEnum[] subDocsEnum;
+   private EnumWithSlice[] subs;
+   int numSubs;
+   int upto;
+@@ -34,6 +36,11 @@
+   int currentBase;
+   int doc = -1;
+ 
++  public MultiDocsEnum(MultiTermsEnum parent, int subReaderCount) {
++    this.parent = parent;
++    subDocsEnum = new DocsEnum[subReaderCount];
++  }
++
+   MultiDocsEnum reset(final EnumWithSlice[] subs, final int numSubs) throws IOException {
+     this.numSubs = numSubs;
+ 
+@@ -48,6 +55,10 @@
+     return this;
+   }
+ 
++  public boolean canReuse(MultiTermsEnum parent) {
++    return this.parent == parent;
++  }
++
+   public int getNumSubs() {
+     return numSubs;
+   }
+Index: lucene/src/java/org/apache/lucene/index/MultiDocsAndPositionsEnum.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/index/MultiDocsAndPositionsEnum.java	(revision 1183267)
++++ lucene/src/java/org/apache/lucene/index/MultiDocsAndPositionsEnum.java	(working copy)
+@@ -29,6 +29,8 @@
+  */
+ 
+ public final class MultiDocsAndPositionsEnum extends DocsAndPositionsEnum {
++  private final MultiTermsEnum parent;
++  final DocsAndPositionsEnum[] subDocsAndPositionsEnum;
+   private EnumWithSlice[] subs;
+   int numSubs;
+   int upto;
+@@ -36,7 +38,16 @@
+   int currentBase;
+   int doc = -1;
+ 
+-  MultiDocsAndPositionsEnum reset(final EnumWithSlice[] subs, final int numSubs) throws IOException {
++  public MultiDocsAndPositionsEnum(MultiTermsEnum parent, int subReaderCount) {
++    this.parent = parent;
++    subDocsAndPositionsEnum = new DocsAndPositionsEnum[subReaderCount];
++  }
++
++  public boolean canReuse(MultiTermsEnum parent) {
++    return this.parent == parent;
++  }
++
++  public MultiDocsAndPositionsEnum reset(final EnumWithSlice[] subs, final int numSubs) throws IOException {
+     this.numSubs = numSubs;
+     this.subs = new EnumWithSlice[subs.length];
+     for(int i=0;i<subs.length;i++) {
+Index: lucene/src/java/org/apache/lucene/index/MultiTermsEnum.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/index/MultiTermsEnum.java	(revision 1183267)
++++ lucene/src/java/org/apache/lucene/index/MultiTermsEnum.java	(working copy)
+@@ -77,7 +77,7 @@
+     subDocs = new MultiDocsEnum.EnumWithSlice[slices.length];
+     subDocsAndPositions = new MultiDocsAndPositionsEnum.EnumWithSlice[slices.length];
+     for(int i=0;i<slices.length;i++) {
+-      subs[i] = new TermsEnumWithSlice(slices[i]);
++      subs[i] = new TermsEnumWithSlice(i, slices[i]);
+       subDocs[i] = new MultiDocsEnum.EnumWithSlice();
+       subDocs[i].slice = slices[i];
+       subDocsAndPositions[i] = new MultiDocsAndPositionsEnum.EnumWithSlice();
+@@ -347,11 +347,16 @@
+ 
+   @Override
+   public DocsEnum docs(Bits liveDocs, DocsEnum reuse) throws IOException {
+-    final MultiDocsEnum docsEnum;
+-    if (reuse != null) {
++    MultiDocsEnum docsEnum;
++    // Can only reuse if incoming enum is also a MultiDocsEnum
++    if (reuse != null && reuse instanceof MultiDocsEnum) {
+       docsEnum = (MultiDocsEnum) reuse;
++      // ... and was previously created w/ this MultiTermsEnum:
++      if (!docsEnum.canReuse(this)) {
++        docsEnum = new MultiDocsEnum(this, subs.length);
++      }
+     } else {
+-      docsEnum = new MultiDocsEnum();
++      docsEnum = new MultiDocsEnum(this, subs.length);
+     }
+     
+     final MultiBits multiLiveDocs;
+@@ -390,8 +395,11 @@
+         b = null;
+       }
+ 
+-      final DocsEnum subDocsEnum = entry.terms.docs(b, null);
++      assert entry.index < docsEnum.subDocsEnum.length: entry.index + " vs " + docsEnum.subDocsEnum.length + "; " + subs.length;
++      final DocsEnum subDocsEnum = entry.terms.docs(b, docsEnum.subDocsEnum[entry.index]);
++
+       if (subDocsEnum != null) {
++        docsEnum.subDocsEnum[entry.index] = subDocsEnum;
+         subDocs[upto].docsEnum = subDocsEnum;
+         subDocs[upto].slice = entry.subSlice;
+ 
+@@ -408,11 +416,16 @@
+ 
+   @Override
+   public DocsAndPositionsEnum docsAndPositions(Bits liveDocs, DocsAndPositionsEnum reuse) throws IOException {
+-    final MultiDocsAndPositionsEnum docsAndPositionsEnum;
+-    if (reuse != null) {
++    MultiDocsAndPositionsEnum docsAndPositionsEnum;
++    // Can only reuse if incoming enum is also a MultiDocsAndPositionsEnum
++    if (reuse != null && reuse instanceof MultiDocsAndPositionsEnum) {
+       docsAndPositionsEnum = (MultiDocsAndPositionsEnum) reuse;
++      // ... and was previously created w/ this MultiTermsEnum:
++      if (!docsAndPositionsEnum.canReuse(this)) {
++        docsAndPositionsEnum = new MultiDocsAndPositionsEnum(this, subs.length);
++      }
+     } else {
+-      docsAndPositionsEnum = new MultiDocsAndPositionsEnum();
++      docsAndPositionsEnum = new MultiDocsAndPositionsEnum(this, subs.length);
+     }
+     
+     final MultiBits multiLiveDocs;
+@@ -452,9 +465,11 @@
+         b = null;
+       }
+ 
+-      final DocsAndPositionsEnum subPostings = entry.terms.docsAndPositions(b, null);
++      assert entry.index < docsAndPositionsEnum.subDocsAndPositionsEnum.length: entry.index + " vs " + docsAndPositionsEnum.subDocsAndPositionsEnum.length + "; " + subs.length;
++      final DocsAndPositionsEnum subPostings = entry.terms.docsAndPositions(b, docsAndPositionsEnum.subDocsAndPositionsEnum[entry.index]);
+ 
+       if (subPostings != null) {
++        docsAndPositionsEnum.subDocsAndPositionsEnum[entry.index] = subPostings;
+         subDocsAndPositions[upto].docsAndPositionsEnum = subPostings;
+         subDocsAndPositions[upto].slice = entry.subSlice;
+         upto++;
+@@ -479,9 +494,11 @@
+     private final ReaderUtil.Slice subSlice;
+     private TermsEnum terms;
+     public BytesRef current;
++    final int index;
+ 
+-    public TermsEnumWithSlice(ReaderUtil.Slice subSlice) {
++    public TermsEnumWithSlice(int index, ReaderUtil.Slice subSlice) {
+       this.subSlice = subSlice;
++      this.index = index;
+       assert subSlice.length >= 0: "length=" + subSlice.length;
+     }
+ 
+Index: lucene/src/java/org/apache/lucene/index/codecs/simpletext/SimpleTextFieldsReader.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/index/codecs/simpletext/SimpleTextFieldsReader.java	(revision 1183267)
++++ lucene/src/java/org/apache/lucene/index/codecs/simpletext/SimpleTextFieldsReader.java	(working copy)
+@@ -216,7 +216,7 @@
+     @Override
+     public DocsEnum docs(Bits liveDocs, DocsEnum reuse) throws IOException {
+       SimpleTextDocsEnum docsEnum;
+-      if (reuse != null && reuse instanceof SimpleTextDocsEnum && ((SimpleTextDocsEnum) reuse).canReuse(in)) {
++      if (reuse != null && reuse instanceof SimpleTextDocsEnum && ((SimpleTextDocsEnum) reuse).canReuse(SimpleTextFieldsReader.this.in)) {
+         docsEnum = (SimpleTextDocsEnum) reuse;
+       } else {
+         docsEnum = new SimpleTextDocsEnum();
+@@ -231,7 +231,7 @@
+       }
+ 
+       SimpleTextDocsAndPositionsEnum docsAndPositionsEnum;
+-      if (reuse != null && reuse instanceof SimpleTextDocsAndPositionsEnum && ((SimpleTextDocsAndPositionsEnum) reuse).canReuse(in)) {
++      if (reuse != null && reuse instanceof SimpleTextDocsAndPositionsEnum && ((SimpleTextDocsAndPositionsEnum) reuse).canReuse(SimpleTextFieldsReader.this.in)) {
+         docsAndPositionsEnum = (SimpleTextDocsAndPositionsEnum) reuse;
+       } else {
+         docsAndPositionsEnum = new SimpleTextDocsAndPositionsEnum();
+@@ -249,7 +249,7 @@
+     private final IndexInput inStart;
+     private final IndexInput in;
+     private boolean omitTF;
+-    private int docID;
++    private int docID = -1;
+     private int tf;
+     private Bits liveDocs;
+     private final BytesRef scratch = new BytesRef(10);
+@@ -268,6 +268,7 @@
+       this.liveDocs = liveDocs;
+       in.seek(fp);
+       this.omitTF = omitTF;
++      docID = -1;
+       if (omitTF) {
+         tf = 1;
+       }
+Index: lucene/src/test-framework/org/apache/lucene/store/MockDirectoryWrapper.java
+===================================================================
+--- lucene/src/test-framework/org/apache/lucene/store/MockDirectoryWrapper.java	(revision 1183267)
++++ lucene/src/test-framework/org/apache/lucene/store/MockDirectoryWrapper.java	(working copy)
+@@ -30,6 +30,7 @@
+ import java.util.Map;
+ import java.util.Random;
+ import java.util.Set;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.codecs.CodecProvider;
+@@ -74,6 +75,8 @@
+   private ThrottledIndexOutput throttledOutput;
+   private Throttling throttling = Throttling.SOMETIMES;
+ 
++  final AtomicInteger inputCloneCount = new AtomicInteger();
++
+   // use this for tracking files for crash.
+   // additionally: provides debugging information in case you leave one open
+   private Map<Closeable,Exception> openFileHandles = Collections.synchronizedMap(new IdentityHashMap<Closeable,Exception>());
+@@ -117,6 +120,10 @@
+     init();
+   }
+ 
++  public int getInputCloneCount() {
++    return inputCloneCount.get();
++  }
++
+   public void setTrackDiskUsage(boolean v) {
+     trackDiskUsage = v;
+   }
+Index: lucene/src/test-framework/org/apache/lucene/store/MockIndexInputWrapper.java
+===================================================================
+--- lucene/src/test-framework/org/apache/lucene/store/MockIndexInputWrapper.java	(revision 1183267)
++++ lucene/src/test-framework/org/apache/lucene/store/MockIndexInputWrapper.java	(working copy)
+@@ -57,6 +57,7 @@
+ 
+   @Override
+   public Object clone() {
++    dir.inputCloneCount.incrementAndGet();
+     IndexInput iiclone = (IndexInput) delegate.clone();
+     MockIndexInputWrapper clone = new MockIndexInputWrapper(dir, name, iiclone);
+     clone.isClone = true;

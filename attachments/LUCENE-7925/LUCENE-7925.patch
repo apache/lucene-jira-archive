@@ -1,0 +1,183 @@
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index 8edd0bd..3ca7500 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -24,6 +24,9 @@ Optimizations
+ * LUCENE-7655: Speed up geo-distance queries in case of dense single-valued
+   fields when most documents match. (Maciej Zasada via Adrien Grand)
+ 
++* LUCENE-7925: Collapse duplicate SHOULD or MUST clauses by summing up their
++  boosts. (Adrien Grand)
++
+ Bug Fixes
+ 
+ * LUCENE-7914: Add a maximum recursion level in automaton recursive
+diff --git a/lucene/core/src/java/org/apache/lucene/search/BooleanQuery.java b/lucene/core/src/java/org/apache/lucene/search/BooleanQuery.java
+index b1f507a..a3f5ae0 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/BooleanQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/BooleanQuery.java
+@@ -23,6 +23,7 @@ import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.EnumMap;
++import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.Iterator;
+ import java.util.List;
+@@ -332,6 +333,69 @@ public class BooleanQuery extends Query implements Iterable<BooleanClause> {
+       }
+     }
+ 
++    // Deduplicate SHOULD clauses by summing up their boosts
++    if (clauseSets.get(Occur.SHOULD).size() > 0 && minimumNumberShouldMatch <= 1) {
++      Map<Query, Double> shouldClauses = new HashMap<>();
++      for (Query query : clauseSets.get(Occur.SHOULD)) {
++        double boost = 1;
++        while (query instanceof BoostQuery) {
++          BoostQuery bq = (BoostQuery) query;
++          boost *= bq.getBoost();
++          query = bq.getQuery();
++        }
++        shouldClauses.put(query, shouldClauses.getOrDefault(query, 0d) + boost);
++      }
++      if (shouldClauses.size() != clauseSets.get(Occur.SHOULD).size()) {
++        BooleanQuery.Builder builder = new BooleanQuery.Builder()
++            .setMinimumNumberShouldMatch(minimumNumberShouldMatch);
++        for (Map.Entry<Query,Double> entry : shouldClauses.entrySet()) {
++          Query query = entry.getKey();
++          float boost = entry.getValue().floatValue();
++          if (boost != 1f) {
++            query = new BoostQuery(query, boost);
++          }
++          builder.add(query, Occur.SHOULD);
++        }
++        for (BooleanClause clause : clauses) {
++          if (clause.getOccur() != Occur.SHOULD) {
++            builder.add(clause);
++          }
++        }
++        return builder.build();
++      }
++    }
++
++    // Deduplicate MUST clauses by summing up their boosts
++    if (clauseSets.get(Occur.MUST).size() > 0) {
++      Map<Query, Double> mustClauses = new HashMap<>();
++      for (Query query : clauseSets.get(Occur.MUST)) {
++        double boost = 1;
++        while (query instanceof BoostQuery) {
++          BoostQuery bq = (BoostQuery) query;
++          boost *= bq.getBoost();
++          query = bq.getQuery();
++        }
++        mustClauses.put(query, mustClauses.getOrDefault(query, 0d) + boost);
++      }
++      if (mustClauses.size() != clauseSets.get(Occur.MUST).size()) {
++        BooleanQuery.Builder builder = new BooleanQuery.Builder()
++            .setMinimumNumberShouldMatch(minimumNumberShouldMatch);
++        for (Map.Entry<Query,Double> entry : mustClauses.entrySet()) {
++          Query query = entry.getKey();
++          float boost = entry.getValue().floatValue();
++          if (boost != 1f) {
++            query = new BoostQuery(query, boost);
++          }
++          builder.add(query, Occur.MUST);
++        }
++        for (BooleanClause clause : clauses) {
++          if (clause.getOccur() != Occur.MUST) {
++            builder.add(clause);
++          }
++        }
++        return builder.build();
++      }
++    }
+ 
+     // Rewrite queries whose single scoring clause is a MUST clause on a
+     // MatchAllDocsQuery to a ConstantScoreQuery
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestBooleanRewrites.java b/lucene/core/src/test/org/apache/lucene/search/TestBooleanRewrites.java
+index 1fd3d4b..9337bf7 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestBooleanRewrites.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestBooleanRewrites.java
+@@ -427,4 +427,57 @@ public class TestBooleanRewrites extends LuceneTestCase {
+       assertEquals(expectedScore, actualScore, expectedScore / 100); // error under 1%
+     }
+   }
++
++  public void testDeduplicateShouldClauses() throws IOException {
++    IndexSearcher searcher = newSearcher(new MultiReader());
++
++    Query query = new BooleanQuery.Builder()
++        .add(new TermQuery(new Term("foo", "bar")), Occur.SHOULD)
++        .add(new TermQuery(new Term("foo", "bar")), Occur.SHOULD)
++        .build();
++    Query expected = new BoostQuery(new TermQuery(new Term("foo", "bar")), 2);
++    assertEquals(expected, searcher.rewrite(query));
++
++    query = new BooleanQuery.Builder()
++        .add(new TermQuery(new Term("foo", "bar")), Occur.SHOULD)
++        .add(new BoostQuery(new TermQuery(new Term("foo", "bar")), 2), Occur.SHOULD)
++        .add(new TermQuery(new Term("foo", "quux")), Occur.SHOULD)
++        .build();
++    expected = new BooleanQuery.Builder()
++        .add(new BoostQuery(new TermQuery(new Term("foo", "bar")), 3), Occur.SHOULD)
++        .add(new TermQuery(new Term("foo", "quux")), Occur.SHOULD)
++        .build();
++    assertEquals(expected, searcher.rewrite(query));
++
++    query = new BooleanQuery.Builder()
++        .setMinimumNumberShouldMatch(2)
++        .add(new TermQuery(new Term("foo", "bar")), Occur.SHOULD)
++        .add(new TermQuery(new Term("foo", "bar")), Occur.SHOULD)
++        .add(new TermQuery(new Term("foo", "quux")), Occur.SHOULD)
++        .build();
++    expected = query;
++    assertEquals(expected, searcher.rewrite(query));
++  }
++
++  public void testDeduplicateMustClauses() throws IOException {
++    IndexSearcher searcher = newSearcher(new MultiReader());
++
++    Query query = new BooleanQuery.Builder()
++        .add(new TermQuery(new Term("foo", "bar")), Occur.MUST)
++        .add(new TermQuery(new Term("foo", "bar")), Occur.MUST)
++        .build();
++    Query expected = new BoostQuery(new TermQuery(new Term("foo", "bar")), 2);
++    assertEquals(expected, searcher.rewrite(query));
++
++    query = new BooleanQuery.Builder()
++        .add(new TermQuery(new Term("foo", "bar")), Occur.MUST)
++        .add(new BoostQuery(new TermQuery(new Term("foo", "bar")), 2), Occur.MUST)
++        .add(new TermQuery(new Term("foo", "quux")), Occur.MUST)
++        .build();
++    expected = new BooleanQuery.Builder()
++        .add(new BoostQuery(new TermQuery(new Term("foo", "bar")), 3), Occur.MUST)
++        .add(new TermQuery(new Term("foo", "quux")), Occur.MUST)
++        .build();
++    assertEquals(expected, searcher.rewrite(query));
++  }
+ }
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestConstantScoreQuery.java b/lucene/core/src/test/org/apache/lucene/search/TestConstantScoreQuery.java
+index 7671cc0..f97afd5 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestConstantScoreQuery.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestConstantScoreQuery.java
+@@ -90,7 +90,8 @@ public class TestConstantScoreQuery extends LuceneTestCase {
+       RandomIndexWriter writer = new RandomIndexWriter (random(), directory);
+ 
+       Document doc = new Document();
+-      doc.add(newStringField("field", "term", Field.Store.NO));
++      doc.add(newStringField("field", "term1", Field.Store.NO));
++      doc.add(newStringField("field", "term2", Field.Store.NO));
+       writer.addDocument(doc);
+ 
+       reader = writer.getReader();
+@@ -99,8 +100,8 @@ public class TestConstantScoreQuery extends LuceneTestCase {
+       searcher = newSearcher(reader, true, false);
+       searcher.setQueryCache(null); // to assert on scorer impl
+       
+-      final BoostQuery csq1 = new BoostQuery(new ConstantScoreQuery(new TermQuery(new Term ("field", "term"))), 2f);
+-      final BoostQuery csq2 = new BoostQuery(new ConstantScoreQuery(csq1), 5f);
++      final BoostQuery csq1 = new BoostQuery(new ConstantScoreQuery(new TermQuery(new Term ("field", "term1"))), 2f);
++      final BoostQuery csq2 = new BoostQuery(new ConstantScoreQuery(new ConstantScoreQuery(new TermQuery(new Term ("field", "term2")))), 5f);
+       
+       final BooleanQuery.Builder bq = new BooleanQuery.Builder();
+       bq.add(csq1, BooleanClause.Occur.SHOULD);

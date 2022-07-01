@@ -1,0 +1,459 @@
+Index: lucene/CHANGES.txt
+===================================================================
+--- lucene/CHANGES.txt	(revision 1619706)
++++ lucene/CHANGES.txt	(working copy)
+@@ -109,6 +109,13 @@
+ 
+ * LUCENE-5672: IndexWriter.addIndexes() calls maybeMerge(), to ensure the index stays
+   healthy. If you don't want merging use NoMergePolicy instead. (Robert Muir)
++  
++* LUCENE-5897, LUCENE-5400: JFlex-based tokenizers StandardTokenizer and
++  UAX29URLEmailTokenizer tokenize extremely slowly over long sequences of
++  text partially matching certain grammar rules.  The scanner default
++  buffer size was reduced, and scanner buffer growth was disabled, resulting
++  in much, much faster tokenization for these text sequences.  
++  (Chris Geeringh, Robert Muir, Steve Rowe)
+ 
+ ======================= Lucene 4.10.0 ======================
+ 
+Index: lucene/analysis/common/build.xml
+===================================================================
+--- lucene/analysis/common/build.xml	(revision 1619706)
++++ lucene/analysis/common/build.xml	(working copy)
+@@ -59,12 +59,14 @@
+   </target>
+ 
+   <target name="-jflex-StandardAnalyzer" depends="init,-install-jflex">
+-    <run-jflex dir="src/java/org/apache/lucene/analysis/standard" name="StandardTokenizerImpl"/>
++    <run-jflex-and-disable-buffer-expansion 
++        dir="src/java/org/apache/lucene/analysis/standard" name="StandardTokenizerImpl"/>
+     <run-jflex dir="src/java/org/apache/lucene/analysis/standard" name="ClassicTokenizerImpl"/>
+   </target>
+ 
+   <target name="-jflex-UAX29URLEmailTokenizer" depends="init,-install-jflex">
+-    <run-jflex dir="src/java/org/apache/lucene/analysis/standard" name="UAX29URLEmailTokenizerImpl"/>
++    <run-jflex-and-disable-buffer-expansion
++        dir="src/java/org/apache/lucene/analysis/standard" name="UAX29URLEmailTokenizerImpl"/>
+   </target>
+   
+   <macrodef name="run-jflex">
+@@ -75,6 +77,27 @@
+     </sequential>
+   </macrodef>
+ 
++  <macrodef name="run-jflex-and-disable-buffer-expansion">
++    <attribute name="dir"/>
++    <attribute name="name"/>
++    <sequential>
++      <jflex file="@{dir}/@{name}.jflex" outdir="@{dir}" nobak="on" inputstreamctor="false"/>
++      <!-- LUCENE-5897: Disallow scanner buffer expansion -->
++      <replaceregexp file="@{dir}/@{name}.java"
++                     match="[ \t]*/\* is the buffer big enough\? \*/\s+if \(zzCurrentPos >= zzBuffer\.length.*?\}[ \t]*\r?\n"
++                     replace="" flags="s" />
++      <replaceregexp file="@{dir}/@{name}.java"
++                     match="private static final int ZZ_BUFFERSIZE ="
++                     replace="private int ZZ_BUFFERSIZE ="/>
++      <replaceregexp file="@{dir}/@{name}.java"
++                     match="int requested = zzBuffer.length - zzEndRead;"
++                     replace="int requested = zzBuffer.length - zzEndRead - zzFinalHighSurrogate;"/>
++      <replaceregexp file="@{dir}/@{name}.java"
++                     match="(zzFinalHighSurrogate = 1;)(\r?\n)"
++                     replace="\1\2          if (totalRead == 1) { return true; }\2"/>
++    </sequential>
++  </macrodef>
++
+   <target name="clean-jflex">
+     <delete>
+       <fileset dir="src/java/org/apache/lucene/analysis/charfilter" includes="*.java">
+Index: lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/ClassicTokenizerImpl.java
+===================================================================
+--- lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/ClassicTokenizerImpl.java	(revision 1619706)
++++ lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/ClassicTokenizerImpl.java	(working copy)
+@@ -374,6 +374,9 @@
+   t.copyBuffer(zzBuffer, zzStartRead, zzMarkedPos-zzStartRead);
+ }
+ 
++   public final void setBufferSize(int numChars) {
++     throw new UnsupportedOperationException();
++   }
+ 
+ 
+   /**
+Index: lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/ClassicTokenizerImpl.jflex
+===================================================================
+--- lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/ClassicTokenizerImpl.jflex	(revision 1619706)
++++ lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/ClassicTokenizerImpl.jflex	(working copy)
+@@ -67,6 +67,9 @@
+   t.copyBuffer(zzBuffer, zzStartRead, zzMarkedPos-zzStartRead);
+ }
+ 
++   public final void setBufferSize(int numChars) {
++     throw new UnsupportedOperationException();
++   }
+ %}
+ 
+ THAI       = [\u0E00-\u0E59]
+Index: lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/StandardTokenizer.java
+===================================================================
+--- lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/StandardTokenizer.java	(revision 1619706)
++++ lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/StandardTokenizer.java	(working copy)
+@@ -100,6 +100,7 @@
+       throw new IllegalArgumentException("maxTokenLength must be greater than zero");
+     }
+     this.maxTokenLength = length;
++    scanner.setBufferSize(Math.min(length, 1024 * 1024)); // limit buffer size to 1M chars
+   }
+ 
+   /** @see #setMaxTokenLength */
+Index: lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/StandardTokenizerImpl.java
+===================================================================
+--- lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/StandardTokenizerImpl.java	(revision 1619706)
++++ lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/StandardTokenizerImpl.java	(working copy)
+@@ -45,7 +45,7 @@
+   public static final int YYEOF = -1;
+ 
+   /** initial size of the lookahead buffer */
+-  private static final int ZZ_BUFFERSIZE = 4096;
++  private int ZZ_BUFFERSIZE = 255;
+ 
+   /** lexical states */
+   public static final int YYINITIAL = 0;
+@@ -454,6 +454,16 @@
+   public final void getText(CharTermAttribute t) {
+     t.copyBuffer(zzBuffer, zzStartRead, zzMarkedPos-zzStartRead);
+   }
++  
++  /**
++   * Sets the scanner buffer size in chars
++   */
++   public final void setBufferSize(int numChars) {
++     ZZ_BUFFERSIZE = numChars;
++     char[] newZzBuffer = new char[ZZ_BUFFERSIZE];
++     System.arraycopy(zzBuffer, 0, newZzBuffer, 0, Math.min(zzBuffer.length, ZZ_BUFFERSIZE));
++     zzBuffer = newZzBuffer;
++   }
+ 
+ 
+   /**
+@@ -509,18 +519,9 @@
+       zzStartRead = 0;
+     }
+ 
+-    /* is the buffer big enough? */
+-    if (zzCurrentPos >= zzBuffer.length - zzFinalHighSurrogate) {
+-      /* if not: blow it up */
+-      char newBuffer[] = new char[zzBuffer.length*2];
+-      System.arraycopy(zzBuffer, 0, newBuffer, 0, zzBuffer.length);
+-      zzBuffer = newBuffer;
+-      zzEndRead += zzFinalHighSurrogate;
+-      zzFinalHighSurrogate = 0;
+-    }
+ 
+     /* fill the buffer with new input */
+-    int requested = zzBuffer.length - zzEndRead;           
++    int requested = zzBuffer.length - zzEndRead - zzFinalHighSurrogate;           
+     int totalRead = 0;
+     while (totalRead < requested) {
+       int numRead = zzReader.read(zzBuffer, zzEndRead + totalRead, requested - totalRead);
+@@ -536,6 +537,7 @@
+         if (Character.isHighSurrogate(zzBuffer[zzEndRead - 1])) {
+           --zzEndRead;
+           zzFinalHighSurrogate = 1;
++          if (totalRead == 1) { return true; }
+         }
+       }
+       return false;
+Index: lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/StandardTokenizerImpl.jflex
+===================================================================
+--- lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/StandardTokenizerImpl.jflex	(revision 1619706)
++++ lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/StandardTokenizerImpl.jflex	(working copy)
+@@ -46,7 +46,7 @@
+ %implements StandardTokenizerInterface
+ %function getNextToken
+ %char
+-%buffer 4096
++%buffer 255
+ 
+ // UAX#29 WB4. X (Extend | Format)* --> X
+ //
+@@ -101,6 +101,16 @@
+   public final void getText(CharTermAttribute t) {
+     t.copyBuffer(zzBuffer, zzStartRead, zzMarkedPos-zzStartRead);
+   }
++  
++  /**
++   * Sets the scanner buffer size in chars
++   */
++   public final void setBufferSize(int numChars) {
++     ZZ_BUFFERSIZE = numChars;
++     char[] newZzBuffer = new char[ZZ_BUFFERSIZE];
++     System.arraycopy(zzBuffer, 0, newZzBuffer, 0, Math.min(zzBuffer.length, ZZ_BUFFERSIZE));
++     zzBuffer = newZzBuffer;
++   }
+ %}
+ 
+ %%
+Index: lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/StandardTokenizerInterface.java
+===================================================================
+--- lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/StandardTokenizerInterface.java	(revision 1619706)
++++ lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/StandardTokenizerInterface.java	(working copy)
+@@ -67,4 +67,8 @@
+    */
+   public int getNextToken() throws IOException;
+ 
++  /**
++   * Sets the scanner buffer size in chars
++   */
++  public void setBufferSize(int numChars);
+ }
+Index: lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/UAX29URLEmailTokenizer.java
+===================================================================
+--- lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/UAX29URLEmailTokenizer.java	(revision 1619706)
++++ lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/UAX29URLEmailTokenizer.java	(working copy)
+@@ -83,6 +83,7 @@
+       throw new IllegalArgumentException("maxTokenLength must be greater than zero");
+     }
+     this.maxTokenLength = length;
++    scanner.setBufferSize(Math.min(length, 1024 * 1024)); // limit buffer size to 1M chars
+   }
+ 
+   /** @see #setMaxTokenLength */
+Index: lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/UAX29URLEmailTokenizerImpl.java
+===================================================================
+--- lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/UAX29URLEmailTokenizerImpl.java	(revision 1619706)
++++ lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/UAX29URLEmailTokenizerImpl.java	(working copy)
+@@ -48,7 +48,7 @@
+   public static final int YYEOF = -1;
+ 
+   /** initial size of the lookahead buffer */
+-  private static final int ZZ_BUFFERSIZE = 4096;
++  private int ZZ_BUFFERSIZE = 255;
+ 
+   /** lexical states */
+   public static final int YYINITIAL = 0;
+@@ -6820,6 +6820,16 @@
+   public final void getText(CharTermAttribute t) {
+     t.copyBuffer(zzBuffer, zzStartRead, zzMarkedPos-zzStartRead);
+   }
++  
++  /**
++   * Sets the scanner buffer size in chars
++   */
++   public final void setBufferSize(int numChars) {
++     ZZ_BUFFERSIZE = numChars;
++     char[] newZzBuffer = new char[ZZ_BUFFERSIZE];
++     System.arraycopy(zzBuffer, 0, newZzBuffer, 0, Math.min(zzBuffer.length, ZZ_BUFFERSIZE));
++     zzBuffer = newZzBuffer;
++   }
+ 
+ 
+   /**
+@@ -6875,18 +6885,9 @@
+       zzStartRead = 0;
+     }
+ 
+-    /* is the buffer big enough? */
+-    if (zzCurrentPos >= zzBuffer.length - zzFinalHighSurrogate) {
+-      /* if not: blow it up */
+-      char newBuffer[] = new char[zzBuffer.length*2];
+-      System.arraycopy(zzBuffer, 0, newBuffer, 0, zzBuffer.length);
+-      zzBuffer = newBuffer;
+-      zzEndRead += zzFinalHighSurrogate;
+-      zzFinalHighSurrogate = 0;
+-    }
+ 
+     /* fill the buffer with new input */
+-    int requested = zzBuffer.length - zzEndRead;           
++    int requested = zzBuffer.length - zzEndRead - zzFinalHighSurrogate;           
+     int totalRead = 0;
+     while (totalRead < requested) {
+       int numRead = zzReader.read(zzBuffer, zzEndRead + totalRead, requested - totalRead);
+@@ -6902,6 +6903,7 @@
+         if (Character.isHighSurrogate(zzBuffer[zzEndRead - 1])) {
+           --zzEndRead;
+           zzFinalHighSurrogate = 1;
++          if (totalRead == 1) { return true; }
+         }
+       }
+       return false;
+Index: lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/UAX29URLEmailTokenizerImpl.jflex
+===================================================================
+--- lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/UAX29URLEmailTokenizerImpl.jflex	(revision 1619706)
++++ lucene/analysis/common/src/java/org/apache/lucene/analysis/standard/UAX29URLEmailTokenizerImpl.jflex	(working copy)
+@@ -50,7 +50,7 @@
+ %function getNextToken
+ %char
+ %xstate AVOID_BAD_URL
+-%buffer 4096
++%buffer 255
+ 
+ // UAX#29 WB4. X (Extend | Format)* --> X
+ //
+@@ -189,6 +189,16 @@
+   public final void getText(CharTermAttribute t) {
+     t.copyBuffer(zzBuffer, zzStartRead, zzMarkedPos-zzStartRead);
+   }
++  
++  /**
++   * Sets the scanner buffer size in chars
++   */
++   public final void setBufferSize(int numChars) {
++     ZZ_BUFFERSIZE = numChars;
++     char[] newZzBuffer = new char[ZZ_BUFFERSIZE];
++     System.arraycopy(zzBuffer, 0, newZzBuffer, 0, Math.min(zzBuffer.length, ZZ_BUFFERSIZE));
++     zzBuffer = newZzBuffer;
++   }
+ %}
+ 
+ %%
+Index: lucene/analysis/common/src/test/org/apache/lucene/analysis/core/TestStandardAnalyzer.java
+===================================================================
+--- lucene/analysis/common/src/test/org/apache/lucene/analysis/core/TestStandardAnalyzer.java	(revision 1619706)
++++ lucene/analysis/common/src/test/org/apache/lucene/analysis/core/TestStandardAnalyzer.java	(working copy)
+@@ -29,8 +29,79 @@
+ import org.apache.lucene.analysis.Tokenizer;
+ import org.apache.lucene.analysis.standard.StandardAnalyzer;
+ import org.apache.lucene.analysis.standard.StandardTokenizer;
++import org.apache.lucene.util.TestUtil;
+ 
+ public class TestStandardAnalyzer extends BaseTokenStreamTestCase {
++
++  // LUCENE-5897: slow tokenization of strings of the form (\p{WB:ExtendNumLet}[\p{WB:Format}\p{WB:Extend}]*)+
++  public void testLargePartiallyMatchingToken() throws Exception {
++    // TODO: get these lists of chars matching a property from ICU4J
++    // http://www.unicode.org/Public/6.3.0/ucd/auxiliary/WordBreakProperty.txt
++    char[] WordBreak_ExtendNumLet_chars = "_\u203f\u2040\u2054\ufe33\ufe34\ufe4d\ufe4e\ufe4f\uff3f".toCharArray();
++
++    // http://www.unicode.org/Public/6.3.0/ucd/auxiliary/WordBreakProperty.txt
++    int[] WordBreak_Format_chars // only the first char in ranges 
++        = { 0xAD, 0x600, 0x61C, 0x6DD, 0x70F, 0x180E, 0x200E, 0x202A, 0x2060, 0x2066, 0xFEFF,
++            0xFFF9, 0x110BD, 0x1D173, 0xE0001, 0xE0020 };
++
++    // http://www.unicode.org/Public/6.3.0/ucd/auxiliary/WordBreakProperty.txt
++    int[] WordBreak_Extend_chars // only the first char in ranges
++        = { 0x300, 0x483, 0x591, 0x5bf, 0x5c1, 0x5c4, 0x5c7, 0x610, 0x64b, 0x670, 0x6d6, 0x6df,
++            0x6e7, 0x6ea, 0x711, 0x730, 0x7a6, 0x7eb, 0x816, 0x81b, 0x825, 0x829, 0x859, 0x8e4,
++            0x900, 0x93a, 0x93e, 0x951, 0x962, 0x981, 0x9bc, 0x9be, 0x9c7, 0x9cb, 0x9d7, 0x9e2,
++            0xa01, 0xa3c, 0xa3e, 0xa47, 0xa4b, 0xa51, 0xa70, 0xa75, 0xa81, 0xabc, 0xabe, 0xac7,
++            0xacb, 0xae2, 0xb01, 0xb3c, 0xb3e, 0xb47, 0xb4b, 0xb56, 0xb62, 0xb82, 0xbbe, 0xbc6,
++            0xbca, 0xbd7, 0xc01, 0xc3e, 0xc46, 0xc4a, 0xc55, 0xc62, 0xc82, 0xcbc, 0xcbe, 0xcc6,
++            0xcca, 0xcd5, 0xce2, 0xd02, 0xd3e, 0xd46, 0xd4a, 0xd57, 0xd62, 0xd82, 0xdca, 0xdcf,
++            0xdd6, 0xdd8, 0xdf2, 0xe31, 0xe34, 0xe47, 0xeb1, 0xeb4, 0xebb, 0xec8, 0xf18, 0xf35,
++            0xf37, 0xf39, 0xf3e, 0xf71, 0xf86, 0xf8d, 0xf99, 0xfc6, 0x102b, 0x1056, 0x105e, 0x1062,
++            0x1067, 0x1071, 0x1082, 0x108f, 0x109a, 0x135d, 0x1712, 0x1732, 0x1752, 0x1772, 0x17b4, 
++            0x17dd, 0x180b, 0x18a9, 0x1920, 0x1930, 0x19b0, 0x19c8, 0x1a17, 0x1a55, 0x1a60, 0x1a7f,
++            0x1b00, 0x1b34, 0x1b6b, 0x1b80, 0x1ba1, 0x1be6, 0x1c24, 0x1cd0, 0x1cd4, 0x1ced, 0x1cf2, 
++            0x1dc0, 0x1dfc, 0x200c, 0x20d0, 0x2cef, 0x2d7f, 0x2de0, 0x302a, 0x3099, 0xa66f, 0xa674,
++            0xa69f, 0xa6f0, 0xa802, 0xa806, 0xa80b, 0xa823, 0xa880, 0xa8b4, 0xa8e0, 0xa926, 0xa947, 
++            0xa980, 0xa9b3, 0xaa29, 0xaa43, 0xaa4c, 0xaa7b, 0xaab0, 0xaab2, 0xaab7, 0xaabe, 0xaac1,
++            0xaaeb, 0xaaf5, 0xabe3, 0xabec, 0xfb1e, 0xfe00, 0xfe20, 0xff9e, 0x101fd, 0x10a01,
++            0x10a05, 0x10a0C, 0x10a38, 0x10a3F, 0x11000, 0x11001, 0x11038, 0x11080, 0x11082,
++            0x110b0, 0x110b3, 0x110b7, 0x110b9, 0x11100, 0x11127, 0x1112c, 0x11180, 0x11182,
++            0x111b3, 0x111b6, 0x111bF, 0x116ab, 0x116ac, 0x116b0, 0x116b6, 0x16f51, 0x16f8f,
++            0x1d165, 0x1d167, 0x1d16d, 0x1d17b, 0x1d185, 0x1d1aa, 0x1d242, 0xe0100 }; 
++        
++    StringBuilder builder = new StringBuilder();
++    int numChars = TestUtil.nextInt(random(), 100 * 1024, 1024 * 1024);
++    for (int i = 0 ; i < numChars ; ) {
++      builder.append(WordBreak_ExtendNumLet_chars[random().nextInt(WordBreak_ExtendNumLet_chars.length)]);
++      ++i;
++      if (random().nextBoolean()) {
++        int numFormatExtendChars = TestUtil.nextInt(random(), 1, 8);
++        for (int j = 0; j < numFormatExtendChars; ++j) {
++          int codepoint;
++          if (random().nextBoolean()) {
++            codepoint = WordBreak_Format_chars[random().nextInt(WordBreak_Format_chars.length)];
++          } else {
++            codepoint = WordBreak_Extend_chars[random().nextInt(WordBreak_Extend_chars.length)];
++          }
++          char[] chars = Character.toChars(codepoint);
++          builder.append(chars);
++          i += chars.length;
++        }
++      }
++    }
++    StandardTokenizer ts = new StandardTokenizer();
++    ts.setReader(new StringReader(builder.toString()));
++    ts.reset();
++    while (ts.incrementToken()) { }
++    ts.end();
++    ts.close();
++
++    int newBufferSize = TestUtil.nextInt(random(), 200, 8192);
++    ts.setMaxTokenLength(newBufferSize); // try a different buffer size
++    ts.setReader(new StringReader(builder.toString()));
++    ts.reset();
++    while (ts.incrementToken()) { }
++    ts.end();
++    ts.close();
++  }
+   
+   public void testHugeDoc() throws IOException {
+     StringBuilder sb = new StringBuilder();
+Index: lucene/analysis/common/src/test/org/apache/lucene/analysis/core/TestUAX29URLEmailTokenizer.java
+===================================================================
+--- lucene/analysis/common/src/test/org/apache/lucene/analysis/core/TestUAX29URLEmailTokenizer.java	(revision 1619706)
++++ lucene/analysis/common/src/test/org/apache/lucene/analysis/core/TestUAX29URLEmailTokenizer.java	(working copy)
+@@ -7,8 +7,10 @@
+ import org.apache.lucene.analysis.Tokenizer;
+ import org.apache.lucene.analysis.standard.UAX29URLEmailTokenizer;
+ import org.apache.lucene.analysis.tokenattributes.TypeAttribute;
++import org.apache.lucene.util.TestUtil;
+ 
+ import java.io.BufferedReader;
++import java.io.FileInputStream;
+ import java.io.IOException;
+ import java.io.InputStreamReader;
+ import java.io.Reader;
+@@ -18,6 +20,7 @@
+ import java.util.Arrays;
+ import java.util.List;
+ import java.util.Random;
++import java.util.regex.Pattern;
+ 
+ /*
+  * Licensed to the Apache Software Foundation (ASF) under one or more
+@@ -37,7 +40,42 @@
+  */
+ 
+ public class TestUAX29URLEmailTokenizer extends BaseTokenStreamTestCase {
+-  
++
++  // LUCENE-5440: extremely slow tokenization of text matching email <local-part> (before the '@')
++  public void testLongEMAILatomText() throws Exception {
++    // EMAILatomText = [A-Za-z0-9!#$%&'*+-/=?\^_`{|}~]
++    char[] emailAtomChars
++        = "!#$%&'*+,-./0123456789=?ABCDEFGHIJKLMNOPQRSTUVWXYZ^_`abcdefghijklmnopqrstuvwxyz{|}~".toCharArray();
++    StringBuilder builder = new StringBuilder();
++    int numChars = TestUtil.nextInt(random(), 100 * 1024, 3 * 1024 * 1024);
++    for (int i = 0 ; i < numChars ; ++i) {
++      builder.append(emailAtomChars[random().nextInt(emailAtomChars.length)]);
++    }
++    int tokenCount = 0;
++    UAX29URLEmailTokenizer ts = new UAX29URLEmailTokenizer();
++    String text = builder.toString();
++    ts.setReader(new StringReader(text));
++    ts.reset();
++    while (ts.incrementToken()) {
++      tokenCount++;
++    }
++    ts.end();
++    ts.close();
++    assertTrue(tokenCount > 0);
++
++    tokenCount = 0;
++    int newBufferSize = TestUtil.nextInt(random(), 200, 8192);
++    ts.setMaxTokenLength(newBufferSize);
++    ts.setReader(new StringReader(text));
++    ts.reset();
++    while (ts.incrementToken()) {
++      tokenCount++;
++    }
++    ts.end();
++    ts.close();
++    assertTrue(tokenCount > 0);
++  }
++
+   public void testHugeDoc() throws IOException {
+     StringBuilder sb = new StringBuilder();
+     char whitespace[] = new char[4094];

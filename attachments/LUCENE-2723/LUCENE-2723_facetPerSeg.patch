@@ -1,0 +1,834 @@
+Index: solr/src/test/org/apache/solr/request/TestFaceting.java
+===================================================================
+--- solr/src/test/org/apache/solr/request/TestFaceting.java	(revision 1050839)
++++ solr/src/test/org/apache/solr/request/TestFaceting.java	(working copy)
+@@ -69,14 +69,14 @@
+     req = lrf.makeRequest("q","*:*");
+ 
+     TermIndex ti = new TermIndex(proto.field());
+-    NumberedTermsEnum te = ti.getEnumerator(req.getSearcher().getReader());
++    NumberedTermsEnum te = ti.getEnumerator(req.getSearcher().multiFields.terms(proto.field()));
+ 
+     // iterate through first
+     while(te.term() != null) te.next();
+     assertEquals(size, te.getTermNumber());
+     te.close();
+ 
+-    te = ti.getEnumerator(req.getSearcher().getReader());
++    te = ti.getEnumerator(req.getSearcher().multiFields.terms(proto.field()));
+ 
+     Random r = new Random(size);
+     // test seeking by term string
+Index: solr/src/java/org/apache/solr/search/SolrIndexSearcher.java
+===================================================================
+--- solr/src/java/org/apache/solr/search/SolrIndexSearcher.java	(revision 1050839)
++++ solr/src/java/org/apache/solr/search/SolrIndexSearcher.java	(working copy)
+@@ -27,6 +27,7 @@
+ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.OpenBitSet;
++import org.apache.lucene.util.ReaderUtil;
+ import org.apache.solr.common.util.NamedList;
+ import org.apache.solr.common.util.SimpleOrderedMap;
+ import org.apache.solr.core.SolrConfig;
+@@ -71,6 +72,11 @@
+   private final SolrIndexReader reader;
+   private final boolean closeReader;
+ 
++  public final MultiFields multiFields;
++  public final ReaderUtil.Slice[] readerSubs;
++  public final Fields[] fieldSubs;
++  public final Bits[] deletedDocs;
++
+   private final int queryResultWindowSize;
+   private final int queryResultMaxDocsCached;
+   private final boolean useFilterForSortedQuery;
+@@ -121,7 +127,7 @@
+   }
+ 
+   /** Creates a searcher searching the provided index. */
+-  public SolrIndexSearcher(SolrCore core, IndexSchema schema, String name, IndexReader r, boolean enableCache) {
++  public SolrIndexSearcher(SolrCore core, IndexSchema schema, String name, IndexReader r, boolean enableCache) throws IOException {
+     this(core, schema,name,r, false, enableCache);
+   }
+ 
+@@ -137,7 +143,7 @@
+     return sir;
+   }
+ 
+-  public SolrIndexSearcher(SolrCore core, IndexSchema schema, String name, IndexReader r, boolean closeReader, boolean enableCache) {
++  public SolrIndexSearcher(SolrCore core, IndexSchema schema, String name, IndexReader r, boolean closeReader, boolean enableCache) throws IOException {
+     super(wrap(r));
+     this.reader = (SolrIndexReader)super.getIndexReader();
+     this.core = core;
+@@ -147,6 +153,20 @@
+ 
+     SolrIndexReader.setSearcher(reader, this);
+ 
++    // set up MultiFields
++    SolrIndexReader[] subReaders = reader.getLeafReaders();
++    readerSubs = new ReaderUtil.Slice[subReaders.length];
++    fieldSubs = new Fields[subReaders.length];
++    deletedDocs = new Bits[subReaders.length];
++
++    for (int i=0; i<subReaders.length; i++) {
++      SolrIndexReader subReader = subReaders[i];
++      readerSubs[i] = new ReaderUtil.Slice(subReader.getBase(), subReader.maxDoc(), i);
++      fieldSubs[i] = MultiFields.getFields(subReader); // hopefully segment level
++      deletedDocs[i] = MultiFields.getDeletedDocs(subReader); // hopefully segment level
++    }
++    multiFields = new MultiFields(fieldSubs, readerSubs);
++
+     if (r.directory() instanceof FSDirectory) {
+       FSDirectory fsDirectory = (FSDirectory) r.directory();
+       indexDir = fsDirectory.getDirectory().getAbsolutePath();
+@@ -493,6 +513,7 @@
+    * @return the first document number containing the term
+    */
+   public int getFirstMatch(Term t) throws IOException {
++    // TODO: do this per-segment
+     Fields fields = MultiFields.getFields(reader);
+     if (fields == null) return -1;
+     Terms terms = fields.terms(t.field());
+@@ -572,29 +593,91 @@
+   }
+ 
+   /** lucene.internal */
+-  public DocSet getDocSet(Query query, DocsEnumState deState) throws IOException {
+-    // Get the absolute value (positive version) of this query.  If we
+-    // get back the same reference, we know it's positive.
+-    Query absQ = QueryUtils.getAbs(query);
+-    boolean positive = query==absQ;
++  public DocSet getDocSet(DocsEnumState deState) throws IOException {
++    int largestPossible = deState.termsEnum.docFreq();
++    if (largestPossible == 0) return DocSet.EMPTY;
++    boolean useCache = filterCache != null && largestPossible >= deState.minSetSizeCached;
++    TermQuery key = null;
+ 
+-    if (filterCache != null) {
+-      DocSet absAnswer = filterCache.get(absQ);
+-      if (absAnswer!=null) {
+-        if (positive) return absAnswer;
+-        else return getPositiveDocSet(matchAllDocsQuery).andNot(absAnswer);
++    if (useCache) {
++      key = new TermQuery(new Term(deState.fieldName, new BytesRef(deState.termsEnum.term()), false));
++      DocSet result = filterCache.get(key);
++      if (result != null) return result;
++    }
++
++    int scratchSize = Math.min(smallSetSize(), largestPossible);
++    if (deState.scratch == null || deState.scratch.length < scratchSize)
++      deState.scratch = new int[scratchSize];
++
++    final int[] docs = deState.scratch;
++    int upto = 0;
++    int bitsSet = 0;
++    OpenBitSet obs = null;
++
++    MultiTermsEnum multiTermsEnum = (MultiTermsEnum)deState.termsEnum;
++
++    MultiTermsEnum.TermsEnumWithSlice[] subMatches = multiTermsEnum.getMatchArray();
++    int nEnums = multiTermsEnum.getMatchCount();
++    for (int i=0; i<nEnums; i++) {
++      MultiTermsEnum.TermsEnumWithSlice match = subMatches[i];
++      BulkPostingsEnum bulkPostings = match.bulkPostings = match.terms.bulkPostings(match.bulkPostings, false, false);
++      BulkPostingsEnum.BlockReader docDeltasReader = bulkPostings.getDocDeltasReader();
++      Bits deleted = deletedDocs[match.subSlice.readerIndex];
++
++      int docsLeft = match.terms.docFreq();
++      assert docsLeft > 0;
++      int[] deltas = docDeltasReader.getBuffer();
++      int docPointer = docDeltasReader.offset();
++      int docPointerMax = docDeltasReader.end();
++      if (docPointerMax - docPointer > docsLeft) docPointerMax = docPointer + docsLeft;
++      int nDocs = docPointerMax - docPointer;
++      docsLeft -= nDocs;
++      int base = match.subSlice.start;
++      int doc = base;
++
++      for(;;) {
++        if (obs != null || upto + nDocs > docs.length) {
++          if (obs == null) obs = new OpenBitSet(maxDoc());
++          while (docPointer < docPointerMax) {
++            doc += deltas[docPointer++];
++            if (deleted != null && deleted.get(doc-base)) continue;
++            obs.fastSet(doc);
++            bitsSet++;
++          }
++        } else {
++          while (docPointer < docPointerMax) {
++            doc += deltas[docPointer++];
++            if (deleted != null && deleted.get(doc-base)) continue;
++            docs[upto++] = doc;
++          }
++        }
++
++        if (docsLeft <= 0) break;
++        docPointerMax = Math.min(docDeltasReader.fill(), docsLeft);
++        assert docPointerMax > 0;
++        docsLeft -= docPointerMax;
++        docPointer = 0; // offset() should always be 0 after fill
++        nDocs = docPointerMax;
+       }
+     }
+ 
+-    DocSet absAnswer = getDocSetNC(deState);
+-    DocSet answer = positive ? absAnswer : getPositiveDocSet(matchAllDocsQuery).andNot(absAnswer);
+ 
+-    if (filterCache != null) {
+-      // cache negative queries as positive
+-      filterCache.put(absQ, absAnswer);
++    DocSet result;
++    if (obs != null) {
++      for (int i=0; i<upto; i++) {
++        obs.fastSet(docs[i]);
++      }
++      bitsSet += upto;
++      result = new BitDocSet(obs, bitsSet);
++    } else {
++      result = new SortedIntDocSet(Arrays.copyOf(docs, upto));
+     }
+ 
+-    return answer;
++    if (useCache) {
++      filterCache.put(key, result);
++    }
++
++    return result;
+   }
+ 
+   // only handle positive (non negative) queries
+@@ -609,18 +692,6 @@
+     return answer;
+   }
+ 
+-  // only handle positive (non negative) queries
+-  DocSet getPositiveDocSet(Query q, DocsEnumState deState) throws IOException {
+-    DocSet answer;
+-    if (filterCache != null) {
+-      answer = filterCache.get(q);
+-      if (answer!=null) return answer;
+-    }
+-    answer = getDocSetNC(deState);
+-    if (filterCache != null) filterCache.put(q,answer);
+-    return answer;
+-  }
+-
+   private static Query matchAllDocsQuery = new MatchAllDocsQuery();
+ 
+   /**
+@@ -755,114 +826,21 @@
+     return (maxDoc()>>6)+5; // add a small constant for better test coverage
+   }
+ 
+-  // query must be positive
+-  protected DocSet getDocSetNC(DocsEnumState deState) throws IOException {
+-    int largestPossible = deState.termsEnum.docFreq();
+ 
+-    int[] docs = new int[Math.min(smallSetSize(), largestPossible)];
+-    int upto = 0;   // number of docs in the array
+-    int nDocs = 0;  // number of docs in this set
+-    OpenBitSet obs = null;
+-
+-    deState.bulkPostings = deState.termsEnum.bulkPostings(deState.bulkPostings, false, false);
+-    final Bits deleted = deState.deletedDocs;
+-
+-    int docsLeft = largestPossible;
+-    
+-    /** TODO: do per seg
+-    if (docsEnum instanceof MultiDocsEnum) {
+-      MultiDocsEnum.EnumWithSlice[] subs = ((MultiDocsEnum)docsEnum).getSubs();
+-      int numSubs = ((MultiDocsEnum)docsEnum).getNumSubs();
+-      for (int subindex = 0; subindex<numSubs; subindex++) {
+-        MultiDocsEnum.EnumWithSlice sub = subs[subindex];
+-        if (sub.docsEnum == null) continue;
+-        DocsEnum.BulkReadResult bulk = sub.docsEnum.getBulkResult();
+-        int base = sub.slice.start;
+-
+-        for (;;) {
+-          int nDocs = sub.docsEnum.read();
+-          if (nDocs == 0) break;
+-          int[] docArr = bulk.docs.ints;
+-          int end = bulk.docs.offset + nDocs;
+-          if (upto + nDocs > docs.length) {
+-            if (obs == null) obs = new OpenBitSet(maxDoc());
+-            for (int i=bulk.docs.offset; i<end; i++) {
+-              obs.fastSet(docArr[i]+base);
+-            }
+-            bitsSet += nDocs;
+-          } else {
+-            for (int i=bulk.docs.offset; i<end; i++) {
+-              docs[upto++] = docArr[i]+base;
+-            }
+-          }
+-        }
+-      }
+-    } else
+-    **/
+-  
+-    {
+-      BulkPostingsEnum.BlockReader docDeltasReader = deState.bulkPostings.getDocDeltasReader();
+-      int[] deltas = docDeltasReader.getBuffer();
+-      int docPointer = docDeltasReader.offset();
+-      int docPointerMax = docDeltasReader.end();
+-      // assert docPointer < docPointerMax;
+-      if (docPointerMax - docPointer > docsLeft) docPointerMax = docPointer + docsLeft;
+-      docsLeft -= docPointerMax - docPointer;
+-
+-      int doc = 0;
+-
+-      for (;;) {
+-        // to big to fit in our temporary int array?
+-        if (obs != null || nDocs + (docPointerMax - docPointer) > docs.length) {
+-          if (obs == null) obs = new OpenBitSet(maxDoc());
+-          while (docPointer < docPointerMax) {
+-            doc += deltas[docPointer++];
+-            if (deleted != null && deleted.get(doc)) continue;
+-            obs.fastSet(doc);
+-            nDocs++;
+-          }
+-        } else {
+-          while (docPointer < docPointerMax) {
+-            doc += deltas[docPointer++];
+-            if (deleted != null && deleted.get(doc)) continue;
+-            docs[upto++] = doc;
+-          }
+-          nDocs = upto;
+-        }
+-
+-        if (docsLeft <= 0) break;
+-        docPointerMax = Math.min(docDeltasReader.fill(), docsLeft);
+-        assert docPointerMax > 0;
+-        docsLeft -= docPointerMax;
+-        docPointer = 0; // offset() should always be 0 after fill
+-      }
+-    }
+-
+-    if (obs != null) {
+-      for (int i=0; i<upto; i++) {
+-        obs.fastSet(docs[i]);  
+-      }
+-      return new BitDocSet(obs, nDocs);
+-    }
+-
+-    return new SortedIntDocSet(docs, upto);
+-  }
+-
+   // query must be positive
+   protected DocSet getDocSetNC(Query query, DocSet filter) throws IOException {
+     if (filter==null) {
+       if (query instanceof TermQuery) {
+         Term t = ((TermQuery)query).getTerm();
+         DocsEnumState deState = new DocsEnumState();
+-        Terms terms = MultiFields.getTerms(reader, t.field());
++        deState.fieldName = t.field();
++        Terms terms = multiFields.terms(t.field());
+         if (terms == null) return DocSet.EMPTY;
+         deState.termsEnum = terms.iterator();
+         if (deState.termsEnum.seek(t.bytes()) != TermsEnum.SeekStatus.FOUND) return DocSet.EMPTY;
+-        deState.deletedDocs = MultiFields.getDeletedDocs(reader);
+-        deState.bulkPostings = null;
++        deState.minSetSizeCached = Integer.MAX_VALUE;  // don't use cache
++        return getDocSet(deState);
+ 
+-        return getDocSetNC(deState);
+-
+         /** TODO: do per seg
+         Term t = ((TermQuery)query).getTerm();
+         SolrIndexReader[] readers = reader.getLeafReaders();
+@@ -872,11 +850,11 @@
+           SolrIndexReader sir = readers[i];
+           int offset = offsets[i];
+           collector.setNextReader(sir, offset);
+-          
++
+           Fields fields = sir.fields();
+           Terms terms = fields.terms(t.field());
+           BytesRef termBytes = t.bytes();
+-          
++
+           Bits skipDocs = sir.getDeletedDocs();
+           DocsEnum docsEnum = terms==null ? null : terms.docs(skipDocs, termBytes, null);
+ 
+@@ -1675,17 +1653,17 @@
+   }
+ 
+   /** @lucene.internal */
+-  public int numDocs(Query a, DocSet b, DocsEnumState deState) throws IOException {
++  public int numDocs(DocSet a, DocsEnumState deState) throws IOException {
+     // Negative query if absolute value different from original
+-    Query absQ = QueryUtils.getAbs(a);
+-    DocSet positiveA = getPositiveDocSet(absQ, deState);
+-    return a==absQ ? b.intersectionSize(positiveA) : b.andNotSize(positiveA);
++    DocSet b = getDocSet(deState);
++    return a.intersectionSize(b);
+   }
+ 
+   public static class DocsEnumState {
++    public String fieldName;    
+     public TermsEnum termsEnum;
+-    public Bits deletedDocs;
+-    public BulkPostingsEnum bulkPostings;
++    public int minSetSizeCached;
++    public int[] scratch;
+   }
+ 
+    /**
+Index: solr/src/java/org/apache/solr/request/SimpleFacets.java
+===================================================================
+--- solr/src/java/org/apache/solr/request/SimpleFacets.java	(revision 1050839)
++++ solr/src/java/org/apache/solr/request/SimpleFacets.java	(working copy)
+@@ -21,6 +21,7 @@
+ import org.apache.lucene.queryParser.ParseException;
+ import org.apache.lucene.search.*;
+ import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.StringHelper;
+ import org.apache.lucene.util.packed.Direct16;
+ import org.apache.lucene.util.packed.Direct32;
+ import org.apache.lucene.util.packed.Direct8;
+@@ -628,8 +629,8 @@
+       startTermBytes = new BytesRef(indexedPrefix);
+     }
+ 
+-    Fields fields = MultiFields.getFields(r);
+-    Terms terms = fields==null ? null : fields.terms(field);
++    Fields fields = searcher.multiFields;
++    Terms terms = fields.terms(field);
+     TermsEnum termsEnum = null;
+     BytesRef term = null;
+     if (terms != null) {
+@@ -650,14 +651,16 @@
+       }
+     }
+ 
++    MultiTermsEnum multiTermsEnum = termsEnum instanceof MultiTermsEnum ? (MultiTermsEnum)termsEnum : null;
++    assert multiTermsEnum != null || term == null; // we should have a multiTermsEnum unless there we no matches
++    
+     Term template = new Term(field);
+     CharArr spare = new CharArr();
+ 
+     if (docs.size() >= mincount) {
+       SolrIndexSearcher.DocsEnumState deState = new SolrIndexSearcher.DocsEnumState();
+-      deState.deletedDocs = MultiFields.getDeletedDocs(r);
++      deState.fieldName = StringHelper.intern(field);  // FUTURE: remove intern
+       deState.termsEnum = termsEnum;
+-      deState.bulkPostings = null;
+ 
+       while (term != null) {
+ 
+@@ -674,50 +677,27 @@
+ 
+           if (df >= minDfFilterCache) {
+             // use the filter cache
+-            Term t = template.createTerm(new BytesRef(term));
+-
+-            c = searcher.numDocs(new TermQuery(t), docs, deState);
++            c = searcher.numDocs(docs, deState);
+           } else {
+             // iterate over TermDocs to calculate the intersection
+             c=0;
+-            final BulkPostingsEnum docsEnum = deState.bulkPostings = deState.termsEnum.bulkPostings(deState.bulkPostings, false, false);            
+ 
+-            /*** do per-seg
+-            // TODO: specialize when base docset is a bitset or hash set (skipDocs)?  or does it matter for this?
+-            // TODO: do this per-segment for better efficiency (MultiDocsEnum just uses base class impl)
+-            // TODO: would passing deleted docs lead to better efficiency over checking the fastForRandomSet?
+-            docsEnum = termsEnum.docs(null, docsEnum);
+-
+-            if (docsEnum instanceof MultiDocsEnum) {
+-              MultiDocsEnum.EnumWithSlice[] subs = ((MultiDocsEnum)docsEnum).getSubs();
+-              int numSubs = ((MultiDocsEnum)docsEnum).getNumSubs();
+-              for (int subindex = 0; subindex<numSubs; subindex++) {
+-                MultiDocsEnum.EnumWithSlice sub = subs[subindex];
+-                if (sub.docsEnum == null) continue;
+-                DocsEnum.BulkReadResult bulk = sub.docsEnum.getBulkResult();
+-                int base = sub.slice.start;
+-                for (;;) {
+-                  int nDocs = sub.docsEnum.read();
+-                  if (nDocs == 0) break;
+-                  int[] docArr = bulk.docs.ints;  // this might be movable outside the loop, but perhaps not worth the risk.
+-                  int end = bulk.docs.offset + nDocs;
+-                  for (int i=bulk.docs.offset; i<end; i++) {
+-                    if (fastForRandomSet.exists(docArr[i]+base)) c++;
+-                  }
+-                }
+-              }
+-            } else
+-            ***/
+-            {
+-              int docsLeft = df;
+-              BulkPostingsEnum.BlockReader docDeltasReader = docsEnum.getDocDeltasReader();
++            MultiTermsEnum.TermsEnumWithSlice[] subMatches = multiTermsEnum.getMatchArray();
++            int nEnums = multiTermsEnum.getMatchCount();
++            for (int i=0; i<nEnums; i++) {
++              MultiTermsEnum.TermsEnumWithSlice match = subMatches[i];
++              BulkPostingsEnum bulkPostings = match.bulkPostings = match.terms.bulkPostings(match.bulkPostings, false, false);
++              BulkPostingsEnum.BlockReader docDeltasReader = bulkPostings.getDocDeltasReader();
++              
++              int docsLeft = match.terms.docFreq();
++              assert docsLeft > 0;
+               int[] deltas = docDeltasReader.getBuffer();
+               int docPointer = docDeltasReader.offset();
+               int docPointerMax = docDeltasReader.end();
+               // assert docPointer < docPointerMax;
+               if (docPointerMax - docPointer > docsLeft) docPointerMax = docPointer + docsLeft;
+               docsLeft -= docPointerMax - docPointer;
+-              int doc = 0;
++              int doc = match.subSlice.start;
+ 
+               for (;;) {
+                 while (docPointer < docPointerMax) {
+Index: solr/src/java/org/apache/solr/request/UnInvertedField.java
+===================================================================
+--- solr/src/java/org/apache/solr/request/UnInvertedField.java	(revision 1050839)
++++ solr/src/java/org/apache/solr/request/UnInvertedField.java	(working copy)
+@@ -21,7 +21,7 @@
+ import org.apache.lucene.search.FieldCache;
+ import org.apache.lucene.search.TermQuery;
+ import org.apache.lucene.search.TermRangeQuery;
+-import org.apache.lucene.util.PagedBytes;
++import org.apache.lucene.util.*;
+ import org.apache.noggit.CharArr;
+ import org.apache.solr.common.params.FacetParams;
+ import org.apache.solr.common.util.NamedList;
+@@ -36,9 +36,6 @@
+ import org.apache.solr.util.PrimUtils;
+ import org.apache.solr.handler.component.StatsValues;
+ import org.apache.solr.handler.component.FieldFacetStats;
+-import org.apache.lucene.util.OpenBitSet;
+-import org.apache.lucene.util.BytesRef;
+-import org.apache.lucene.util.Bits;
+ 
+ import java.io.IOException;
+ import java.util.ArrayList;
+@@ -195,7 +192,8 @@
+     final byte[][] bytes = new byte[maxDoc][]; // list of term numbers for the doc (delta encoded vInts)
+     maxTermCounts = new int[1024];
+ 
+-    NumberedTermsEnum te = ti.getEnumerator(reader);
++    Terms terms = searcher.multiFields.terms(field);
++    NumberedTermsEnum te = ti.getEnumerator(terms);
+ 
+     // threshold, over which we use set intersections instead of counting
+     // to (1) save memory, and (2) speed up faceting.
+@@ -225,11 +223,10 @@
+     // frequent terms ahead of time.
+ 
+     SolrIndexSearcher.DocsEnumState deState = new SolrIndexSearcher.DocsEnumState();
+-    deState.deletedDocs = te.deletedDocs;
++    deState.fieldName = StringHelper.intern(field);  // FUTURE: remove intern
+     deState.termsEnum = te.tenum;
+-    deState.bulkPostings = null;
++    MultiTermsEnum multiTermsEnum = deState.termsEnum instanceof MultiTermsEnum ? (MultiTermsEnum)deState.termsEnum : null;
+ 
+-    final Bits deletes = deState.deletedDocs;
+ 
+     for (;;) {
+       BytesRef t = te.term();
+@@ -252,7 +249,7 @@
+         topTerm.termNum = termNum;
+         bigTerms.put(topTerm.termNum, topTerm);
+ 
+-        DocSet set = searcher.getDocSet(new TermQuery(new Term(ti.field, topTerm.term)), deState);
++        DocSet set = searcher.getDocSet(deState);
+ 
+         maxTermCounts[termNum] = set.size();
+ 
+@@ -262,95 +259,106 @@
+ 
+       termsInverted++;
+ 
+-      int docsLeft = df;
+-      deState.bulkPostings = deState.termsEnum.bulkPostings(deState.bulkPostings, false, false);
+-      final BulkPostingsEnum.BlockReader docDeltasReader = deState.bulkPostings.getDocDeltasReader();
+-      final int[] deltas = docDeltasReader.getBuffer();
+-      int docPointer = docDeltasReader.offset();
+-      int docPointerMax = docDeltasReader.end();
+-      // assert docPointer < docPointerMax;
+-      if (docPointerMax - docPointer > docsLeft) docPointerMax = docPointer + docsLeft;
+-      docsLeft -= docPointerMax - docPointer;
+-      int doc = 0;
++      MultiTermsEnum.TermsEnumWithSlice[] subMatches = multiTermsEnum.getMatchArray();
++      int nEnums = multiTermsEnum.getMatchCount();
+       int nDocs = 0;
+ 
+-      for(;;) {
+-        while (docPointer < docPointerMax) {
+-          doc += deltas[docPointer++];
+-          if (deletes != null && deletes.get(doc)) continue;
+-          nDocs++;
+-          // add 2 to the term number to make room for special reserved values:
+-          // 0 (end term) and 1 (index into byte array follows)
+-          int delta = termNum - lastTerm[doc] + TNUM_OFFSET;
+-          lastTerm[doc] = termNum;
+-          int val = index[doc];
++      for (int i=0; i<nEnums; i++) {
++        MultiTermsEnum.TermsEnumWithSlice match = subMatches[i];
++        BulkPostingsEnum bulkPostings = match.bulkPostings = match.terms.bulkPostings(match.bulkPostings, false, false);
++        BulkPostingsEnum.BlockReader docDeltasReader = bulkPostings.getDocDeltasReader();
++        Bits deleted = searcher.deletedDocs[match.subSlice.readerIndex];
+ 
+-          if ((val & 0xff)==1) {
+-            // index into byte array (actually the end of
+-            // the doc-specific byte[] when building)
+-            int pos = val >>> 8;
+-            int ilen = vIntSize(delta);
+-            byte[] arr = bytes[doc];
+-            int newend = pos+ilen;
+-            if (newend > arr.length) {
+-              // We avoid a doubling strategy to lower memory usage.
+-              // this faceting method isn't for docs with many terms.
+-              // In hotspot, objects have 2 words of overhead, then fields, rounded up to a 64-bit boundary.
+-              // TODO: figure out what array lengths we can round up to w/o actually using more memory
+-              // (how much space does a byte[] take up?  Is data preceded by a 32 bit length only?
+-              // It should be safe to round up to the nearest 32 bits in any case.
+-              int newLen = (newend + 3) & 0xfffffffc;  // 4 byte alignment
+-              byte[] newarr = new byte[newLen];
+-              System.arraycopy(arr, 0, newarr, 0, pos);
+-              arr = newarr;
+-              bytes[doc] = newarr;
+-            }
+-            pos = writeInt(delta, arr, pos);
+-            index[doc] = (pos<<8) | 1;  // update pointer to end index in byte[]
+-          } else {
+-            // OK, this int has data in it... find the end (a zero starting byte - not
+-            // part of another number, hence not following a byte with the high bit set).
+-            int ipos;
+-            if (val==0) {
+-              ipos=0;
+-            } else if ((val & 0x0000ff80)==0) {
+-              ipos=1;
+-            } else if ((val & 0x00ff8000)==0) {
+-              ipos=2;
+-            } else if ((val & 0xff800000)==0) {
+-              ipos=3;
+-            } else {
+-              ipos=4;
+-            }
++        int docsLeft = match.terms.docFreq();
++        assert docsLeft > 0;
++        int[] deltas = docDeltasReader.getBuffer();
++        int docPointer = docDeltasReader.offset();
++        int docPointerMax = docDeltasReader.end();
++        // assert docPointer < docPointerMax;
++        if (docPointerMax - docPointer > docsLeft) docPointerMax = docPointer + docsLeft;
++        docsLeft -= docPointerMax - docPointer;
++        int base = match.subSlice.start;
++        int doc = base;
+ 
+-            int endPos = writeInt(delta, tempArr, ipos);
+-            if (endPos <= 4) {
+-              // value will fit in the integer... move bytes back
+-              for (int j=ipos; j<endPos; j++) {
+-                val |= (tempArr[j] & 0xff) << (j<<3);
++        for (;;) {
++          while (docPointer < docPointerMax) {
++            doc += deltas[docPointer++];
++            if (deleted != null && deleted.get(doc-base)) continue;
++            ////////////////////
++            nDocs++;
++            // add 2 to the term number to make room for special reserved values:
++            // 0 (end term) and 1 (index into byte array follows)
++            int delta = termNum - lastTerm[doc] + TNUM_OFFSET;
++            lastTerm[doc] = termNum;
++            int val = index[doc];
++
++            if ((val & 0xff)==1) {
++              // index into byte array (actually the end of
++              // the doc-specific byte[] when building)
++              int pos = val >>> 8;
++              int ilen = vIntSize(delta);
++              byte[] arr = bytes[doc];
++              int newend = pos+ilen;
++              if (newend > arr.length) {
++                // We avoid a doubling strategy to lower memory usage.
++                // this faceting method isn't for docs with many terms.
++                // In hotspot, objects have 2 words of overhead, then fields, rounded up to a 64-bit boundary.
++                // TODO: figure out what array lengths we can round up to w/o actually using more memory
++                // (how much space does a byte[] take up?  Is data preceded by a 32 bit length only?
++                // It should be safe to round up to the nearest 32 bits in any case.
++                int newLen = (newend + 3) & 0xfffffffc;  // 4 byte alignment
++                byte[] newarr = new byte[newLen];
++                System.arraycopy(arr, 0, newarr, 0, pos);
++                arr = newarr;
++                bytes[doc] = newarr;
+               }
+-              index[doc] = val;
++              pos = writeInt(delta, arr, pos);
++              index[doc] = (pos<<8) | 1;  // update pointer to end index in byte[]
+             } else {
+-              // value won't fit... move integer into byte[]
+-              for (int j=0; j<ipos; j++) {
+-                tempArr[j] = (byte)val;
+-                val >>>=8;
++              // OK, this int has data in it... find the end (a zero starting byte - not
++              // part of another number, hence not following a byte with the high bit set).
++              int ipos;
++              if (val==0) {
++                ipos=0;
++              } else if ((val & 0x0000ff80)==0) {
++                ipos=1;
++              } else if ((val & 0x00ff8000)==0) {
++                ipos=2;
++              } else if ((val & 0xff800000)==0) {
++                ipos=3;
++              } else {
++                ipos=4;
+               }
+-              // point at the end index in the byte[]
+-              index[doc] = (endPos<<8) | 1;
+-              bytes[doc] = tempArr;
+-              tempArr = new byte[12];
+-            }
+ 
++              int endPos = writeInt(delta, tempArr, ipos);
++              if (endPos <= 4) {
++                // value will fit in the integer... move bytes back
++                for (int j=ipos; j<endPos; j++) {
++                  val |= (tempArr[j] & 0xff) << (j<<3);
++                }
++                index[doc] = val;
++              } else {
++                // value won't fit... move integer into byte[]
++                for (int j=0; j<ipos; j++) {
++                  tempArr[j] = (byte)val;
++                  val >>>=8;
++                }
++                // point at the end index in the byte[]
++                index[doc] = (endPos<<8) | 1;
++                bytes[doc] = tempArr;
++                tempArr = new byte[12];
++              }
++
++            }
++            ////////////////////
+           }
+ 
++          if (docsLeft <= 0) break;
++          docPointerMax = Math.min(docDeltasReader.fill(), docsLeft);
++          assert docPointerMax > 0;
++          docsLeft -= docPointerMax;
++          docPointer = 0; // offset() should always be 0 after fill
+         }
+-
+-        if (docsLeft <= 0) break;
+-        docPointerMax = Math.min(docDeltasReader.fill(), docsLeft);
+-        assert docPointerMax > 0;
+-        docsLeft -= docPointerMax;
+-        docPointer = 0; // offset() should always be 0 after fill
+       }
+ 
+       termInstances += nDocs;
+@@ -485,7 +493,7 @@
+       int startTerm = 0;
+       int endTerm = numTermsInField;  // one past the end
+ 
+-      NumberedTermsEnum te = ti.getEnumerator(searcher.getReader());
++      NumberedTermsEnum te = ti.getEnumerator(searcher.multiFields.terms(field));
+       if (prefix != null && prefix.length() > 0) {
+         BytesRef prefixBr = new BytesRef(prefix);
+         te.skipTo(prefixBr);
+@@ -735,7 +743,7 @@
+     final int[] index = this.index;
+     final int[] counts = new int[numTermsInField];//keep track of the number of times we see each word in the field for all the documents in the docset
+ 
+-    NumberedTermsEnum te = ti.getEnumerator(searcher.getReader());
++    NumberedTermsEnum te = ti.getEnumerator(searcher.multiFields.terms(field));
+ 
+ 
+     boolean doNegative = false;
+@@ -939,27 +947,19 @@
+ 
+ 
+ class NumberedTermsEnum extends TermsEnum {
+-  protected final IndexReader reader;
+   protected final TermIndex tindex;
+   protected TermsEnum tenum;
+   protected int pos=-1;
+   protected BytesRef termText;
+-  protected DocsEnum docsEnum;
+-  protected Bits deletedDocs;
+ 
+-
+-  NumberedTermsEnum(IndexReader reader, TermIndex tindex) throws IOException {
+-    this.reader = reader;
++  NumberedTermsEnum(TermIndex tindex) throws IOException {
+     this.tindex = tindex;
+   }
+ 
+ 
+-  NumberedTermsEnum(IndexReader reader, TermIndex tindex, BytesRef termValue, int pos) throws IOException {
+-    this.reader = reader;
++  NumberedTermsEnum(Terms terms, TermIndex tindex, BytesRef termValue, int pos) throws IOException {
+     this.tindex = tindex;
+     this.pos = pos;
+-    Terms terms = MultiFields.getTerms(reader, tindex.field);
+-    deletedDocs = MultiFields.getDeletedDocs(reader);
+     if (terms != null) {
+       tenum = terms.iterator();
+       tenum.seek(termValue);
+@@ -977,11 +977,6 @@
+     return tenum.bulkPostings(reuse, doFreqs, doPositions);
+   }
+ 
+-  public DocsEnum getDocsEnum() throws IOException {
+-    docsEnum = tenum.docs(deletedDocs, docsEnum);
+-    return docsEnum;
+-  }
+-
+   protected BytesRef setTerm() throws IOException {
+     termText = tenum.term();
+     if (tindex.prefix != null && !termText.startsWith(tindex.prefix)) {
+@@ -1153,8 +1148,8 @@
+     this.prefix = prefix == null ? null : new BytesRef(prefix);
+   }
+ 
+-  NumberedTermsEnum getEnumerator(IndexReader reader, int termNumber) throws IOException {
+-    NumberedTermsEnum te = new NumberedTermsEnum(reader, this);
++  NumberedTermsEnum getEnumerator(Terms terms, int termNumber) throws IOException {
++    NumberedTermsEnum te = new NumberedTermsEnum(this);
+     te.skipTo(termNumber);
+     return te;
+   }
+@@ -1163,8 +1158,8 @@
+      with next() to fully traverse all of the terms so the index
+      will be built.
+    */
+-  NumberedTermsEnum getEnumerator(IndexReader reader) throws IOException {
+-    if (index==null) return new NumberedTermsEnum(reader,this, prefix==null?new BytesRef():prefix, 0) {
++  NumberedTermsEnum getEnumerator(Terms terms) throws IOException {
++    if (index==null) return new NumberedTermsEnum(terms,this, prefix==null?new BytesRef():prefix, 0) {
+       ArrayList<BytesRef> lst;
+       PagedBytes bytes;
+ 
+@@ -1193,7 +1188,7 @@
+         index = lst!=null ? lst.toArray(new BytesRef[lst.size()]) : new BytesRef[0];
+       }
+     };
+-    else return new NumberedTermsEnum(reader,this,new BytesRef(),0);
++    else return new NumberedTermsEnum(terms,this,new BytesRef(),0);
+   }
+ 
+ 
+Index: lucene/src/java/org/apache/lucene/index/MultiTermsEnum.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/index/MultiTermsEnum.java	(revision 1050839)
++++ lucene/src/java/org/apache/lucene/index/MultiTermsEnum.java	(working copy)
+@@ -441,11 +441,14 @@
+     }
+   }
+ 
+-  private final static class TermsEnumWithSlice {
+-    private final ReaderUtil.Slice subSlice;
+-    private TermsEnum terms;
++  public final static class TermsEnumWithSlice {
++    public final ReaderUtil.Slice subSlice;
++    public TermsEnum terms;
+     public BytesRef current;
+ 
++    /** initially null, settable by clients for reuse */
++    public BulkPostingsEnum bulkPostings;
++
+     public TermsEnumWithSlice(ReaderUtil.Slice subSlice) {
+       this.subSlice = subSlice;
+       assert subSlice.length >= 0: "length=" + subSlice.length;

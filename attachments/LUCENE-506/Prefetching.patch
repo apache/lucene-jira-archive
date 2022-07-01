@@ -1,0 +1,911 @@
+Index: test/org/apache/lucene/index/TestSegmentTermEnum.java
+===================================================================
+--- test/org/apache/lucene/index/TestSegmentTermEnum.java	(revision 382121)
++++ test/org/apache/lucene/index/TestSegmentTermEnum.java	(working copy)
+@@ -1,16 +1,14 @@
+ package org.apache.lucene.index;
+ 
+ import java.io.IOException;
++import java.util.Collection;
++import java.util.Collections;
+ 
+ import junit.framework.TestCase;
+ 
+ import org.apache.lucene.analysis.WhitespaceAnalyzer;
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.Field;
+-import org.apache.lucene.index.IndexReader;
+-import org.apache.lucene.index.IndexWriter;
+-import org.apache.lucene.index.Term;
+-import org.apache.lucene.index.TermEnum;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.RAMDirectory;
+ 
+@@ -37,8 +35,11 @@
+ 
+     writer.close();
+ 
++    Collection termsToPrefetch = Collections.singleton(new Term("content", "aaa"));
++
+     // verify document frequency of terms in an unoptimized index
+-    verifyDocFreq();
++    verifyDocFreq(null);
++    verifyDocFreq(termsToPrefetch);  // Test with prefetching
+ 
+     // merge segments by optimizing the index
+     writer = new IndexWriter(dir, new WhitespaceAnalyzer(), false);
+@@ -46,13 +47,14 @@
+     writer.close();
+ 
+     // verify document frequency of terms in an optimized index
+-    verifyDocFreq();
++    verifyDocFreq(null);
++    verifyDocFreq(termsToPrefetch);  // Test with prefetching
+   }
+ 
+-  private void verifyDocFreq()
++  private void verifyDocFreq(Collection termsToPrefetch)
+       throws IOException
+   {
+-      IndexReader reader = IndexReader.open(dir);
++      IndexReader reader = IndexReader.open(dir, termsToPrefetch);
+       TermEnum termEnum = null;
+ 
+     // create enumeration of all terms
+Index: test/org/apache/lucene/index/TestSegmentReader.java
+===================================================================
+--- test/org/apache/lucene/index/TestSegmentReader.java	(revision 382121)
++++ test/org/apache/lucene/index/TestSegmentReader.java	(working copy)
+@@ -16,16 +16,19 @@
+  * limitations under the License.
+  */
+ 
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.Enumeration;
++import java.util.Iterator;
++import java.util.List;
++
+ import junit.framework.TestCase;
+-import org.apache.lucene.store.RAMDirectory;
++
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.Field;
+ import org.apache.lucene.search.DefaultSimilarity;
+-
+-import java.io.IOException;
+-import java.util.Collection;
+-import java.util.Iterator;
+-import java.util.Enumeration;
++import org.apache.lucene.store.RAMDirectory;
+ 
+ public class TestSegmentReader extends TestCase {
+   private RAMDirectory dir = new RAMDirectory();
+@@ -205,4 +208,53 @@
+     assertTrue(results.length == 2);      
+   }    
+   
++  public void testPrefetching() throws IOException {
++      // Construct a prefetched list of terms to read and make sure we can read them.
++      List termsToPrefetch = new ArrayList();
++      termsToPrefetch.add(new Term(DocHelper.TEXT_FIELD_1_KEY, "field"));
++      termsToPrefetch.add(new Term(DocHelper.NO_NORMS_KEY,  DocHelper.NO_NORMS_TEXT));
++
++      IndexReader prefetchReader = SegmentReader.get(new SegmentInfo("test", 1, dir), termsToPrefetch);
++
++      TermEnum terms = prefetchReader.terms();
++      assertTrue(terms != null);
++      while (terms.next() == true)
++      {
++        Term term = terms.term();
++        assertTrue(term != null);
++        //System.out.println("Term: " + term);
++        String fieldValue = (String)DocHelper.nameValues.get(term.field());
++        assertTrue(fieldValue.indexOf(term.text()) != -1);
++      }
++
++
++      TermDocs termDocs = prefetchReader.termDocs();
++      assertTrue(termDocs != null);
++      termDocs.seek(new Term(DocHelper.TEXT_FIELD_1_KEY, "field"));
++      assertTrue(termDocs.next() == true);
++
++      termDocs.seek(new Term(DocHelper.NO_NORMS_KEY,  DocHelper.NO_NORMS_TEXT));
++      assertTrue(termDocs.next() == true);
++
++      TermPositions positions = prefetchReader.termPositions();
++      positions.seek(new Term(DocHelper.TEXT_FIELD_1_KEY, "field"));
++      assertTrue(positions != null);
++      assertTrue(positions.doc() == 0);
++      assertTrue(positions.nextPosition() >= 0);
++
++      // Check prefetching specifically
++      TermEnum termEnum = prefetchReader.terms(new Term(DocHelper.TEXT_FIELD_1_KEY, "field"));
++      assertTrue(termEnum != null);
++      assertTrue(termEnum.term().equals(new Term(DocHelper.TEXT_FIELD_1_KEY, "field")));
++      assertTrue(termEnum.next() == true);
++
++      // Test looking for a term that doesn't exist
++      try {
++          prefetchReader.terms(new Term(DocHelper.TEXT_FIELD_1_KEY, "WontBeFound"));
++          fail("Shouldn't have been able to get here");
++      } catch (AssertionError ex) {
++          // This is the JDK 1.4 error, (junit throws AssertionFailedError, yeah, confusing)
++      }
++  }
++
+ }
+Index: java/org/apache/lucene/index/SegmentTermEnum.java
+===================================================================
+--- java/org/apache/lucene/index/SegmentTermEnum.java	(revision 382121)
++++ java/org/apache/lucene/index/SegmentTermEnum.java	(working copy)
+@@ -140,6 +140,88 @@
+     return true;
+   }
+ 
++
++  /**
++   * Provides a method to skip to a given Term.  However, it has special
++   * handling for Index values.  It won't skip past the term, but will instead
++   * skip to the value just before the correct one in the TII.  This is because
++   * the "real value" in the term dictionary will most of the time lie before
++   * the term that would be returned by the parent's contract.
++   */
++  public final boolean skipTo(Term target) throws IOException {
++    if (scratch == null)
++        scratch = new TermBuffer();
++    scratch.set(target);
++
++    // Perform a simple test to see if we're already on what we're looking for.
++    if (target.equals(term())) return true;
++
++    if (isIndex) {  // This is the "you can go back" skip method.  If we're not index, we should never go backwards.
++        long oldPointer;
++        long oldIndexPointer;
++        long oldFreqPointer;
++        long oldProxPointer;
++        int oldDocFreq;
++        int oldSkipOffset;
++        boolean atEnd = false;
++
++        do {
++            // store the previous value in local variables so we can return to previous state.
++            oldPointer = input.getFilePointer();
++            oldDocFreq = termInfo.docFreq;
++            oldFreqPointer = termInfo.freqPointer;
++            oldProxPointer = termInfo.proxPointer;
++            oldSkipOffset = termInfo.skipOffset;
++            oldIndexPointer = indexPointer;
++
++            if (! next()) {
++                atEnd = true;
++                break;
++            }
++        } while (scratch.compareTo(termBuffer) > 0);
++
++        // If we were pointing at -1, and not at the end, or we're pointing at what they're asking for, don't go backwards.
++         if (!atEnd && (position == 0 || prev() == null || scratch.compareTo(termBuffer) == 0)) return true;
++
++        // We have to swap in the "old value" to go "before" the start
++        input.seek(oldPointer);
++        indexPointer = oldIndexPointer;
++        termInfo.freqPointer = oldFreqPointer;
++        termInfo.proxPointer = oldProxPointer;
++        termInfo.docFreq = oldDocFreq;
++        termInfo.skipOffset = oldSkipOffset;
++        termBuffer.set(prevBuffer);
++        prevBuffer.reset(); // We can't go back.
++        position--;
++        return true;
++    }
++
++    do {
++        if (!next()) return false;
++    } while (scratch.compareTo(termBuffer) > 0);
++    return true;
++  }
++
++  /**
++   * Compare the given term with the current contents of the term buffer
++   * @param term the term to compare
++   * @return 1 if the term lies beyond the current value, -1 if it lies before,
++   * and 0 if it's the same.
++   */
++  public int compareWithTerm(Term term) {
++      if (position < 1) return 1;
++      if (scratch == null)
++          scratch = new TermBuffer();
++      scratch.set(term);
++      try {
++          return scratch.compareTo(termBuffer);
++      } catch (NullPointerException ex) {
++          return -1;
++      }
++  }
++
++
++
+   /** Optimized scan, without allocating new terms. */
+   final void scanTo(Term term) throws IOException {
+     if (scratch == null)
+Index: java/org/apache/lucene/index/PrefetchedTermInfosReader.java
+===================================================================
+--- java/org/apache/lucene/index/PrefetchedTermInfosReader.java	(revision 0)
++++ java/org/apache/lucene/index/PrefetchedTermInfosReader.java	(revision 0)
+@@ -0,0 +1,157 @@
++package org.apache.lucene.index;
++
++/**
++ * Copyright 2006 The Apache Software Foundation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Map;
++import java.util.TreeMap;
++
++import org.apache.lucene.store.Directory;
++
++/**
++ * A reimplementation of TermInfosReader that doesn't read the entire term info index into memory,
++ * but only enough to satisfy a set of predefined terms that are allowed to be queries.
++ *
++ * This is useful if you are throw away the index everytime you make a query.
++ * Then you don't need to instantiate the entire set of terms, only the terms we need.
++ */
++public class PrefetchedTermInfosReader extends TermInfosReader {
++    private SegmentTermEnum resultEnum = null;
++
++    private Map indexMap = null;
++
++    private class IndexEntry {
++        IndexEntry(Term term, TermInfo termInfo, int offset, long pointer) {
++            this.term = term;
++            this.termInfo = termInfo;
++            this.offset = offset;
++            this.pointer = pointer;
++        }
++
++        Term term;
++        TermInfo termInfo;
++        int offset;  // This is the offset in the index array
++        long pointer;
++
++        public String toString() {
++            return term + ";" + offset + ";" + pointer;
++        }
++
++    }
++
++    PrefetchedTermInfosReader(Directory dir, String seg, FieldInfos fis, Collection termsToPrefetch)
++         throws IOException {
++      super(dir, seg, fis);
++
++      readIndex(termsToPrefetch);
++    }
++
++
++    private final void readIndex(Collection termsToPrefetch) throws IOException {
++        SegmentTermEnum indexEnum =
++            new SegmentTermEnum(getDirectory().openInput(getSegment() + ".tii"),
++                    getFieldInfos(), true);
++
++        List terms = new ArrayList(termsToPrefetch);
++        indexMap = new TreeMap();
++
++        Collections.sort(terms);  // Sort the terms so we can skipTo them in order.
++
++        // Now we are going to search for the current value.
++        for (Iterator i = terms.iterator(); i.hasNext(); ) {
++            Term term = (Term) i.next();
++            indexEnum.skipTo(term);
++            IndexEntry entry = new IndexEntry(indexEnum.term(), indexEnum.termInfo(), (int) indexEnum.position, indexEnum.indexPointer);
++            indexMap.put(term, entry);
++        }
++
++        indexEnum.close();
++    }
++
++    private SegmentTermEnum getEnum() {
++        if (resultEnum == null) resultEnum = terms();
++        return resultEnum;
++    }
++
++    // The currentWildcardTerm we've tried to find.  This only supports prefix queries.
++    private Term currentWildcardTerm = null;
++    private final void seekEnum(Term term) throws IOException {
++
++        IndexEntry entry = (IndexEntry) indexMap.get(term);
++        if (entry == null) {
++            // OK, we matched a wildcard term... we need to see if we're at the correct enum, which is straightforward.
++            if (currentWildcardTerm != null && term.field == currentWildcardTerm.field
++                    && term.text.startsWith(currentWildcardTerm.text)) {
++                if (getEnum().compareWithTerm(term) > 0) {  // It's really term.compareTo(getEnum.term())
++                    // OK, the term we're looking for is past the current, so it's ok.
++                    // If we're looking at it right now (unlikely), go backwards.
++                    return;
++                }
++                currentWildcardTerm = null;
++            }
++            // Find the wildcard term we're searching for
++            for (Iterator i = indexMap.entrySet().iterator(); i.hasNext(); ) {
++                Map.Entry wcEntry = (Map.Entry) i.next();
++                String wcText = ((Term)wcEntry.getKey()).text;
++                if (term.field == ((Term)wcEntry.getKey()).field
++                        && term.text.startsWith(wcText)) {
++                    // Our term starts with what the wildcard version.
++                    currentWildcardTerm = (Term) wcEntry.getKey();
++                    entry = (IndexEntry) wcEntry.getValue();
++                    break;  // TEST:  was this why it failed?
++                }
++
++            }
++            if (entry == null) throw new AssertionError("Can't find term "  + term);
++        }
++
++        getEnum().seek(entry.pointer,
++              (entry.offset * getEnum().indexInterval) - 1,
++              entry.term, entry.termInfo);
++      }
++
++    /** Returns the TermInfo for a Term in the set, or null. */
++    TermInfo get(Term term) throws IOException {
++      if (size() == 0) return null;
++
++      seekEnum(term);
++      return scanEnum(term);
++    }
++
++    /** Scans resultEnum within block for matching term. */
++    private final TermInfo scanEnum(Term term) throws IOException {
++      SegmentTermEnum enumerator = getEnum();
++      if (!enumerator.skipTo(term)) return null;  // This will avoid any of the resetting nonsense
++      if (enumerator.term() != null && term.compareTo(enumerator.term()) == 0)
++        return enumerator.termInfo();
++      else
++        return null;
++    }
++
++
++    /** Returns an enumeration of terms starting at or after the named term. */
++    public SegmentTermEnum terms(Term term) throws IOException {
++      get(term);
++      return (SegmentTermEnum)getEnum().clone();
++    }
++
++}
+Index: java/org/apache/lucene/index/TermInfosReader.java
+===================================================================
+--- java/org/apache/lucene/index/TermInfosReader.java	(revision 382121)
++++ java/org/apache/lucene/index/TermInfosReader.java	(working copy)
+@@ -24,21 +24,14 @@
+  * Directory.  Pairs are accessed either by Term or by ordinal position the
+  * set.  */
+ 
+-final class TermInfosReader {
++public abstract class TermInfosReader {
+   private Directory directory;
+   private String segment;
+   private FieldInfos fieldInfos;
+ 
+-  private ThreadLocal enumerators = new ThreadLocal();
+   private SegmentTermEnum origEnum;
+   private long size;
+ 
+-  private Term[] indexTerms = null;
+-  private TermInfo[] indexInfos;
+-  private long[] indexPointers;
+-  
+-  private SegmentTermEnum indexEnum;
+-
+   TermInfosReader(Directory dir, String seg, FieldInfos fis)
+        throws IOException {
+     directory = dir;
+@@ -48,158 +41,30 @@
+     origEnum = new SegmentTermEnum(directory.openInput(segment + ".tis"),
+                                    fieldInfos, false);
+     size = origEnum.size;
+-
+-    indexEnum =
+-      new SegmentTermEnum(directory.openInput(segment + ".tii"),
+-			  fieldInfos, true);
+-  }
+-
+-  protected void finalize() {
+-    // patch for pre-1.4.2 JVMs, whose ThreadLocals leak
+-    enumerators.set(null);
+   }
+ 
+-  public int getSkipInterval() {
+-    return origEnum.skipInterval;
+-  }
+-
+-  final void close() throws IOException {
+-    if (origEnum != null)
+-      origEnum.close();
+-    if (indexEnum != null)
+-      indexEnum.close();
+-  }
++  Directory getDirectory() { return directory; }
++  String getSegment() { return segment; }
++  FieldInfos getFieldInfos() { return fieldInfos; }
++  SegmentTermEnum getOrigEnum() {return this.origEnum;}
+ 
+   /** Returns the number of term/value pairs in the set. */
+   final long size() {
+     return size;
+   }
+ 
+-  private SegmentTermEnum getEnum() {
+-    SegmentTermEnum termEnum = (SegmentTermEnum)enumerators.get();
+-    if (termEnum == null) {
+-      termEnum = terms();
+-      enumerators.set(termEnum);
+-    }
+-    return termEnum;
+-  }
+-
+-  private synchronized void ensureIndexIsRead() throws IOException {
+-    if (indexTerms != null)                       // index already read
+-      return;                                     // do nothing
+-    try {
+-      int indexSize = (int)indexEnum.size;        // otherwise read index
+-
+-      indexTerms = new Term[indexSize];
+-      indexInfos = new TermInfo[indexSize];
+-      indexPointers = new long[indexSize];
+-        
+-      for (int i = 0; indexEnum.next(); i++) {
+-        indexTerms[i] = indexEnum.term();
+-        indexInfos[i] = indexEnum.termInfo();
+-        indexPointers[i] = indexEnum.indexPointer;
+-      }
+-    } finally {
+-        indexEnum.close();
+-        indexEnum = null;
+-    }
+-  }
+-
+-  /** Returns the offset of the greatest index entry which is less than or equal to term.*/
+-  private final int getIndexOffset(Term term) {
+-    int lo = 0;					  // binary search indexTerms[]
+-    int hi = indexTerms.length - 1;
+-
+-    while (hi >= lo) {
+-      int mid = (lo + hi) >> 1;
+-      int delta = term.compareTo(indexTerms[mid]);
+-      if (delta < 0)
+-	hi = mid - 1;
+-      else if (delta > 0)
+-	lo = mid + 1;
+-      else
+-	return mid;
+-    }
+-    return hi;
++  public int getSkipInterval() {
++    return origEnum.skipInterval;
+   }
+ 
+-  private final void seekEnum(int indexOffset) throws IOException {
+-    getEnum().seek(indexPointers[indexOffset],
+-	      (indexOffset * getEnum().indexInterval) - 1,
+-	      indexTerms[indexOffset], indexInfos[indexOffset]);
++  protected void close() throws IOException {
++    if (origEnum != null)
++      origEnum.close();
+   }
+ 
+   /** Returns the TermInfo for a Term in the set, or null. */
+-  TermInfo get(Term term) throws IOException {
+-    if (size == 0) return null;
+-
+-    ensureIndexIsRead();
++  abstract TermInfo get(Term term) throws IOException;
+ 
+-    // optimize sequential access: first try scanning cached enum w/o seeking
+-    SegmentTermEnum enumerator = getEnum();
+-    if (enumerator.term() != null                 // term is at or past current
+-	&& ((enumerator.prev() != null && term.compareTo(enumerator.prev())> 0)
+-	    || term.compareTo(enumerator.term()) >= 0)) {
+-      int enumOffset = (int)(enumerator.position/enumerator.indexInterval)+1;
+-      if (indexTerms.length == enumOffset	  // but before end of block
+-	  || term.compareTo(indexTerms[enumOffset]) < 0)
+-	return scanEnum(term);			  // no need to seek
+-    }
+-
+-    // random-access: must seek
+-    seekEnum(getIndexOffset(term));
+-    return scanEnum(term);
+-  }
+-
+-  /** Scans within block for matching term. */
+-  private final TermInfo scanEnum(Term term) throws IOException {
+-    SegmentTermEnum enumerator = getEnum();
+-    enumerator.scanTo(term);
+-    if (enumerator.term() != null && term.compareTo(enumerator.term()) == 0)
+-      return enumerator.termInfo();
+-    else
+-      return null;
+-  }
+-
+-  /** Returns the nth term in the set. */
+-  final Term get(int position) throws IOException {
+-    if (size == 0) return null;
+-
+-    SegmentTermEnum enumerator = getEnum();
+-    if (enumerator != null && enumerator.term() != null &&
+-        position >= enumerator.position &&
+-	position < (enumerator.position + enumerator.indexInterval))
+-      return scanEnum(position);		  // can avoid seek
+-
+-    seekEnum(position / enumerator.indexInterval); // must seek
+-    return scanEnum(position);
+-  }
+-
+-  private final Term scanEnum(int position) throws IOException {
+-    SegmentTermEnum enumerator = getEnum();
+-    while(enumerator.position < position)
+-      if (!enumerator.next())
+-	return null;
+-
+-    return enumerator.term();
+-  }
+-
+-  /** Returns the position of a Term in the set or -1. */
+-  final long getPosition(Term term) throws IOException {
+-    if (size == 0) return -1;
+-
+-    ensureIndexIsRead();
+-    int indexOffset = getIndexOffset(term);
+-    seekEnum(indexOffset);
+-
+-    SegmentTermEnum enumerator = getEnum();
+-    while(term.compareTo(enumerator.term()) > 0 && enumerator.next()) {}
+-
+-    if (term.compareTo(enumerator.term()) == 0)
+-      return enumerator.position;
+-    else
+-      return -1;
+-  }
+ 
+   /** Returns an enumeration of all the Terms and TermInfos in the set. */
+   public SegmentTermEnum terms() {
+@@ -207,8 +72,5 @@
+   }
+ 
+   /** Returns an enumeration of terms starting at or after the named term. */
+-  public SegmentTermEnum terms(Term term) throws IOException {
+-    get(term);
+-    return (SegmentTermEnum)getEnum().clone();
+-  }
++  public abstract SegmentTermEnum terms(Term term) throws IOException;
+ }
+Index: java/org/apache/lucene/index/IndexReader.java
+===================================================================
+--- java/org/apache/lucene/index/IndexReader.java	(revision 382121)
++++ java/org/apache/lucene/index/IndexReader.java	(working copy)
+@@ -124,21 +124,33 @@
+   /** Returns an IndexReader reading the index in an FSDirectory in the named
+    path. */
+   public static IndexReader open(String path) throws IOException {
+-    return open(FSDirectory.getDirectory(path, false), true);
++    return open(FSDirectory.getDirectory(path, false), true, null);
+   }
+ 
+   /** Returns an IndexReader reading the index in an FSDirectory in the named
+    path. */
+   public static IndexReader open(File path) throws IOException {
+-    return open(FSDirectory.getDirectory(path, false), true);
++    return open(FSDirectory.getDirectory(path, false), true, null);
+   }
+   
+   /** Returns an IndexReader reading the index in the given Directory. */
+   public static IndexReader open(final Directory directory) throws IOException {
+-    return open(directory, false);
++    return open(directory, false, null);
+   }
+ 
+-  private static IndexReader open(final Directory directory, final boolean closeDirectory) throws IOException {
++  /**
++   * Returns an IndexReader reading the index in the given Directory.
++   * Call this method *only* if you know the complete set of terms you will retrieve
++   * from the index for all time.  I.e. if you are using short-lived large indexes.
++   *
++   * This will improve performance by not loading the entire TermInfoIndex into memory
++   * when loading the index, but only those fields you want to see.
++   * */
++  public static IndexReader open(final Directory directory, Collection termsToPrefetch) throws IOException {
++    return open(directory, false, termsToPrefetch);
++  }
++
++  private static IndexReader open(final Directory directory, final boolean closeDirectory, final Collection termsToPrefetch) throws IOException {
+     synchronized (directory) {			  // in- & inter-process sync
+       return (IndexReader)new Lock.With(
+           directory.makeLock(IndexWriter.COMMIT_LOCK_NAME),
+@@ -147,11 +159,11 @@
+             SegmentInfos infos = new SegmentInfos();
+             infos.read(directory);
+             if (infos.size() == 1) {		  // index is optimized
+-              return SegmentReader.get(infos, infos.info(0), closeDirectory);
++              return SegmentReader.get(infos, infos.info(0), closeDirectory, termsToPrefetch);
+             }
+             IndexReader[] readers = new IndexReader[infos.size()];
+             for (int i = 0; i < infos.size(); i++)
+-              readers[i] = SegmentReader.get(infos.info(i));
++              readers[i] = SegmentReader.get(infos.info(i), termsToPrefetch);
+             return new MultiReader(directory, infos, closeDirectory, readers);
+             
+           }
+Index: java/org/apache/lucene/index/SegmentTermInfosReader.java
+===================================================================
+--- java/org/apache/lucene/index/SegmentTermInfosReader.java	(revision 0)
++++ java/org/apache/lucene/index/SegmentTermInfosReader.java	(revision 0)
+@@ -0,0 +1,187 @@
++package org.apache.lucene.index;
++
++/**
++ * Copyright 2004 The Apache Software Foundation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++
++import org.apache.lucene.store.Directory;
++
++/** This stores a monotonically increasing set of <Term, TermInfo> pairs in a
++ * Directory.  Pairs are accessed either by Term or by ordinal position the
++ * set.  */
++
++class SegmentTermInfosReader extends TermInfosReader {
++    private ThreadLocal enumerators = new ThreadLocal();
++
++    private Term[] indexTerms = null;
++    private TermInfo[] indexInfos;
++    private long[] indexPointers;
++
++    private SegmentTermEnum indexEnum;
++
++    SegmentTermInfosReader(Directory dir, String seg, FieldInfos fis)
++         throws IOException {
++      super(dir, seg, fis);
++
++      indexEnum =
++        new SegmentTermEnum(dir.openInput(seg + ".tii"),
++              fis, true);
++    }
++
++    protected void finalize() {
++      // patch for pre-1.4.2 JVMs, whose ThreadLocals leak
++      enumerators.set(null);
++    }
++
++    protected final void close() throws IOException {
++      super.close();
++      if (indexEnum != null)
++        indexEnum.close();
++    }
++
++    private SegmentTermEnum getEnum() {
++      SegmentTermEnum termEnum = (SegmentTermEnum)enumerators.get();
++      if (termEnum == null) {
++        termEnum = terms();
++        enumerators.set(termEnum);
++      }
++      return termEnum;
++    }
++
++    private synchronized void ensureIndexIsRead() throws IOException {
++      if (indexTerms != null)                       // index already read
++        return;                                     // do nothing
++      try {
++        int indexSize = (int)indexEnum.size;        // otherwise read index
++
++        indexTerms = new Term[indexSize];
++        indexInfos = new TermInfo[indexSize];
++        indexPointers = new long[indexSize];
++
++        for (int i = 0; indexEnum.next(); i++) {
++          indexTerms[i] = indexEnum.term();
++          indexInfos[i] = indexEnum.termInfo();
++          indexPointers[i] = indexEnum.indexPointer;
++        }
++      } finally {
++          indexEnum.close();
++          indexEnum = null;
++      }
++    }
++
++    /** Returns the offset of the greatest index entry which is less than or equal to term.*/
++    private final int getIndexOffset(Term term) {
++      int lo = 0;                     // binary search indexTerms[]
++      int hi = indexTerms.length - 1;
++
++      while (hi >= lo) {
++        int mid = (lo + hi) >> 1;
++        int delta = term.compareTo(indexTerms[mid]);
++        if (delta < 0)
++    hi = mid - 1;
++        else if (delta > 0)
++    lo = mid + 1;
++        else
++    return mid;
++      }
++      return hi;
++    }
++
++    private final void seekEnum(int indexOffset) throws IOException {
++      getEnum().seek(indexPointers[indexOffset],
++          (indexOffset * getEnum().indexInterval) - 1,
++          indexTerms[indexOffset], indexInfos[indexOffset]);
++    }
++
++    /** Returns the TermInfo for a Term in the set, or null. */
++    TermInfo get(Term term) throws IOException {
++      if (size() == 0) return null;
++
++      ensureIndexIsRead();
++
++      // optimize sequential access: first try scanning cached enum w/o seeking
++      SegmentTermEnum enumerator = getEnum();
++      if (enumerator.term() != null                 // term is at or past current
++    && ((enumerator.prev() != null && term.compareTo(enumerator.prev())> 0)
++        || term.compareTo(enumerator.term()) >= 0)) {
++        int enumOffset = (int)(enumerator.position/enumerator.indexInterval)+1;
++        if (indexTerms.length == enumOffset   // but before end of block
++      || term.compareTo(indexTerms[enumOffset]) < 0)
++    return scanEnum(term);            // no need to seek
++      }
++
++      // random-access: must seek
++      seekEnum(getIndexOffset(term));
++      return scanEnum(term);
++    }
++
++    /** Scans within block for matching term. */
++    private final TermInfo scanEnum(Term term) throws IOException {
++      SegmentTermEnum enumerator = getEnum();
++      enumerator.scanTo(term);
++      if (enumerator.term() != null && term.compareTo(enumerator.term()) == 0)
++        return enumerator.termInfo();
++      else
++        return null;
++    }
++
++    /** Returns the nth term in the set. */
++    final Term get(int position) throws IOException {
++      if (size() == 0) return null;
++
++      SegmentTermEnum enumerator = getEnum();
++      if (enumerator != null && enumerator.term() != null &&
++          position >= enumerator.position &&
++    position < (enumerator.position + enumerator.indexInterval))
++        return scanEnum(position);        // can avoid seek
++
++      seekEnum(position / enumerator.indexInterval); // must seek
++      return scanEnum(position);
++    }
++
++    private final Term scanEnum(int position) throws IOException {
++      SegmentTermEnum enumerator = getEnum();
++      while(enumerator.position < position)
++        if (!enumerator.next())
++    return null;
++
++      return enumerator.term();
++    }
++
++    /** Returns the position of a Term in the set or -1. */
++    final long getPosition(Term term) throws IOException {
++      if (size() == 0) return -1;
++
++      ensureIndexIsRead();
++      int indexOffset = getIndexOffset(term);
++      seekEnum(indexOffset);
++
++      SegmentTermEnum enumerator = getEnum();
++      while(term.compareTo(enumerator.term()) > 0 && enumerator.next()) {}
++
++      if (term.compareTo(enumerator.term()) == 0)
++        return enumerator.position;
++      else
++        return -1;
++    }
++
++    /** Returns an enumeration of terms starting at or after the named term. */
++    public SegmentTermEnum terms(Term term) throws IOException {
++      get(term);
++      return (SegmentTermEnum)getEnum().clone();
++    }
++}
+Index: java/org/apache/lucene/index/SegmentReader.java
+===================================================================
+--- java/org/apache/lucene/index/SegmentReader.java	(revision 382121)
++++ java/org/apache/lucene/index/SegmentReader.java	(working copy)
+@@ -110,14 +110,29 @@
+     return get(si.dir, si, null, false, false);
+   }
+ 
++  static SegmentReader get(SegmentInfo si, Collection termsToPrefetch) throws IOException {
++      return get(si.dir, si, null, false, false, termsToPrefetch);
++  }
++
+   public static SegmentReader get(SegmentInfos sis, SegmentInfo si,
+                                   boolean closeDir) throws IOException {
+     return get(si.dir, si, sis, closeDir, true);
+   }
+ 
++  public static SegmentReader get(SegmentInfos sis, SegmentInfo si,
++          boolean closeDir, Collection termsToPrefetch) throws IOException {
++    return get(si.dir, si, sis, closeDir, true, termsToPrefetch);
++  }
++
+   public static SegmentReader get(Directory dir, SegmentInfo si,
+                                   SegmentInfos sis,
+-                                  boolean closeDir, boolean ownDir)
++          boolean closeDir, boolean ownDir) throws IOException {
++    return get(dir, si, sis, closeDir, ownDir, null);
++  }
++
++  static SegmentReader get(Directory dir, SegmentInfo si,
++                                  SegmentInfos sis,
++                                  boolean closeDir, boolean ownDir, Collection prefetchedTerms)
+     throws IOException {
+     SegmentReader instance;
+     try {
+@@ -126,11 +141,11 @@
+       throw new RuntimeException("cannot load SegmentReader class: " + e);
+     }
+     instance.init(dir, sis, closeDir, ownDir);
+-    instance.initialize(si);
++    instance.initialize(si, prefetchedTerms);
+     return instance;
+   }
+ 
+-   private void initialize(SegmentInfo si) throws IOException {
++   private void initialize(SegmentInfo si, Collection prefetchedTerms) throws IOException {
+     segment = si.name;
+ 
+     // Use compound file directory for some files, if it exists
+@@ -144,7 +159,13 @@
+     fieldInfos = new FieldInfos(cfsDir, segment + ".fnm");
+     fieldsReader = new FieldsReader(cfsDir, segment, fieldInfos);
+ 
+-    tis = new TermInfosReader(cfsDir, segment, fieldInfos);
++    if (prefetchedTerms != null && prefetchedTerms.size() > 0) {
++        // If there are terms to prefetch (i.e. the only terms we will ever use
++        // Then don't load the index, just load the given values.
++        tis = new PrefetchedTermInfosReader(cfsDir, segment, fieldInfos, prefetchedTerms);
++    } else {
++        tis = new SegmentTermInfosReader(cfsDir, segment, fieldInfos);
++    }
+ 
+     // NOTE: the bitvector is stored using the regular directory, not cfs
+     if (hasDeletions(si))

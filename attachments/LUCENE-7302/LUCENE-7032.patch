@@ -1,0 +1,2026 @@
+diff -ruN -x .svn -x .git -x build -x dist -x .caches -x .idea -x idea-build -x eclipse-build -x .settings trunk/lucene/core/src/java/org/apache/lucene/index/BufferedUpdates.java sequences/lucene/core/src/java/org/apache/lucene/index/BufferedUpdates.java
+--- trunk/lucene/core/src/java/org/apache/lucene/index/BufferedUpdates.java	2016-03-02 04:32:40.435807336 -0500
++++ sequences/lucene/core/src/java/org/apache/lucene/index/BufferedUpdates.java	2016-05-26 15:29:58.444121057 -0400
+@@ -34,7 +34,7 @@
+  * single segment. This is used to hold buffered pending
+  * deletes and updates against the to-be-flushed segment.  Once the
+  * deletes and updates are pushed (on flush in DocumentsWriter), they
+- * are converted to a FrozenDeletes instance. */
++ * are converted to a FrozenBufferedUpdates instance. */
+ 
+ // NOTE: instances of this class are accessed either via a private
+ // instance on DocumentWriterPerThread, or via sync'd code by
+diff -ruN -x .svn -x .git -x build -x dist -x .caches -x .idea -x idea-build -x eclipse-build -x .settings trunk/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterDeleteQueue.java sequences/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterDeleteQueue.java
+--- trunk/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterDeleteQueue.java	2016-05-26 04:44:28.275494658 -0400
++++ sequences/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterDeleteQueue.java	2016-05-26 15:31:49.860122859 -0400
+@@ -17,6 +17,7 @@
+ package org.apache.lucene.index;
+ 
+ import java.util.Arrays;
++import java.util.concurrent.atomic.AtomicLong;
+ import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+ import java.util.concurrent.locks.ReentrantLock;
+ 
+@@ -81,18 +82,23 @@
+   final ReentrantLock globalBufferLock = new ReentrantLock();
+ 
+   final long generation;
++
++  /** Generates the sequence number that IW returns to callers changing the index, showing the effective serialization of all operations. */
++  final AtomicLong seqNo;
+   
+   DocumentsWriterDeleteQueue() {
+-    this(0);
++    // seqNo must start at 1 because some APIs negate this to also return a boolean
++    this(0, 1);
+   }
+   
+-  DocumentsWriterDeleteQueue(long generation) {
+-    this(new BufferedUpdates(), generation);
++  DocumentsWriterDeleteQueue(long generation, long startSeqNo) {
++    this(new BufferedUpdates(), generation, startSeqNo);
+   }
+ 
+-  DocumentsWriterDeleteQueue(BufferedUpdates globalBufferedUpdates, long generation) {
++  DocumentsWriterDeleteQueue(BufferedUpdates globalBufferedUpdates, long generation, long startSeqNo) {
+     this.globalBufferedUpdates = globalBufferedUpdates;
+     this.generation = generation;
++    this.seqNo = new AtomicLong(startSeqNo);
+     /*
+      * we use a sentinel instance as our initial tail. No slice will ever try to
+      * apply this tail since the head is always omitted.
+@@ -101,28 +107,31 @@
+     globalSlice = new DeleteSlice(tail);
+   }
+ 
+-  void addDelete(Query... queries) {
+-    add(new QueryArrayNode(queries));
++  long addDelete(Query... queries) {
++    long seqNo = add(new QueryArrayNode(queries));
+     tryApplyGlobalSlice();
++    return seqNo;
+   }
+ 
+-  void addDelete(Term... terms) {
+-    add(new TermArrayNode(terms));
++  long addDelete(Term... terms) {
++    long seqNo = add(new TermArrayNode(terms));
+     tryApplyGlobalSlice();
++    return seqNo;
+   }
+ 
+-  void addDocValuesUpdates(DocValuesUpdate... updates) {
+-    add(new DocValuesUpdatesNode(updates));
++  long addDocValuesUpdates(DocValuesUpdate... updates) {
++    long seqNo = add(new DocValuesUpdatesNode(updates));
+     tryApplyGlobalSlice();
++    return seqNo;
+   }
+   
+   /**
+    * invariant for document update
+    */
+-  void add(Term term, DeleteSlice slice) {
++  long add(Term term, DeleteSlice slice) {
+     final TermNode termNode = new TermNode(term);
+ //    System.out.println(Thread.currentThread().getName() + ": push " + termNode + " this=" + this);
+-    add(termNode);
++    long seqNo = add(termNode);
+     /*
+      * this is an update request where the term is the updated documents
+      * delTerm. in that case we need to guarantee that this insert is atomic
+@@ -137,39 +146,32 @@
+     assert slice.sliceHead != slice.sliceTail : "slice head and tail must differ after add";
+     tryApplyGlobalSlice(); // TODO doing this each time is not necessary maybe
+     // we can do it just every n times or so?
++
++    return seqNo;
+   }
+ 
+-  void add(Node<?> item) {
++  long add(Node<?> newNode) {
+     /*
+      * this non-blocking / 'wait-free' linked list add was inspired by Apache
+      * Harmony's ConcurrentLinkedQueue Implementation.
+      */
+     while (true) {
+-      final Node<?> currentTail = this.tail;
++      final Node<?> currentTail = tail;
+       final Node<?> tailNext = currentTail.next;
+-      if (tail == currentTail) {
+-        if (tailNext != null) {
+-          /*
+-           * we are in intermediate state here. the tails next pointer has been
+-           * advanced but the tail itself might not be updated yet. help to
+-           * advance the tail and try again updating it.
+-           */
+-          tailUpdater.compareAndSet(this, currentTail, tailNext); // can fail
+-        } else {
++      if (tail == currentTail && tailNext == null) {
++        /*
++         * we are in quiescent state and can try to insert the newNode to the
++         * current tail if we fail to insert we just retry the operation since
++         * somebody else has already added its newNode
++         */
++        if (currentTail.casNext(null, newNode)) {
+           /*
+-           * we are in quiescent state and can try to insert the item to the
+-           * current tail if we fail to insert we just retry the operation since
+-           * somebody else has already added its item
++           * now that we are done we need to advance the tail
+            */
+-          if (currentTail.casNext(null, item)) {
+-            /*
+-             * now that we are done we need to advance the tail while another
+-             * thread could have advanced it already so we can ignore the return
+-             * type of this CAS call
+-             */
+-            tailUpdater.compareAndSet(this, currentTail, item);
+-            return;
+-          }
++          long mySeqNo = seqNo.getAndIncrement();
++          boolean result = tailUpdater.compareAndSet(this, currentTail, newNode);
++          assert result;
++          return mySeqNo;
+         }
+       }
+     }
+@@ -230,8 +232,7 @@
+       }
+ 
+ //      System.out.println(Thread.currentThread().getName() + ": now freeze global buffer " + globalBufferedDeletes);
+-      final FrozenBufferedUpdates packet = new FrozenBufferedUpdates(
+-          globalBufferedUpdates, false);
++      final FrozenBufferedUpdates packet = new FrozenBufferedUpdates(globalBufferedUpdates, false);
+       globalBufferedUpdates.clear();
+       return packet;
+     } finally {
+diff -ruN -x .svn -x .git -x build -x dist -x .caches -x .idea -x idea-build -x eclipse-build -x .settings trunk/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterFlushControl.java sequences/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterFlushControl.java
+--- trunk/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterFlushControl.java	2016-02-16 11:18:34.661021815 -0500
++++ sequences/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterFlushControl.java	2016-05-26 15:34:05.348125051 -0400
+@@ -141,8 +141,7 @@
+   }
+ 
+   private void commitPerThreadBytes(ThreadState perThread) {
+-    final long delta = perThread.dwpt.bytesUsed()
+-        - perThread.bytesUsed;
++    final long delta = perThread.dwpt.bytesUsed() - perThread.bytesUsed;
+     perThread.bytesUsed += delta;
+     /*
+      * We need to differentiate here if we are pending since setFlushPending
+@@ -167,8 +166,7 @@
+     return true;
+   }
+ 
+-  synchronized DocumentsWriterPerThread doAfterDocument(ThreadState perThread,
+-      boolean isUpdate) {
++  synchronized DocumentsWriterPerThread doAfterDocument(ThreadState perThread, boolean isUpdate) {
+     try {
+       commitPerThreadBytes(perThread);
+       if (!perThread.flushPending) {
+@@ -471,8 +469,9 @@
+     }
+   }
+   
+-  void markForFullFlush() {
++  long markForFullFlush() {
+     final DocumentsWriterDeleteQueue flushingQueue;
++    long seqNo;
+     synchronized (this) {
+       assert !fullFlush : "called DWFC#markForFullFlush() while full flush is still running";
+       assert fullFlushBuffer.isEmpty() : "full flush buffer should be empty: "+ fullFlushBuffer;
+@@ -480,7 +479,14 @@
+       flushingQueue = documentsWriter.deleteQueue;
+       // Set a new delete queue - all subsequent DWPT will use this queue until
+       // we do another full flush
+-      DocumentsWriterDeleteQueue newQueue = new DocumentsWriterDeleteQueue(flushingQueue.generation+1);
++      //System.out.println("DWFC: fullFLush old seqNo=" + documentsWriter.deleteQueue.seqNo.get() + " activeThreadCount=" + perThreadPool.getActiveThreadStateCount());
++
++      // Insert a gap in seqNo of current active thread count, in the worst case those threads now have one operation in flight.  It's fine
++      // if we have some sequence numbers that were never assigned:
++      seqNo = documentsWriter.deleteQueue.seqNo.get() + perThreadPool.getActiveThreadStateCount();
++
++      DocumentsWriterDeleteQueue newQueue = new DocumentsWriterDeleteQueue(flushingQueue.generation+1, seqNo+1);
++
+       documentsWriter.deleteQueue = newQueue;
+     }
+     final int limit = perThreadPool.getActiveThreadStateCount();
+@@ -520,6 +526,7 @@
+       updateStallState();
+     }
+     assert assertActiveDeleteQueue(documentsWriter.deleteQueue);
++    return seqNo;
+   }
+   
+   private boolean assertActiveDeleteQueue(DocumentsWriterDeleteQueue queue) {
+diff -ruN -x .svn -x .git -x build -x dist -x .caches -x .idea -x idea-build -x eclipse-build -x .settings trunk/lucene/core/src/java/org/apache/lucene/index/DocumentsWriter.java sequences/lucene/core/src/java/org/apache/lucene/index/DocumentsWriter.java
+--- trunk/lucene/core/src/java/org/apache/lucene/index/DocumentsWriter.java	2016-02-16 11:18:34.661021815 -0500
++++ sequences/lucene/core/src/java/org/apache/lucene/index/DocumentsWriter.java	2016-05-26 15:29:58.444121057 -0400
+@@ -136,30 +136,40 @@
+     flushControl = new DocumentsWriterFlushControl(this, config, writer.bufferedUpdatesStream);
+   }
+   
+-  synchronized boolean deleteQueries(final Query... queries) throws IOException {
++  synchronized long deleteQueries(final Query... queries) throws IOException {
+     // TODO why is this synchronized?
+     final DocumentsWriterDeleteQueue deleteQueue = this.deleteQueue;
+-    deleteQueue.addDelete(queries);
++    long seqNo = deleteQueue.addDelete(queries);
+     flushControl.doOnDelete();
+-    return applyAllDeletes(deleteQueue);
++    if (applyAllDeletes(deleteQueue)) {
++      seqNo = -seqNo;
++    }
++    return seqNo;
+   }
+ 
+   // TODO: we could check w/ FreqProxTermsWriter: if the
+   // term doesn't exist, don't bother buffering into the
+   // per-DWPT map (but still must go into the global map)
+-  synchronized boolean deleteTerms(final Term... terms) throws IOException {
++  synchronized long deleteTerms(final Term... terms) throws IOException {
+     // TODO why is this synchronized?
+     final DocumentsWriterDeleteQueue deleteQueue = this.deleteQueue;
+-    deleteQueue.addDelete(terms);
++    long seqNo = deleteQueue.addDelete(terms);
+     flushControl.doOnDelete();
+-    return applyAllDeletes( deleteQueue);
++    if (applyAllDeletes(deleteQueue)) {
++      seqNo = -seqNo;
++    }
++    return seqNo;
+   }
+ 
+-  synchronized boolean updateDocValues(DocValuesUpdate... updates) throws IOException {
++  synchronized long updateDocValues(DocValuesUpdate... updates) throws IOException {
+     final DocumentsWriterDeleteQueue deleteQueue = this.deleteQueue;
+-    deleteQueue.addDocValuesUpdates(updates);
++    long seqNo = deleteQueue.addDocValuesUpdates(updates);
+     flushControl.doOnDelete();
+-    return applyAllDeletes(deleteQueue);
++    if (applyAllDeletes(deleteQueue)) {
++      seqNo = -seqNo;
++    }
++
++    return seqNo;
+   }
+   
+   DocumentsWriterDeleteQueue currentDeleteSession() {
+@@ -247,6 +257,10 @@
+         abortedDocCount += abortThreadState(perThread);
+       }
+       deleteQueue.clear();
++
++      // jump over any possible in flight ops:
++      deleteQueue.seqNo.addAndGet(perThreadPool.getActiveThreadStateCount()+1);
++
+       flushControl.abortPendingFlushes();
+       flushControl.waitForFlush();
+       success = true;
+@@ -393,13 +407,14 @@
+     }
+   }
+ 
+-  boolean updateDocuments(final Iterable<? extends Iterable<? extends IndexableField>> docs, final Analyzer analyzer,
+-                          final Term delTerm) throws IOException, AbortingException {
++  long updateDocuments(final Iterable<? extends Iterable<? extends IndexableField>> docs, final Analyzer analyzer,
++                       final Term delTerm) throws IOException, AbortingException {
+     boolean hasEvents = preUpdate();
+ 
+     final ThreadState perThread = flushControl.obtainAndLock();
+     final DocumentsWriterPerThread flushingDWPT;
+-    
++    final long seqNo;
++
+     try {
+       // This must happen after we've pulled the ThreadState because IW.close
+       // waits for all ThreadStates to be released:
+@@ -409,7 +424,7 @@
+       final DocumentsWriterPerThread dwpt = perThread.dwpt;
+       final int dwptNumDocs = dwpt.getNumDocsInRAM();
+       try {
+-        dwpt.updateDocuments(docs, analyzer, delTerm);
++        seqNo = dwpt.updateDocuments(docs, analyzer, delTerm);
+       } catch (AbortingException ae) {
+         flushControl.doOnAbort(perThread);
+         dwpt.abort();
+@@ -426,10 +441,14 @@
+       perThreadPool.release(perThread);
+     }
+ 
+-    return postUpdate(flushingDWPT, hasEvents);
++    if (postUpdate(flushingDWPT, hasEvents)) {
++      return -seqNo;
++    } else {
++      return seqNo;
++    }
+   }
+ 
+-  boolean updateDocument(final Iterable<? extends IndexableField> doc, final Analyzer analyzer,
++  long updateDocument(final Iterable<? extends IndexableField> doc, final Analyzer analyzer,
+       final Term delTerm) throws IOException, AbortingException {
+ 
+     boolean hasEvents = preUpdate();
+@@ -437,6 +456,7 @@
+     final ThreadState perThread = flushControl.obtainAndLock();
+ 
+     final DocumentsWriterPerThread flushingDWPT;
++    final long seqNo;
+     try {
+       // This must happen after we've pulled the ThreadState because IW.close
+       // waits for all ThreadStates to be released:
+@@ -446,7 +466,7 @@
+       final DocumentsWriterPerThread dwpt = perThread.dwpt;
+       final int dwptNumDocs = dwpt.getNumDocsInRAM();
+       try {
+-        dwpt.updateDocument(doc, analyzer, delTerm); 
++        seqNo = dwpt.updateDocument(doc, analyzer, delTerm); 
+       } catch (AbortingException ae) {
+         flushControl.doOnAbort(perThread);
+         dwpt.abort();
+@@ -463,7 +483,11 @@
+       perThreadPool.release(perThread);
+     }
+ 
+-    return postUpdate(flushingDWPT, hasEvents);
++    if (postUpdate(flushingDWPT, hasEvents)) {
++      return -seqNo;
++    } else {
++      return seqNo;
++    }
+   }
+ 
+   private boolean doFlush(DocumentsWriterPerThread flushingDWPT) throws IOException, AbortingException {
+@@ -587,20 +611,22 @@
+    * two stage operation; the caller must ensure (in try/finally) that finishFlush
+    * is called after this method, to release the flush lock in DWFlushControl
+    */
+-  boolean flushAllThreads()
++  long flushAllThreads()
+     throws IOException, AbortingException {
+     final DocumentsWriterDeleteQueue flushingDeleteQueue;
+     if (infoStream.isEnabled("DW")) {
+       infoStream.message("DW", "startFullFlush");
+     }
+-    
++
++    long seqNo;
++
+     synchronized (this) {
+       pendingChangesInCurrentFullFlush = anyChanges();
+       flushingDeleteQueue = deleteQueue;
+       /* Cutover to a new delete queue.  This must be synced on the flush control
+        * otherwise a new DWPT could sneak into the loop with an already flushing
+        * delete queue */
+-      flushControl.markForFullFlush(); // swaps the delQueue synced on FlushControl
++      seqNo = flushControl.markForFullFlush(); // swaps the delQueue synced on FlushControl
+       assert setFlushingDeleteQueue(flushingDeleteQueue);
+     }
+     assert currentFullFlushDelQueue != null;
+@@ -620,13 +646,17 @@
+           infoStream.message("DW", Thread.currentThread().getName() + ": flush naked frozen global deletes");
+         }
+         ticketQueue.addDeletes(flushingDeleteQueue);
+-      } 
++      }
+       ticketQueue.forcePurge(writer);
+       assert !flushingDeleteQueue.anyChanges() && !ticketQueue.hasTickets();
+     } finally {
+       assert flushingDeleteQueue == currentFullFlushDelQueue;
+     }
+-    return anythingFlushed;
++    if (anythingFlushed) {
++      return -seqNo;
++    } else {
++      return seqNo;
++    }
+   }
+   
+   void finishFullFlush(IndexWriter indexWriter, boolean success) {
+diff -ruN -x .svn -x .git -x build -x dist -x .caches -x .idea -x idea-build -x eclipse-build -x .settings trunk/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterPerThread.java sequences/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterPerThread.java
+--- trunk/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterPerThread.java	2016-05-16 08:59:52.717045118 -0400
++++ sequences/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterPerThread.java	2016-05-26 15:29:58.444121057 -0400
+@@ -175,7 +175,6 @@
+     intBlockAllocator = new IntBlockAllocator(bytesUsed);
+     this.deleteQueue = deleteQueue;
+     assert numDocsInRAM == 0 : "num docs " + numDocsInRAM;
+-    pendingUpdates.clear();
+     deleteSlice = deleteQueue.newSlice();
+    
+     segmentInfo = new SegmentInfo(directoryOrig, Version.LATEST, segmentName, -1, false, codec, Collections.emptyMap(), StringHelper.randomId(), new HashMap<>(), null);
+@@ -210,7 +209,7 @@
+     }
+   }
+ 
+-  public void updateDocument(Iterable<? extends IndexableField> doc, Analyzer analyzer, Term delTerm) throws IOException, AbortingException {
++  public long updateDocument(Iterable<? extends IndexableField> doc, Analyzer analyzer, Term delTerm) throws IOException, AbortingException {
+     testPoint("DocumentsWriterPerThread addDocument start");
+     assert deleteQueue != null;
+     reserveOneDoc();
+@@ -241,10 +240,11 @@
+         numDocsInRAM++;
+       }
+     }
+-    finishDocument(delTerm);
++
++    return finishDocument(delTerm);
+   }
+ 
+-  public int updateDocuments(Iterable<? extends Iterable<? extends IndexableField>> docs, Analyzer analyzer, Term delTerm) throws IOException, AbortingException {
++  public long updateDocuments(Iterable<? extends Iterable<? extends IndexableField>> docs, Analyzer analyzer, Term delTerm) throws IOException, AbortingException {
+     testPoint("DocumentsWriterPerThread addDocuments start");
+     assert deleteQueue != null;
+     docState.analyzer = analyzer;
+@@ -285,12 +285,18 @@
+       // Apply delTerm only after all indexing has
+       // succeeded, but apply it only to docs prior to when
+       // this batch started:
++      long seqNo;
+       if (delTerm != null) {
+-        deleteQueue.add(delTerm, deleteSlice);
++        seqNo = deleteQueue.add(delTerm, deleteSlice);
+         assert deleteSlice.isTailItem(delTerm) : "expected the delete term as the tail item";
+         deleteSlice.apply(pendingUpdates, numDocsInRAM-docCount);
++        return seqNo;
++      } else {
++        seqNo = deleteQueue.seqNo.get();
+       }
+ 
++      return seqNo;
++
+     } finally {
+       if (!allDocsIndexed && !aborted) {
+         // the iterator threw an exception that is not aborting 
+@@ -304,11 +310,9 @@
+       }
+       docState.clear();
+     }
+-
+-    return docCount;
+   }
+   
+-  private void finishDocument(Term delTerm) {
++  private long finishDocument(Term delTerm) {
+     /*
+      * here we actually finish the document in two steps 1. push the delete into
+      * the queue and update our slice. 2. increment the DWPT private document
+@@ -318,11 +322,13 @@
+      * since we updated the slice the last time.
+      */
+     boolean applySlice = numDocsInRAM != 0;
++    long seqNo;
+     if (delTerm != null) {
+-      deleteQueue.add(delTerm, deleteSlice);
++      seqNo = deleteQueue.add(delTerm, deleteSlice);
+       assert deleteSlice.isTailItem(delTerm) : "expected the delete term as the tail item";
+     } else  {
+       applySlice &= deleteQueue.updateSlice(deleteSlice);
++      seqNo = deleteQueue.seqNo.get();
+     }
+     
+     if (applySlice) {
+@@ -331,6 +337,8 @@
+       deleteSlice.reset();
+     }
+     ++numDocsInRAM;
++
++    return seqNo;
+   }
+ 
+   // Buffer a specific docID for deletion. Currently only
+diff -ruN -x .svn -x .git -x build -x dist -x .caches -x .idea -x idea-build -x eclipse-build -x .settings trunk/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterPerThreadPool.java sequences/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterPerThreadPool.java
+--- trunk/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterPerThreadPool.java	2016-02-16 11:18:34.661021815 -0500
++++ sequences/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterPerThreadPool.java	2016-05-26 15:29:58.444121057 -0400
+@@ -229,19 +229,4 @@
+   synchronized int getMaxThreadStates() {
+     return threadStates.size();
+   }
+-
+-  /**
+-   * Returns the ThreadState with the minimum estimated number of threads
+-   * waiting to acquire its lock or <code>null</code> if no {@link ThreadState}
+-   * is yet visible to the calling thread.
+-   */
+-  ThreadState minContendedThreadState() {
+-    ThreadState minThreadState = null;
+-    for (ThreadState state : threadStates) {
+-      if (minThreadState == null || state.getQueueLength() < minThreadState.getQueueLength()) {
+-        minThreadState = state;
+-      }
+-    }
+-    return minThreadState;
+-  }
+ }
+diff -ruN -x .svn -x .git -x build -x dist -x .caches -x .idea -x idea-build -x eclipse-build -x .settings trunk/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java sequences/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java
+--- trunk/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java	2016-05-16 08:59:52.717045118 -0400
++++ sequences/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java	2016-05-26 15:29:58.444121057 -0400
+@@ -266,6 +266,7 @@
+   private List<SegmentCommitInfo> rollbackSegments;      // list of segmentInfo we will fallback to if the commit fails
+ 
+   volatile SegmentInfos pendingCommit;            // set when a commit is pending (after prepareCommit() & before commit())
++  volatile long pendingSeqNo;
+   volatile long pendingCommitChangeCount;
+ 
+   private Collection<String> filesToCommit;
+@@ -425,7 +426,14 @@
+       boolean success = false;
+       synchronized (fullFlushLock) {
+         try {
+-          anyChanges = docWriter.flushAllThreads();
++          // TODO: should we somehow make this available in the returned NRT reader?
++          long seqNo = docWriter.flushAllThreads();
++          if (seqNo < 0) {
++            anyChanges = true;
++            seqNo = -seqNo;
++          } else {
++            anyChanges = false;
++          }
+           if (!anyChanges) {
+             // prevent double increment since docWriter#doFlush increments the flushcount
+             // if we flushed anything.
+@@ -1283,8 +1291,8 @@
+    * @throws CorruptIndexException if the index is corrupt
+    * @throws IOException if there is a low-level IO error
+    */
+-  public void addDocument(Iterable<? extends IndexableField> doc) throws IOException {
+-    updateDocument(null, doc);
++  public long addDocument(Iterable<? extends IndexableField> doc) throws IOException {
++    return updateDocument(null, doc);
+   }
+ 
+   /**
+@@ -1324,8 +1332,8 @@
+    *
+    * @lucene.experimental
+    */
+-  public void addDocuments(Iterable<? extends Iterable<? extends IndexableField>> docs) throws IOException {
+-    updateDocuments(null, docs);
++  public long addDocuments(Iterable<? extends Iterable<? extends IndexableField>> docs) throws IOException {
++    return updateDocuments(null, docs);
+   }
+ 
+   /**
+@@ -1341,15 +1349,18 @@
+    *
+    * @lucene.experimental
+    */
+-  public void updateDocuments(Term delTerm, Iterable<? extends Iterable<? extends IndexableField>> docs) throws IOException {
++  public long updateDocuments(Term delTerm, Iterable<? extends Iterable<? extends IndexableField>> docs) throws IOException {
+     ensureOpen();
+     try {
+       boolean success = false;
+       try {
+-        if (docWriter.updateDocuments(docs, analyzer, delTerm)) {
++        long seqNo = docWriter.updateDocuments(docs, analyzer, delTerm);
++        if (seqNo < 0) {
++          seqNo = -seqNo;
+           processEvents(true, false);
+         }
+         success = true;
++        return seqNo;
+       } finally {
+         if (!success) {
+           if (infoStream.isEnabled("IW")) {
+@@ -1359,6 +1370,9 @@
+       }
+     } catch (AbortingException | VirtualMachineError tragedy) {
+       tragicEvent(tragedy, "updateDocuments");
++
++      // dead code but javac disagrees
++      return -1;
+     }
+   }
+ 
+@@ -1367,15 +1381,15 @@
+    *  DirectoryReader#open(IndexWriter)}).  If the
+    *  provided reader is an NRT reader obtained from this
+    *  writer, and its segment has not been merged away, then
+-   *  the delete succeeds and this method returns true; else, it
+-   *  returns false the caller must then separately delete by
+-   *  Term or Query.
++   *  the delete succeeds and this method returns a valid (&gt; 0) sequence
++   *  number; else, it returns -1 and the caller must then
++   *  separately delete by Term or Query.
+    *
+    *  <b>NOTE</b>: this method can only delete documents
+    *  visible to the currently open NRT reader.  If you need
+    *  to delete documents indexed after opening the NRT
+    *  reader you must use {@link #deleteDocuments(Term...)}). */
+-  public synchronized boolean tryDeleteDocument(IndexReader readerIn, int docID) throws IOException {
++  public synchronized long tryDeleteDocument(IndexReader readerIn, int docID) throws IOException {
+ 
+     final LeafReader reader;
+     if (readerIn instanceof LeafReader) {
+@@ -1426,7 +1440,8 @@
+             changed();
+           }
+           //System.out.println("  yes " + info.info.name + " " + docID);
+-          return true;
++
++          return docWriter.deleteQueue.seqNo.getAndIncrement();
+         }
+       } else {
+         //System.out.println("  no rld " + info.info.name + " " + docID);
+@@ -1434,7 +1449,8 @@
+     } else {
+       //System.out.println("  no seg " + info.info.name + " " + docID);
+     }
+-    return false;
++
++    return -1;
+   }
+ 
+   /**
+@@ -1447,14 +1463,20 @@
+    * @throws CorruptIndexException if the index is corrupt
+    * @throws IOException if there is a low-level IO error
+    */
+-  public void deleteDocuments(Term... terms) throws IOException {
++  public long deleteDocuments(Term... terms) throws IOException {
+     ensureOpen();
+     try {
+-      if (docWriter.deleteTerms(terms)) {
++      long seqNo = docWriter.deleteTerms(terms);
++      if (seqNo < 0) {
++        seqNo = -seqNo;
+         processEvents(true, false);
+       }
++      return seqNo;
+     } catch (VirtualMachineError tragedy) {
+       tragicEvent(tragedy, "deleteDocuments(Term..)");
++
++      // dead code but javac disagrees:
++      return -1;
+     }
+   }
+ 
+@@ -1467,23 +1489,29 @@
+    * @throws CorruptIndexException if the index is corrupt
+    * @throws IOException if there is a low-level IO error
+    */
+-  public void deleteDocuments(Query... queries) throws IOException {
++  public long deleteDocuments(Query... queries) throws IOException {
+     ensureOpen();
+ 
+     // LUCENE-6379: Specialize MatchAllDocsQuery
+     for(Query query : queries) {
+       if (query.getClass() == MatchAllDocsQuery.class) {
+-        deleteAll();
+-        return;
++        return deleteAll();
+       }
+     }
+ 
+     try {
+-      if (docWriter.deleteQueries(queries)) {
++      long seqNo = docWriter.deleteQueries(queries);
++      if (seqNo < 0) {
++        seqNo = -seqNo;
+         processEvents(true, false);
+       }
++
++      return seqNo;
+     } catch (VirtualMachineError tragedy) {
+       tragicEvent(tragedy, "deleteDocuments(Query..)");
++
++      // dead code but javac disagrees:
++      return -1;
+     }
+   }
+ 
+@@ -1500,15 +1528,18 @@
+    * @throws CorruptIndexException if the index is corrupt
+    * @throws IOException if there is a low-level IO error
+    */
+-  public void updateDocument(Term term, Iterable<? extends IndexableField> doc) throws IOException {
++  public long updateDocument(Term term, Iterable<? extends IndexableField> doc) throws IOException {
+     ensureOpen();
+     try {
+       boolean success = false;
+       try {
+-        if (docWriter.updateDocument(doc, analyzer, term)) {
++        long seqNo = docWriter.updateDocument(doc, analyzer, term);
++        if (seqNo < 0) {
++          seqNo = - seqNo;
+           processEvents(true, false);
+         }
+         success = true;
++        return seqNo;
+       } finally {
+         if (!success) {
+           if (infoStream.isEnabled("IW")) {
+@@ -1518,6 +1549,9 @@
+       }
+     } catch (AbortingException | VirtualMachineError tragedy) {
+       tragicEvent(tragedy, "updateDocument");
++
++      // dead code but javac disagrees:
++      return -1;
+     }
+   }
+ 
+@@ -1537,17 +1571,23 @@
+    * @throws IOException
+    *           if there is a low-level IO error
+    */
+-  public void updateNumericDocValue(Term term, String field, long value) throws IOException {
++  public long updateNumericDocValue(Term term, String field, long value) throws IOException {
+     ensureOpen();
+     if (!globalFieldNumberMap.contains(field, DocValuesType.NUMERIC)) {
+       throw new IllegalArgumentException("can only update existing numeric-docvalues fields!");
+     }
+     try {
+-      if (docWriter.updateDocValues(new NumericDocValuesUpdate(term, field, value))) {
++      long seqNo = docWriter.updateDocValues(new NumericDocValuesUpdate(term, field, value));
++      if (seqNo < 0) {
++        seqNo = -seqNo;
+         processEvents(true, false);
+       }
++      return seqNo;
+     } catch (VirtualMachineError tragedy) {
+       tragicEvent(tragedy, "updateNumericDocValue");
++
++      // dead code but javac disagrees:
++      return -1;
+     }
+   }
+ 
+@@ -1571,7 +1611,7 @@
+    * @throws IOException
+    *           if there is a low-level IO error
+    */
+-  public void updateBinaryDocValue(Term term, String field, BytesRef value) throws IOException {
++  public long updateBinaryDocValue(Term term, String field, BytesRef value) throws IOException {
+     ensureOpen();
+     if (value == null) {
+       throw new IllegalArgumentException("cannot update a field to a null value: " + field);
+@@ -1580,11 +1620,17 @@
+       throw new IllegalArgumentException("can only update existing binary-docvalues fields!");
+     }
+     try {
+-      if (docWriter.updateDocValues(new BinaryDocValuesUpdate(term, field, value))) {
++      long seqNo = docWriter.updateDocValues(new BinaryDocValuesUpdate(term, field, value));
++      if (seqNo < 0) {
++        seqNo = -seqNo;
+         processEvents(true, false);
+       }
++      return seqNo;
+     } catch (VirtualMachineError tragedy) {
+       tragicEvent(tragedy, "updateBinaryDocValue");
++
++      // dead code but javac disagrees:
++      return -1;
+     }
+   }
+   
+@@ -1601,7 +1647,7 @@
+    * @throws IOException
+    *           if there is a low-level IO error
+    */
+-  public void updateDocValues(Term term, Field... updates) throws IOException {
++  public long updateDocValues(Term term, Field... updates) throws IOException {
+     ensureOpen();
+     DocValuesUpdate[] dvUpdates = new DocValuesUpdate[updates.length];
+     for (int i = 0; i < updates.length; i++) {
+@@ -1628,11 +1674,17 @@
+       }
+     }
+     try {
+-      if (docWriter.updateDocValues(dvUpdates)) {
++      long seqNo = docWriter.updateDocValues(dvUpdates);
++      if (seqNo < 0) {
++        seqNo = -seqNo;
+         processEvents(true, false);
+       }
++      return seqNo;
+     } catch (VirtualMachineError tragedy) {
+       tragicEvent(tragedy, "updateDocValues");
++
++      // dead code but javac disagrees:
++      return -1;
+     }
+   }
+   
+@@ -2205,7 +2257,7 @@
+    * or {@link #forceMergeDeletes} methods, they may receive
+    * {@link MergePolicy.MergeAbortedException}s.
+    */
+-  public void deleteAll() throws IOException {
++  public long deleteAll() throws IOException {
+     ensureOpen();
+     // Remove any buffered docs
+     boolean success = false;
+@@ -2252,6 +2304,8 @@
+             globalFieldNumberMap.clear();
+ 
+             success = true;
++            return docWriter.deleteQueue.seqNo.get();
++
+           } finally {
+             docWriter.unlockAllAfterAbortAll(this);
+             if (!success) {
+@@ -2264,6 +2318,9 @@
+       }
+     } catch (VirtualMachineError tragedy) {
+       tragicEvent(tragedy, "deleteAll");
++
++      // dead code but javac disagrees
++      return -1;
+     }
+   }
+ 
+@@ -2491,7 +2548,7 @@
+    *   the index to exceed {@link #MAX_DOCS}, or if the indoming
+    *   index sort does not match this index's index sort
+    */
+-  public void addIndexes(Directory... dirs) throws IOException {
++  public long addIndexes(Directory... dirs) throws IOException {
+     ensureOpen();
+ 
+     noDupDirs(dirs);
+@@ -2598,6 +2655,9 @@
+       }
+     }
+     maybeMerge();
++
++    // no need to increment:
++    return docWriter.deleteQueue.seqNo.get();
+   }
+   
+   /**
+@@ -2629,7 +2689,7 @@
+    * @throws IllegalArgumentException
+    *           if addIndexes would cause the index to exceed {@link #MAX_DOCS}
+    */
+-  public void addIndexes(CodecReader... readers) throws IOException {
++  public long addIndexes(CodecReader... readers) throws IOException {
+     ensureOpen();
+ 
+     // long so we can detect int overflow:
+@@ -2671,7 +2731,8 @@
+       rateLimiters.set(new MergeRateLimiter(null));
+ 
+       if (!merger.shouldMerge()) {
+-        return;
++        // no need to increment:
++        return docWriter.deleteQueue.seqNo.get();
+       }
+ 
+       merger.merge();                // merge 'em
+@@ -2689,7 +2750,9 @@
+         if (stopMerges) {
+           // Safe: these files must exist
+           deleteNewFiles(infoPerCommit.files());
+-          return;
++
++          // no need to increment:
++          return docWriter.deleteQueue.seqNo.get();
+         }
+         ensureOpen();
+         useCompoundFile = mergePolicy.useCompoundFile(segmentInfos, infoPerCommit, this);
+@@ -2724,7 +2787,9 @@
+         if (stopMerges) {
+           // Safe: these files must exist
+           deleteNewFiles(infoPerCommit.files());
+-          return;
++
++          // no need to increment:
++          return docWriter.deleteQueue.seqNo.get();
+         }
+         ensureOpen();
+ 
+@@ -2738,6 +2803,9 @@
+       tragicEvent(tragedy, "addIndexes(CodecReader...)");
+     }
+     maybeMerge();
++
++    // no need to increment:
++    return docWriter.deleteQueue.seqNo.get();
+   }
+ 
+   /** Copies the segment files as-is into the IndexWriter's directory. */
+@@ -2807,12 +2875,13 @@
+    *  will internally call prepareCommit.
+    */
+   @Override
+-  public final void prepareCommit() throws IOException {
++  public final long prepareCommit() throws IOException {
+     ensureOpen();
+-    prepareCommitInternal(config.getMergePolicy());
++    pendingSeqNo = prepareCommitInternal(config.getMergePolicy());
++    return pendingSeqNo;
+   }
+ 
+-  private void prepareCommitInternal(MergePolicy mergePolicy) throws IOException {
++  private long prepareCommitInternal(MergePolicy mergePolicy) throws IOException {
+     startCommitTime = System.nanoTime();
+     synchronized(commitLock) {
+       ensureOpen(false);
+@@ -2833,6 +2902,7 @@
+       testPoint("startDoFlush");
+       SegmentInfos toCommit = null;
+       boolean anySegmentsFlushed = false;
++      long seqNo;
+ 
+       // This is copied from doFlush, except it's modified to
+       // clone & incRef the flushed SegmentInfos inside the
+@@ -2844,7 +2914,11 @@
+           boolean flushSuccess = false;
+           boolean success = false;
+           try {
+-            anySegmentsFlushed = docWriter.flushAllThreads();
++            seqNo = docWriter.flushAllThreads();
++            if (seqNo < 0) {
++              anySegmentsFlushed = true;
++              seqNo = -seqNo;
++            }
+             if (!anySegmentsFlushed) {
+               // prevent double increment since docWriter#doFlush increments the flushcount
+               // if we flushed anything.
+@@ -2898,6 +2972,9 @@
+         }
+       } catch (AbortingException | VirtualMachineError tragedy) {
+         tragicEvent(tragedy, "prepareCommit");
++
++        // dead code but javac disagrees:
++        seqNo = -1;
+       }
+      
+       boolean success = false;
+@@ -2907,6 +2984,11 @@
+         }
+         startCommit(toCommit);
+         success = true;
++        if (pendingCommit == null) {
++          return -1;
++        } else {
++          return seqNo;
++        }
+       } finally {
+         if (!success) {
+           synchronized (this) {
+@@ -2980,12 +3062,18 @@
+    * loss it may still lose data.  Lucene cannot guarantee
+    * consistency on such devices.  </p>
+    *
++   * <p> If nothing was committed, because there were no
++   * pending changes, this returns -1.  Otherwise, it returns
++   * the sequence number such that all indexing operations
++   * prior to this sequence will be included in the commit
++   * point, and all other operations will not. </p>
++   *
+    * @see #prepareCommit
+    */
+   @Override
+-  public final void commit() throws IOException {
++  public final long commit() throws IOException {
+     ensureOpen();
+-    commitInternal(config.getMergePolicy());
++    return commitInternal(config.getMergePolicy());
+   }
+ 
+   /** Returns true if there may be changes that have not been
+@@ -3001,7 +3089,7 @@
+     return changeCount.get() != lastCommitChangeCount || docWriter.anyChanges() || bufferedUpdatesStream.any();
+   }
+ 
+-  private final void commitInternal(MergePolicy mergePolicy) throws IOException {
++  private final long commitInternal(MergePolicy mergePolicy) throws IOException {
+ 
+     if (infoStream.isEnabled("IW")) {
+       infoStream.message("IW", "commit: start");
+@@ -3014,18 +3102,23 @@
+         infoStream.message("IW", "commit: enter lock");
+       }
+ 
++      long seqNo;
++
+       if (pendingCommit == null) {
+         if (infoStream.isEnabled("IW")) {
+           infoStream.message("IW", "commit: now prepare");
+         }
+-        prepareCommitInternal(mergePolicy);
++        seqNo = prepareCommitInternal(mergePolicy);
+       } else {
+         if (infoStream.isEnabled("IW")) {
+           infoStream.message("IW", "commit: already prepared");
+         }
++        seqNo = pendingSeqNo;
+       }
+ 
+       finishCommit();
++
++      return seqNo;
+     }
+   }
+ 
+@@ -3167,7 +3260,13 @@
+       synchronized (fullFlushLock) {
+         boolean flushSuccess = false;
+         try {
+-          anyChanges = docWriter.flushAllThreads();
++          long seqNo = docWriter.flushAllThreads();
++          if (seqNo < 0) {
++            seqNo = -seqNo;
++            anyChanges = true;
++          } else {
++            anyChanges = false;
++          }
+           if (!anyChanges) {
+             // flushCount is incremented in flushAllThreads
+             flushCount.incrementAndGet();
+@@ -4888,4 +4987,12 @@
+       }
+     };
+   }
++
++  /** Returns the last sequence number.
++   *
++   * @lucene.experimental */
++  public long getLastSequenceNumber() {
++    ensureOpen();
++    return docWriter.deleteQueue.seqNo.get()-1;
++  }
+ }
+diff -ruN -x .svn -x .git -x build -x dist -x .caches -x .idea -x idea-build -x eclipse-build -x .settings trunk/lucene/core/src/java/org/apache/lucene/index/StandardDirectoryReader.java sequences/lucene/core/src/java/org/apache/lucene/index/StandardDirectoryReader.java
+--- trunk/lucene/core/src/java/org/apache/lucene/index/StandardDirectoryReader.java	2016-02-16 11:18:34.669021815 -0500
++++ sequences/lucene/core/src/java/org/apache/lucene/index/StandardDirectoryReader.java	2016-05-26 15:29:58.444121057 -0400
+@@ -421,7 +421,7 @@
+ 
+     @Override
+     public String toString() {
+-      return "DirectoryReader.ReaderCommit(" + segmentsFileName + ")";
++      return "StandardDirectoryReader.ReaderCommit(" + segmentsFileName + " files=" + files + ")";
+     }
+ 
+     @Override
+diff -ruN -x .svn -x .git -x build -x dist -x .caches -x .idea -x idea-build -x eclipse-build -x .settings trunk/lucene/core/src/java/org/apache/lucene/index/TrackingIndexWriter.java sequences/lucene/core/src/java/org/apache/lucene/index/TrackingIndexWriter.java
+--- trunk/lucene/core/src/java/org/apache/lucene/index/TrackingIndexWriter.java	2016-02-16 11:18:34.669021815 -0500
++++ sequences/lucene/core/src/java/org/apache/lucene/index/TrackingIndexWriter.java	1969-12-31 19:00:00.000000000 -0500
+@@ -1,168 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.lucene.index;
+-
+-
+-import java.io.IOException;
+-import java.util.concurrent.atomic.AtomicLong;
+-
+-import org.apache.lucene.analysis.Analyzer;
+-import org.apache.lucene.search.ControlledRealTimeReopenThread; // javadocs
+-import org.apache.lucene.search.Query;
+-import org.apache.lucene.store.Directory;
+-
+-/** Class that tracks changes to a delegated
+- *  IndexWriter, used by {@link
+- *  ControlledRealTimeReopenThread} to ensure specific
+- *  changes are visible.   Create this class (passing your
+- *  IndexWriter), and then pass this class to {@link
+- *  ControlledRealTimeReopenThread}.
+- *  Be sure to make all changes via the
+- *  TrackingIndexWriter, otherwise {@link
+- *  ControlledRealTimeReopenThread} won't know about the changes.
+- *
+- * @lucene.experimental */
+-
+-public class TrackingIndexWriter {
+-  private final IndexWriter writer;
+-  private final AtomicLong indexingGen = new AtomicLong(1);
+-
+-  /** Create a {@code TrackingIndexWriter} wrapping the
+-   *  provided {@link IndexWriter}. */
+-  public TrackingIndexWriter(IndexWriter writer) {
+-    this.writer = writer;
+-  }
+-
+-  /** Calls {@link
+-   *  IndexWriter#updateDocument(Term,Iterable)} and
+-   *  returns the generation that reflects this change. */
+-  public long updateDocument(Term t, Iterable<? extends IndexableField> d) throws IOException {
+-    writer.updateDocument(t, d);
+-    // Return gen as of when indexing finished:
+-    return indexingGen.get();
+-  }
+-
+-  /** Calls {@link
+-   *  IndexWriter#updateDocuments(Term,Iterable)} and returns
+-   *  the generation that reflects this change. */
+-  public long updateDocuments(Term t, Iterable<? extends Iterable<? extends IndexableField>> docs) throws IOException {
+-    writer.updateDocuments(t, docs);
+-    // Return gen as of when indexing finished:
+-    return indexingGen.get();
+-  }
+-
+-  /** Calls {@link IndexWriter#deleteDocuments(Term...)} and
+-   *  returns the generation that reflects this change. */
+-  public long deleteDocuments(Term t) throws IOException {
+-    writer.deleteDocuments(t);
+-    // Return gen as of when indexing finished:
+-    return indexingGen.get();
+-  }
+-
+-  /** Calls {@link IndexWriter#deleteDocuments(Term...)} and
+-   *  returns the generation that reflects this change. */
+-  public long deleteDocuments(Term... terms) throws IOException {
+-    writer.deleteDocuments(terms);
+-    // Return gen as of when indexing finished:
+-    return indexingGen.get();
+-  }
+-
+-  /** Calls {@link IndexWriter#deleteDocuments(Query...)} and
+-   *  returns the generation that reflects this change. */
+-  public long deleteDocuments(Query q) throws IOException {
+-    writer.deleteDocuments(q);
+-    // Return gen as of when indexing finished:
+-    return indexingGen.get();
+-  }
+-
+-  /** Calls {@link IndexWriter#deleteDocuments(Query...)}
+-   *  and returns the generation that reflects this change. */
+-  public long deleteDocuments(Query... queries) throws IOException {
+-    writer.deleteDocuments(queries);
+-    // Return gen as of when indexing finished:
+-    return indexingGen.get();
+-  }
+-
+-  /** Calls {@link IndexWriter#deleteAll} and returns the
+-   *  generation that reflects this change. */
+-  public long deleteAll() throws IOException {
+-    writer.deleteAll();
+-    // Return gen as of when indexing finished:
+-    return indexingGen.get();
+-  }
+-
+-  /** Calls {@link IndexWriter#addDocument(Iterable)}
+-   *  and returns the generation that reflects this change. */
+-  public long addDocument(Iterable<? extends IndexableField> d) throws IOException {
+-    writer.addDocument(d);
+-    // Return gen as of when indexing finished:
+-    return indexingGen.get();
+-  }
+-
+-  /** Calls {@link IndexWriter#addDocuments(Iterable)} and
+-   *  returns the generation that reflects this change. */
+-  public long addDocuments(Iterable<? extends Iterable<? extends IndexableField>> docs) throws IOException {
+-    writer.addDocuments(docs);
+-    // Return gen as of when indexing finished:
+-    return indexingGen.get();
+-  }
+-
+-  /** Calls {@link IndexWriter#addIndexes(Directory...)} and
+-   *  returns the generation that reflects this change. */
+-  public long addIndexes(Directory... dirs) throws IOException {
+-    writer.addIndexes(dirs);
+-    // Return gen as of when indexing finished:
+-    return indexingGen.get();
+-  }
+-
+-  /** Calls {@link IndexWriter#addIndexes(CodecReader...)}
+-   *  and returns the generation that reflects this change. */
+-  public long addIndexes(CodecReader... readers) throws IOException {
+-    writer.addIndexes(readers);
+-    // Return gen as of when indexing finished:
+-    return indexingGen.get();
+-  }
+-
+-  /** Return the current generation being indexed. */
+-  public long getGeneration() {
+-    return indexingGen.get();
+-  }
+-
+-  /** Return the wrapped {@link IndexWriter}. */
+-  public IndexWriter getIndexWriter() {
+-    return writer;
+-  }
+-
+-  /** Return and increment current gen.
+-   *
+-   * @lucene.internal */
+-  public long getAndIncrementGeneration() {
+-    return indexingGen.getAndIncrement();
+-  }
+-
+-  /** Cals {@link
+-   *  IndexWriter#tryDeleteDocument(IndexReader,int)} and
+-   *  returns the generation that reflects this change. */
+-  public long tryDeleteDocument(IndexReader reader, int docID) throws IOException {
+-    if (writer.tryDeleteDocument(reader, docID)) {
+-      return indexingGen.get();
+-    } else {
+-      return -1;
+-    }
+-  }
+-}
+-
+diff -ruN -x .svn -x .git -x build -x dist -x .caches -x .idea -x idea-build -x eclipse-build -x .settings trunk/lucene/core/src/java/org/apache/lucene/index/TwoPhaseCommit.java sequences/lucene/core/src/java/org/apache/lucene/index/TwoPhaseCommit.java
+--- trunk/lucene/core/src/java/org/apache/lucene/index/TwoPhaseCommit.java	2016-02-16 11:18:34.669021815 -0500
++++ sequences/lucene/core/src/java/org/apache/lucene/index/TwoPhaseCommit.java	2016-05-26 15:29:58.444121057 -0400
+@@ -34,7 +34,7 @@
+    * 2-phase commit fails, {@link #rollback()} is called to discard all changes
+    * since last successful commit.
+    */
+-  public void prepareCommit() throws IOException;
++  public long prepareCommit() throws IOException;
+ 
+   /**
+    * The second phase of a 2-phase commit. Implementations should ideally do
+@@ -42,7 +42,7 @@
+    * after it returns, the caller can assume that the changes were successfully
+    * committed to the underlying storage.
+    */
+-  public void commit() throws IOException;
++  public long commit() throws IOException;
+ 
+   /**
+    * Discards any changes that have occurred since the last commit. In a 2-phase
+@@ -51,5 +51,4 @@
+    * back to their previous state.
+    */
+   public void rollback() throws IOException;
+-
+ }
+diff -ruN -x .svn -x .git -x build -x dist -x .caches -x .idea -x idea-build -x eclipse-build -x .settings trunk/lucene/core/src/java/org/apache/lucene/search/ControlledRealTimeReopenThread.java sequences/lucene/core/src/java/org/apache/lucene/search/ControlledRealTimeReopenThread.java
+--- trunk/lucene/core/src/java/org/apache/lucene/search/ControlledRealTimeReopenThread.java	2016-02-16 11:18:34.673021815 -0500
++++ sequences/lucene/core/src/java/org/apache/lucene/search/ControlledRealTimeReopenThread.java	2016-05-26 15:29:58.444121057 -0400
+@@ -23,16 +23,11 @@
+ import java.util.concurrent.locks.ReentrantLock;
+ 
+ import org.apache.lucene.index.IndexWriter;
+-import org.apache.lucene.index.TrackingIndexWriter;
+ import org.apache.lucene.util.ThreadInterruptedException;
+ 
+ /** Utility class that runs a thread to manage periodicc
+  *  reopens of a {@link ReferenceManager}, with methods to wait for a specific
+- *  index changes to become visible.  To use this class you
+- *  must first wrap your {@link IndexWriter} with a {@link
+- *  TrackingIndexWriter} and always use it to make changes
+- *  to the index, saving the returned generation.  Then,
+- *  when a given search request needs to see a specific
++ *  index changes to become visible.  When a given search request needs to see a specific
+  *  index change, call the {#waitForGeneration} to wait for
+  *  that change to be visible.  Note that this will only
+  *  scale well if most searches do not need to wait for a
+@@ -44,7 +39,7 @@
+   private final ReferenceManager<T> manager;
+   private final long targetMaxStaleNS;
+   private final long targetMinStaleNS;
+-  private final TrackingIndexWriter writer;
++  private final IndexWriter writer;
+   private volatile boolean finish;
+   private volatile long waitingGen;
+   private volatile long searchingGen;
+@@ -69,7 +64,7 @@
+    *        is waiting for a specific generation to
+    *        become visible.
+    */
+-  public ControlledRealTimeReopenThread(TrackingIndexWriter writer, ReferenceManager<T> manager, double targetMaxStaleSec, double targetMinStaleSec) {
++  public ControlledRealTimeReopenThread(IndexWriter writer, ReferenceManager<T> manager, double targetMaxStaleSec, double targetMinStaleSec) {
+     if (targetMaxStaleSec < targetMinStaleSec) {
+       throw new IllegalArgumentException("targetMaxScaleSec (= " + targetMaxStaleSec + ") < targetMinStaleSec (=" + targetMinStaleSec + ")");
+     }
+@@ -155,10 +150,7 @@
+    *         or false if maxMS wait time was exceeded
+    */
+   public synchronized boolean waitForGeneration(long targetGen, int maxMS) throws InterruptedException {
+-    final long curGen = writer.getGeneration();
+-    if (targetGen > curGen) {
+-      throw new IllegalArgumentException("targetGen=" + targetGen + " was never returned by the ReferenceManager instance (current gen=" + curGen + ")");
+-    }
++    final long curGen = writer.getLastSequenceNumber();
+     if (targetGen > searchingGen) {
+       // Notify the reopen thread that the waitingGen has
+       // changed, so it may wake up and realize it should
+@@ -240,7 +232,7 @@
+       // Save the gen as of when we started the reopen; the
+       // listener (HandleRefresh above) copies this to
+       // searchingGen once the reopen completes:
+-      refreshStartGen = writer.getAndIncrementGeneration();
++      refreshStartGen = writer.getLastSequenceNumber();
+       try {
+         manager.maybeRefreshBlocking();
+       } catch (IOException ioe) {
+diff -ruN -x .svn -x .git -x build -x dist -x .caches -x .idea -x idea-build -x eclipse-build -x .settings trunk/lucene/core/src/test/org/apache/lucene/index/TestIndexingSequenceNumbers.java sequences/lucene/core/src/test/org/apache/lucene/index/TestIndexingSequenceNumbers.java
+--- trunk/lucene/core/src/test/org/apache/lucene/index/TestIndexingSequenceNumbers.java	1969-12-31 19:00:00.000000000 -0500
++++ sequences/lucene/core/src/test/org/apache/lucene/index/TestIndexingSequenceNumbers.java	2016-05-26 15:29:58.444121057 -0400
+@@ -0,0 +1,296 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.lucene.index;
++
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.Field;
++import org.apache.lucene.document.StoredField;
++import org.apache.lucene.document.StringField;
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.TermQuery;
++import org.apache.lucene.search.TopDocs;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util.TestUtil;
++
++public class TestIndexingSequenceNumbers extends LuceneTestCase {
++
++  public void testBasic() throws Exception {
++    Directory dir = newDirectory();
++    IndexWriter w = new IndexWriter(dir, newIndexWriterConfig());
++    long a = w.addDocument(new Document());
++    long b = w.addDocument(new Document());
++    assertTrue(b >= a);
++    w.close();
++    dir.close();
++  }
++
++  public void testAfterRefresh() throws Exception {
++    Directory dir = newDirectory();
++    IndexWriter w = new IndexWriter(dir, newIndexWriterConfig());
++    long a = w.addDocument(new Document());
++    DirectoryReader.open(w).close();
++    long b = w.addDocument(new Document());
++    assertTrue(b > a);
++    w.close();
++    dir.close();
++  }
++
++  public void testAfterCommit() throws Exception {
++    Directory dir = newDirectory();
++    IndexWriter w = new IndexWriter(dir, newIndexWriterConfig());
++    long a = w.addDocument(new Document());
++    w.commit();
++    long b = w.addDocument(new Document());
++    assertTrue(b > a);
++    w.close();
++    dir.close();
++  }
++
++  public void testStressUpdateSameID() throws Exception {
++    int iters = atLeast(100);
++    for(int iter=0;iter<iters;iter++) {
++      Directory dir = newDirectory();
++      final RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++      Thread[] threads = new Thread[TestUtil.nextInt(random(), 2, 5)];
++      final CountDownLatch startingGun = new CountDownLatch(1);
++      final long[] seqNos = new long[threads.length];
++      final Term id = new Term("id", "id");
++      // multiple threads update the same document
++      for(int i=0;i<threads.length;i++) {
++        final int threadID = i;
++        threads[i] = new Thread() {
++            @Override
++            public void run() {
++              try {
++                Document doc = new Document();
++                doc.add(new StoredField("thread", threadID));
++                doc.add(new StringField("id", "id", Field.Store.NO));
++                startingGun.await();
++                for(int j=0;j<100;j++) {
++                  seqNos[threadID] = w.updateDocument(id, doc);
++                }
++              } catch (Exception e) {
++                throw new RuntimeException(e);
++              }
++            }
++          };
++        threads[i].start();
++      }
++      startingGun.countDown();
++      for(Thread thread : threads) {
++        thread.join();
++      }
++
++      // now confirm that the reported sequence numbers agree with the index:
++      int maxThread = 0;
++      Set<Long> allSeqNos = new HashSet<>();
++      for(int i=0;i<threads.length;i++) {
++        allSeqNos.add(seqNos[i]);
++        if (seqNos[i] > seqNos[maxThread]) {
++          maxThread = i;
++        }
++      }
++      // make sure all sequence numbers were different
++      assertEquals(threads.length, allSeqNos.size());
++      DirectoryReader r = w.getReader();
++      IndexSearcher s = newSearcher(r);
++      TopDocs hits = s.search(new TermQuery(id), 1);
++      assertEquals(1, hits.totalHits);
++      Document doc = r.document(hits.scoreDocs[0].doc);
++      assertEquals(maxThread, doc.getField("thread").numericValue().intValue());
++      r.close();
++      w.close();
++      dir.close();
++    }
++  }
++
++  static class Operation {
++    // 0 = update, 1 = delete, 2 = commit
++    byte what;
++    int id;
++    int threadID;
++    long seqNo;
++  }
++
++  public void testStressConcurrentCommit() throws Exception {
++    final int opCount = atLeast(10000);
++    final int idCount = TestUtil.nextInt(random(), 10, 1000);
++
++    Directory dir = newDirectory();
++    IndexWriterConfig iwc = newIndexWriterConfig();
++    iwc.setIndexDeletionPolicy(NoDeletionPolicy.INSTANCE);
++
++    // Cannot use RIW since it randomly commits:
++    final IndexWriter w = new IndexWriter(dir, iwc);
++
++    final int numThreads = TestUtil.nextInt(random(), 2, 5);
++    Thread[] threads = new Thread[numThreads];
++    //System.out.println("TEST: iter=" + iter + " opCount=" + opCount + " idCount=" + idCount + " threadCount=" + threads.length);
++    final CountDownLatch startingGun = new CountDownLatch(1);
++    List<List<Operation>> threadOps = new ArrayList<>();
++
++    Object commitLock = new Object();
++    final List<Operation> commits = new ArrayList<>();
++
++    // multiple threads update the same set of documents, and we randomly commit
++    for(int i=0;i<threads.length;i++) {
++      final List<Operation> ops = new ArrayList<>();
++      threadOps.add(ops);
++      final int threadID = i;
++      threads[i] = new Thread() {
++          @Override
++          public void run() {
++            try {
++              startingGun.await();
++              for(int i=0;i<opCount;i++) {
++                Operation op = new Operation();
++                op.threadID = threadID;
++                if (random().nextInt(500) == 17) {
++                  op.what = 2;
++                  synchronized(commitLock) {
++                    op.seqNo = w.commit();
++                    if (op.seqNo != -1) {
++                      commits.add(op);
++                    }
++                  }
++                } else {
++                  op.id = random().nextInt(idCount);
++                  Term idTerm = new Term("id", "" + op.id);
++                  if (random().nextInt(10) == 1) {
++                    op.what = 1;
++                    if (random().nextBoolean()) {
++                      op.seqNo = w.deleteDocuments(idTerm);
++                    } else {
++                      op.seqNo = w.deleteDocuments(new TermQuery(idTerm));
++                    }
++                  } else {
++                    Document doc = new Document();
++                    doc.add(new StoredField("thread", threadID));
++                    doc.add(new StringField("id", "" + op.id, Field.Store.NO));
++                    if (random().nextBoolean()) {
++                      List<Document> docs = new ArrayList<>();
++                      docs.add(doc);
++                      op.seqNo = w.updateDocuments(idTerm, docs);
++                    } else {
++                      op.seqNo = w.updateDocument(idTerm, doc);
++                    }
++                    op.what = 2;
++                  }
++                  ops.add(op);
++                }
++              }
++            } catch (Exception e) {
++              throw new RuntimeException(e);
++            }
++          }
++        };
++      threads[i].start();
++    }
++    startingGun.countDown();
++    for(Thread thread : threads) {
++      thread.join();
++    }
++
++    Operation commitOp = new Operation();
++    commitOp.seqNo = w.commit();
++    if (commitOp.seqNo != -1) {
++      commits.add(commitOp);
++    }
++
++    List<IndexCommit> indexCommits = DirectoryReader.listCommits(dir);
++    assertEquals(commits.size(), indexCommits.size());
++
++    int[] expectedThreadIDs = new int[idCount];
++    long[] seqNos = new long[idCount];
++      
++    //System.out.println("TEST: " + commits.size() + " commits");
++    for(int i=0;i<commits.size();i++) {
++      // this commit point should reflect all operations <= this seqNo
++      long commitSeqNo = commits.get(i).seqNo;
++      //System.out.println("  commit " + i + ": seqNo=" + commitSeqNo + " segs=" + indexCommits.get(i));
++
++      Arrays.fill(expectedThreadIDs, -1);
++      Arrays.fill(seqNos, 0);
++
++      for(int threadID=0;threadID<threadOps.size();threadID++) {
++        long lastSeqNo = 0;
++        for(Operation op : threadOps.get(threadID)) {
++          if (op.seqNo <= commitSeqNo && op.seqNo > seqNos[op.id]) {
++            seqNos[op.id] = op.seqNo;
++            if (op.what == 2) {
++              expectedThreadIDs[op.id] = threadID;
++            } else {
++              expectedThreadIDs[op.id] = -1;
++            }
++          }
++
++          assertTrue(op.seqNo >= lastSeqNo);
++          lastSeqNo = op.seqNo;
++        }
++      }
++
++      DirectoryReader r = DirectoryReader.open(indexCommits.get(i));
++      IndexSearcher s = new IndexSearcher(r);
++
++      for(int id=0;id<idCount;id++) {
++        //System.out.println("TEST: check id=" + id + " expectedThreadID=" + expectedThreadIDs[id]);
++        TopDocs hits = s.search(new TermQuery(new Term("id", ""+id)), 1);
++                                  
++        if (expectedThreadIDs[id] != -1) {
++          assertEquals(1, hits.totalHits);
++          Document doc = r.document(hits.scoreDocs[0].doc);
++          int actualThreadID = doc.getField("thread").numericValue().intValue();
++          if (expectedThreadIDs[id] != actualThreadID) {
++            System.out.println("FAIL: id=" + id + " expectedThreadID=" + expectedThreadIDs[id] + " vs actualThreadID=" + actualThreadID);
++            for(int threadID=0;threadID<threadOps.size();threadID++) {
++              for(Operation op : threadOps.get(threadID)) {
++                if (id == op.id) {
++                  System.out.println("  threadID=" + threadID + " seqNo=" + op.seqNo + " " + (op.what == 2 ? "updated" : "deleted"));
++                }
++              }
++            }
++            assertEquals("id=" + id, expectedThreadIDs[id], actualThreadID);
++          }
++        } else if (hits.totalHits != 0) {
++          System.out.println("FAIL: id=" + id + " expectedThreadID=" + expectedThreadIDs[id] + " vs totalHits=" + hits.totalHits);
++          for(int threadID=0;threadID<threadOps.size();threadID++) {
++            for(Operation op : threadOps.get(threadID)) {
++              if (id == op.id) {
++                System.out.println("  threadID=" + threadID + " seqNo=" + op.seqNo + " " + (op.what == 2 ? "updated" : "del"));
++              }
++            }
++          }
++          assertEquals(0, hits.totalHits);
++        }
++      }
++      w.close();
++      r.close();
++    }
++
++    dir.close();
++  }
++}
+diff -ruN -x .svn -x .git -x build -x dist -x .caches -x .idea -x idea-build -x eclipse-build -x .settings trunk/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterDelete.java sequences/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterDelete.java
+--- trunk/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterDelete.java	2016-03-02 04:32:40.443807336 -0500
++++ sequences/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterDelete.java	2016-05-26 15:29:58.444121057 -0400
+@@ -1238,8 +1238,8 @@
+     iwc.setOpenMode(IndexWriterConfig.OpenMode.APPEND);
+     w = new IndexWriter(d, iwc);
+     IndexReader r = DirectoryReader.open(w, false, false);
+-    assertTrue(w.tryDeleteDocument(r, 1));
+-    assertTrue(w.tryDeleteDocument(r.leaves().get(0).reader(), 0));
++    assertTrue(w.tryDeleteDocument(r, 1) != -1);
++    assertTrue(w.tryDeleteDocument(r.leaves().get(0).reader(), 0) != -1);
+     r.close();
+     w.close();
+ 
+diff -ruN -x .svn -x .git -x build -x dist -x .caches -x .idea -x idea-build -x eclipse-build -x .settings trunk/lucene/core/src/test/org/apache/lucene/index/TestRollingUpdates.java sequences/lucene/core/src/test/org/apache/lucene/index/TestRollingUpdates.java
+--- trunk/lucene/core/src/test/org/apache/lucene/index/TestRollingUpdates.java	2016-03-08 17:22:26.832938630 -0500
++++ sequences/lucene/core/src/test/org/apache/lucene/index/TestRollingUpdates.java	2016-05-26 15:29:58.448121057 -0400
+@@ -80,7 +80,7 @@
+       if (s != null && updateCount < SIZE) {
+         TopDocs hits = s.search(new TermQuery(idTerm), 1);
+         assertEquals(1, hits.totalHits);
+-        doUpdate = !w.tryDeleteDocument(r, hits.scoreDocs[0].doc);
++        doUpdate = w.tryDeleteDocument(r, hits.scoreDocs[0].doc) == -1;
+         if (VERBOSE) {
+           if (doUpdate) {
+             System.out.println("  tryDeleteDocument failed");
+diff -ruN -x .svn -x .git -x build -x dist -x .caches -x .idea -x idea-build -x eclipse-build -x .settings trunk/lucene/core/src/test/org/apache/lucene/index/TestTryDelete.java sequences/lucene/core/src/test/org/apache/lucene/index/TestTryDelete.java
+--- trunk/lucene/core/src/test/org/apache/lucene/index/TestTryDelete.java	2016-02-16 11:18:34.717021816 -0500
++++ sequences/lucene/core/src/test/org/apache/lucene/index/TestTryDelete.java	2016-05-26 15:29:58.448121057 -0400
+@@ -79,8 +79,6 @@
+     ReferenceManager<IndexSearcher> mgr = new SearcherManager(writer,
+                                                               new SearcherFactory());
+ 
+-    TrackingIndexWriter mgrWriter = new TrackingIndexWriter(writer);
+-
+     IndexSearcher searcher = mgr.acquire();
+ 
+     TopDocs topDocs = searcher.search(new TermQuery(new Term("foo", "0")),
+@@ -90,10 +88,10 @@
+     long result;
+     if (random().nextBoolean()) {
+       IndexReader r = DirectoryReader.open(writer);
+-      result = mgrWriter.tryDeleteDocument(r, 0);
++      result = writer.tryDeleteDocument(r, 0);
+       r.close();
+     } else {
+-      result = mgrWriter.tryDeleteDocument(searcher.getIndexReader(), 0);
++      result = writer.tryDeleteDocument(searcher.getIndexReader(), 0);
+     }
+ 
+     // The tryDeleteDocument should have succeeded:
+@@ -132,10 +130,9 @@
+                                       100);
+     assertEquals(1, topDocs.totalHits);
+ 
+-    TrackingIndexWriter mgrWriter = new TrackingIndexWriter(writer);
+-    long result = mgrWriter.tryDeleteDocument(DirectoryReader.open(writer), 0);
++    long result = writer.tryDeleteDocument(DirectoryReader.open(writer), 0);
+ 
+-    assertEquals(1, result);
++    assertTrue(result != -1);
+ 
+     writer.commit();
+ 
+@@ -175,11 +172,9 @@
+                                       100);
+     assertEquals(1, topDocs.totalHits);
+ 
+-    TrackingIndexWriter mgrWriter = new TrackingIndexWriter(writer);
+-    long result = mgrWriter.deleteDocuments(new TermQuery(new Term("foo",
+-                                                                   "0")));
++    long result = writer.deleteDocuments(new TermQuery(new Term("foo", "0")));
+ 
+-    assertEquals(1, result);
++    assertTrue(result != -1);
+ 
+     // writer.commit();
+ 
+diff -ruN -x .svn -x .git -x build -x dist -x .caches -x .idea -x idea-build -x eclipse-build -x .settings trunk/lucene/core/src/test/org/apache/lucene/index/TestTwoPhaseCommitTool.java sequences/lucene/core/src/test/org/apache/lucene/index/TestTwoPhaseCommitTool.java
+--- trunk/lucene/core/src/test/org/apache/lucene/index/TestTwoPhaseCommitTool.java	2016-02-16 11:18:34.717021816 -0500
++++ sequences/lucene/core/src/test/org/apache/lucene/index/TestTwoPhaseCommitTool.java	2016-05-26 15:29:58.448121057 -0400
+@@ -40,29 +40,31 @@
+     }
+ 
+     @Override
+-    public void prepareCommit() throws IOException {
+-      prepareCommit(null);
++    public long prepareCommit() throws IOException {
++      return prepareCommit(null);
+     }
+ 
+-    public void prepareCommit(Map<String, String> commitData) throws IOException {
++    public long prepareCommit(Map<String, String> commitData) throws IOException {
+       this.prepareCommitData = commitData;
+       assertFalse("commit should not have been called before all prepareCommit were", commitCalled);
+       if (failOnPrepare) {
+         throw new IOException("failOnPrepare");
+       }
++      return 1;
+     }
+ 
+     @Override
+-    public void commit() throws IOException {
+-      commit(null);
++    public long commit() throws IOException {
++      return commit(null);
+     }
+ 
+-    public void commit(Map<String, String> commitData) throws IOException {
++    public long commit(Map<String, String> commitData) throws IOException {
+       this.commitData = commitData;
+       commitCalled = true;
+       if (failOnCommit) {
+         throw new RuntimeException("failOnCommit");
+       }
++      return 1;
+     }
+ 
+     @Override
+diff -ruN -x .svn -x .git -x build -x dist -x .caches -x .idea -x idea-build -x eclipse-build -x .settings trunk/lucene/core/src/test/org/apache/lucene/search/TestControlledRealTimeReopenThread.java sequences/lucene/core/src/test/org/apache/lucene/search/TestControlledRealTimeReopenThread.java
+--- trunk/lucene/core/src/test/org/apache/lucene/search/TestControlledRealTimeReopenThread.java	2016-03-02 04:32:40.447807337 -0500
++++ sequences/lucene/core/src/test/org/apache/lucene/search/TestControlledRealTimeReopenThread.java	2016-05-26 15:29:58.448121057 -0400
+@@ -40,7 +40,6 @@
+ import org.apache.lucene.index.SnapshotDeletionPolicy;
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.index.ThreadedIndexingAndSearchingTestCase;
+-import org.apache.lucene.index.TrackingIndexWriter;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.NRTCachingDirectory;
+ import org.apache.lucene.util.IOUtils;
+@@ -57,7 +56,7 @@
+   // Is guaranteed to reflect deletes:
+   private SearcherManager nrtDeletes;
+ 
+-  private TrackingIndexWriter genWriter;
++  private IndexWriter genWriter;
+ 
+   private ControlledRealTimeReopenThread<IndexSearcher> nrtDeletesThread;
+   private ControlledRealTimeReopenThread<IndexSearcher> nrtNoDeletesThread;
+@@ -219,7 +218,7 @@
+       System.out.println("TEST: make SearcherManager maxReopenSec=" + maxReopenSec + " minReopenSec=" + minReopenSec);
+     }
+ 
+-    genWriter = new TrackingIndexWriter(writer);
++    genWriter = writer;
+ 
+     final SearcherFactory sf = new SearcherFactory() {
+         @Override
+@@ -311,9 +310,8 @@
+     final CountDownLatch latch = new CountDownLatch(1);
+     final CountDownLatch signal = new CountDownLatch(1);
+ 
+-    LatchedIndexWriter _writer = new LatchedIndexWriter(d, conf, latch, signal);
+-    final TrackingIndexWriter writer = new TrackingIndexWriter(_writer);
+-    final SearcherManager manager = new SearcherManager(_writer, false, false, null);
++    LatchedIndexWriter writer = new LatchedIndexWriter(d, conf, latch, signal);
++    final SearcherManager manager = new SearcherManager(writer, false, false, null);
+     Document doc = new Document();
+     doc.add(newTextField("test", "test", Field.Store.YES));
+     writer.addDocument(doc);
+@@ -334,7 +332,7 @@
+       }
+     };
+     t.start();
+-    _writer.waitAfterUpdate = true; // wait in addDocument to let some reopens go through
++    writer.waitAfterUpdate = true; // wait in addDocument to let some reopens go through
+     final long lastGen = writer.updateDocument(new Term("foo", "bar"), doc); // once this returns the doc is already reflected in the last reopen
+ 
+     assertFalse(manager.isSearcherCurrent()); // false since there is a delete in the queue
+@@ -373,7 +371,7 @@
+     }
+     thread.close();
+     thread.join();
+-    _writer.close();
++    writer.close();
+     IOUtils.close(manager, d);
+   }
+   
+@@ -389,14 +387,13 @@
+       super(d, conf);
+       this.latch = latch;
+       this.signal = signal;
+-
+     }
+ 
+     @Override
+-    public void updateDocument(Term term,
++    public long updateDocument(Term term,
+         Iterable<? extends IndexableField> doc)
+         throws IOException {
+-      super.updateDocument(term, doc);
++      long result = super.updateDocument(term, doc);
+       try {
+         if (waitAfterUpdate) {
+           signal.countDown();
+@@ -405,6 +402,7 @@
+       } catch (InterruptedException e) {
+         throw new ThreadInterruptedException(e);
+       }
++      return result;
+     }
+   }
+ 
+@@ -483,9 +481,8 @@
+     config.setOpenMode(IndexWriterConfig.OpenMode.CREATE_OR_APPEND);
+     final IndexWriter iw = new IndexWriter(dir, config);
+     SearcherManager sm = new SearcherManager(iw, new SearcherFactory());
+-    final TrackingIndexWriter tiw = new TrackingIndexWriter(iw);
+     ControlledRealTimeReopenThread<IndexSearcher> controlledRealTimeReopenThread =
+-      new ControlledRealTimeReopenThread<>(tiw, sm, maxStaleSecs, 0);
++      new ControlledRealTimeReopenThread<>(iw, sm, maxStaleSecs, 0);
+ 
+     controlledRealTimeReopenThread.setDaemon(true);
+     controlledRealTimeReopenThread.start();
+@@ -517,7 +514,7 @@
+       d.add(new TextField("count", i + "", Field.Store.NO));
+       d.add(new TextField("content", content, Field.Store.YES));
+       long start = System.currentTimeMillis();
+-      long l = tiw.addDocument(d);
++      long l = iw.addDocument(d);
+       controlledRealTimeReopenThread.waitForGeneration(l);
+       long wait = System.currentTimeMillis() - start;
+       assertTrue("waited too long for generation " + wait,
+diff -ruN -x .svn -x .git -x build -x dist -x .caches -x .idea -x idea-build -x eclipse-build -x .settings trunk/lucene/facet/src/java/org/apache/lucene/facet/taxonomy/directory/DirectoryTaxonomyWriter.java sequences/lucene/facet/src/java/org/apache/lucene/facet/taxonomy/directory/DirectoryTaxonomyWriter.java
+--- trunk/lucene/facet/src/java/org/apache/lucene/facet/taxonomy/directory/DirectoryTaxonomyWriter.java	2016-02-16 11:18:34.737021816 -0500
++++ sequences/lucene/facet/src/java/org/apache/lucene/facet/taxonomy/directory/DirectoryTaxonomyWriter.java	2016-05-26 15:29:58.448121057 -0400
+@@ -581,14 +581,14 @@
+   }
+   
+   @Override
+-  public synchronized void commit() throws IOException {
++  public synchronized long commit() throws IOException {
+     ensureOpen();
+     // LUCENE-4972: if we always call setCommitData, we create empty commits
+     String epochStr = indexWriter.getCommitData().get(INDEX_EPOCH);
+     if (epochStr == null || Long.parseLong(epochStr, 16) != indexEpoch) {
+       indexWriter.setCommitData(combinedCommitData(indexWriter.getCommitData()));
+     }
+-    indexWriter.commit();
++    return indexWriter.commit();
+   }
+ 
+   /** Combine original user data with the taxonomy epoch. */
+@@ -616,14 +616,14 @@
+    * See {@link IndexWriter#prepareCommit}.
+    */
+   @Override
+-  public synchronized void prepareCommit() throws IOException {
++  public synchronized long prepareCommit() throws IOException {
+     ensureOpen();
+     // LUCENE-4972: if we always call setCommitData, we create empty commits
+     String epochStr = indexWriter.getCommitData().get(INDEX_EPOCH);
+     if (epochStr == null || Long.parseLong(epochStr, 16) != indexEpoch) {
+       indexWriter.setCommitData(combinedCommitData(indexWriter.getCommitData()));
+     }
+-    indexWriter.prepareCommit();
++    return indexWriter.prepareCommit();
+   }
+   
+   @Override
+diff -ruN -x .svn -x .git -x build -x dist -x .caches -x .idea -x idea-build -x eclipse-build -x .settings trunk/lucene/test-framework/src/java/org/apache/lucene/index/RandomIndexWriter.java sequences/lucene/test-framework/src/java/org/apache/lucene/index/RandomIndexWriter.java
+--- trunk/lucene/test-framework/src/java/org/apache/lucene/index/RandomIndexWriter.java	2016-02-16 11:18:34.845021818 -0500
++++ sequences/lucene/test-framework/src/java/org/apache/lucene/index/RandomIndexWriter.java	2016-05-26 15:29:58.448121057 -0400
+@@ -130,14 +130,15 @@
+    * Adds a Document.
+    * @see IndexWriter#addDocument(Iterable)
+    */
+-  public <T extends IndexableField> void addDocument(final Iterable<T> doc) throws IOException {
++  public <T extends IndexableField> long addDocument(final Iterable<T> doc) throws IOException {
+     LuceneTestCase.maybeChangeLiveIndexWriterConfig(r, w.getConfig());
++    long seqNo;
+     if (r.nextInt(5) == 3) {
+       // TODO: maybe, we should simply buffer up added docs
+       // (but we need to clone them), and only when
+       // getReader, commit, etc. are called, we do an
+       // addDocuments?  Would be better testing.
+-      w.addDocuments(new Iterable<Iterable<T>>() {
++      seqNo = w.addDocuments(new Iterable<Iterable<T>>() {
+ 
+         @Override
+         public Iterator<Iterable<T>> iterator() {
+@@ -167,10 +168,12 @@
+         }
+         });
+     } else {
+-      w.addDocument(doc);
++      seqNo = w.addDocument(doc);
+     }
+     
+     maybeFlushOrCommit();
++
++    return seqNo;
+   }
+ 
+   private void maybeFlushOrCommit() throws IOException {
+@@ -195,26 +198,29 @@
+     }
+   }
+   
+-  public void addDocuments(Iterable<? extends Iterable<? extends IndexableField>> docs) throws IOException {
++  public long addDocuments(Iterable<? extends Iterable<? extends IndexableField>> docs) throws IOException {
+     LuceneTestCase.maybeChangeLiveIndexWriterConfig(r, w.getConfig());
+-    w.addDocuments(docs);
++    long seqNo = w.addDocuments(docs);
+     maybeFlushOrCommit();
++    return seqNo;
+   }
+ 
+-  public void updateDocuments(Term delTerm, Iterable<? extends Iterable<? extends IndexableField>> docs) throws IOException {
++  public long updateDocuments(Term delTerm, Iterable<? extends Iterable<? extends IndexableField>> docs) throws IOException {
+     LuceneTestCase.maybeChangeLiveIndexWriterConfig(r, w.getConfig());
+-    w.updateDocuments(delTerm, docs);
++    long seqNo = w.updateDocuments(delTerm, docs);
+     maybeFlushOrCommit();
++    return seqNo;
+   }
+ 
+   /**
+    * Updates a document.
+    * @see IndexWriter#updateDocument(Term, Iterable)
+    */
+-  public <T extends IndexableField> void updateDocument(Term t, final Iterable<T> doc) throws IOException {
++  public <T extends IndexableField> long updateDocument(Term t, final Iterable<T> doc) throws IOException {
+     LuceneTestCase.maybeChangeLiveIndexWriterConfig(r, w.getConfig());
++    long seqNo;
+     if (r.nextInt(5) == 3) {
+-      w.updateDocuments(t, new Iterable<Iterable<T>>() {
++      seqNo = w.updateDocuments(t, new Iterable<Iterable<T>>() {
+ 
+         @Override
+         public Iterator<Iterable<T>> iterator() {
+@@ -243,49 +249,51 @@
+         }
+         });
+     } else {
+-      w.updateDocument(t, doc);
++      seqNo = w.updateDocument(t, doc);
+     }
+     maybeFlushOrCommit();
++
++    return seqNo;
+   }
+   
+-  public void addIndexes(Directory... dirs) throws IOException {
++  public long addIndexes(Directory... dirs) throws IOException {
+     LuceneTestCase.maybeChangeLiveIndexWriterConfig(r, w.getConfig());
+-    w.addIndexes(dirs);
++    return w.addIndexes(dirs);
+   }
+ 
+-  public void addIndexes(CodecReader... readers) throws IOException {
++  public long addIndexes(CodecReader... readers) throws IOException {
+     LuceneTestCase.maybeChangeLiveIndexWriterConfig(r, w.getConfig());
+-    w.addIndexes(readers);
++    return w.addIndexes(readers);
+   }
+   
+-  public void updateNumericDocValue(Term term, String field, Long value) throws IOException {
++  public long updateNumericDocValue(Term term, String field, Long value) throws IOException {
+     LuceneTestCase.maybeChangeLiveIndexWriterConfig(r, w.getConfig());
+-    w.updateNumericDocValue(term, field, value);
++    return w.updateNumericDocValue(term, field, value);
+   }
+   
+-  public void updateBinaryDocValue(Term term, String field, BytesRef value) throws IOException {
++  public long updateBinaryDocValue(Term term, String field, BytesRef value) throws IOException {
+     LuceneTestCase.maybeChangeLiveIndexWriterConfig(r, w.getConfig());
+-    w.updateBinaryDocValue(term, field, value);
++    return w.updateBinaryDocValue(term, field, value);
+   }
+   
+-  public void updateDocValues(Term term, Field... updates) throws IOException {
++  public long updateDocValues(Term term, Field... updates) throws IOException {
+     LuceneTestCase.maybeChangeLiveIndexWriterConfig(r, w.getConfig());
+-    w.updateDocValues(term, updates);
++    return w.updateDocValues(term, updates);
+   }
+   
+-  public void deleteDocuments(Term term) throws IOException {
++  public long deleteDocuments(Term term) throws IOException {
+     LuceneTestCase.maybeChangeLiveIndexWriterConfig(r, w.getConfig());
+-    w.deleteDocuments(term);
++    return w.deleteDocuments(term);
+   }
+ 
+-  public void deleteDocuments(Query q) throws IOException {
++  public long deleteDocuments(Query q) throws IOException {
+     LuceneTestCase.maybeChangeLiveIndexWriterConfig(r, w.getConfig());
+-    w.deleteDocuments(q);
++    return w.deleteDocuments(q);
+   }
+   
+-  public void commit() throws IOException {
++  public long commit() throws IOException {
+     LuceneTestCase.maybeChangeLiveIndexWriterConfig(r, w.getConfig());
+-    w.commit();
++    return w.commit();
+   }
+   
+   public int numDocs() {
+@@ -296,8 +304,8 @@
+     return w.maxDoc();
+   }
+ 
+-  public void deleteAll() throws IOException {
+-    w.deleteAll();
++  public long deleteAll() throws IOException {
++    return w.deleteAll();
+   }
+ 
+   public DirectoryReader getReader() throws IOException {

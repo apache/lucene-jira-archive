@@ -1,0 +1,479 @@
+Index: lucene/CHANGES.txt
+===================================================================
+--- lucene/CHANGES.txt	(revision 1488278)
++++ lucene/CHANGES.txt	(working copy)
+@@ -169,6 +169,10 @@
+ * LUCENE-5022: Added FacetResult.mergeHierarchies to merge multiple
+   FacetResult of the same dimension into a single one with the reconstructed
+   hierarchy. (Shai Erera)
++
++* LUCENE-5026: Added PagedGrowableWriter, a new internal packed-ints structure
++  that grows on demand, can store more than 2B values and supports random write
++  and read access. (Adrien Grand)
+   
+ Build
+ 
+Index: lucene/core/src/test/org/apache/lucene/util/packed/TestPackedInts.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/util/packed/TestPackedInts.java	(revision 1488278)
++++ lucene/core/src/test/org/apache/lucene/util/packed/TestPackedInts.java	(working copy)
+@@ -659,6 +659,61 @@
+     assertEquals(1 << 10, wrt.get(valueCount - 1));
+   }
+ 
++  public void testPagedGrowableWriter() {
++    int pageSize = 1 << (_TestUtil.nextInt(random(), 6, 22));
++    // supports 0 values?
++    PagedGrowableWriter writer = new PagedGrowableWriter(0, pageSize, _TestUtil.nextInt(random(), 1, 64), random().nextFloat());
++    assertEquals(0, writer.size());
++
++    // compare against AppendingLongBuffer
++    AppendingLongBuffer buf = new AppendingLongBuffer();
++    int size = random().nextInt(1000000);
++    long max = 5;
++    for (int i = 0; i < size; ++i) {
++      buf.add(_TestUtil.nextLong(random(), 0, max));
++      if (rarely()) {
++        max = PackedInts.maxValue(rarely() ? _TestUtil.nextInt(random(), 0, 63) : _TestUtil.nextInt(random(), 0, 31));
++      }
++    }
++    writer = new PagedGrowableWriter(size, pageSize, _TestUtil.nextInt(random(), 1, 64), random().nextFloat());
++    assertEquals(size, writer.size());
++    for (int i = size - 1; i >= 0; --i) {
++      writer.set(i, buf.get(i));
++    }
++    for (int i = 0; i < size; ++i) {
++      assertEquals(buf.get(i), writer.get(i));
++    }
++
++    // test copy
++    PagedGrowableWriter copy = writer.resize(_TestUtil.nextLong(random(), writer.size(), 2 * writer.size()));
++    for (long i = 0; i < copy.size(); ++i) {
++      if (i < writer.size()) {
++        assertEquals(writer.get(i), copy.get(i));
++      } else {
++        assertEquals(0, copy.get(i));
++      }
++    }
++  }
++
++  // memory hole
++  @Ignore
++  public void testPagedGrowableWriterOverflow() {
++    final long size = _TestUtil.nextLong(random(), 2 * (long) Integer.MAX_VALUE, 3 * (long) Integer.MAX_VALUE);
++    final int pageSize = 1 << (_TestUtil.nextInt(random(), 16, 24));
++    final PagedGrowableWriter writer = new PagedGrowableWriter(size, pageSize, 1, random().nextFloat());
++    final long index = _TestUtil.nextLong(random(), (long) Integer.MAX_VALUE, size);
++    writer.set(index, 2);
++    assertEquals(2, writer.get(index));
++    for (int i = 0; i < 1000000; ++i) {
++      final long idx = _TestUtil.nextLong(random(), 0, size);
++      if (idx == index) {
++        assertEquals(2, writer.get(idx));
++      } else {
++        assertEquals(0, writer.get(idx));
++      }
++    }
++  }
++
+   public void testSave() throws IOException {
+     final int valueCount = _TestUtil.nextInt(random(), 1, 2048);
+     for (int bpv = 1; bpv <= 64; ++bpv) {
+Index: lucene/core/src/test/org/apache/lucene/util/fst/Test2BFST.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/util/fst/Test2BFST.java	(revision 1488278)
++++ lucene/core/src/test/org/apache/lucene/util/fst/Test2BFST.java	(working copy)
+@@ -34,7 +34,8 @@
+ import org.junit.Ignore;
+ import com.carrotsearch.randomizedtesting.annotations.TimeoutSuite;
+ 
+-@Ignore("Requires tons of heap to run (10G works)")
++// nocommit
++//@Ignore("Requires tons of heap to run (420G works)")
+ @TimeoutSuite(millis = 100 * TimeUnits.HOUR)
+ public class Test2BFST extends LuceneTestCase {
+ 
+@@ -50,12 +51,12 @@
+     for(int doPackIter=0;doPackIter<2;doPackIter++) {
+       boolean doPack = doPackIter == 1;
+ 
+-      // Build FST w/ NoOutputs and stop when nodeCount > 3B
++      // Build FST w/ NoOutputs and stop when nodeCount > 2.2B
+       if (!doPack) {
+         System.out.println("\nTEST: 3B nodes; doPack=false output=NO_OUTPUTS");
+         Outputs<Object> outputs = NoOutputs.getSingleton();
+         Object NO_OUTPUT = outputs.getNoOutput();
+-        final Builder<Object> b = new Builder<Object>(FST.INPUT_TYPE.BYTE1, 0, 0, false, false, Integer.MAX_VALUE, outputs,
++        final Builder<Object> b = new Builder<Object>(FST.INPUT_TYPE.BYTE1, 0, 0, true, true, Integer.MAX_VALUE, outputs,
+                                                       null, doPack, PackedInts.COMPACT, true, 15);
+ 
+         int count = 0;
+@@ -72,7 +73,7 @@
+           if (count % 100000 == 0) {
+             System.out.println(count + ": " + b.fstSizeInBytes() + " bytes; " + b.getTotStateCount() + " nodes");
+           }
+-          if (b.getTotStateCount() > LIMIT) {
++          if (b.getTotStateCount() > Integer.MAX_VALUE + 100L * 1024 * 1024) {
+             break;
+           }
+           nextInput(r, ints2);
+Index: lucene/core/src/java/org/apache/lucene/util/fst/NodeHash.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/fst/NodeHash.java	(revision 1488278)
++++ lucene/core/src/java/org/apache/lucene/util/fst/NodeHash.java	(working copy)
+@@ -21,19 +21,20 @@
+ 
+ import org.apache.lucene.util.packed.GrowableWriter;
+ import org.apache.lucene.util.packed.PackedInts;
++import org.apache.lucene.util.packed.PagedGrowableWriter;
+ 
+ // Used to dedup states (lookup already-frozen states)
+ final class NodeHash<T> {
+ 
+-  private GrowableWriter table;
+-  private int count;
+-  private int mask;
++  private PagedGrowableWriter table;
++  private long count;
++  private long mask;
+   private final FST<T> fst;
+   private final FST.Arc<T> scratchArc = new FST.Arc<T>();
+   private final FST.BytesReader in;
+ 
+   public NodeHash(FST<T> fst, FST.BytesReader in) {
+-    table = new GrowableWriter(8, 16, PackedInts.COMPACT);
++    table = new PagedGrowableWriter(16, 1<<30, 8, PackedInts.COMPACT);
+     mask = 15;
+     this.fst = fst;
+     this.in = in;
+@@ -69,10 +70,10 @@
+ 
+   // hash code for an unfrozen node.  This must be identical
+   // to the un-frozen case (below)!!
+-  private int hash(Builder.UnCompiledNode<T> node) {
++  private long hash(Builder.UnCompiledNode<T> node) {
+     final int PRIME = 31;
+     //System.out.println("hash unfrozen");
+-    int h = 0;
++    long h = 0;
+     // TODO: maybe if number of arcs is high we can safely subsample?
+     for(int arcIdx=0;arcIdx<node.numArcs;arcIdx++) {
+       final Builder.Arc<T> arc = node.arcs[arcIdx];
+@@ -87,14 +88,14 @@
+       }
+     }
+     //System.out.println("  ret " + (h&Integer.MAX_VALUE));
+-    return h & Integer.MAX_VALUE;
++    return h & Long.MAX_VALUE;
+   }
+ 
+   // hash code for a frozen node
+-  private int hash(long node) throws IOException {
++  private long hash(long node) throws IOException {
+     final int PRIME = 31;
+     //System.out.println("hash frozen node=" + node);
+-    int h = 0;
++    long h = 0;
+     fst.readFirstRealTargetArc(node, scratchArc, in);
+     while(true) {
+       //System.out.println("  label=" + scratchArc.label + " target=" + scratchArc.target + " h=" + h + " output=" + fst.outputs.outputToString(scratchArc.output) + " next?=" + scratchArc.flag(4) + " final?=" + scratchArc.isFinal() + " pos=" + in.getPosition());
+@@ -111,13 +112,13 @@
+       fst.readNextRealArc(scratchArc, in);
+     }
+     //System.out.println("  ret " + (h&Integer.MAX_VALUE));
+-    return h & Integer.MAX_VALUE;
++    return h & Long.MAX_VALUE;
+   }
+ 
+   public long add(Builder.UnCompiledNode<T> nodeIn) throws IOException {
+-    // System.out.println("hash: add count=" + count + " vs " + table.size());
+-    final int h = hash(nodeIn);
+-    int pos = h & mask;
++    //System.out.println("hash: add count=" + count + " vs " + table.size() + " mask=" + mask);
++    final long h = hash(nodeIn);
++    long pos = h & mask;
+     int c = 0;
+     while(true) {
+       final long v = table.get(pos);
+@@ -128,7 +129,8 @@
+         assert hash(node) == h : "frozenHash=" + hash(node) + " vs h=" + h;
+         count++;
+         table.set(pos, node);
+-        if (table.size() < 2*count) {
++        // Rehash at 2/3 occupancy:
++        if (count > 2*table.size()/3) {
+           rehash();
+         }
+         return node;
+@@ -144,7 +146,7 @@
+ 
+   // called only by rehash
+   private void addNew(long address) throws IOException {
+-    int pos = hash(address) & mask;
++    long pos = hash(address) & mask;
+     int c = 0;
+     while(true) {
+       if (table.get(pos) == 0) {
+@@ -158,15 +160,12 @@
+   }
+ 
+   private void rehash() throws IOException {
+-    final GrowableWriter oldTable = table;
++    final PagedGrowableWriter oldTable = table;
+ 
+-    if (oldTable.size() >= Integer.MAX_VALUE/2) {
+-      throw new IllegalStateException("FST too large (> 2.1 GB)");
+-    }
+-
+-    table = new GrowableWriter(oldTable.getBitsPerValue(), 2*oldTable.size(), PackedInts.COMPACT);
++    table = new PagedGrowableWriter(2*oldTable.size(), 1<<30, PackedInts.bitsRequired(count), PackedInts.COMPACT);
++    System.out.println("rehash to " + table.size());
+     mask = table.size()-1;
+-    for(int idx=0;idx<oldTable.size();idx++) {
++    for(long idx=0;idx<oldTable.size();idx++) {
+       final long address = oldTable.get(idx);
+       if (address != 0) {
+         addNew(address);
+@@ -174,7 +173,10 @@
+     }
+   }
+ 
+-  public int count() {
++  // nocommit unused?
++  /*
++  public long count() {
+     return count;
+   }
++  */
+ }
+Index: lucene/core/src/java/org/apache/lucene/util/packed/package.html
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/package.html	(revision 1488278)
++++ lucene/core/src/java/org/apache/lucene/util/packed/package.html	(working copy)
+@@ -47,6 +47,11 @@
+         <li>Same as PackedInts.Mutable but grows the number of bits per values when needed.</li>
+         <li>Useful to build a PackedInts.Mutable from a read-once stream of longs.</li>
+     </ul></li>
++    <li><b>{@link org.apache.lucene.util.packed.PagedGrowableWriter}</b><ul>
++        <li>Slices data into fixed-size blocks stored in GrowableWriters.</li>
++        <li>Supports more than 2B values.</li>
++        <li>You should use AppendingLongBuffer instead if you don't need random write access.</li>
++    </ul></li>
+     <li><b>{@link org.apache.lucene.util.packed.AppendingLongBuffer}</b><ul>
+         <li>Can store any sequence of longs.</li>
+         <li>Compression is good when values are close to each other.</li>
+Index: lucene/core/src/java/org/apache/lucene/util/packed/PagedGrowableWriter.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/PagedGrowableWriter.java	(revision 0)
++++ lucene/core/src/java/org/apache/lucene/util/packed/PagedGrowableWriter.java	(working copy)
+@@ -0,0 +1,139 @@
++package org.apache.lucene.util.packed;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * A {@link PagedGrowableWriter}. This class slices data into fixed-size blocks
++ * which have independent numbers of bits per value and grow on-demand.
++ * <p>You should use this class instead of {@link AppendingLongBuffer} only when
++ * you need random write-access. Otherwise this class will likely be slower and
++ * less memory-efficient.
++ * @lucene.internal
++ */
++public final class PagedGrowableWriter {
++
++  private final long size;
++  private final int pageShift;
++  private final int pageMask;
++  private final GrowableWriter[] subWriters;
++  private final int startBitsPerValue;
++  private final float acceptableOverheadRatio;
++
++  /**
++   * Create a new {@link PagedGrowableWriter} instance.
++   *
++   * @param size the number of values to store.
++   * @param pageSize the number of values per page
++   * @param startBitsPerValue the initial number of bits per value
++   * @param acceptableOverheadRatio an acceptable overhead ratio
++   */
++  public PagedGrowableWriter(long size, int pageSize,
++      int startBitsPerValue, float acceptableOverheadRatio) {
++    this(size, pageSize, startBitsPerValue, acceptableOverheadRatio, true);
++  }
++
++  PagedGrowableWriter(long size, int pageSize,int startBitsPerValue, float acceptableOverheadRatio, boolean fillPages) {
++    super();
++    this.size = size;
++    this.startBitsPerValue = startBitsPerValue;
++    this.acceptableOverheadRatio = acceptableOverheadRatio;
++    if (pageSize < 64  || ((pageSize & (pageSize - 1)) != 0)) {
++      throw new IllegalArgumentException("pageSize must be >= 64 and a power of 2, got " + pageSize);
++    }
++    pageShift = 31 - Integer.numberOfLeadingZeros(pageSize);
++    assert (1 << pageShift) == pageSize;
++    pageMask = pageSize - 1;
++    final int numPages = (int) ((size + pageSize - 1) / pageSize);
++    if ((long) numPages * pageSize < size || (long) (numPages - 1) * pageSize > size) {
++      throw new IllegalArgumentException("pageSize must be chosen so that there are at most Integer.MAX_VALUE pages, got size=" + size + ", pageSize=" + pageSize);
++    }
++    subWriters = new GrowableWriter[numPages];
++    if (fillPages) {
++      for (int i = 0; i < numPages; ++i) {
++        int thisPageSize;
++        if (i == numPages-1) {
++          thisPageSize = (int) (size % pageSize);
++          if (thisPageSize == 0) {
++            thisPageSize = pageSize;
++          }
++        } else {
++          thisPageSize = pageSize;
++        }
++        subWriters[i] = new GrowableWriter(startBitsPerValue, thisPageSize, acceptableOverheadRatio);
++      }
++    }
++  }
++
++  private int pageSize() {
++    return pageMask + 1;
++  }
++
++  /** The number of values. */
++  public long size() {
++    return size;
++  }
++
++  int pageIndex(long index) {
++    return (int) (index >>> pageShift);
++  }
++
++  int indexInPage(long index) {
++    return (int) index & pageMask;
++  }
++
++  /** Get value at <code>index</code>. */
++  public long get(long index) {
++    assert index >= 0 && index < size: "index=" + index + " size=" + size;
++    final int pageIndex = pageIndex(index);
++    final int indexInPage = indexInPage(index);
++    return subWriters[pageIndex].get(indexInPage);
++  }
++
++  /** Set value at <code>index</code>. */
++  public void set(long index, long value) {
++    assert index >= 0 && index < size;
++    final int pageIndex = pageIndex(index);
++    final int indexInPage = indexInPage(index);
++    subWriters[pageIndex].set(indexInPage, value);
++  }
++
++  /** Create a new {@link PagedGrowableWriter} of size <code>newSize</code>
++   *  based on the content of this buffer. This method is much more efficient
++   *  than creating a new {@link PagedGrowableWriter} and copying values one by
++   *  one. */
++  public PagedGrowableWriter resize(long newSize) {
++    PagedGrowableWriter newWriter = new PagedGrowableWriter(newSize, pageSize(), startBitsPerValue, acceptableOverheadRatio, false);
++    final int numCommonPages = Math.min(newWriter.subWriters.length, subWriters.length);
++    final long[] copyBuffer = new long[1024];
++    for (int i = 0; i < numCommonPages; ++i) {
++      final int bpv = subWriters[i].getBitsPerValue();
++      newWriter.subWriters[i] = new GrowableWriter(bpv, pageSize(), acceptableOverheadRatio);
++      PackedInts.copy(subWriters[i], 0, newWriter.subWriters[i], 0, pageSize(), copyBuffer);
++    }
++    for (int i = numCommonPages; i < newWriter.subWriters.length; ++i) {
++      newWriter.subWriters[i] = new GrowableWriter(startBitsPerValue, pageSize(), acceptableOverheadRatio);
++    }
++    return newWriter;
++  }
++
++  @Override
++  public String toString() {
++    return getClass().getSimpleName() + "(size=" + size() + ",pageSize=" + (pageMask+1) + ")";
++  }
++
++}
+
+Property changes on: lucene/core/src/java/org/apache/lucene/util/packed/PagedGrowableWriter.java
+___________________________________________________________________
+Added: svn:eol-style
+## -0,0 +1 ##
++native
+\ No newline at end of property
+Index: lucene/core/src/java/org/apache/lucene/util/packed/PackedInts.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/PackedInts.java	(revision 1488278)
++++ lucene/core/src/java/org/apache/lucene/util/packed/PackedInts.java	(working copy)
+@@ -1200,31 +1200,37 @@
+       }
+     } else {
+       // use bulk operations
+-      long[] buf = new long[Math.min(capacity, len)];
+-      int remaining = 0;
+-      while (len > 0) {
+-        final int read = src.get(srcPos, buf, remaining, Math.min(len, buf.length - remaining));
+-        assert read > 0;
+-        srcPos += read;
+-        len -= read;
+-        remaining += read;
+-        final int written = dest.set(destPos, buf, 0, remaining);
+-        assert written > 0;
+-        destPos += written;
+-        if (written < remaining) {
+-          System.arraycopy(buf, written, buf, 0, remaining - written);
+-        }
+-        remaining -= written;
++      final long[] buf = new long[Math.min(capacity, len)];
++      copy(src, srcPos, dest, destPos, len, buf);
++    }
++  }
++
++  /** Same as {@link #copy(Reader, int, Mutable, int, int, int)} but using a pre-allocated buffer. */
++  static void copy(Reader src, int srcPos, Mutable dest, int destPos, int len, long[] buf) {
++    assert buf.length > 0;
++    int remaining = 0;
++    while (len > 0) {
++      final int read = src.get(srcPos, buf, remaining, Math.min(len, buf.length - remaining));
++      assert read > 0;
++      srcPos += read;
++      len -= read;
++      remaining += read;
++      final int written = dest.set(destPos, buf, 0, remaining);
++      assert written > 0;
++      destPos += written;
++      if (written < remaining) {
++        System.arraycopy(buf, written, buf, 0, remaining - written);
+       }
+-      while (remaining > 0) {
+-        final int written = dest.set(destPos, buf, 0, remaining);
+-        destPos += written;
+-        remaining -= written;
+-        System.arraycopy(buf, written, buf, 0, remaining);
+-      }
++      remaining -= written;
+     }
++    while (remaining > 0) {
++      final int written = dest.set(destPos, buf, 0, remaining);
++      destPos += written;
++      remaining -= written;
++      System.arraycopy(buf, written, buf, 0, remaining);
++    }
+   }
+-  
++
+   /**
+    * Expert: reads only the metadata from a stream. This is useful to later
+    * restore a stream or open a direct reader via 

@@ -1,0 +1,715 @@
+diff --git a/lucene/join/src/java/org/apache/lucene/search/join/ChildTraversableToParentBlockJoinQuery.java b/lucene/join/src/java/org/apache/lucene/search/join/ChildTraversableToParentBlockJoinQuery.java
+new file mode 100644
+index 0000000..486e006
+--- /dev/null
++++ b/lucene/join/src/java/org/apache/lucene/search/join/ChildTraversableToParentBlockJoinQuery.java
+@@ -0,0 +1,420 @@
++package org.apache.lucene.search.join;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.Locale;
++import java.util.Set;
++
++import org.apache.lucene.index.AtomicReaderContext;
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.IndexWriter;       // javadocs
++import org.apache.lucene.index.Term;
++import org.apache.lucene.search.ComplexExplanation;
++import org.apache.lucene.search.DocIdSet;
++import org.apache.lucene.search.DocIdSetIterator;
++import org.apache.lucene.search.Explanation;
++import org.apache.lucene.search.Filter;
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.Query;
++import org.apache.lucene.search.Scorer;
++import org.apache.lucene.search.Weight;
++import org.apache.lucene.search.grouping.TopGroups;
++import org.apache.lucene.util.Bits;
++import org.apache.lucene.util.FixedBitSet;
++
++/**
++ * TODO: add traverse specific javadoc
++ * <p>
++ * This query requires that you index
++ * children and parent docs as a single block, using the
++ * {@link IndexWriter#addDocuments IndexWriter.addDocuments()} or {@link
++ * IndexWriter#updateDocuments IndexWriter.updateDocuments()} API.  In each block, the
++ * child documents must appear first, ending with the parent
++ * document.  At search time you provide a Filter
++ * identifying the parents, however this Filter must provide
++ * an {@link FixedBitSet} per sub-reader.
++ *
++ * <p>Once the block index is built, use this query to wrap
++ * any sub-query matching only child docs and join matches in that
++ * child document space up to the parent document space.
++ * You can then use this Query as a clause with
++ * other queries in the parent document space.</p>
++ *
++ * <p>See {@link ToChildBlockJoinQuery} if you need to join
++ * in the reverse order.
++ *
++ * <p>The child documents must be orthogonal to the parent
++ * documents: the wrapped child query must never
++ * return a parent document.</p>
++ *
++ * If you'd like to retrieve {@link TopGroups} for the
++ * resulting query, use the {@link ToParentBlockJoinCollector}.
++ * Note that this is not necessary, ie, if you simply want
++ * to collect the parent documents and don't need to see
++ * which child documents matched under that parent, then
++ * you can use any collector.
++ *
++ * <p><b>NOTE</b>: If the overall query contains parent-only
++ * matches, for example you OR a parent-only query with a
++ * joined child-only query, then the resulting collected documents
++ * will be correct, however the {@link TopGroups} you get
++ * from {@link ToParentBlockJoinCollector} will not contain every
++ * child for parents that had matched.
++ *
++ * <p>See {@link org.apache.lucene.search.join} for an
++ * overview. </p>
++ *
++ * @lucene.experimental
++ */
++public class ChildTraversableToParentBlockJoinQuery extends Query {
++
++  protected final Filter parentsFilter;
++  protected final Query childQuery;
++
++  // If we are rewritten, this is the original childQuery we
++  // were passed; we use this for .equals() and
++  // .hashCode().  This makes rewritten query equal the
++  // original, so that user does not have to .rewrite() their
++  // query before searching:
++  protected final Query origChildQuery;
++
++  /** 
++   * Create a ChildTraversableToParentBlockJoinQuery.
++   * 
++   * @param childQuery Query matching child documents.
++   * @param parentsFilter Filter (must produce FixedBitSet
++   * per-segment) identifying the parent documents.
++   * into a single parent score.
++   **/
++  public ChildTraversableToParentBlockJoinQuery(Query childQuery, Filter parentsFilter) {
++    super();
++    this.origChildQuery = childQuery;
++    this.childQuery = childQuery;
++    this.parentsFilter = parentsFilter;
++  }
++
++  private ChildTraversableToParentBlockJoinQuery(Query origChildQuery, Query childQuery, Filter parentsFilter) {
++    super();
++    this.origChildQuery = origChildQuery;
++    this.childQuery = childQuery;
++    this.parentsFilter = parentsFilter;
++  }
++
++  @Override
++  public Weight createWeight(IndexSearcher searcher) throws IOException {
++    return new ChildTraversableBlockJoinWeight(this, childQuery.createWeight(searcher), parentsFilter);
++  }
++
++  private static class ChildTraversableBlockJoinWeight extends Weight {
++    private final Query joinQuery;
++    private final Weight childWeight;
++    private final Filter parentsFilter;
++
++    public ChildTraversableBlockJoinWeight(Query joinQuery, Weight childWeight, Filter parentsFilter) {
++      super();
++      this.joinQuery = joinQuery;
++      this.childWeight = childWeight;
++      this.parentsFilter = parentsFilter;
++    }
++
++    @Override
++    public Query getQuery() {
++      return joinQuery;
++    }
++
++    @Override
++    public float getValueForNormalization() throws IOException {
++      return childWeight.getValueForNormalization() * joinQuery.getBoost() * joinQuery.getBoost();
++    }
++
++    @Override
++    public void normalize(float norm, float topLevelBoost) {
++      childWeight.normalize(norm, topLevelBoost * joinQuery.getBoost());
++    }
++
++    // NOTE: acceptDocs applies (and is checked) only in the
++    // parent document space
++    @Override
++    public Scorer scorer(AtomicReaderContext readerContext, boolean scoreDocsInOrder,
++        boolean topScorer, Bits acceptDocs) throws IOException {
++
++      // Pass scoreDocsInOrder true, topScorer false to our sub and the live docs:
++      final Scorer childScorer = childWeight.scorer(readerContext, true, false, readerContext.reader().getLiveDocs());
++
++      if (childScorer == null) {
++        // No matches
++        return null;
++      }
++
++//      final int firstChildDoc = childScorer.nextDoc();
++//      if (firstChildDoc == DocIdSetIterator.NO_MORE_DOCS) {
++//        // No matches
++//        return null;
++//      }
++
++      // NOTE: we cannot pass acceptDocs here because this
++      // will (most likely, justifiably) cause the filter to
++      // not return a FixedBitSet but rather a
++      // BitsFilteredDocIdSet.  Instead, we filter by
++      // acceptDocs when we score:
++      final DocIdSet parents = parentsFilter.getDocIdSet(readerContext, null);
++
++      if (parents == null
++          || parents.iterator().docID() == DocIdSetIterator.NO_MORE_DOCS) { // <-- means DocIdSet#EMPTY_DOCIDSET
++        // No matches
++        return null;
++      }
++      if (!(parents instanceof FixedBitSet)) {
++        throw new IllegalStateException("parentFilter must return FixedBitSet; got " + parents);
++      }
++
++      return new TraversableBlockJoinScorer(this, childScorer, (FixedBitSet) parents, acceptDocs);
++    }
++
++    @Override
++    public Explanation explain(AtomicReaderContext context, int doc) throws IOException {
++      TraversableBlockJoinScorer scorer = (TraversableBlockJoinScorer) scorer(context, true, false, context.reader().getLiveDocs());
++      if (scorer != null) {
++        if (scorer.advance(doc) == doc) {
++          return scorer.explain(context.docBase);
++        }
++      }
++      return new ComplexExplanation(false, 0.0f, "Not a match");
++    }
++
++    @Override
++    public boolean scoresDocsOutOfOrder() {
++      return false;
++    }
++  }
++
++  public static class TraversableBlockJoinScorer extends Scorer {
++    public static final int NO_MORE_CHILDREN = Integer.MAX_VALUE;
++    
++    private final Scorer childScorer;
++    private final FixedBitSet parentBits;
++    private final Bits acceptDocs;
++    
++    private int childDoc = -2;
++    private int parentDoc = -1;
++    
++    public TraversableBlockJoinScorer(Weight weight, Scorer childScorer, FixedBitSet parentBits, Bits acceptDocs) {
++      super(weight);
++      this.parentBits = parentBits;
++      this.childScorer = childScorer;
++      this.acceptDocs = acceptDocs;
++    }
++
++    @Override
++    public Collection<ChildScorer> getChildren() {
++      return Collections.singleton(new ChildScorer(childScorer, "BLOCK_JOIN"));
++    }
++
++    @Override
++    public int nextDoc() throws IOException {
++      // System.out.println("Q.nextDoc() childDoc=" + childDoc);
++      
++      // Loop until we hit a parentDoc that's accepted
++      while (true) {
++        if (parentDoc == NO_MORE_DOCS) {
++          return NO_MORE_DOCS;
++        }
++        
++        // Advance child scorer to the next parent's first child if it wasn't done by nextChild()
++        if (childDoc < parentDoc) {
++          childDoc = childScorer.advance(parentDoc + 1);
++        }
++        
++        if (childDoc == NO_MORE_DOCS) {
++          //System.out.println("  end");
++          return parentDoc = NO_MORE_DOCS;
++        }
++
++        // Gather all children sharing the same parent as
++        // childDoc
++        parentDoc = parentBits.nextSetBit(childDoc);
++
++        //System.out.println("  parentDoc=" + parentDoc);
++        assert parentDoc != -1;
++
++        //System.out.println("  childDoc=" + childDoc);
++        if (acceptDocs != null && !acceptDocs.get(parentDoc)) {
++            // Parent doc not accepted; skip it and go next iteration
++            continue;
++        }
++
++        // Parent & child docs are supposed to be orthogonal:
++        assert childDoc != parentDoc;
++
++        //System.out.println("  return parentDoc=" + parentDoc);
++        return parentDoc;
++      }
++    }
++    
++    /**
++     * Advances to the next child document in the parent childs set and returns the child doc it is currently on, or 
++     * {@code TraversableBlockJoinScorer#NO_MORE_CHILDREN} if there are no more docs for the parent.
++     * 
++     * <p><b>Note:</b> this method is intended to be called after nextDoc to traverse parent childs one by one
++     * until child set for the parent will be exhausted. After that, method should always return NO_MORE_CHILDREN until nextDoc is 
++     * called.
++     * 
++     * @return next child document or {@code TraversableBlockJoinScorer#NO_MORE_CHILDREN} if no children for the parent left
++     * @throws IOException if any io error occurs
++     */
++    public int nextChild() throws IOException {
++      if (childDoc < parentDoc) {
++          childDoc = childScorer.nextDoc();  
++      }
++      
++      // Parent & child docs are supposed to be orthogonal:
++      assert childDoc != parentDoc;
++      
++      // two situations possible now:
++      // 1. childDoc is less than parentDoc - return it
++      // 2. childDoc is greater than parentDoc - return NO_MORE_CHILDREN for the parent 
++      return childDoc < parentDoc ? childDoc : NO_MORE_CHILDREN;
++    }
++
++    @Override
++    public int docID() {
++      return parentDoc;
++    }
++    
++    public int childDocID() {
++      return childDoc;
++    }
++
++    @Override
++    public float score() throws IOException {
++      // using child score
++      return childScorer.score();
++    }
++    
++    @Override
++    public int freq() throws IOException {
++      // using child score
++      return childScorer.freq();
++    }
++
++    @Override
++    public int advance(int parentTarget) throws IOException {
++
++      //System.out.println("Q.advance parentTarget=" + parentTarget);
++      if (parentTarget == NO_MORE_DOCS) {
++        return parentDoc = NO_MORE_DOCS;
++      }
++
++      if (parentTarget == 0) {
++        // Callers should only be passing in a docID from
++        // the parent space, so this means this parent
++        // has no children (it got docID 0), so it cannot
++        // possibly match.  We must handle this case
++        // separately otherwise we pass invalid -1 to
++        // prevSetBit below:
++        return nextDoc();
++      }
++
++      //find parent doc which is before target parent doc
++      final int prevParentDoc = parentBits.prevSetBit(parentTarget-1);
++
++      //System.out.println("  rolled back to prevParentDoc=" + prevParentDoc + " vs parentDoc=" + parentDoc);
++      // assert that we are not advancing backwards
++      assert prevParentDoc >= parentDoc;
++      
++      if (prevParentDoc > childDoc) {
++        childDoc = childScorer.advance(prevParentDoc);
++        // System.out.println("  childScorer advanced to child docID=" + childDoc);
++      //} else {
++        //System.out.println("  skip childScorer advance");
++      }
++
++      // Parent & child docs are supposed to be orthogonal:
++      assert childDoc != prevParentDoc;
++
++      final int nd = nextDoc();
++      //System.out.println("  return nextParentDoc=" + nd);
++      return nd;
++    }
++
++    public Explanation explain(int docBase) throws IOException {
++      /*
++       * Explainig (parentDoc, childDoc) tupple   
++       */
++      int parentDocAbs = docBase + parentDoc;
++      int childDocAbs = docBase + childDoc;
++      return new ComplexExplanation(
++          true, childScorer.score(), String.format(Locale.ROOT, "Score based on parent %d and its child doc %d", parentDocAbs, childDocAbs)
++      );
++    }
++
++  }
++
++  @Override
++  public void extractTerms(Set<Term> terms) {
++    childQuery.extractTerms(terms);
++  }
++
++  @Override
++  public Query rewrite(IndexReader reader) throws IOException {
++    final Query childRewrite = childQuery.rewrite(reader);
++    if (childRewrite != childQuery) {
++      Query rewritten = new ChildTraversableToParentBlockJoinQuery(childQuery,
++                                childRewrite,
++                                parentsFilter);
++      rewritten.setBoost(getBoost());
++      return rewritten;
++    } else {
++      return this;
++    }
++  }
++
++  @Override
++  public String toString(String field) {
++    return "ChildTraversableToParentBlockJoinQuery ("+childQuery.toString()+")";
++  }
++
++  @Override
++  public boolean equals(Object _other) {
++    if (_other instanceof ChildTraversableToParentBlockJoinQuery) {
++      final ChildTraversableToParentBlockJoinQuery other = (ChildTraversableToParentBlockJoinQuery) _other;
++      return origChildQuery.equals(other.origChildQuery) &&
++        parentsFilter.equals(other.parentsFilter);
++    } else {
++      return false;
++    }
++  }
++
++  @Override
++  public int hashCode() {
++    final int prime = 31;
++    int hash = 1;
++    hash = prime * hash + origChildQuery.hashCode();
++    hash = prime * hash + parentsFilter.hashCode();
++    return hash;
++  }
++
++  @Override
++  public ChildTraversableToParentBlockJoinQuery clone() {
++    return new ChildTraversableToParentBlockJoinQuery(origChildQuery.clone(),
++                              parentsFilter);
++  }
++}
+diff --git a/lucene/join/src/test/org/apache/lucene/search/join/TestTraversableBlockJoin.java b/lucene/join/src/test/org/apache/lucene/search/join/TestTraversableBlockJoin.java
+new file mode 100644
+index 0000000..a86bfc4
+--- /dev/null
++++ b/lucene/join/src/test/org/apache/lucene/search/join/TestTraversableBlockJoin.java
+@@ -0,0 +1,283 @@
++package org.apache.lucene.search.join;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.analysis.MockAnalyzer;
++import org.apache.lucene.document.*;
++import org.apache.lucene.index.*;
++import org.apache.lucene.search.*;
++import org.apache.lucene.search.BooleanClause.Occur;
++import org.apache.lucene.search.join.ChildTraversableToParentBlockJoinQuery.TraversableBlockJoinScorer;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.*;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.List;
++
++public class TestTraversableBlockJoin extends LuceneTestCase {
++
++  // One resume...
++  private Document makeResume(String name, String country) {
++    Document resume = new Document();
++    resume.add(newStringField("docType", "resume", Field.Store.NO));
++    resume.add(newStringField("name", name, Field.Store.YES));
++    resume.add(newStringField("country", country, Field.Store.NO));
++    return resume;
++  }
++
++  // ... has multiple jobs
++  private Document makeJob(String skill, int year) {
++    Document job = new Document();
++    job.add(newStringField("skill", skill, Field.Store.YES));
++    job.add(new IntField("year", year, Field.Store.NO));
++    job.add(new StoredField("year", year));
++    return job;
++  }
++
++  private void addSkillless(final RandomIndexWriter w) throws IOException {
++    if (random().nextBoolean()) {
++      w.addDocument(makeResume("Skillless", random().nextBoolean() ? "United Kingdom":"United States"));
++    }
++  }
++
++  public void testAdvanceSingleParentNoChild() throws Exception {
++    Directory dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir, newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).setMergePolicy(new LogDocMergePolicy()));
++    Document parentDoc = new Document();
++    parentDoc.add(newStringField("parent", "1", Field.Store.NO));
++    parentDoc.add(newStringField("isparent", "yes", Field.Store.NO));
++    w.addDocuments(Arrays.asList(parentDoc));
++
++    // Add another doc so scorer is not null
++    parentDoc = new Document();
++    parentDoc.add(newStringField("parent", "2", Field.Store.NO));
++    parentDoc.add(newStringField("isparent", "yes", Field.Store.NO));
++    Document childDoc = new Document();
++    childDoc.add(newStringField("child", "2", Field.Store.NO));
++    w.addDocuments(Arrays.asList(childDoc, parentDoc));
++
++    // Need single seg:
++    w.forceMerge(1);
++    IndexReader r = w.getReader();
++    w.close();
++    IndexSearcher s = newSearcher(r);
++    Query tq = new TermQuery(new Term("child", "2"));
++    Filter parentFilter = new CachingWrapperFilter(
++                            new QueryWrapperFilter(
++                              new TermQuery(new Term("isparent", "yes"))));
++
++    ToParentBlockJoinQuery q = new ToParentBlockJoinQuery(tq, parentFilter, ScoreMode.Avg);
++    Weight weight = s.createNormalizedWeight(q);
++    DocIdSetIterator disi = weight.scorer(s.getIndexReader().leaves().get(0), true, true, null);
++    assertEquals(2, disi.advance(0));
++
++    ChildTraversableToParentBlockJoinQuery traversableQ = new ChildTraversableToParentBlockJoinQuery(tq, parentFilter);
++    Weight traversableWeight = s.createNormalizedWeight(traversableQ);
++    TraversableBlockJoinScorer traversableScorer = (TraversableBlockJoinScorer) traversableWeight.scorer(s.getIndexReader().leaves().get(0), true, true, null);
++    assertEquals(2, traversableScorer.advance(0));
++
++    r.close();
++    dir.close();
++  }
++
++  public void testRandomAdvanceTraversable() throws Exception {
++    Directory dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir, newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).setMergePolicy(new LogDocMergePolicy()));
++    Document parentDoc = new Document();
++    parentDoc.add(newStringField("parent", "1", Field.Store.NO));
++    parentDoc.add(newStringField("isparent", "yes", Field.Store.NO));
++    w.addDocuments(Arrays.asList(parentDoc));
++
++
++    // Add another docs so scorer is not null
++    List<List<Document>> docs = new ArrayList<List<Document>>();
++    for (int i = 2; i < 6; ++i) {
++      parentDoc = new Document();
++      parentDoc.add(newStringField("parent", Integer.toString(i), Field.Store.YES));
++      parentDoc.add(newStringField("isparent", "yes", Field.Store.YES));
++      Document childDoc = new Document();
++      if (random().nextBoolean()) {
++        childDoc.add(newStringField("child", "2", Field.Store.YES));
++      } else {
++        childDoc.add(newStringField("child", "1", Field.Store.YES));
++      }
++      docs.add(Arrays.asList(childDoc, parentDoc));
++    }
++    Collections.shuffle(docs, random());
++    for (List<Document> block : docs) {
++      w.addDocuments(block);
++    }
++
++    // Need single seg:
++    w.forceMerge(1);
++    IndexReader r = w.getReader();
++    w.close();
++    IndexSearcher s = newSearcher(r);
++    Query tq = new TermQuery(new Term("child", "2"));
++    Filter parentFilter = new CachingWrapperFilter(
++                            new QueryWrapperFilter(
++                              new TermQuery(new Term("isparent", "yes"))));
++
++    ChildTraversableToParentBlockJoinQuery q = new ChildTraversableToParentBlockJoinQuery(tq, parentFilter);
++    Weight weight = s.createNormalizedWeight(q);
++    TraversableBlockJoinScorer traversableScorer = (TraversableBlockJoinScorer) weight.scorer(s.getIndexReader().leaves().get(0), true, true, null);
++
++    traversableScorer.advance(random().nextInt(9));
++    assertTrue(traversableScorer.childDocID() + 1 == traversableScorer.docID() ||
++               (traversableScorer.childDocID() == DocIdSetIterator.NO_MORE_DOCS && traversableScorer.docID() == DocIdSetIterator.NO_MORE_DOCS));
++
++    r.close();
++    dir.close();
++  }
++
++  public void testNextChild() throws Exception {
++
++    final Directory dir = newDirectory();
++    final RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++
++    final List<Document> docs = new ArrayList<Document>();
++    docs.add(makeJob("java", 2007));
++    docs.add(makeJob("python", 2010));
++    Collections.shuffle(docs, random());
++    docs.add(makeResume("Lisa", "United Kingdom"));
++
++    final List<Document> docs2 = new ArrayList<Document>();
++    docs2.add(makeJob("ruby", 2005));
++    docs2.add(makeJob("java", 2006));
++    Collections.shuffle(docs2, random());
++    docs2.add(makeResume("Frank", "United States"));
++
++    addSkillless(w);
++    boolean turn = random().nextBoolean();
++    w.addDocuments(turn ? docs:docs2);
++
++    addSkillless(w);
++
++    w.addDocuments(!turn ? docs:docs2);
++
++    addSkillless(w);
++
++    IndexReader r = w.getReader();
++    w.close();
++    IndexSearcher s = newSearcher(r);
++
++    // Create a filter that defines "parent" documents in the index - in this case resumes
++    Filter parentsFilter = new CachingWrapperFilter(new QueryWrapperFilter(new TermQuery(new Term("docType", "resume"))));
++
++    // Define child document criteria (finds an example of relevant work experience)
++    BooleanQuery childQuery = new BooleanQuery();
++    childQuery.add(new BooleanClause(new TermQuery(new Term("skill", "java")), Occur.MUST));
++    childQuery.add(new BooleanClause(NumericRangeQuery.newIntRange("year", 2006, 2011, true, true), Occur.MUST));
++
++    // Wrap the child document query to 'join' any matches
++    // up to corresponding parent:
++    ChildTraversableToParentBlockJoinQuery childJoinQuery = new ChildTraversableToParentBlockJoinQuery(childQuery, parentsFilter);
++
++    Weight weight = s.createNormalizedWeight(childJoinQuery);
++    TraversableBlockJoinScorer traversableScorer = (TraversableBlockJoinScorer) weight.scorer(s.getIndexReader().leaves().get(0), true, true, null);
++    List<Integer> childDocs = new ArrayList<Integer>();
++
++    while (traversableScorer.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
++      do {
++        childDocs.add(traversableScorer.childDocID());
++      } while (traversableScorer.nextChild() != TraversableBlockJoinScorer.NO_MORE_CHILDREN);
++    }
++
++    assertEquals(2, childDocs.size());
++    for (Integer childDoc : childDocs) {
++      assertEquals("java", r.document(childDoc).get("skill"));
++      int year = Integer.parseInt(r.document(childDoc).get("year"));
++      assertTrue(year >= 2006 && year <= 2011);
++    }
++
++    r.close();
++    dir.close();
++  }
++
++  public void testFilterTraversableToParentBJQ() throws Exception {
++
++    final Directory dir = newDirectory();
++    final RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++
++    final List<Document> docs = new ArrayList<Document>();
++    docs.add(makeJob("java", 2007));
++    docs.add(makeJob("python", 2010));
++    Collections.shuffle(docs, random());
++    docs.add(makeResume("Lisa", "United Kingdom"));
++
++    final List<Document> docs2 = new ArrayList<Document>();
++    docs2.add(makeJob("ruby", 2005));
++    docs2.add(makeJob("java", 2006));
++    Collections.shuffle(docs2, random());
++    docs2.add(makeResume("Frank", "United States"));
++
++    addSkillless(w);
++    boolean turn = random().nextBoolean();
++    w.addDocuments(turn ? docs:docs2);
++
++    addSkillless(w);
++
++    w.addDocuments(!turn ? docs:docs2);
++
++    addSkillless(w);
++
++    IndexReader r = w.getReader();
++    w.close();
++    IndexSearcher s = newSearcher(r);
++
++    // Create a filter that defines "parent" documents in the index - in this case resumes
++    Filter parentsFilter = new CachingWrapperFilter(new QueryWrapperFilter(new TermQuery(new Term("docType", "resume"))));
++
++    // Define child document criteria (finds an example of relevant work experience)
++    BooleanQuery childQuery = new BooleanQuery();
++    childQuery.add(new BooleanClause(new TermQuery(new Term("skill", "java")), Occur.MUST));
++    childQuery.add(new BooleanClause(NumericRangeQuery.newIntRange("year", 2006, 2011, true, true), Occur.MUST));
++
++    // Define parent document criteria (find a resident in the UK)
++    Query parentQuery = new TermQuery(new Term("country", "United Kingdom"));
++
++    // Wrap the child document query to 'join' any matches
++    // up to corresponding parent:
++    ChildTraversableToParentBlockJoinQuery childJoinQuery = new ChildTraversableToParentBlockJoinQuery(childQuery, parentsFilter);
++
++    assertEquals("no filter - both passed", 2, s.search(childJoinQuery, 10).totalHits);
++
++    assertEquals("dummy filter passes everyone ", 2, s.search(childJoinQuery, parentsFilter, 10).totalHits);
++    assertEquals("dummy filter passes everyone ", 2, s.search(childJoinQuery, new QueryWrapperFilter(new TermQuery(new Term("docType", "resume"))), 10).totalHits);
++
++    // not found test
++    assertEquals("noone live there", 0, s.search(childJoinQuery, new CachingWrapperFilter(new QueryWrapperFilter(new TermQuery(new Term("country", "Oz")))), 1).totalHits);
++    assertEquals("noone live there", 0, s.search(childJoinQuery, new QueryWrapperFilter(new TermQuery(new Term("country", "Oz"))), 1).totalHits);
++
++    // apply the UK filter by the searcher
++    TopDocs ukOnly = s.search(childJoinQuery, new QueryWrapperFilter(parentQuery), 1);
++    assertEquals("has filter - single passed", 1, ukOnly.totalHits);
++    assertEquals( "Lisa", r.document(ukOnly.scoreDocs[0].doc).get("name"));
++
++    // looking for US candidates
++    TopDocs usThen = s.search(childJoinQuery , new QueryWrapperFilter(new TermQuery(new Term("country", "United States"))), 1);
++    assertEquals("has filter - single passed", 1, usThen.totalHits);
++    assertEquals("Frank", r.document(usThen.scoreDocs[0].doc).get("name"));
++
++    r.close();
++    dir.close();
++  }
++}

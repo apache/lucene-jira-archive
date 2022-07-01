@@ -1,0 +1,2423 @@
+Index: core/src/java/org/apache/lucene/search/payloads/PayloadNearQuery.java
+===================================================================
+--- core/src/java/org/apache/lucene/search/payloads/PayloadNearQuery.java	(revision 1680500)
++++ core/src/java/org/apache/lucene/search/payloads/PayloadNearQuery.java	(working copy)
+@@ -24,9 +24,11 @@
+ import org.apache.lucene.search.similarities.DefaultSimilarity;
+ import org.apache.lucene.search.similarities.Similarity;
+ import org.apache.lucene.search.similarities.Similarity.SimScorer;
++import org.apache.lucene.search.spans.SpanCollectorFactory;
+ import org.apache.lucene.search.spans.SpanNearQuery;
+ import org.apache.lucene.search.spans.SpanQuery;
+ import org.apache.lucene.search.spans.SpanScorer;
++import org.apache.lucene.search.spans.SpanSimilarity;
+ import org.apache.lucene.search.spans.SpanWeight;
+ import org.apache.lucene.search.spans.Spans;
+ import org.apache.lucene.util.Bits;
+@@ -34,8 +36,10 @@
+ import org.apache.lucene.util.ToStringUtils;
+ 
+ import java.io.IOException;
++import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.Iterator;
++import java.util.List;
+ import java.util.Objects;
+ 
+ /**
+@@ -69,8 +73,13 @@
+   }
+ 
+   @Override
+-  public SpanWeight createWeight(IndexSearcher searcher, boolean needsScores) throws IOException {
+-    return new PayloadNearSpanWeight(this, searcher);
++  public SpanWeight createWeight(IndexSearcher searcher, boolean needsScores, SpanCollectorFactory factory) throws IOException {
++    List<SpanWeight> subWeights = new ArrayList<>();
++    for (SpanQuery q : clauses) {
++      subWeights.add(q.createWeight(searcher, false, PayloadSpanCollector.FACTORY));
++    }
++    SpanSimilarity similarity = SpanSimilarity.build(this, searcher, needsScores, subWeights);
++    return new PayloadNearSpanWeight(subWeights, similarity);
+   }
+ 
+   @Override
+@@ -127,20 +136,20 @@
+           && function.equals(other.function);
+   }
+ 
+-  public class PayloadNearSpanWeight extends SpanWeight {
++  public class PayloadNearSpanWeight extends SpanNearWeight {
+ 
+-    public PayloadNearSpanWeight(SpanQuery query, IndexSearcher searcher)
++    public PayloadNearSpanWeight(List<SpanWeight> subWeights, SpanSimilarity similarity)
+         throws IOException {
+-      super(query, searcher, PayloadSpanCollector.FACTORY);
++      super(subWeights, similarity, PayloadSpanCollector.FACTORY);
+     }
+ 
+     @Override
+     public Scorer scorer(LeafReaderContext context, Bits acceptDocs) throws IOException {
+-      PayloadSpanCollector collector = PayloadSpanCollector.FACTORY.newCollector();
+-      Spans spans = query.getSpans(context, acceptDocs, termContexts, collector);
++      PayloadSpanCollector collector = (PayloadSpanCollector) collectorFactory.newCollector();
++      Spans spans = super.getSpans(context, acceptDocs, collector);
+       return (spans == null)
+               ? null
+-              : new PayloadNearSpanScorer(spans, this, collector, similarity.simScorer(stats, context));
++              : new PayloadNearSpanScorer(spans, this, collector, similarity.simScorer(context));
+     }
+     
+     @Override
+@@ -151,7 +160,7 @@
+         if (newDoc == doc) {
+           float freq = scorer.freq();
+           Explanation freqExplanation = Explanation.match(freq, "phraseFreq=" + freq);
+-          SimScorer docScorer = similarity.simScorer(stats, context);
++          SimScorer docScorer = similarity.simScorer(context);
+           Explanation scoreExplanation = docScorer.explain(doc, freqExplanation);
+           Explanation expl = Explanation.match(
+               scoreExplanation.getValue(),
+Index: core/src/java/org/apache/lucene/search/payloads/PayloadSpanCollector.java
+===================================================================
+--- core/src/java/org/apache/lucene/search/payloads/PayloadSpanCollector.java	(revision 1680500)
++++ core/src/java/org/apache/lucene/search/payloads/PayloadSpanCollector.java	(working copy)
+@@ -34,7 +34,7 @@
+  */
+ public class PayloadSpanCollector implements SpanCollector {
+ 
+-  public static final SpanCollectorFactory<PayloadSpanCollector> FACTORY = new SpanCollectorFactory<PayloadSpanCollector>() {
++  public static final SpanCollectorFactory FACTORY = new SpanCollectorFactory() {
+     @Override
+     public PayloadSpanCollector newCollector() {
+       return new PayloadSpanCollector();
+Index: core/src/java/org/apache/lucene/search/payloads/PayloadSpanUtil.java
+===================================================================
+--- core/src/java/org/apache/lucene/search/payloads/PayloadSpanUtil.java	(revision 1680499)
++++ core/src/java/org/apache/lucene/search/payloads/PayloadSpanUtil.java	(working copy)
+@@ -21,7 +21,6 @@
+ import org.apache.lucene.index.IndexReaderContext;
+ import org.apache.lucene.index.LeafReaderContext;
+ import org.apache.lucene.index.Term;
+-import org.apache.lucene.index.TermContext;
+ import org.apache.lucene.search.BooleanClause;
+ import org.apache.lucene.search.BooleanQuery;
+ import org.apache.lucene.search.DisjunctionMaxQuery;
+@@ -35,16 +34,14 @@
+ import org.apache.lucene.search.spans.SpanOrQuery;
+ import org.apache.lucene.search.spans.SpanQuery;
+ import org.apache.lucene.search.spans.SpanTermQuery;
++import org.apache.lucene.search.spans.SpanWeight;
+ import org.apache.lucene.search.spans.Spans;
+ 
+ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.Collection;
+-import java.util.HashMap;
+ import java.util.Iterator;
+ import java.util.List;
+-import java.util.Map;
+-import java.util.TreeSet;
+ 
+ /**
+  * Experimental class to get set of payloads for most standard Lucene queries.
+@@ -179,18 +176,15 @@
+ 
+   private void getPayloads(Collection<byte []> payloads, SpanQuery query)
+       throws IOException {
+-    Map<Term,TermContext> termContexts = new HashMap<>();
+-    TreeSet<Term> terms = new TreeSet<>();
++
+     final IndexSearcher searcher = new IndexSearcher(context);
+     searcher.setQueryCache(null);
+-    searcher.createNormalizedWeight(query, false).extractTerms(terms);
+-    for (Term term : terms) {
+-      termContexts.put(term, TermContext.build(context, term));
+-    }
+ 
++    SpanWeight w = (SpanWeight) searcher.createNormalizedWeight(query, false);
++
+     PayloadSpanCollector collector = new PayloadSpanCollector();
+     for (LeafReaderContext leafReaderContext : context.leaves()) {
+-      final Spans spans = query.getSpans(leafReaderContext, leafReaderContext.reader().getLiveDocs(), termContexts, collector);
++      final Spans spans = w.getSpans(leafReaderContext, leafReaderContext.reader().getLiveDocs(), collector);
+       if (spans != null) {
+         while (spans.nextDoc() != Spans.NO_MORE_DOCS) {
+           while (spans.nextStartPosition() != Spans.NO_MORE_POSITIONS) {
+Index: core/src/java/org/apache/lucene/search/payloads/PayloadTermQuery.java
+===================================================================
+--- core/src/java/org/apache/lucene/search/payloads/PayloadTermQuery.java	(revision 1680500)
++++ core/src/java/org/apache/lucene/search/payloads/PayloadTermQuery.java	(working copy)
+@@ -20,6 +20,7 @@
+ import org.apache.lucene.index.LeafReaderContext;
+ import org.apache.lucene.index.PostingsEnum;
+ import org.apache.lucene.index.Term;
++import org.apache.lucene.index.TermContext;
+ import org.apache.lucene.search.Explanation;
+ import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.similarities.DefaultSimilarity;
+@@ -27,13 +28,12 @@
+ import org.apache.lucene.search.similarities.Similarity.SimScorer;
+ import org.apache.lucene.search.spans.BufferedSpanCollector;
+ import org.apache.lucene.search.spans.SpanCollector;
+-import org.apache.lucene.search.spans.SpanCollectorFactory;
+ import org.apache.lucene.search.spans.SpanQuery;
+ import org.apache.lucene.search.spans.SpanScorer;
++import org.apache.lucene.search.spans.SpanSimilarity;
+ import org.apache.lucene.search.spans.SpanTermQuery;
+ import org.apache.lucene.search.spans.SpanWeight;
+ import org.apache.lucene.search.spans.Spans;
+-import org.apache.lucene.search.spans.TermSpans;
+ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.BytesRef;
+ 
+@@ -70,7 +70,9 @@
+ 
+   @Override
+   public SpanWeight createWeight(IndexSearcher searcher, boolean needsScores) throws IOException {
+-    return new PayloadTermWeight(this, searcher);
++    TermContext context = TermContext.build(searcher.getTopReaderContext(), term);
++    SpanSimilarity similarity = SpanSimilarity.build(this, searcher, needsScores, searcher.termStatistics(term, context));
++    return new PayloadTermWeight(context, similarity);
+   }
+ 
+   private static class PayloadTermCollector implements SpanCollector {
+@@ -103,20 +105,20 @@
+     }
+   }
+ 
+-  private class PayloadTermWeight extends SpanWeight {
++  private class PayloadTermWeight extends SpanTermWeight {
+ 
+-    public PayloadTermWeight(PayloadTermQuery query, IndexSearcher searcher)
++    public PayloadTermWeight(TermContext context, SpanSimilarity similarity)
+         throws IOException {
+-      super(query, searcher, SpanCollectorFactory.NO_OP_FACTORY);
++      super(context, similarity, PayloadSpanCollector.FACTORY);
+     }
+ 
+     @Override
+     public PayloadTermSpanScorer scorer(LeafReaderContext context, Bits acceptDocs) throws IOException {
+       PayloadTermCollector collector = new PayloadTermCollector();
+-      TermSpans spans = (TermSpans) query.getSpans(context, acceptDocs, termContexts, collector);
++      Spans spans = super.getSpans(context, acceptDocs, collector);
+       return (spans == null)
+               ? null
+-              : new PayloadTermSpanScorer(spans, this, collector, similarity.simScorer(stats, context));
++              : new PayloadTermSpanScorer(spans, this, collector, similarity.simScorer(context));
+     }
+ 
+     protected class PayloadTermSpanScorer extends SpanScorer {
+@@ -125,7 +127,7 @@
+       protected int payloadsSeen;
+       private final PayloadTermCollector payloadCollector;
+ 
+-      public PayloadTermSpanScorer(TermSpans spans, SpanWeight weight, PayloadTermCollector collector,
++      public PayloadTermSpanScorer(Spans spans, SpanWeight weight, PayloadTermCollector collector,
+                                    Similarity.SimScorer docScorer) throws IOException {
+         super(spans, weight, docScorer);
+         this.payloadCollector = collector;
+@@ -206,7 +208,7 @@
+         if (newDoc == doc) {
+           float freq = scorer.sloppyFreq();
+           Explanation freqExplanation = Explanation.match(freq, "phraseFreq=" + freq);
+-          SimScorer docScorer = similarity.simScorer(stats, context);
++          SimScorer docScorer = similarity.simScorer(context);
+           Explanation scoreExplanation = docScorer.explain(doc, freqExplanation);
+           Explanation expl = Explanation.match(
+               scoreExplanation.getValue(),
+Index: core/src/java/org/apache/lucene/search/payloads/SpanNearPayloadCheckQuery.java
+===================================================================
+--- core/src/java/org/apache/lucene/search/payloads/SpanNearPayloadCheckQuery.java	(revision 1680500)
++++ core/src/java/org/apache/lucene/search/payloads/SpanNearPayloadCheckQuery.java	(working copy)
+@@ -50,7 +50,7 @@
+ 
+   @Override
+   public SpanWeight createWeight(IndexSearcher searcher, boolean needsScores) throws IOException {
+-    return new SpanWeight(this, searcher, PayloadSpanCollector.FACTORY);
++    return createWeight(searcher, needsScores, PayloadSpanCollector.FACTORY);
+   }
+ 
+   @Override
+Index: core/src/java/org/apache/lucene/search/payloads/SpanPayloadCheckQuery.java
+===================================================================
+--- core/src/java/org/apache/lucene/search/payloads/SpanPayloadCheckQuery.java	(revision 1680500)
++++ core/src/java/org/apache/lucene/search/payloads/SpanPayloadCheckQuery.java	(working copy)
+@@ -58,7 +58,7 @@
+ 
+   @Override
+   public SpanWeight createWeight(IndexSearcher searcher, boolean needsScores) throws IOException {
+-    return new SpanWeight(this, searcher, PayloadSpanCollector.FACTORY);
++    return super.createWeight(searcher, needsScores, PayloadSpanCollector.FACTORY);
+   }
+ 
+   @Override
+Index: core/src/java/org/apache/lucene/search/spans/FieldMaskingSpanQuery.java
+===================================================================
+--- core/src/java/org/apache/lucene/search/spans/FieldMaskingSpanQuery.java	(revision 1680499)
++++ core/src/java/org/apache/lucene/search/spans/FieldMaskingSpanQuery.java	(working copy)
+@@ -18,18 +18,12 @@
+  */
+ 
+ import org.apache.lucene.index.IndexReader;
+-import org.apache.lucene.index.LeafReaderContext;
+-import org.apache.lucene.index.Term;
+-import org.apache.lucene.index.TermContext;
+ import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.Query;
+-import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.ToStringUtils;
+ 
+ import java.io.IOException;
+-import java.util.Map;
+ import java.util.Objects;
+-import java.util.Set;
+ 
+ /**
+  * <p>Wrapper to allow {@link SpanQuery} objects participate in composite 
+@@ -94,20 +88,10 @@
+ 
+   // :NOTE: getBoost and setBoost are not proxied to the maskedQuery
+   // ...this is done to be more consistent with things like SpanFirstQuery
+-  
+-  @Override
+-  public Spans getSpans(LeafReaderContext context, Bits acceptDocs, Map<Term,TermContext> termContexts, SpanCollector collector) throws IOException {
+-    return maskedQuery.getSpans(context, acceptDocs, termContexts, collector);
+-  }
+ 
+   @Override
+-  public void extractTerms(Set<Term> terms) {
+-    maskedQuery.extractTerms(terms);
+-  }  
+-
+-  @Override
+-  public SpanWeight createWeight(IndexSearcher searcher, boolean needsScores) throws IOException {
+-    return maskedQuery.createWeight(searcher, needsScores);
++  public SpanWeight createWeight(IndexSearcher searcher, boolean needsScores, SpanCollectorFactory factory) throws IOException {
++    return maskedQuery.createWeight(searcher, needsScores, factory);
+   }
+ 
+   @Override
+Index: core/src/java/org/apache/lucene/search/spans/SpanCollectorFactory.java
+===================================================================
+--- core/src/java/org/apache/lucene/search/spans/SpanCollectorFactory.java	(revision 1680500)
++++ core/src/java/org/apache/lucene/search/spans/SpanCollectorFactory.java	(working copy)
+@@ -19,19 +19,18 @@
+ 
+ /**
+  * Interface defining a factory for creating new {@link SpanCollector}s
+- * @param <T> the SpanCollector type
+  */
+-public interface SpanCollectorFactory<T extends SpanCollector> {
++public interface SpanCollectorFactory {
+ 
+   /**
+    * @return a new SpanCollector
+    */
+-  T newCollector();
++  SpanCollector newCollector();
+ 
+   /**
+    * Factory for creating NO_OP collectors
+    */
+-  public static final SpanCollectorFactory<?> NO_OP_FACTORY = new SpanCollectorFactory() {
++  public static final SpanCollectorFactory NO_OP_FACTORY = new SpanCollectorFactory() {
+     @Override
+     public SpanCollector newCollector() {
+       return SpanCollector.NO_OP;
+Index: core/src/java/org/apache/lucene/search/spans/SpanContainQuery.java
+===================================================================
+--- core/src/java/org/apache/lucene/search/spans/SpanContainQuery.java	(revision 1680499)
++++ core/src/java/org/apache/lucene/search/spans/SpanContainQuery.java	(working copy)
+@@ -31,6 +31,7 @@
+ import java.util.Set;
+ 
+ abstract class SpanContainQuery extends SpanQuery implements Cloneable {
++
+   SpanQuery big;
+   SpanQuery little;
+ 
+@@ -48,26 +49,48 @@
+   @Override
+   public String getField() { return big.getField(); }
+ 
+-  /** Extract terms from both <code>big</code> and <code>little</code>. */
+-  @Override
+-  public void extractTerms(Set<Term> terms) {
+-    big.extractTerms(terms);
+-    little.extractTerms(terms);
+-  }
++  public abstract class SpanContainWeight extends SpanWeight {
+ 
+-  ArrayList<Spans> prepareConjunction(final LeafReaderContext context, final Bits acceptDocs, final Map<Term,TermContext> termContexts, SpanCollector collector) throws IOException {
+-    Spans bigSpans = big.getSpans(context, acceptDocs, termContexts, collector);
+-    if (bigSpans == null) {
+-      return null;
++    final SpanWeight bigWeight;
++    final SpanWeight littleWeight;
++
++    public SpanContainWeight(SpanSimilarity similarity, SpanCollectorFactory factory,
++                             SpanWeight bigWeight, SpanWeight littleWeight) throws IOException {
++      super(SpanContainQuery.this, similarity, factory);
++      this.bigWeight = bigWeight;
++      this.littleWeight = littleWeight;
+     }
+-    Spans littleSpans = little.getSpans(context, acceptDocs, termContexts, collector);
+-    if (littleSpans == null) {
+-      return null;
++
++    /**
++     * Extract terms from both <code>big</code> and <code>little</code>.
++     */
++    @Override
++    public void extractTerms(Set<Term> terms) {
++      bigWeight.extractTerms(terms);
++      littleWeight.extractTerms(terms);
+     }
+-    ArrayList<Spans> bigAndLittle = new ArrayList<>();
+-    bigAndLittle.add(bigSpans);
+-    bigAndLittle.add(littleSpans);
+-    return bigAndLittle;
++
++    ArrayList<Spans> prepareConjunction(final LeafReaderContext context, final Bits acceptDocs, SpanCollector collector) throws IOException {
++      Spans bigSpans = bigWeight.getSpans(context, acceptDocs, collector);
++      if (bigSpans == null) {
++        return null;
++      }
++      Spans littleSpans = littleWeight.getSpans(context, acceptDocs, collector);
++      if (littleSpans == null) {
++        return null;
++      }
++      ArrayList<Spans> bigAndLittle = new ArrayList<>();
++      bigAndLittle.add(bigSpans);
++      bigAndLittle.add(littleSpans);
++      return bigAndLittle;
++    }
++
++    @Override
++    public void extractTermContexts(Map<Term, TermContext> contexts) {
++      bigWeight.extractTermContexts(contexts);
++      littleWeight.extractTermContexts(contexts);
++    }
++
+   }
+ 
+   String toString(String field, String name) {
+Index: core/src/java/org/apache/lucene/search/spans/SpanContainingQuery.java
+===================================================================
+--- core/src/java/org/apache/lucene/search/spans/SpanContainingQuery.java	(revision 1680499)
++++ core/src/java/org/apache/lucene/search/spans/SpanContainingQuery.java	(working copy)
+@@ -18,13 +18,11 @@
+  */
+ 
+ import org.apache.lucene.index.LeafReaderContext;
+-import org.apache.lucene.index.Term;
+-import org.apache.lucene.index.TermContext;
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.util.Bits;
+ 
+ import java.io.IOException;
+ import java.util.ArrayList;
+-import java.util.Map;
+ 
+ /** Keep matches that contain another Spans. */
+ public class SpanContainingQuery extends SpanContainQuery {
+@@ -48,63 +46,79 @@
+           (SpanQuery) big.clone(),
+           (SpanQuery) little.clone());
+   }
+-  
+-  /** 
+-   * Return spans from <code>big</code> that contain at least one spans from <code>little</code>.
+-   * The payload is from the spans of <code>big</code>.
+-   */
++
+   @Override
+-  public Spans getSpans(final LeafReaderContext context, final Bits acceptDocs, final Map<Term,TermContext> termContexts, SpanCollector collector) throws IOException {
+-    ArrayList<Spans> containerContained = prepareConjunction(context, acceptDocs, termContexts, collector);
+-    if (containerContained == null) {
+-      return null;
++  public SpanWeight createWeight(IndexSearcher searcher, boolean needsScores, SpanCollectorFactory factory) throws IOException {
++    SpanWeight bigWeight = big.createWeight(searcher, false, factory);
++    SpanWeight littleWeight = little.createWeight(searcher, false, factory);
++    SpanSimilarity similarity = SpanSimilarity.build(this, searcher, needsScores, bigWeight, littleWeight);
++    return new SpanContainingWeight(similarity, factory, bigWeight, littleWeight);
++  }
++
++  public class SpanContainingWeight extends SpanContainWeight {
++
++    public SpanContainingWeight(SpanSimilarity similarity, SpanCollectorFactory factory,
++                                SpanWeight bigWeight, SpanWeight littleWeight) throws IOException {
++      super(similarity, factory, bigWeight, littleWeight);
+     }
+-    
+-    Spans big = containerContained.get(0);
+-    Spans little = containerContained.get(1);
+ 
+-    return new ContainSpans(big, little, big) {
++    /**
++     * Return spans from <code>big</code> that contain at least one spans from <code>little</code>.
++     * The payload is from the spans of <code>big</code>.
++     */
++    @Override
++    public Spans getSpans(final LeafReaderContext context, final Bits acceptDocs, SpanCollector collector) throws IOException {
++      ArrayList<Spans> containerContained = prepareConjunction(context, acceptDocs, collector);
++      if (containerContained == null) {
++        return null;
++      }
+ 
+-      @Override
+-      boolean twoPhaseCurrentDocMatches() throws IOException {
+-        oneExhaustedInCurrentDoc = false;
+-        assert littleSpans.startPosition() == -1;
+-        while (bigSpans.nextStartPosition() != NO_MORE_POSITIONS) {
+-          while (littleSpans.startPosition() < bigSpans.startPosition()) {
+-            if (littleSpans.nextStartPosition() == NO_MORE_POSITIONS) {
+-              oneExhaustedInCurrentDoc = true;
+-              return false;
++      Spans big = containerContained.get(0);
++      Spans little = containerContained.get(1);
++
++      return new ContainSpans(big, little, big) {
++
++        @Override
++        boolean twoPhaseCurrentDocMatches() throws IOException {
++          oneExhaustedInCurrentDoc = false;
++          assert littleSpans.startPosition() == -1;
++          while (bigSpans.nextStartPosition() != NO_MORE_POSITIONS) {
++            while (littleSpans.startPosition() < bigSpans.startPosition()) {
++              if (littleSpans.nextStartPosition() == NO_MORE_POSITIONS) {
++                oneExhaustedInCurrentDoc = true;
++                return false;
++              }
+             }
++            if (bigSpans.endPosition() >= littleSpans.endPosition()) {
++              atFirstInCurrentDoc = true;
++              return true;
++            }
+           }
+-          if (bigSpans.endPosition() >= littleSpans.endPosition()) {
+-            atFirstInCurrentDoc = true;
+-            return true;
++          oneExhaustedInCurrentDoc = true;
++          return false;
++        }
++
++        @Override
++        public int nextStartPosition() throws IOException {
++          if (atFirstInCurrentDoc) {
++            atFirstInCurrentDoc = false;
++            return bigSpans.startPosition();
+           }
+-        } 
+-        oneExhaustedInCurrentDoc = true;
+-        return false;
+-      }
+-
+-      @Override
+-      public int nextStartPosition() throws IOException {
+-        if (atFirstInCurrentDoc) {
+-          atFirstInCurrentDoc = false;
+-          return bigSpans.startPosition();
+-        }
+-        while (bigSpans.nextStartPosition() != NO_MORE_POSITIONS) {
+-          while (littleSpans.startPosition() < bigSpans.startPosition()) {
+-            if (littleSpans.nextStartPosition() == NO_MORE_POSITIONS) {
+-              oneExhaustedInCurrentDoc = true;
+-              return NO_MORE_POSITIONS;
++          while (bigSpans.nextStartPosition() != NO_MORE_POSITIONS) {
++            while (littleSpans.startPosition() < bigSpans.startPosition()) {
++              if (littleSpans.nextStartPosition() == NO_MORE_POSITIONS) {
++                oneExhaustedInCurrentDoc = true;
++                return NO_MORE_POSITIONS;
++              }
+             }
++            if (bigSpans.endPosition() >= littleSpans.endPosition()) {
++              return bigSpans.startPosition();
++            }
+           }
+-          if (bigSpans.endPosition() >= littleSpans.endPosition()) {
+-            return bigSpans.startPosition();
+-          }
++          oneExhaustedInCurrentDoc = true;
++          return NO_MORE_POSITIONS;
+         }
+-        oneExhaustedInCurrentDoc = true;
+-        return NO_MORE_POSITIONS;
+-      }
+-    };
++      };
++    }
+   }
+ }
+\ No newline at end of file
+Index: core/src/java/org/apache/lucene/search/spans/SpanMultiTermQueryWrapper.java
+===================================================================
+--- core/src/java/org/apache/lucene/search/spans/SpanMultiTermQueryWrapper.java	(revision 1680499)
++++ core/src/java/org/apache/lucene/search/spans/SpanMultiTermQueryWrapper.java	(working copy)
+@@ -18,20 +18,17 @@
+  */
+ 
+ import org.apache.lucene.index.IndexReader;
+-import org.apache.lucene.index.LeafReaderContext;
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.index.TermContext;
+ import org.apache.lucene.search.BooleanClause.Occur;
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.MultiTermQuery;
+ import org.apache.lucene.search.Query;
+ import org.apache.lucene.search.ScoringRewrite;
+ import org.apache.lucene.search.TopTermsRewrite;
+-import org.apache.lucene.util.Bits;
+ 
+ import java.io.IOException;
+-import java.util.Map;
+ import java.util.Objects;
+-import java.util.Set;
+ 
+ /**
+  * Wraps any {@link MultiTermQuery} as a {@link SpanQuery}, 
+@@ -75,11 +72,6 @@
+     }
+   }
+ 
+-  @Override
+-  protected void extractTerms(Set<Term> terms) {
+-    throw new IllegalStateException("Rewrite first");
+-  }
+-
+   /**
+    * Expert: returns the rewriteMethod
+    */
+@@ -97,17 +89,17 @@
+   public final void setRewriteMethod(SpanRewriteMethod rewriteMethod) {
+     query.setRewriteMethod(rewriteMethod);
+   }
+-  
+-  @Override
+-  public Spans getSpans(LeafReaderContext context, Bits acceptDocs, Map<Term,TermContext> termContexts, SpanCollector collector) throws IOException {
+-    throw new UnsupportedOperationException("Query should have been rewritten");
+-  }
+ 
+   @Override
+   public String getField() {
+     return query.getField();
+   }
+-  
++
++  @Override
++  public SpanWeight createWeight(IndexSearcher searcher, boolean needsScores, SpanCollectorFactory factory) throws IOException {
++    throw new IllegalArgumentException("Rewrite first!");
++  }
++
+   /** Returns the wrapped query */
+   public Query getWrappedQuery() {
+     return query;
+Index: core/src/java/org/apache/lucene/search/spans/SpanNearQuery.java
+===================================================================
+--- core/src/java/org/apache/lucene/search/spans/SpanNearQuery.java	(revision 1680499)
++++ core/src/java/org/apache/lucene/search/spans/SpanNearQuery.java	(working copy)
+@@ -22,6 +22,7 @@
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.index.TermContext;
+ import org.apache.lucene.index.Terms;
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.Query;
+ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.ToStringUtils;
+@@ -90,13 +91,6 @@
+   public String getField() { return field; }
+ 
+   @Override
+-  public void extractTerms(Set<Term> terms) {
+-    for (final SpanQuery clause : clauses) {
+-      clause.extractTerms(terms);
+-    }
+-  }
+-
+-  @Override
+   public String toString(String field) {
+     StringBuilder buffer = new StringBuilder();
+     buffer.append("spanNear([");
+@@ -118,27 +112,61 @@
+   }
+ 
+   @Override
+-  public Spans getSpans(final LeafReaderContext context, Bits acceptDocs, Map<Term,TermContext> termContexts, SpanCollector collector) throws IOException {
++  public SpanWeight createWeight(IndexSearcher searcher, boolean needsScores, SpanCollectorFactory factory) throws IOException {
++    List<SpanWeight> subWeights = new ArrayList<>();
++    for (SpanQuery q : clauses) {
++      subWeights.add(q.createWeight(searcher, false, factory));
++    }
++    SpanSimilarity similarity = SpanSimilarity.build(this, searcher, needsScores, subWeights);
++    return new SpanNearWeight(subWeights, similarity, factory);
++  }
+ 
+-    Terms terms = context.reader().terms(field);
+-    if (terms == null) {
+-      return null; // field does not exist
++  public class SpanNearWeight extends SpanWeight {
++
++    final List<SpanWeight> subWeights;
++
++    public SpanNearWeight(List<SpanWeight> subWeights, SpanSimilarity similarity, SpanCollectorFactory factory) throws IOException {
++      super(SpanNearQuery.this, similarity, factory);
++      this.subWeights = subWeights;
+     }
+ 
+-    ArrayList<Spans> subSpans = new ArrayList<>(clauses.size());
+-    SpanCollector subSpanCollector = inOrder ? collector.bufferedCollector() : collector;
+-    for (SpanQuery seq : clauses) {
+-      Spans subSpan = seq.getSpans(context, acceptDocs, termContexts, subSpanCollector);
+-      if (subSpan != null) {
+-        subSpans.add(subSpan);
+-      } else {
+-        return null; // all required
++    @Override
++    public void extractTermContexts(Map<Term, TermContext> contexts) {
++      for (SpanWeight w : subWeights) {
++        w.extractTermContexts(contexts);
+       }
+     }
+ 
+-    
+-    // all NearSpans require at least two subSpans
+-    return (! inOrder) ? new NearSpansUnordered(this, subSpans) : new NearSpansOrdered(this, subSpans, collector);
++    @Override
++    public Spans getSpans(final LeafReaderContext context, Bits acceptDocs, SpanCollector collector) throws IOException {
++
++      Terms terms = context.reader().terms(field);
++      if (terms == null) {
++        return null; // field does not exist
++      }
++
++      ArrayList<Spans> subSpans = new ArrayList<>(clauses.size());
++      SpanCollector subSpanCollector = inOrder ? collector.bufferedCollector() : collector;
++      for (SpanWeight w : subWeights) {
++        Spans subSpan = w.getSpans(context, acceptDocs, subSpanCollector);
++        if (subSpan != null) {
++          subSpans.add(subSpan);
++        } else {
++          return null; // all required
++        }
++      }
++
++      // all NearSpans require at least two subSpans
++      return (!inOrder) ? new NearSpansUnordered(SpanNearQuery.this, subSpans)
++          : new NearSpansOrdered(SpanNearQuery.this, subSpans, collector);
++    }
++
++    @Override
++    public void extractTerms(Set<Term> terms) {
++      for (SpanWeight w : subWeights) {
++        w.extractTerms(terms);
++      }
++    }
+   }
+ 
+   @Override
+Index: core/src/java/org/apache/lucene/search/spans/SpanNotQuery.java
+===================================================================
+--- core/src/java/org/apache/lucene/search/spans/SpanNotQuery.java	(revision 1680499)
++++ core/src/java/org/apache/lucene/search/spans/SpanNotQuery.java	(working copy)
+@@ -22,6 +22,7 @@
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.index.TermContext;
+ import org.apache.lucene.search.DocIdSetIterator;
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.Query;
+ import org.apache.lucene.search.TwoPhaseIterator;
+ import org.apache.lucene.util.Bits;
+@@ -78,9 +79,6 @@
+   public String getField() { return include.getField(); }
+ 
+   @Override
+-  public void extractTerms(Set<Term> terms) { include.extractTerms(terms); }
+-
+-  @Override
+   public String toString(String field) {
+     StringBuilder buffer = new StringBuilder();
+     buffer.append("spanNot(");
+@@ -105,69 +103,100 @@
+   }
+ 
+   @Override
+-  public Spans getSpans(final LeafReaderContext context, final Bits acceptDocs, final Map<Term,TermContext> termContexts, SpanCollector collector) throws IOException {
+-    Spans includeSpans = include.getSpans(context, acceptDocs, termContexts, collector);
+-    if (includeSpans == null) {
+-      return null;
++  public SpanWeight createWeight(IndexSearcher searcher, boolean needsScores, SpanCollectorFactory factory) throws IOException {
++    SpanWeight includeWeight = include.createWeight(searcher, false, factory);
++    SpanWeight excludeWeight = exclude.createWeight(searcher, false, factory);
++    SpanSimilarity similarity = SpanSimilarity.build(this, searcher, needsScores, includeWeight);
++    return new SpanNotWeight(similarity, factory, includeWeight, excludeWeight);
++  }
++
++  public class SpanNotWeight extends SpanWeight {
++
++    final SpanWeight includeWeight;
++    final SpanWeight excludeWeight;
++
++    public SpanNotWeight(SpanSimilarity similarity, SpanCollectorFactory factory,
++                         SpanWeight includeWeight, SpanWeight excludeWeight) throws IOException {
++      super(SpanNotQuery.this, similarity, factory);
++      this.includeWeight = includeWeight;
++      this.excludeWeight = excludeWeight;
+     }
+ 
+-    Spans excludeSpans = exclude.getSpans(context, acceptDocs, termContexts, collector);
+-    if (excludeSpans == null) {
+-      return includeSpans;
++    @Override
++    public void extractTermContexts(Map<Term, TermContext> contexts) {
++      includeWeight.extractTermContexts(contexts);
+     }
+-    
+-    TwoPhaseIterator excludeTwoPhase = excludeSpans.asTwoPhaseIterator();
+-    DocIdSetIterator excludeApproximation = excludeTwoPhase == null ? null : excludeTwoPhase.approximation();
+-    
+-    return new FilterSpans(includeSpans) {
+-      // last document we have checked matches() against for the exclusion, and failed
+-      // when using approximations, so we don't call it again, and pass thru all inclusions.
+-      int lastApproxDoc = -1;
+-      boolean lastApproxResult = false;
+-      
+-      @Override
+-      protected AcceptStatus accept(Spans candidate) throws IOException {
+-        // TODO: this logic is ugly and sneaky, can we clean it up?
+-        int doc = candidate.docID();
+-        if (doc > excludeSpans.docID()) {
+-          // catch up 'exclude' to the current doc
+-          if (excludeTwoPhase != null) {
+-            if (excludeApproximation.advance(doc) == doc) {
+-              lastApproxDoc = doc;
+-              lastApproxResult = excludeTwoPhase.matches();
++
++    @Override
++    public Spans getSpans(final LeafReaderContext context, final Bits acceptDocs, SpanCollector collector) throws IOException {
++      Spans includeSpans = includeWeight.getSpans(context, acceptDocs, collector);
++      if (includeSpans == null) {
++        return null;
++      }
++
++      Spans excludeSpans = excludeWeight.getSpans(context, acceptDocs, collector);
++      if (excludeSpans == null) {
++        return includeSpans;
++      }
++
++      TwoPhaseIterator excludeTwoPhase = excludeSpans.asTwoPhaseIterator();
++      DocIdSetIterator excludeApproximation = excludeTwoPhase == null ? null : excludeTwoPhase.approximation();
++
++      return new FilterSpans(includeSpans) {
++        // last document we have checked matches() against for the exclusion, and failed
++        // when using approximations, so we don't call it again, and pass thru all inclusions.
++        int lastApproxDoc = -1;
++        boolean lastApproxResult = false;
++
++        @Override
++        protected AcceptStatus accept(Spans candidate) throws IOException {
++          // TODO: this logic is ugly and sneaky, can we clean it up?
++          int doc = candidate.docID();
++          if (doc > excludeSpans.docID()) {
++            // catch up 'exclude' to the current doc
++            if (excludeTwoPhase != null) {
++              if (excludeApproximation.advance(doc) == doc) {
++                lastApproxDoc = doc;
++                lastApproxResult = excludeTwoPhase.matches();
++              }
++            } else {
++              excludeSpans.advance(doc);
+             }
++          } else if (excludeTwoPhase != null && doc == excludeSpans.docID() && doc != lastApproxDoc) {
++            // excludeSpans already sitting on our candidate doc, but matches not called yet.
++            lastApproxDoc = doc;
++            lastApproxResult = excludeTwoPhase.matches();
++          }
++
++          if (doc != excludeSpans.docID() || (doc == lastApproxDoc && lastApproxResult == false)) {
++            return AcceptStatus.YES;
++          }
++
++          if (excludeSpans.startPosition() == -1) { // init exclude start position if needed
++            excludeSpans.nextStartPosition();
++          }
++
++          while (excludeSpans.endPosition() <= candidate.startPosition() - pre) {
++            // exclude end position is before a possible exclusion
++            if (excludeSpans.nextStartPosition() == NO_MORE_POSITIONS) {
++              return AcceptStatus.YES; // no more exclude at current doc.
++            }
++          }
++
++          // exclude end position far enough in current doc, check start position:
++          if (candidate.endPosition() + post <= excludeSpans.startPosition()) {
++            return AcceptStatus.YES;
+           } else {
+-            excludeSpans.advance(doc);
++            return AcceptStatus.NO;
+           }
+-        } else if (excludeTwoPhase != null && doc == excludeSpans.docID() && doc != lastApproxDoc) {
+-          // excludeSpans already sitting on our candidate doc, but matches not called yet.
+-          lastApproxDoc = doc;
+-          lastApproxResult = excludeTwoPhase.matches();
+         }
+-        
+-        if (doc != excludeSpans.docID() || (doc == lastApproxDoc && lastApproxResult == false)) {
+-          return AcceptStatus.YES;
+-        }
+-        
+-        if (excludeSpans.startPosition() == -1) { // init exclude start position if needed
+-          excludeSpans.nextStartPosition();
+-        }
+-        
+-        while (excludeSpans.endPosition() <= candidate.startPosition() - pre) {
+-          // exclude end position is before a possible exclusion
+-          if (excludeSpans.nextStartPosition() == NO_MORE_POSITIONS) {
+-            return AcceptStatus.YES; // no more exclude at current doc.
+-          }
+-        }
+-        
+-        // exclude end position far enough in current doc, check start position:
+-        if (candidate.endPosition() + post <= excludeSpans.startPosition()) {
+-          return AcceptStatus.YES;
+-        } else {
+-          return AcceptStatus.NO;
+-        }
+-      }
+-    };
++      };
++    }
++
++    @Override
++    public void extractTerms(Set<Term> terms) {
++      includeWeight.extractTerms(terms);
++    }
+   }
+ 
+   @Override
+Index: core/src/java/org/apache/lucene/search/spans/SpanOrQuery.java
+===================================================================
+--- core/src/java/org/apache/lucene/search/spans/SpanOrQuery.java	(revision 1680499)
++++ core/src/java/org/apache/lucene/search/spans/SpanOrQuery.java	(working copy)
+@@ -24,6 +24,7 @@
+ import org.apache.lucene.search.DisiPriorityQueue;
+ import org.apache.lucene.search.DisiWrapper;
+ import org.apache.lucene.search.DisjunctionDISIApproximation;
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.Query;
+ import org.apache.lucene.search.TwoPhaseIterator;
+ import org.apache.lucene.util.Bits;
+@@ -72,13 +73,6 @@
+   public String getField() { return field; }
+ 
+   @Override
+-  public void extractTerms(Set<Term> terms) {
+-    for(final SpanQuery clause: clauses) {
+-      clause.extractTerms(terms);
+-    }
+-  }
+-
+-  @Override
+   public SpanOrQuery clone() {
+     int sz = clauses.size();
+     SpanQuery[] newClauses = new SpanQuery[sz];
+@@ -143,190 +137,223 @@
+     return h;
+   }
+ 
+-
+   @Override
+-  public Spans getSpans(final LeafReaderContext context, final Bits acceptDocs, final Map<Term,TermContext> termContexts, SpanCollector collector)
+-  throws IOException {
++  public SpanWeight createWeight(IndexSearcher searcher, boolean needsScores, SpanCollectorFactory factory) throws IOException {
++    List<SpanWeight> subWeights = new ArrayList<>(clauses.size());
++    for (SpanQuery q : clauses) {
++      subWeights.add(q.createWeight(searcher, false, factory));
++    }
++    SpanSimilarity similarity = SpanSimilarity.build(this, searcher, needsScores, subWeights);
++    return new SpanOrWeight(similarity, factory, subWeights);
++  }
+ 
+-    ArrayList<Spans> subSpans = new ArrayList<>(clauses.size());
++  public class SpanOrWeight extends SpanWeight {
+ 
+-    for (SpanQuery sq : clauses) {
+-      Spans spans = sq.getSpans(context, acceptDocs, termContexts, collector);
+-      if (spans != null) {
+-        subSpans.add(spans);
+-      }
++    final List<SpanWeight> subWeights;
++
++    public SpanOrWeight(SpanSimilarity similarity, SpanCollectorFactory factory, List<SpanWeight> subWeights) throws IOException {
++      super(SpanOrQuery.this, similarity, factory);
++      this.subWeights = subWeights;
+     }
+ 
+-    if (subSpans.size() == 0) {
+-      return null;
+-    } else if (subSpans.size() == 1) {
+-      return subSpans.get(0);
++    @Override
++    public void extractTerms(Set<Term> terms) {
++      for (final SpanWeight w: subWeights) {
++        w.extractTerms(terms);
++      }
+     }
+ 
+-    DisiPriorityQueue<Spans> byDocQueue = new DisiPriorityQueue<>(subSpans.size());
+-    for (Spans spans : subSpans) {
+-      byDocQueue.add(new DisiWrapper<>(spans));
++    @Override
++    public void extractTermContexts(Map<Term, TermContext> contexts) {
++      for (SpanWeight w : subWeights) {
++        w.extractTermContexts(contexts);
++      }
+     }
+ 
+-    SpanPositionQueue byPositionQueue = new SpanPositionQueue(subSpans.size()); // when empty use -1
++    @Override
++    public Spans getSpans(final LeafReaderContext context, final Bits acceptDocs, SpanCollector collector)
++        throws IOException {
+ 
+-    return new Spans() {
+-      Spans topPositionSpans = null;
++      ArrayList<Spans> subSpans = new ArrayList<>(clauses.size());
+ 
+-      @Override
+-      public int nextDoc() throws IOException {
+-        topPositionSpans = null;
+-        DisiWrapper<Spans> topDocSpans = byDocQueue.top();
+-        int currentDoc = topDocSpans.doc;
+-        do {
+-          topDocSpans.doc = topDocSpans.iterator.nextDoc();
+-          topDocSpans = byDocQueue.updateTop();
+-        } while (topDocSpans.doc == currentDoc);
+-        return topDocSpans.doc;
++      for (SpanWeight w : subWeights) {
++        Spans spans = w.getSpans(context, acceptDocs, collector);
++        if (spans != null) {
++          subSpans.add(spans);
++        }
+       }
+ 
+-      @Override
+-      public int advance(int target) throws IOException {
+-        topPositionSpans = null;
+-        DisiWrapper<Spans> topDocSpans = byDocQueue.top();
+-        do {
+-          topDocSpans.doc = topDocSpans.iterator.advance(target);
+-          topDocSpans = byDocQueue.updateTop();
+-        } while (topDocSpans.doc < target);
+-        return topDocSpans.doc;
++      if (subSpans.size() == 0) {
++        return null;
++      } else if (subSpans.size() == 1) {
++        return subSpans.get(0);
+       }
+ 
+-      @Override
+-      public int docID() {
+-        DisiWrapper<Spans> topDocSpans = byDocQueue.top();
+-        return topDocSpans.doc;
++      DisiPriorityQueue<Spans> byDocQueue = new DisiPriorityQueue<>(subSpans.size());
++      for (Spans spans : subSpans) {
++        byDocQueue.add(new DisiWrapper<>(spans));
+       }
+ 
+-      @Override
+-      public TwoPhaseIterator asTwoPhaseIterator() {
+-        boolean hasApproximation = false;
+-        for (DisiWrapper<Spans> w : byDocQueue) {
+-          if (w.twoPhaseView != null) {
+-            hasApproximation = true;
+-            break;
+-          }
++      SpanPositionQueue byPositionQueue = new SpanPositionQueue(subSpans.size()); // when empty use -1
++
++      return new Spans() {
++        Spans topPositionSpans = null;
++
++        @Override
++        public int nextDoc() throws IOException {
++          topPositionSpans = null;
++          DisiWrapper<Spans> topDocSpans = byDocQueue.top();
++          int currentDoc = topDocSpans.doc;
++          do {
++            topDocSpans.doc = topDocSpans.iterator.nextDoc();
++            topDocSpans = byDocQueue.updateTop();
++          } while (topDocSpans.doc == currentDoc);
++          return topDocSpans.doc;
+         }
+ 
+-        if (! hasApproximation) { // none of the sub spans supports approximations
+-          return null;
++        @Override
++        public int advance(int target) throws IOException {
++          topPositionSpans = null;
++          DisiWrapper<Spans> topDocSpans = byDocQueue.top();
++          do {
++            topDocSpans.doc = topDocSpans.iterator.advance(target);
++            topDocSpans = byDocQueue.updateTop();
++          } while (topDocSpans.doc < target);
++          return topDocSpans.doc;
+         }
+ 
+-        return new TwoPhaseIterator(new DisjunctionDISIApproximation<Spans>(byDocQueue)) {
+-          @Override
+-          public boolean matches() throws IOException {
+-            return twoPhaseCurrentDocMatches();
++        @Override
++        public int docID() {
++          DisiWrapper<Spans> topDocSpans = byDocQueue.top();
++          return topDocSpans.doc;
++        }
++
++        @Override
++        public TwoPhaseIterator asTwoPhaseIterator() {
++          boolean hasApproximation = false;
++          for (DisiWrapper<Spans> w : byDocQueue) {
++            if (w.twoPhaseView != null) {
++              hasApproximation = true;
++              break;
++            }
+           }
+-        };
+-      }
+-      
+-      int lastDocTwoPhaseMatched = -1;
+ 
+-      boolean twoPhaseCurrentDocMatches() throws IOException {
+-        DisiWrapper<Spans> listAtCurrentDoc = byDocQueue.topList();
+-        // remove the head of the list as long as it does not match
+-        final int currentDoc = listAtCurrentDoc.doc;
+-        while (listAtCurrentDoc.twoPhaseView != null) {
+-          if (listAtCurrentDoc.twoPhaseView.matches()) {
+-            // use this spans for positions at current doc:
+-            listAtCurrentDoc.lastApproxMatchDoc = currentDoc;
+-            break;
++          if (!hasApproximation) { // none of the sub spans supports approximations
++            return null;
+           }
+-          // do not use this spans for positions at current doc:
+-          listAtCurrentDoc.lastApproxNonMatchDoc = currentDoc;
+-          listAtCurrentDoc = listAtCurrentDoc.next;
+-          if (listAtCurrentDoc == null) {
+-            return false;
++
++          return new TwoPhaseIterator(new DisjunctionDISIApproximation<Spans>(byDocQueue)) {
++            @Override
++            public boolean matches() throws IOException {
++              return twoPhaseCurrentDocMatches();
++            }
++          };
++        }
++
++        int lastDocTwoPhaseMatched = -1;
++
++        boolean twoPhaseCurrentDocMatches() throws IOException {
++          DisiWrapper<Spans> listAtCurrentDoc = byDocQueue.topList();
++          // remove the head of the list as long as it does not match
++          final int currentDoc = listAtCurrentDoc.doc;
++          while (listAtCurrentDoc.twoPhaseView != null) {
++            if (listAtCurrentDoc.twoPhaseView.matches()) {
++              // use this spans for positions at current doc:
++              listAtCurrentDoc.lastApproxMatchDoc = currentDoc;
++              break;
++            }
++            // do not use this spans for positions at current doc:
++            listAtCurrentDoc.lastApproxNonMatchDoc = currentDoc;
++            listAtCurrentDoc = listAtCurrentDoc.next;
++            if (listAtCurrentDoc == null) {
++              return false;
++            }
+           }
++          lastDocTwoPhaseMatched = currentDoc;
++          topPositionSpans = null;
++          return true;
+         }
+-        lastDocTwoPhaseMatched = currentDoc;
+-        topPositionSpans = null;
+-        return true;
+-      }
+ 
+-      void fillPositionQueue() throws IOException { // called at first nextStartPosition
+-        assert byPositionQueue.size() == 0;
+-        // add all matching Spans at current doc to byPositionQueue
+-        DisiWrapper<Spans> listAtCurrentDoc = byDocQueue.topList();
+-        while (listAtCurrentDoc != null) {
+-          Spans spansAtDoc = listAtCurrentDoc.iterator;
+-          if (lastDocTwoPhaseMatched == listAtCurrentDoc.doc) { // matched by DisjunctionDisiApproximation
+-            if (listAtCurrentDoc.twoPhaseView != null) { // matched by approximation
+-              if (listAtCurrentDoc.lastApproxNonMatchDoc == listAtCurrentDoc.doc) { // matches() returned false
+-                spansAtDoc = null;
+-              } else {
+-                if (listAtCurrentDoc.lastApproxMatchDoc != listAtCurrentDoc.doc) {
+-                  if (! listAtCurrentDoc.twoPhaseView.matches()) {
+-                    spansAtDoc = null;
++        void fillPositionQueue() throws IOException { // called at first nextStartPosition
++          assert byPositionQueue.size() == 0;
++          // add all matching Spans at current doc to byPositionQueue
++          DisiWrapper<Spans> listAtCurrentDoc = byDocQueue.topList();
++          while (listAtCurrentDoc != null) {
++            Spans spansAtDoc = listAtCurrentDoc.iterator;
++            if (lastDocTwoPhaseMatched == listAtCurrentDoc.doc) { // matched by DisjunctionDisiApproximation
++              if (listAtCurrentDoc.twoPhaseView != null) { // matched by approximation
++                if (listAtCurrentDoc.lastApproxNonMatchDoc == listAtCurrentDoc.doc) { // matches() returned false
++                  spansAtDoc = null;
++                } else {
++                  if (listAtCurrentDoc.lastApproxMatchDoc != listAtCurrentDoc.doc) {
++                    if (!listAtCurrentDoc.twoPhaseView.matches()) {
++                      spansAtDoc = null;
++                    }
+                   }
+                 }
+-              } 
++              }
+             }
++
++            if (spansAtDoc != null) {
++              assert spansAtDoc.docID() == listAtCurrentDoc.doc;
++              assert spansAtDoc.startPosition() == -1;
++              spansAtDoc.nextStartPosition();
++              assert spansAtDoc.startPosition() != NO_MORE_POSITIONS;
++              byPositionQueue.add(spansAtDoc);
++            }
++            listAtCurrentDoc = listAtCurrentDoc.next;
+           }
++          assert byPositionQueue.size() > 0;
++        }
+ 
+-          if (spansAtDoc != null) {
+-            assert spansAtDoc.docID() == listAtCurrentDoc.doc;
+-            assert spansAtDoc.startPosition() == -1;
+-            spansAtDoc.nextStartPosition();
+-            assert spansAtDoc.startPosition() != NO_MORE_POSITIONS;
+-            byPositionQueue.add(spansAtDoc);
++        @Override
++        public int nextStartPosition() throws IOException {
++          if (topPositionSpans == null) {
++            byPositionQueue.clear();
++            fillPositionQueue(); // fills byPositionQueue at first position
++            topPositionSpans = byPositionQueue.top();
++          } else {
++            topPositionSpans.nextStartPosition();
++            topPositionSpans = byPositionQueue.updateTop();
+           }
+-          listAtCurrentDoc = listAtCurrentDoc.next;
++          return topPositionSpans.startPosition();
+         }
+-        assert byPositionQueue.size() > 0;
+-      }
+-        
+-      @Override
+-      public int nextStartPosition() throws IOException {
+-        if (topPositionSpans == null) {
+-          byPositionQueue.clear();
+-          fillPositionQueue(); // fills byPositionQueue at first position
+-          topPositionSpans = byPositionQueue.top();
+-        } else {
+-          topPositionSpans.nextStartPosition();
+-          topPositionSpans = byPositionQueue.updateTop();
++
++        @Override
++        public int startPosition() {
++          return topPositionSpans == null ? -1 : topPositionSpans.startPosition();
+         }
+-        return topPositionSpans.startPosition();
+-      }
+ 
+-      @Override
+-      public int startPosition() {
+-        return topPositionSpans == null ? -1 : topPositionSpans.startPosition();
+-      }
++        @Override
++        public int endPosition() {
++          return topPositionSpans == null ? -1 : topPositionSpans.endPosition();
++        }
+ 
+-      @Override
+-      public int endPosition() {
+-        return topPositionSpans == null ? -1 : topPositionSpans.endPosition();
+-      }
++        @Override
++        public void collect(SpanCollector collector) throws IOException {
++          if (topPositionSpans != null)
++            topPositionSpans.collect(collector);
++        }
+ 
+-      @Override
+-      public void collect(SpanCollector collector) throws IOException {
+-        if (topPositionSpans != null)
+-          topPositionSpans.collect(collector);
+-      }
++        @Override
++        public String toString() {
++          return "spanOr(" + SpanOrQuery.this + ")@" + docID() + ": " + startPosition() + " - " + endPosition();
++        }
+ 
+-      @Override
+-      public String toString() {
+-        return "spanOr("+SpanOrQuery.this+")@"+docID()+": "+startPosition()+" - "+endPosition();
+-      }
++        long cost = -1;
+ 
+-      long cost = -1;
+-
+-      @Override
+-      public long cost() {
+-        if (cost == -1) {
+-          cost = 0;
+-          for (Spans spans : subSpans) {
+-            cost += spans.cost();
++        @Override
++        public long cost() {
++          if (cost == -1) {
++            cost = 0;
++            for (Spans spans : subSpans) {
++              cost += spans.cost();
++            }
+           }
++          return cost;
+         }
+-        return cost;
+-      }
+-    };
++      };
++    }
+   }
+ 
+ }
+Index: core/src/java/org/apache/lucene/search/spans/SpanPositionCheckQuery.java
+===================================================================
+--- core/src/java/org/apache/lucene/search/spans/SpanPositionCheckQuery.java	(revision 1680500)
++++ core/src/java/org/apache/lucene/search/spans/SpanPositionCheckQuery.java	(working copy)
+@@ -21,6 +21,7 @@
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.index.TermContext;
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.Query;
+ import org.apache.lucene.search.spans.FilterSpans.AcceptStatus;
+ import org.apache.lucene.util.Bits;
+@@ -47,18 +48,9 @@
+    * */
+   public SpanQuery getMatch() { return match; }
+ 
+-
+-
+   @Override
+   public String getField() { return match.getField(); }
+ 
+-
+-
+-  @Override
+-  public void extractTerms(Set<Term> terms) {
+-    match.extractTerms(terms);
+-  }
+-
+   /**
+    * Implementing classes are required to return whether the current position is a match for the passed in
+    * "match" {@link SpanQuery}.
+@@ -66,7 +58,6 @@
+    * This is only called if the underlying last {@link Spans#nextStartPosition()} for the
+    * match indicated a valid start position.
+    *
+-   *
+    * @param spans The {@link Spans} instance, positioned at the spot to check
+    * @param collector the {@link SpanCollector} associated with the Spans
+    *
+@@ -78,16 +69,49 @@
+   protected abstract AcceptStatus acceptPosition(Spans spans, SpanCollector collector) throws IOException;
+ 
+   @Override
+-  public Spans getSpans(final LeafReaderContext context, Bits acceptDocs, Map<Term,TermContext> termContexts, SpanCollector collector) throws IOException {
+-    Spans matchSpans = match.getSpans(context, acceptDocs, termContexts, collector);
+-    return (matchSpans == null) ? null : new FilterSpans(matchSpans) {
+-      @Override
+-      protected AcceptStatus accept(Spans candidate) throws IOException {
+-        return acceptPosition(candidate, collector);
+-      }
+-    };
++  public SpanWeight createWeight(IndexSearcher searcher, boolean needsScores, SpanCollectorFactory factory) throws IOException {
++    SpanWeight matchWeight = match.createWeight(searcher, false, factory);
++    SpanSimilarity similarity = SpanSimilarity.build(this, searcher, needsScores, matchWeight);
++    return new SpanPositionCheckWeight(matchWeight, similarity, factory);
+   }
+ 
++  public class SpanPositionCheckWeight extends SpanWeight {
++
++    final SpanWeight matchWeight;
++
++    public SpanPositionCheckWeight(SpanWeight matchWeight, SpanSimilarity similarity,
++                                   SpanCollectorFactory collectorFactory) throws IOException {
++      super(SpanPositionCheckQuery.this, similarity, collectorFactory);
++      this.matchWeight = matchWeight;
++    }
++
++    public SpanPositionCheckWeight(SpanWeight matchWeight, SpanSimilarity similarity) throws IOException {
++      this(matchWeight, similarity, SpanCollectorFactory.NO_OP_FACTORY);
++    }
++
++    @Override
++    public void extractTerms(Set<Term> terms) {
++      matchWeight.extractTerms(terms);
++    }
++
++    @Override
++    public void extractTermContexts(Map<Term, TermContext> contexts) {
++      matchWeight.extractTermContexts(contexts);
++    }
++
++    @Override
++    public Spans getSpans(final LeafReaderContext context, Bits acceptDocs, SpanCollector collector) throws IOException {
++      Spans matchSpans = matchWeight.getSpans(context, acceptDocs, collector);
++      return (matchSpans == null) ? null : new FilterSpans(matchSpans) {
++        @Override
++        protected AcceptStatus accept(Spans candidate) throws IOException {
++          return acceptPosition(candidate, collector);
++        }
++      };
++    }
++
++  }
++
+   @Override
+   public Query rewrite(IndexReader reader) throws IOException {
+     SpanPositionCheckQuery clone = null;
+Index: core/src/java/org/apache/lucene/search/spans/SpanQuery.java
+===================================================================
+--- core/src/java/org/apache/lucene/search/spans/SpanQuery.java	(revision 1680500)
++++ core/src/java/org/apache/lucene/search/spans/SpanQuery.java	(working copy)
+@@ -17,47 +17,33 @@
+  * limitations under the License.
+  */
+ 
+-import org.apache.lucene.index.LeafReaderContext;
+-import org.apache.lucene.index.Term;
+-import org.apache.lucene.index.TermContext;
+ import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.Query;
+ import org.apache.lucene.search.Weight;
+-import org.apache.lucene.util.Bits;
+ 
+ import java.io.IOException;
+-import java.util.Map;
+-import java.util.Set;
+ 
+ /** Base class for span-based queries. */
+ public abstract class SpanQuery extends Query {
+-  /** Expert: Returns the matches for this query in an index.  
+-   *  Used internally to search for spans.
+-   *  This may return null to indicate that the SpanQuery has no results.
+-   */
+-  public abstract Spans getSpans(LeafReaderContext context, Bits acceptDocs, Map<Term,TermContext> termContexts, SpanCollector collector) throws IOException;
+ 
+   /**
+-   * Extract terms from these spans.
+-   * @lucene.internal
+-   * @see Weight#extractTerms
++   * Returns the name of the field matched by this query.
+    */
+-  protected abstract void extractTerms(Set<Term> terms);
++  public abstract String getField();
+ 
+   /**
+-   * Returns the name of the field matched by this query.
+-   * <p>
+-   * Note that this may return null if the query matches no terms.
++   * Create a SpanWeight for this query
++   * @param searcher the IndexSearcher to be searched across
++   * @param needsScores if the query needs scores
++   * @param collectorFactory a SpanCollectorFactory to use in collecting postings data
++   * @return a SpanWeight
++   * @throws IOException on error
+    */
+-  public abstract String getField();
++  public abstract SpanWeight createWeight(IndexSearcher searcher, boolean needsScores,
++                                          SpanCollectorFactory collectorFactory) throws IOException;
+ 
+   @Override
+-  public SpanWeight createWeight(IndexSearcher searcher, boolean needsScores) throws IOException {
+-    return new SpanWeight(this, searcher, getSpanCollectorFactory());
++  public Weight createWeight(IndexSearcher searcher, boolean needsScores) throws IOException {
++    return createWeight(searcher, needsScores, SpanCollectorFactory.NO_OP_FACTORY);
+   }
+-
+-  protected SpanCollectorFactory<? extends SpanCollector> getSpanCollectorFactory() {
+-    return SpanCollectorFactory.NO_OP_FACTORY;
+-  }
+-
+ }
+Index: core/src/java/org/apache/lucene/search/spans/SpanScorer.java
+===================================================================
+--- core/src/java/org/apache/lucene/search/spans/SpanScorer.java	(revision 1680499)
++++ core/src/java/org/apache/lucene/search/spans/SpanScorer.java	(working copy)
+@@ -17,13 +17,13 @@
+  * limitations under the License.
+  */
+ 
+-import java.io.IOException;
+-import java.util.Objects;
+-
+ import org.apache.lucene.search.Scorer;
+ import org.apache.lucene.search.TwoPhaseIterator;
+ import org.apache.lucene.search.similarities.Similarity;
+ 
++import java.io.IOException;
++import java.util.Objects;
++
+ /**
+  * Public for extension only.
+  */
+@@ -42,7 +42,7 @@
+ 
+   protected SpanScorer(Spans spans, SpanWeight weight, Similarity.SimScorer docScorer) throws IOException {
+     super(weight);
+-    this.docScorer = Objects.requireNonNull(docScorer);
++    this.docScorer = docScorer;
+     this.spans = Objects.requireNonNull(spans);
+   }
+ 
+@@ -91,6 +91,10 @@
+       // assert (startPos != prevStartPos) || (endPos > prevEndPos) : "non increased endPos="+endPos;
+       assert (startPos != prevStartPos) || (endPos >= prevEndPos) : "decreased endPos="+endPos;
+       numMatches++;
++      if (docScorer == null) {  // scores not required, break out here
++        freq = 1;
++        return;
++      }
+       int matchLength = endPos - startPos;
+       freq += docScorer.computeSlopFactor(matchLength);
+       prevStartPos = startPos;
+Index: core/src/java/org/apache/lucene/search/spans/SpanSimilarity.java
+===================================================================
+--- core/src/java/org/apache/lucene/search/spans/SpanSimilarity.java	(revision 0)
++++ core/src/java/org/apache/lucene/search/spans/SpanSimilarity.java	(working copy)
+@@ -0,0 +1,202 @@
++package org.apache.lucene.search.spans;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.index.LeafReaderContext;
++import org.apache.lucene.index.Term;
++import org.apache.lucene.index.TermContext;
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.TermStatistics;
++import org.apache.lucene.search.similarities.Similarity;
++
++import java.io.IOException;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++
++/**
++ * Encapsulates similarity statistics required for SpanScorers
++ */
++public abstract class SpanSimilarity {
++
++  /**
++   * The field term statistics are taken from
++   */
++  protected final String field;
++
++  /**
++   * Create a new SpanSimilarity
++   * @param field the similarity field for term statistics
++   */
++  protected SpanSimilarity(String field) {
++    this.field = field;
++  }
++
++  /**
++   * Create a SimScorer for this SpanSimilarity's statistics
++   * @param context the LeafReaderContext to calculate the scorer for
++   * @return a SimScorer, or null if no scoring is required
++   * @throws IOException on error
++   */
++  public abstract Similarity.SimScorer simScorer(LeafReaderContext context) throws IOException;
++
++  /**
++   * @return the field for term statistics
++   */
++  public String getField() {
++    return field;
++  }
++
++  /**
++   * See {@link org.apache.lucene.search.Weight#getValueForNormalization()}
++   *
++   * @return the value for normalization
++   * @throws IOException on error
++   */
++  public abstract float getValueForNormalization() throws IOException;
++
++  /**
++   * See {@link org.apache.lucene.search.Weight#normalize(float,float)}
++   *
++   * @param queryNorm the query norm
++   * @param topLevelBoost the top level boost
++   */
++  public abstract void normalize(float queryNorm, float topLevelBoost);
++
++  /**
++   * A SpanSimilarity class that calculates similarity statistics based on the term statistics
++   * of a set of terms.
++   */
++  public static class ScoringSimilarity extends SpanSimilarity {
++
++    private final Similarity similarity;
++    private final Similarity.SimWeight stats;
++
++    private ScoringSimilarity(SpanQuery query, IndexSearcher searcher, TermStatistics... termStats) throws IOException {
++      super(query.getField());
++      this.similarity = searcher.getSimilarity();
++      this.stats = similarity.computeWeight(query.getBoost(), searcher.collectionStatistics(field), termStats);
++    }
++
++    @Override
++    public Similarity.SimScorer simScorer(LeafReaderContext context) throws IOException {
++      return similarity.simScorer(stats, context);
++    }
++
++    @Override
++    public String getField() {
++      return field;
++    }
++
++    @Override
++    public float getValueForNormalization() throws IOException {
++      return stats.getValueForNormalization();
++    }
++
++    @Override
++    public void normalize(float queryNorm, float topLevelBoost) {
++      stats.normalize(queryNorm, topLevelBoost);
++    }
++
++  }
++
++  /**
++   * A SpanSimilarity class that does no scoring
++   */
++  public static class NonScoringSimilarity extends SpanSimilarity {
++
++    private NonScoringSimilarity(String field) {
++      super(field);
++    }
++
++    @Override
++    public Similarity.SimScorer simScorer(LeafReaderContext context) throws IOException {
++      return null;
++    }
++
++    @Override
++    public float getValueForNormalization() throws IOException {
++      return 0;
++    }
++
++    @Override
++    public void normalize(float queryNorm, float topLevelBoost) {
++
++    }
++  }
++
++  /**
++   * Build a SpanSimilarity
++   * @param query the SpanQuery to be run
++   * @param searcher the searcher
++   * @param needsScores whether or not scores are required
++   * @param stats an array of TermStatistics to use in creating the similarity
++   * @return a SpanSimilarity, or null if there are no statistics to use
++   * @throws IOException on error
++   */
++  public static SpanSimilarity build(SpanQuery query, IndexSearcher searcher,
++                                     boolean needsScores, TermStatistics... stats) throws IOException {
++    return needsScores ? new ScoringSimilarity(query, searcher, stats) : new NonScoringSimilarity(query.getField());
++  }
++
++  /**
++   * Build a SpanSimilarity
++   * @param query the SpanQuery to be run
++   * @param searcher the searcher
++   * @param needsScores whether or not scores are required
++   * @param weights a set of {@link org.apache.lucene.search.spans.SpanWeight}s to extract terms from
++   * @return a SpanSimilarity, or null if there are no statistics to use
++   * @throws IOException on error
++   */
++  public static SpanSimilarity build(SpanQuery query, IndexSearcher searcher, boolean needsScores, List<SpanWeight> weights) throws IOException {
++    return build(query, searcher, needsScores, weights.toArray(new SpanWeight[weights.size()]));
++  }
++
++  /**
++   * Build a SpanSimilarity
++   * @param query the SpanQuery to run
++   * @param searcher the searcher
++   * @param needsScores whether or not scores are required
++   * @param weights an array of {@link org.apache.lucene.search.spans.SpanWeight}s to extract terms from
++   * @return a SpanSimilarity, or null if there are no statistics to use
++   * @throws IOException on error
++   */
++  public static SpanSimilarity build(SpanQuery query, IndexSearcher searcher, boolean needsScores, SpanWeight... weights) throws IOException {
++
++    if (!needsScores)
++      return new NonScoringSimilarity(query.getField());
++
++    Map<Term, TermContext> contexts = new HashMap<>();
++    for (SpanWeight w : weights) {
++      w.extractTermContexts(contexts);
++    }
++
++    if (contexts.size() == 0)
++      return null;
++
++    TermStatistics[] stats = new TermStatistics[contexts.size()];
++    int i = 0;
++    for (Term term : contexts.keySet()) {
++      stats[i] = searcher.termStatistics(term, contexts.get(term));
++      i++;
++    }
++
++    return new ScoringSimilarity(query, searcher, stats);
++  }
++
++}
+
+Property changes on: core/src/java/org/apache/lucene/search/spans/SpanSimilarity.java
+___________________________________________________________________
+Added: svn:eol-style
+## -0,0 +1 ##
++native
+\ No newline at end of property
+Index: core/src/java/org/apache/lucene/search/spans/SpanTermQuery.java
+===================================================================
+--- core/src/java/org/apache/lucene/search/spans/SpanTermQuery.java	(revision 1680499)
++++ core/src/java/org/apache/lucene/search/spans/SpanTermQuery.java	(working copy)
+@@ -24,6 +24,7 @@
+ import org.apache.lucene.index.TermState;
+ import org.apache.lucene.index.Terms;
+ import org.apache.lucene.index.TermsEnum;
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.ToStringUtils;
+ 
+@@ -50,10 +51,53 @@
+   public String getField() { return term.field(); }
+ 
+   @Override
+-  public void extractTerms(Set<Term> terms) {
+-    terms.add(term);
++  public SpanWeight createWeight(IndexSearcher searcher, boolean needsScores, SpanCollectorFactory factory) throws IOException {
++    TermContext context = TermContext.build(searcher.getTopReaderContext(), term);
++    SpanSimilarity similarity = SpanSimilarity.build(this, searcher, needsScores, searcher.termStatistics(term, context));
++    return new SpanTermWeight(context, similarity, factory);
+   }
+ 
++  public class SpanTermWeight extends SpanWeight {
++
++    final TermContext termContext;
++
++    public SpanTermWeight(TermContext termContext, SpanSimilarity similarity, SpanCollectorFactory factory) throws IOException {
++      super(SpanTermQuery.this, similarity, factory);
++      this.termContext = termContext;
++    }
++
++    @Override
++    public void extractTerms(Set<Term> terms) {
++      terms.add(term);
++    }
++
++    @Override
++    public void extractTermContexts(Map<Term, TermContext> contexts) {
++      contexts.put(term, termContext);
++    }
++
++    @Override
++    public Spans getSpans(final LeafReaderContext context, Bits acceptDocs, SpanCollector collector) throws IOException {
++
++      final TermState state = termContext.get(context.ord);
++      if (state == null) { // term is not present in that reader
++        return null;
++      }
++
++      final Terms terms = context.reader().terms(term.field());
++      if (terms == null)
++        return null;
++      if (terms.hasPositions() == false)
++        throw new IllegalStateException("field \"" + term.field() + "\" was indexed without position data; cannot run SpanTermQuery (term=" + term.text() + ")");
++
++      final TermsEnum termsEnum = terms.iterator();
++      termsEnum.seekExact(term.bytes(), state);
++
++      final PostingsEnum postings = termsEnum.postings(acceptDocs, null, collector.requiredPostings());
++      return new TermSpans(postings, term);
++    }
++  }
++
+   @Override
+   public String toString(String field) {
+     StringBuilder buffer = new StringBuilder();
+@@ -82,40 +126,4 @@
+     return term.equals(other.term);
+   }
+ 
+-  @Override
+-  public Spans getSpans(final LeafReaderContext context, Bits acceptDocs, Map<Term,TermContext> termContexts, SpanCollector collector) throws IOException {
+-    TermContext termContext = termContexts.get(term);
+-    final TermState state;
+-    if (termContext == null) {
+-      // this happens with span-not query, as it doesn't include the NOT side in extractTerms()
+-      // so we seek to the term now in this segment..., this sucks because it's ugly mostly!
+-      final Terms terms = context.reader().terms(term.field());
+-      if (terms != null) {
+-        if (terms.hasPositions() == false) {
+-          throw new IllegalStateException("field \"" + term.field() + "\" was indexed without position data; cannot run SpanTermQuery (term=" + term.text() + ")");
+-        }
+-
+-        final TermsEnum termsEnum = terms.iterator();
+-        if (termsEnum.seekExact(term.bytes())) {
+-          state = termsEnum.termState();
+-        } else {
+-          state = null;
+-        }
+-      } else {
+-        state = null;
+-      }
+-    } else {
+-      state = termContext.get(context.ord);
+-    }
+-
+-    if (state == null) { // term is not present in that reader
+-      return null;
+-    }
+-
+-    final TermsEnum termsEnum = context.reader().terms(term.field()).iterator();
+-    termsEnum.seekExact(term.bytes(), state);
+-
+-    final PostingsEnum postings = termsEnum.postings(acceptDocs, null, collector.requiredPostings());
+-    return new TermSpans(postings, term);
+-  }
+ }
+Index: core/src/java/org/apache/lucene/search/spans/SpanWeight.java
+===================================================================
+--- core/src/java/org/apache/lucene/search/spans/SpanWeight.java	(revision 1680500)
++++ core/src/java/org/apache/lucene/search/spans/SpanWeight.java	(working copy)
+@@ -17,97 +17,91 @@
+  * limitations under the License.
+  */
+ 
+-import org.apache.lucene.index.IndexReaderContext;
+ import org.apache.lucene.index.LeafReaderContext;
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.index.TermContext;
+ import org.apache.lucene.index.Terms;
+ import org.apache.lucene.search.Explanation;
+-import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.Scorer;
+-import org.apache.lucene.search.TermStatistics;
+ import org.apache.lucene.search.Weight;
+-import org.apache.lucene.search.similarities.Similarity;
+ import org.apache.lucene.search.similarities.Similarity.SimScorer;
+ import org.apache.lucene.util.Bits;
+ 
+ import java.io.IOException;
+-import java.util.HashMap;
+ import java.util.Map;
+-import java.util.Set;
+-import java.util.TreeSet;
+ 
+ /**
+  * Expert-only.  Public for use by other weight implementations
+  */
+-public class SpanWeight extends Weight {
+-  protected final Similarity similarity;
+-  protected final Map<Term,TermContext> termContexts;
+-  protected final SpanQuery query;
+-  protected final SpanCollectorFactory<?> collectorFactory;
+-  protected Similarity.SimWeight stats;
++public abstract class SpanWeight extends Weight {
+ 
+-  public SpanWeight(SpanQuery query, IndexSearcher searcher, SpanCollectorFactory<?> collectorFactory) throws IOException {
++  protected final SpanSimilarity similarity;
++  protected final SpanCollectorFactory collectorFactory;
++
++  /**
++   * Create a new SpanWeight
++   * @param query the parent query
++   * @param similarity a SpanSimilarity to be used for scoring
++   * @param collectorFactory a SpanCollectorFactory to be used for Span collection
++   * @throws IOException on error
++   */
++  public SpanWeight(SpanQuery query, SpanSimilarity similarity, SpanCollectorFactory collectorFactory) throws IOException {
+     super(query);
+-    this.similarity = searcher.getSimilarity();
+-    this.query = query;
++    this.similarity = similarity;
+     this.collectorFactory = collectorFactory;
+-
+-    termContexts = new HashMap<>();
+-    TreeSet<Term> terms = new TreeSet<>();
+-    query.extractTerms(terms);
+-    final IndexReaderContext context = searcher.getTopReaderContext();
+-    final TermStatistics termStats[] = new TermStatistics[terms.size()];
+-    int i = 0;
+-    for (Term term : terms) {
+-      TermContext state = TermContext.build(context, term);
+-      termStats[i] = searcher.termStatistics(term, state);
+-      termContexts.put(term, state);
+-      i++;
+-    }
+-    final String field = query.getField();
+-    if (field != null) {
+-      stats = similarity.computeWeight(query.getBoost(),
+-                                       searcher.collectionStatistics(query.getField()),
+-                                       termStats);
+-    }
+   }
+ 
+   /**
+-   * @return the SpanCollectorFactory associated with this SpanWeight
++   * Collect all TermContexts used by this Weight
++   * @param contexts a map to add the TermContexts to
+    */
+-  public SpanCollectorFactory<?> getSpanCollectorFactory() {
+-    return collectorFactory;
+-  }
++  public abstract void extractTermContexts(Map<Term, TermContext> contexts);
+ 
+-  @Override
+-  public void extractTerms(Set<Term> terms) {
+-    query.extractTerms(terms);
++  /**
++   * Expert: Return a Spans object iterating over matches from this Weight
++   * @param ctx a LeafReaderContext for this Spans
++   * @param acceptDocs a bitset of documents to check
++   * @param collector a SpanCollector to use for postings data collection
++   * @return a Spans
++   * @throws IOException on error
++   */
++  public abstract Spans getSpans(LeafReaderContext ctx, Bits acceptDocs, SpanCollector collector) throws IOException;
++
++  /**
++   * Expert: Return a Spans object iterating over matches from this Weight, without
++   * collecting any postings data.
++   * @param ctx a LeafReaderContext for this Spans
++   * @param acceptDocs a bitset of documents to check
++   * @return a Spans
++   * @throws IOException on error
++   */
++  public final Spans getSpans(LeafReaderContext ctx, Bits acceptDocs) throws IOException {
++    return getSpans(ctx, acceptDocs, collectorFactory.newCollector());
+   }
+ 
+   @Override
+   public float getValueForNormalization() throws IOException {
+-    return stats == null ? 1.0f : stats.getValueForNormalization();
++    return similarity == null ? 1.0f : similarity.getValueForNormalization();
+   }
+ 
+   @Override
+   public void normalize(float queryNorm, float topLevelBoost) {
+-    if (stats != null) {
+-      stats.normalize(queryNorm, topLevelBoost);
++    if (similarity != null) {
++      similarity.normalize(queryNorm, topLevelBoost);
+     }
+   }
+ 
+   @Override
+   public Scorer scorer(LeafReaderContext context, Bits acceptDocs) throws IOException {
+-    if (stats == null) {
++    if (similarity == null) {
+       return null;
+     }
+-    Terms terms = context.reader().terms(query.getField());
++    Terms terms = context.reader().terms(similarity.getField());
+     if (terms != null && terms.hasPositions() == false) {
+-      throw new IllegalStateException("field \"" + query.getField() + "\" was indexed without position data; cannot run SpanQuery (query=" + query + ")");
++      throw new IllegalStateException("field \"" + similarity.getField() + "\" was indexed without position data; cannot run SpanQuery (query=" + parentQuery + ")");
+     }
+-    Spans spans = query.getSpans(context, acceptDocs, termContexts, collectorFactory.newCollector());
+-    return (spans == null) ? null : new SpanScorer(spans, this, similarity.simScorer(stats, context));
++    Spans spans = getSpans(context, acceptDocs, collectorFactory.newCollector());
++    return (spans == null) ? null : new SpanScorer(spans, this, similarity.simScorer(context));
+   }
+ 
+   @Override
+@@ -117,7 +111,7 @@
+       int newDoc = scorer.advance(doc);
+       if (newDoc == doc) {
+         float freq = scorer.sloppyFreq();
+-        SimScorer docScorer = similarity.simScorer(stats, context);
++        SimScorer docScorer = similarity.simScorer(context);
+         Explanation freqExplanation = Explanation.match(freq, "phraseFreq=" + freq);
+         Explanation scoreExplanation = docScorer.explain(doc, freqExplanation);
+         return Explanation.match(scoreExplanation.getValue(),
+Index: core/src/java/org/apache/lucene/search/spans/SpanWithinQuery.java
+===================================================================
+--- core/src/java/org/apache/lucene/search/spans/SpanWithinQuery.java	(revision 1680499)
++++ core/src/java/org/apache/lucene/search/spans/SpanWithinQuery.java	(working copy)
+@@ -18,16 +18,15 @@
+  */
+ 
+ import org.apache.lucene.index.LeafReaderContext;
+-import org.apache.lucene.index.Term;
+-import org.apache.lucene.index.TermContext;
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.util.Bits;
+ 
+ import java.io.IOException;
+ import java.util.ArrayList;
+-import java.util.Map;
+ 
+ /** Keep matches that are contained within another Spans. */
+ public class SpanWithinQuery extends SpanContainQuery {
++
+   /** Construct a SpanWithinQuery matching spans from <code>little</code>
+    * that are inside of <code>big</code>.
+    * This query has the boost of <code>little</code>.
+@@ -49,62 +48,79 @@
+           (SpanQuery) little.clone());
+   }
+ 
+-  /** 
+-   * Return spans from <code>little</code> that are contained in a spans from <code>big</code>.
+-   * The payload is from the spans of <code>little</code>.
+-   */
+   @Override
+-  public Spans getSpans(final LeafReaderContext context, final Bits acceptDocs, final Map<Term,TermContext> termContexts, SpanCollector collector) throws IOException {
+-    ArrayList<Spans> containerContained = prepareConjunction(context, acceptDocs, termContexts, collector);
+-    if (containerContained == null) {
+-      return null;
++  public SpanWeight createWeight(IndexSearcher searcher, boolean needsScores, SpanCollectorFactory factory) throws IOException {
++    SpanWeight bigWeight = big.createWeight(searcher, false, factory);
++    SpanWeight littleWeight = little.createWeight(searcher, false, factory);
++    SpanSimilarity similarity = SpanSimilarity.build(this, searcher, needsScores, bigWeight, littleWeight);
++    return new SpanWithinWeight(similarity, factory, bigWeight, littleWeight);
++  }
++
++  public class SpanWithinWeight extends SpanContainWeight {
++
++    public SpanWithinWeight(SpanSimilarity similarity, SpanCollectorFactory factory,
++                            SpanWeight bigWeight, SpanWeight littleWeight) throws IOException {
++      super(similarity, factory, bigWeight, littleWeight);
+     }
+ 
+-    Spans big = containerContained.get(0);
+-    Spans little = containerContained.get(1);
++    /**
++     * Return spans from <code>little</code> that are contained in a spans from <code>big</code>.
++     * The payload is from the spans of <code>little</code>.
++     */
++    @Override
++    public Spans getSpans(final LeafReaderContext context, final Bits acceptDocs, SpanCollector collector) throws IOException {
++      ArrayList<Spans> containerContained = prepareConjunction(context, acceptDocs, collector);
++      if (containerContained == null) {
++        return null;
++      }
+ 
+-    return new ContainSpans(big, little, little) {
++      Spans big = containerContained.get(0);
++      Spans little = containerContained.get(1);
+ 
+-      @Override
+-      boolean twoPhaseCurrentDocMatches() throws IOException {
+-        oneExhaustedInCurrentDoc = false;
+-        assert littleSpans.startPosition() == -1;
+-        while (littleSpans.nextStartPosition() != NO_MORE_POSITIONS) {
+-          while (bigSpans.endPosition() < littleSpans.endPosition()) {
+-            if (bigSpans.nextStartPosition() == NO_MORE_POSITIONS) {
+-              oneExhaustedInCurrentDoc = true;
+-              return false;
++      return new ContainSpans(big, little, little) {
++
++        @Override
++        boolean twoPhaseCurrentDocMatches() throws IOException {
++          oneExhaustedInCurrentDoc = false;
++          assert littleSpans.startPosition() == -1;
++          while (littleSpans.nextStartPosition() != NO_MORE_POSITIONS) {
++            while (bigSpans.endPosition() < littleSpans.endPosition()) {
++              if (bigSpans.nextStartPosition() == NO_MORE_POSITIONS) {
++                oneExhaustedInCurrentDoc = true;
++                return false;
++              }
+             }
++            if (bigSpans.startPosition() <= littleSpans.startPosition()) {
++              atFirstInCurrentDoc = true;
++              return true;
++            }
+           }
+-          if (bigSpans.startPosition() <= littleSpans.startPosition()) {
+-            atFirstInCurrentDoc = true;
+-            return true;
++          oneExhaustedInCurrentDoc = true;
++          return false;
++        }
++
++        @Override
++        public int nextStartPosition() throws IOException {
++          if (atFirstInCurrentDoc) {
++            atFirstInCurrentDoc = false;
++            return littleSpans.startPosition();
+           }
+-        } 
+-        oneExhaustedInCurrentDoc = true;
+-        return false;
+-      }
+-
+-      @Override
+-      public int nextStartPosition() throws IOException {
+-        if (atFirstInCurrentDoc) {
+-          atFirstInCurrentDoc = false;
+-          return littleSpans.startPosition();
+-        }
+-        while (littleSpans.nextStartPosition() != NO_MORE_POSITIONS) {
+-          while (bigSpans.endPosition() < littleSpans.endPosition()) {
+-            if (bigSpans.nextStartPosition() == NO_MORE_POSITIONS) {
+-              oneExhaustedInCurrentDoc = true;
+-              return NO_MORE_POSITIONS;
++          while (littleSpans.nextStartPosition() != NO_MORE_POSITIONS) {
++            while (bigSpans.endPosition() < littleSpans.endPosition()) {
++              if (bigSpans.nextStartPosition() == NO_MORE_POSITIONS) {
++                oneExhaustedInCurrentDoc = true;
++                return NO_MORE_POSITIONS;
++              }
+             }
++            if (bigSpans.startPosition() <= littleSpans.startPosition()) {
++              return littleSpans.startPosition();
++            }
+           }
+-          if (bigSpans.startPosition() <= littleSpans.startPosition()) {
+-            return littleSpans.startPosition();
+-          }
++          oneExhaustedInCurrentDoc = true;
++          return NO_MORE_POSITIONS;
+         }
+-        oneExhaustedInCurrentDoc = true;
+-        return NO_MORE_POSITIONS;
+-      }
+-    };
++      };
++    }
+   }
++
+ }
+\ No newline at end of file
+Index: core/src/test/org/apache/lucene/search/spans/JustCompileSearchSpans.java
+===================================================================
+--- core/src/test/org/apache/lucene/search/spans/JustCompileSearchSpans.java	(revision 1680499)
++++ core/src/test/org/apache/lucene/search/spans/JustCompileSearchSpans.java	(working copy)
+@@ -17,15 +17,10 @@
+  * limitations under the License.
+  */
+ 
+-import org.apache.lucene.index.LeafReaderContext;
+-import org.apache.lucene.index.Term;
+-import org.apache.lucene.index.TermContext;
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.similarities.Similarity;
+-import org.apache.lucene.util.Bits;
+ 
+ import java.io.IOException;
+-import java.util.Map;
+-import java.util.Set;
+ 
+ /**
+  * Holds all implementations of classes in the o.a.l.s.spans package as a
+@@ -84,17 +79,12 @@
+   static final class JustCompileSpanQuery extends SpanQuery {
+ 
+     @Override
+-    protected void extractTerms(Set<Term> terms) {
+-      throw new UnsupportedOperationException(UNSUPPORTED_MSG);
+-    }
+-
+-    @Override
+     public String getField() {
+       throw new UnsupportedOperationException(UNSUPPORTED_MSG);
+     }
+ 
+     @Override
+-    public Spans getSpans(LeafReaderContext context, Bits acceptDocs, Map<Term,TermContext> termContexts, SpanCollector collector) {
++    public SpanWeight createWeight(IndexSearcher searcher, boolean needsScores, SpanCollectorFactory factory) throws IOException {
+       throw new UnsupportedOperationException(UNSUPPORTED_MSG);
+     }
+ 
+Index: core/src/test/org/apache/lucene/search/spans/MultiSpansWrapper.java
+===================================================================
+--- core/src/test/org/apache/lucene/search/spans/MultiSpansWrapper.java	(revision 1680499)
++++ core/src/test/org/apache/lucene/search/spans/MultiSpansWrapper.java	(working copy)
+@@ -21,14 +21,10 @@
+ import org.apache.lucene.index.LeafReader;
+ import org.apache.lucene.index.LeafReaderContext;
+ import org.apache.lucene.index.SlowCompositeReaderWrapper;
+-import org.apache.lucene.index.Term;
+-import org.apache.lucene.index.TermContext;
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.util.Bits;
+ 
+ import java.io.IOException;
+-import java.util.HashMap;
+-import java.util.HashSet;
+-import java.util.Map;
+ 
+ /**
+  * 
+@@ -44,17 +40,14 @@
+   }
+ 
+   public static Spans wrap(IndexReader reader, SpanQuery spanQuery, SpanCollector collector) throws IOException {
++
++    IndexSearcher searcher = new IndexSearcher(reader);
++    searcher.setQueryCache(null);
+     LeafReader lr = SlowCompositeReaderWrapper.wrap(reader); // slow, but ok for testing
+     LeafReaderContext lrContext = lr.getContext();
+-    SpanQuery rewrittenQuery = (SpanQuery) spanQuery.rewrite(lr); // get the term contexts so getSpans can be called directly
+-    HashSet<Term> termSet = new HashSet<>();
+-    rewrittenQuery.extractTerms(termSet);
+-    Map<Term,TermContext> termContexts = new HashMap<>();
+-    for (Term term: termSet) {
+-      TermContext termContext = TermContext.build(lrContext, term);
+-      termContexts.put(term, termContext);
+-    }
+-    Spans actSpans = spanQuery.getSpans(lrContext, new Bits.MatchAllBits(lr.numDocs()), termContexts, collector);
+-    return actSpans;
++
++    SpanWeight w = (SpanWeight) searcher.createNormalizedWeight(spanQuery, false);
++
++    return w.getSpans(lrContext, new Bits.MatchAllBits(lr.numDocs()), collector);
+   }
+ }
+Index: core/src/test/org/apache/lucene/search/spans/TestFieldMaskingSpanQuery.java
+===================================================================
+--- core/src/test/org/apache/lucene/search/spans/TestFieldMaskingSpanQuery.java	(revision 1680499)
++++ core/src/test/org/apache/lucene/search/spans/TestFieldMaskingSpanQuery.java	(working copy)
+@@ -17,9 +17,6 @@
+  * limitations under the License.
+  */
+ 
+-import java.util.HashSet;
+-import java.util.Set;
+-
+ import org.apache.lucene.analysis.MockAnalyzer;
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.Field;
+@@ -36,8 +33,12 @@
+ import org.junit.AfterClass;
+ import org.junit.BeforeClass;
+ 
+-import static org.apache.lucene.search.spans.SpanTestUtil.*;
++import java.util.HashSet;
++import java.util.Set;
+ 
++import static org.apache.lucene.search.spans.SpanTestUtil.assertFinished;
++import static org.apache.lucene.search.spans.SpanTestUtil.assertNext;
++
+ public class TestFieldMaskingSpanQuery extends LuceneTestCase {
+ 
+   protected static Document doc(Field[] fields) {
+@@ -141,7 +142,7 @@
+     QueryUtils.checkEqual(q, qr);
+ 
+     Set<Term> terms = new HashSet<>();
+-    qr.extractTerms(terms);
++    qr.createWeight(searcher, false).extractTerms(terms);
+     assertEquals(1, terms.size());
+   }
+   
+@@ -161,7 +162,7 @@
+     QueryUtils.checkUnequal(q, qr);
+ 
+     Set<Term> terms = new HashSet<>();
+-    qr.extractTerms(terms);
++    qr.createWeight(searcher, false).extractTerms(terms);
+     assertEquals(2, terms.size());
+   }
+   
+Index: highlighter/src/java/org/apache/lucene/search/highlight/WeightedSpanTermExtractor.java
+===================================================================
+--- highlighter/src/java/org/apache/lucene/search/highlight/WeightedSpanTermExtractor.java	(revision 1680500)
++++ highlighter/src/java/org/apache/lucene/search/highlight/WeightedSpanTermExtractor.java	(working copy)
+@@ -29,7 +29,6 @@
+ import org.apache.lucene.index.NumericDocValues;
+ import org.apache.lucene.index.SortedDocValues;
+ import org.apache.lucene.index.Term;
+-import org.apache.lucene.index.TermContext;
+ import org.apache.lucene.index.Terms;
+ import org.apache.lucene.index.memory.MemoryIndex;
+ import org.apache.lucene.queries.CommonTermsQuery;
+@@ -68,7 +67,6 @@
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+-import java.util.TreeSet;
+ 
+ 
+ /**
+@@ -301,15 +299,9 @@
+         q = spanQuery;
+       }
+       LeafReaderContext context = getLeafContext();
+-      Map<Term,TermContext> termContexts = new HashMap<>();
+-      TreeSet<Term> extractedTerms = new TreeSet<>();
+       SpanWeight w = (SpanWeight) searcher.createNormalizedWeight(q, false);
+-      w.extractTerms(extractedTerms);
+-      for (Term term : extractedTerms) {
+-        termContexts.put(term, TermContext.build(context, term));
+-      }
+       Bits acceptDocs = context.reader().getLiveDocs();
+-      final Spans spans = q.getSpans(context, acceptDocs, termContexts, w.getSpanCollectorFactory().newCollector());
++      final Spans spans = w.getSpans(context, acceptDocs);
+       if (spans == null) {
+         return;
+       }
+Index: test-framework/src/java/org/apache/lucene/search/spans/AssertingSpanQuery.java
+===================================================================
+--- test-framework/src/java/org/apache/lucene/search/spans/AssertingSpanQuery.java	(revision 1680499)
++++ test-framework/src/java/org/apache/lucene/search/spans/AssertingSpanQuery.java	(working copy)
+@@ -18,16 +18,10 @@
+  */
+ 
+ import org.apache.lucene.index.IndexReader;
+-import org.apache.lucene.index.LeafReaderContext;
+-import org.apache.lucene.index.Term;
+-import org.apache.lucene.index.TermContext;
+ import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.Query;
+-import org.apache.lucene.util.Bits;
+ 
+ import java.io.IOException;
+-import java.util.Map;
+-import java.util.Set;
+ 
+ /** Wraps a span query with asserts */
+ public class AssertingSpanQuery extends SpanQuery {
+@@ -38,21 +32,6 @@
+   }
+ 
+   @Override
+-  protected void extractTerms(Set<Term> terms) {
+-    in.extractTerms(terms);
+-  }
+-
+-  @Override
+-  public Spans getSpans(LeafReaderContext context, Bits acceptDocs, Map<Term,TermContext> termContexts, SpanCollector collector) throws IOException {
+-    Spans spans = in.getSpans(context, acceptDocs, termContexts, collector);
+-    if (spans == null) {
+-      return null;
+-    } else {
+-      return new AssertingSpans(spans);
+-    }
+-  }
+-
+-  @Override
+   public String getField() {
+     return in.getField();
+   }
+@@ -63,15 +42,9 @@
+   }
+ 
+   @Override
+-  public SpanWeight createWeight(IndexSearcher searcher, boolean needsScores) throws IOException {
+-    // TODO: we are wasteful and createWeight twice in this case... use VirtualMethod?
+-    // we need to not wrap if the query is e.g. a Payload one that overrides this (it should really be final)
+-    SpanWeight weight = in.createWeight(searcher, needsScores);
+-    if (weight.getClass() == SpanWeight.class) {
+-      return super.createWeight(searcher, needsScores);
+-    } else {
+-      return weight;
+-    }
++  public SpanWeight createWeight(IndexSearcher searcher, boolean needsScores, SpanCollectorFactory factory) throws IOException {
++    SpanWeight weight = in.createWeight(searcher, needsScores, factory);
++    return new AssertingSpanWeight(weight);
+   }
+ 
+   @Override
+Index: test-framework/src/java/org/apache/lucene/search/spans/AssertingSpanWeight.java
+===================================================================
+--- test-framework/src/java/org/apache/lucene/search/spans/AssertingSpanWeight.java	(revision 0)
++++ test-framework/src/java/org/apache/lucene/search/spans/AssertingSpanWeight.java	(working copy)
+@@ -0,0 +1,63 @@
++package org.apache.lucene.search.spans;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.index.LeafReaderContext;
++import org.apache.lucene.index.Term;
++import org.apache.lucene.index.TermContext;
++import org.apache.lucene.util.Bits;
++
++import java.io.IOException;
++import java.util.Map;
++import java.util.Set;
++
++/**
++ * Wraps a SpanWeight with additional asserts
++ */
++public class AssertingSpanWeight extends SpanWeight {
++
++  final SpanWeight in;
++
++  /**
++   * Create an AssertingSpanWeight
++   * @param in the SpanWeight to wrap
++   * @throws IOException on error
++   */
++  public AssertingSpanWeight(SpanWeight in) throws IOException {
++    super((SpanQuery) in.getQuery(), in.similarity, in.collectorFactory);
++    this.in = in;
++  }
++
++  @Override
++  public void extractTermContexts(Map<Term, TermContext> contexts) {
++    in.extractTermContexts(contexts);
++  }
++
++  @Override
++  public Spans getSpans(LeafReaderContext context, Bits liveDocs, SpanCollector collector) throws IOException {
++    Spans spans = in.getSpans(context, liveDocs, collector);
++    if (spans == null)
++      return null;
++    return new AssertingSpans(spans);
++  }
++
++  @Override
++  public void extractTerms(Set<Term> terms) {
++    in.extractTerms(terms);
++  }
++}
+
+Property changes on: test-framework/src/java/org/apache/lucene/search/spans/AssertingSpanWeight.java
+___________________________________________________________________
+Added: svn:eol-style
+## -0,0 +1 ##
++native
+\ No newline at end of property

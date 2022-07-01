@@ -1,0 +1,460 @@
+Index: lucene/core/src/java/org/apache/lucene/index/IndexFileNames.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/index/IndexFileNames.java	(revision 1340074)
++++ lucene/core/src/java/org/apache/lucene/index/IndexFileNames.java	(working copy)
+@@ -56,6 +56,9 @@
+ 
+   /** Extension of terms index file */
+   public static final String TERMS_INDEX_EXTENSION = "tii";
++  
++  /** Extension of optional Bloom filters file */
++  public static final String TERMS_BLOOM_FILTER = "blm";  
+ 
+   /** Extension of stored fields index file */
+   public static final String FIELDS_INDEX_EXTENSION = "fdx";
+@@ -107,6 +110,7 @@
+     FIELDS_INDEX_EXTENSION,
+     FIELDS_EXTENSION,
+     TERMS_INDEX_EXTENSION,
++    TERMS_BLOOM_FILTER,
+     TERMS_EXTENSION,
+     FREQ_EXTENSION,
+     PROX_EXTENSION,
+@@ -126,6 +130,7 @@
+     FIELDS_INDEX_EXTENSION,
+     FIELDS_EXTENSION,
+     TERMS_INDEX_EXTENSION,
++    TERMS_BLOOM_FILTER,
+     TERMS_EXTENSION,
+     FREQ_EXTENSION,
+     PROX_EXTENSION,
+@@ -149,6 +154,7 @@
+     PROX_EXTENSION,
+     TERMS_EXTENSION,
+     TERMS_INDEX_EXTENSION,
++    TERMS_BLOOM_FILTER,
+     NORMS_EXTENSION
+   };
+   
+@@ -160,6 +166,7 @@
+     FIELDS_INDEX_EXTENSION,
+     FIELDS_EXTENSION,
+     TERMS_INDEX_EXTENSION,
++    TERMS_BLOOM_FILTER,
+     TERMS_EXTENSION
+   };
+   
+Index: lucene/core/src/java/org/apache/lucene/index/TermInfosReader.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/index/TermInfosReader.java	(revision 1340074)
++++ lucene/core/src/java/org/apache/lucene/index/TermInfosReader.java	(working copy)
+@@ -19,11 +19,16 @@
+ 
+ import java.io.Closeable;
+ import java.io.IOException;
++import java.util.IdentityHashMap;
++import java.util.Map;
+ 
+ import org.apache.lucene.store.Directory;
++import org.apache.lucene.store.IndexInput;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.DoubleBarrelLRUCache;
+ import org.apache.lucene.util.CloseableThreadLocal;
++import org.apache.lucene.util.MurmurHash;
++import org.apache.lucene.util.OpenBitSet;
+ 
+ /** This stores a monotonically increasing set of <Term, TermInfo> pairs in a
+  * Directory.  Pairs are accessed either by Term or by ordinal position the
+@@ -80,7 +85,10 @@
+   }
+ 
+   private final DoubleBarrelLRUCache<CloneableTerm,TermInfoAndOrd> termsCache = new DoubleBarrelLRUCache<CloneableTerm,TermInfoAndOrd>(DEFAULT_CACHE_SIZE);
++
++  private Map<String, FieldBloomFilter> bloomsByInternedFieldName = null;
+   
++  
+   /**
+    * Per-thread resources managed by ThreadLocal
+    */
+@@ -100,6 +108,35 @@
+       directory = dir;
+       segment = seg;
+       fieldInfos = fis;
++      
++      String bloomFileName = IndexFileNames.segmentFileName(segment,
++          IndexFileNames.TERMS_BLOOM_FILTER);
++      if (directory.fileExists(bloomFileName)) {
++        bloomsByInternedFieldName = new IdentityHashMap<String,TermInfosReader.FieldBloomFilter>();
++        IndexInput bloomIn = directory.openInput(bloomFileName);
++        int numBlooms = bloomIn.readInt();
++        for (int i = 0; i < numBlooms; i++) {
++          int fieldNumber = bloomIn.readInt();
++          FieldInfo fi = fis.fieldInfo(fieldNumber);
++          int bloomSize = bloomIn.readInt();
++          int numWords = bloomIn.readInt();
++          long bits[] = new long[numWords];
++          for (int w = 0; w < numWords; w++) {
++            bits[w] = bloomIn.readLong();
++          }
++          OpenBitSet bloom = new OpenBitSet(bits, numWords);
++          // float saturation = (float) bloom.cardinality() / (float) bloomSize;
++          // System.out.println(seg + " seg bloom card=" + bloom.cardinality() +
++          // "/"
++          // + bloomSize + " saturation=" + saturation + " on " + fi.name);
++          FieldBloomFilter fieldBloomFilter = new FieldBloomFilter(fi, bloom,
++              bloomSize);
++          // Ensure we use the same fieldname interning mechanism used by Term
++          // class...
++          Term tKey = new Term(fi.name);
++          bloomsByInternedFieldName.put(tKey.field(), fieldBloomFilter);
++        }
++      }      
+ 
+       origEnum = new SegmentTermEnum(directory.openInput(IndexFileNames.segmentFileName(segment, IndexFileNames.TERMS_EXTENSION),
+           readBufferSize), fieldInfos, false);
+@@ -137,6 +174,50 @@
+     }
+   }
+ 
++  static class FieldBloomFilter
++  {
++      FieldInfo fi;
++      OpenBitSet filter;
++      int bloomSize;
++
++      public FieldBloomFilter(FieldInfo fi, OpenBitSet filter, int bloomSize)
++      {
++          super();
++          this.fi = fi;
++          this.filter = filter;
++          this.bloomSize = bloomSize;
++      }
++
++      public boolean mayContainValue(BytesRef termBytesRef)
++      {
++          // TODO if termBytesRef cached hashcode() results then each segment being searched by the same
++          // term would not have to re-hash the same bytes.
++          byte[] bytes = termBytesRef.bytes;
++          int hash = MurmurHash.hash32(bytes, termBytesRef.length);
++          if (hash < 0)
++          {
++              hash = hash * -1;
++          }
++          return mayContainValue(hash);
++      }
++
++      // Fail fast on terms that show no traces of being stored in this segment
++      private boolean mayContainValue(int positiveHash)
++      {
++          //Bloom sizes are always base 2 and so can be ANDed for a fast modulo
++          int pos = positiveHash & bloomSize;
++          //            int pos = hash % bloomSize;
++          if (filter.fastGet(pos))
++          {
++              //This term may be recorded in this index (but could be a collision)
++              return true;
++          }
++          //definitely NOT in this segment
++          return false;
++      }
++  }
++  
++  
+   public int getSkipInterval() {
+     return origEnum.skipInterval;
+   }
+@@ -176,6 +257,17 @@
+   private TermInfo get(Term term, boolean mustSeekEnum, BytesRef termBytesRef) throws IOException {
+     if (size == 0) return null;
+ 
++    if (bloomsByInternedFieldName != null) {
++      if (!mustSeekEnum) {
++        FieldBloomFilter filter = bloomsByInternedFieldName.get(term.field);
++        if (filter != null) {
++          if (!filter.mayContainValue(termBytesRef)) {
++            return null;
++          }
++        }
++      }
++    }    
++    
+     ensureIndexIsRead();
+ 
+     final CloneableTerm cacheKey = new CloneableTerm(term);
+Index: lucene/core/src/java/org/apache/lucene/index/TermInfosWriter.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/index/TermInfosWriter.java	(revision 1340074)
++++ lucene/core/src/java/org/apache/lucene/index/TermInfosWriter.java	(working copy)
+@@ -23,6 +23,8 @@
+ import org.apache.lucene.store.IndexOutput;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.util.IOUtils;
++import org.apache.lucene.util.MurmurHash;
++import org.apache.lucene.util.OpenBitSet;
+ import org.apache.lucene.util.UnicodeUtil;
+ import org.apache.lucene.util.ArrayUtil;
+ 
+@@ -45,6 +47,19 @@
+   private IndexOutput output;
+   private TermInfo lastTi = new TermInfo();
+   private long size;
++  
++  //Various scales used for performing modulo operations 
++  int[] base2ModuloMasks = { 0Xfff, 0X1fff, 0X3fff, 0X7fff, 0Xffff, 0X1ffff, 0X3ffff, 0X7ffff,
++          0Xfffff, 0X1fffff, 0X3fffff, 0X7fffff, 0Xffffff, 0X1ffffff, 0X3ffffff };
++  //The largest is ~8meg capable of holding 67m bits - a reasonable upper limit?
++  //0X7ffffff, 0Xfffffff , 0X1fffffff, 0X3fffffff, 0X7fffffff };
++  //Default to the biggest number space (we don't know how many terms we will be accumulating here and will right-size on save).
++  int bloomSize = base2ModuloMasks[base2ModuloMasks.length - 1];
++  //an array indexed on field number - will contain nulls for fields that do not require a bloom filter
++  private OpenBitSet[] bloomFilters;
++  Directory directory;
++  String segment;
++  
+ 
+   // TODO: the default values for these two parameters should be settable from
+   // IndexWriter.  However, once that's done, folks will start setting them to
+@@ -107,6 +122,24 @@
+     indexInterval = interval;
+     fieldInfos = fis;
+     isIndex = isi;
++    if (!isIndex) {
++      bloomFilters = new OpenBitSet[fis.size()];
++      for (int i = 0; i < bloomFilters.length; i++) {
++        FieldInfo fi = fis.fieldInfo(i);
++        // Select which fields need a BloomFilter on the basis of their
++        // fieldname ending in "_blm"
++        // TODO FieldInfo should change to convey Bloom filter setting choices
++        // more cleanly.
++        if (fi.name.endsWith("_blm")) {
++          // Pessimistic assumption here being that a large bitset is required
++          // for
++          // each bloom-filtered field listed in the FieldInfos
++          bloomFilters[i] = new OpenBitSet(bloomSize);
++        }
++      }
++      this.directory = directory;
++      this.segment = segment;
++    }   
+     output = directory.createOutput(segment + (isIndex ? ".tii" : ".tis"));
+     boolean success = false;
+     try {
+@@ -215,6 +248,19 @@
+ 
+   private void writeTerm(int fieldNumber, byte[] termBytes, int termBytesLength)
+        throws IOException {
++    if (bloomFilters != null) {
++      FieldInfo fi = fieldInfos.fieldInfo(fieldNumber);
++      OpenBitSet bloomFilter = bloomFilters[fieldNumber];
++      if (bloomFilter != null) {
++        int hash = MurmurHash.hash32(termBytes, termBytesLength);
++        if (hash < 0) {
++          hash = hash * -1;
++        }
++        // Bitmasking using bloomSize is effectively a modulo operation.
++        int bloomPos = hash & bloomSize;
++        bloomFilter.fastSet(bloomPos);
++      }
++    }
+ 
+     // TODO: UTF16toUTF8 could tell us this prefix
+     // Compute prefix in common with last term:
+@@ -240,6 +286,10 @@
+ 
+   /** Called to complete TermInfos creation. */
+   public void close() throws IOException {
++    if (bloomFilters != null) {
++      storeBloomFilters();
++    }
++    
+     try {
+       output.seek(4);          // write size after format
+       output.writeLong(size);
+@@ -255,4 +305,98 @@
+ 
+   }
+ 
++  //Creates a ".blm" file with serialized Bitsets representing terms in the index
++  private void storeBloomFilters() throws IOException {
++    int numberOfNonSaturatedBloomFilters = 0;
++    //Check if we need to create a .blm file - ensure all BloomFilters are not saturated
++    for (int i = 0; i < bloomFilters.length; i++) {
++      OpenBitSet bloomFilter = bloomFilters[i];
++      if (bloomFilter != null) {
++        int numBitsSet = (int) bloomFilter.cardinality();
++        float saturation = (float) numBitsSet / (float) bloomSize;
++        // Don't bother saving bitsets if maximum saturation is reached - we don't want to 
++        // throw any more memory at this problem
++        if (saturation < 0.9f) { //Maximum tolerated saturation - beyond this Bloom buys us v little
++          numberOfNonSaturatedBloomFilters++;
++        } else {
++          bloomFilters[i] = null;
++          System.out.println("Saturated segment: " + segment
++              + " (saturation level=" + saturation + ")");
++        }
++      }
++    }
++    if (numberOfNonSaturatedBloomFilters > 0) {
++      // Create a ".blm" file with all the fields that require a filter saving
++      IndexOutput bloomOutput = null;
++      try {
++        bloomOutput = directory.createOutput(segment + "."
++            + IndexFileNames.TERMS_BLOOM_FILTER);
++        bloomOutput.writeInt(numberOfNonSaturatedBloomFilters);
++        for (int i = 0; i < bloomFilters.length; i++) {
++          OpenBitSet bloomFilter = bloomFilters[i];
++          if (bloomFilter != null) {
++            saveAppropriatelySizedBloomFilter(bloomOutput, bloomFilter,
++                fieldInfos.fieldInfo(i));
++          }
++        }
++      } finally {
++        if (bloomOutput != null) {
++          bloomOutput.close();
++        }
++      }
++    }
++  }
++  
++  private void saveAppropriatelySizedBloomFilter(IndexOutput bloomOutput,
++      OpenBitSet bloomFilter, FieldInfo fieldInfo) throws IOException {
++    bloomOutput.writeInt(fieldInfo.number);
++    // Down-scale the BloomFilter size here for small segments with very sparse
++    // settings.
++    // Find an appropriate sized bitset for storage given the sparseness of
++    // contents accumulated during writing
++    int numBitsSet = (int) bloomFilter.cardinality();
++    float targetMaxSaturation = 0.1f; // Aim for a bitset size that would have
++                                      // max 10% of bits set - TODO could be a config choice
++    OpenBitSet rightSizedBitSet = bloomFilter;
++    int rightSizedBitSetSize = bloomSize;
++    for (int i = 0; i < base2ModuloMasks.length; i++) {
++      int candidateBitsetSize = base2ModuloMasks[i];
++      float candidateSaturation = (float) numBitsSet
++          / (float) candidateBitsetSize;
++      if (candidateSaturation <= targetMaxSaturation) {
++        rightSizedBitSetSize = candidateBitsetSize;
++        break;
++      }
++    }
++    // Re-project the numbers to a smaller space if necessary
++    if (rightSizedBitSetSize != bloomSize) {
++      rightSizedBitSet = new OpenBitSet(rightSizedBitSetSize);
++      int bitIndex = 0;
++      do {
++        bitIndex = bloomFilter.nextSetBit(bitIndex);
++        if (bitIndex >= 0) {
++          // Project the larger number into a smaller one by effectively
++          // modulo-ing
++          int downSizedBitIndex = bitIndex & rightSizedBitSetSize;
++          rightSizedBitSet.fastSet(downSizedBitIndex);
++          bitIndex++;
++        }
++      } while (bitIndex >= 0);
++      // Reset the bitset
++      // System.out.println("Downsized bloom filter: Saving ="
++      // + (bloomSize - rightSizedBitSetSize) + " bits");
++      bloomSize = rightSizedBitSetSize;
++    } else {
++      // Use the existing bloom filter and size
++      rightSizedBitSetSize = bloomSize;
++    }
++    long[] bits = rightSizedBitSet.getBits();
++    bloomOutput.writeInt(rightSizedBitSetSize);
++    bloomOutput.writeInt(bits.length);
++    for (int i = 0; i < bits.length; i++) {
++      // Can't used VLong encoding because cant cope with negative numbers output by OpenBitSet
++      bloomOutput.writeLong(bits[i]);
++    }
++  }
++
+ }
+Index: lucene/core/src/java/org/apache/lucene/util/MurmurHash.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/MurmurHash.java	(revision 0)
++++ lucene/core/src/java/org/apache/lucene/util/MurmurHash.java	(revision 0)
+@@ -0,0 +1,84 @@
++package org.apache.lucene.util;
++
++/**
++ * This is a very fast, non-cryptographic hash suitable for general hash-based lookup. See
++ * http://murmurhash.googlepages.com/ for more details.
++ * <p>
++ * The C version of MurmurHash 2.0 found at that site was ported to Java by Andrzej Bialecki (ab at
++ * getopt org).
++ * </p>
++ */
++public class MurmurHash
++{
++    //MH changed Andrzej code to allow passing of byte arrays with length setting
++    public static int hash(byte[] data, int seed, int len)
++    {
++        int m = 0x5bd1e995;
++        int r = 24;
++        int h = seed ^ len;
++        int len_4 = len >> 2;
++        for (int i = 0; i < len_4; i++)
++        {
++            int i_4 = i << 2;
++            int k = data[i_4 + 3];
++            k = k << 8;
++            k = k | (data[i_4 + 2] & 0xff);
++            k = k << 8;
++            k = k | (data[i_4 + 1] & 0xff);
++            k = k << 8;
++            k = k | (data[i_4 + 0] & 0xff);
++            k *= m;
++            k ^= k >>> r;
++            k *= m;
++            h *= m;
++            h ^= k;
++        }
++        int len_m = len_4 << 2;
++        int left = len - len_m;
++        if (left != 0)
++        {
++            if (left >= 3)
++            {
++                h ^= data[len - 3] << 16;
++            }
++            if (left >= 2)
++            {
++                h ^= data[len - 2] << 8;
++            }
++            if (left >= 1)
++            {
++                h ^= data[len - 1];
++            }
++            h *= m;
++        }
++        h ^= h >>> 13;
++        h *= m;
++        h ^= h >>> 15;
++        return h;
++    }
++
++    /* Testing ...
++    static int NUM = 1000;
++
++    public static void main(String[] args) {
++      byte[] bytes = new byte[4];
++      for (int i = 0; i < NUM; i++) {
++        bytes[0] = (byte)(i & 0xff);
++        bytes[1] = (byte)((i & 0xff00) >> 8);
++        bytes[2] = (byte)((i & 0xff0000) >> 16);
++        bytes[3] = (byte)((i & 0xff000000) >> 24);
++        System.out.println(Integer.toHexString(i) + " " + Integer.toHexString(hash(bytes, 1)));
++      }
++    } */
++    /**
++     * Generates 32 bit hash from byte array with default seed value.
++     * @param data byte array to hash
++     * @param len length of the array to hash
++     * @return 32 bit hash of the given array
++     */
++    public static final int hash32(final byte[] data, int len)
++    {
++        return MurmurHash.hash(data, 0x9747b28c, len);
++    }
++
++}

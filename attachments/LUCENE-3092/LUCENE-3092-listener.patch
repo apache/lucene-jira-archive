@@ -1,0 +1,354 @@
+Index: lucene/src/java/org/apache/lucene/store/NRTCachingDirectory.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/store/NRTCachingDirectory.java	Fri May 13 16:23:40 NZST 2011
++++ lucene/src/java/org/apache/lucene/store/NRTCachingDirectory.java	Fri May 13 16:23:40 NZST 2011
+@@ -0,0 +1,227 @@
++package org.apache.lucene.store;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.Collection;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++
++import org.apache.lucene.index.*;
++
++// TODO
++//   - let subclass dictate policy...?
++//   - rename to MergeCacheingDir?  NRTCachingDir
++
++/**
++ * Wraps a RAMDir around any provided delegate directory, to
++ * be used during NRT search.  Make sure you pull the merge
++ * scheduler using getMergeScheduler, and pass that to your
++ * IndexWriter; this class uses that to keep track of which
++ * merges are being done by which threads, to decide when to
++ * cache each written file.
++ *
++ * <p>This class is really only useful in a near-real-time
++ * context, where indexing rate isn't very high but reopen
++ * rate is, and so many smallish segments are being
++ * flushed.  This directory keeps such segments (as well as
++ * the segments produced by merging them, as long as they
++ * are small enough), in RAM.</p>
++ *
++ * <p>This is safe to use, ie, when your app calls commit,
++ * this class will write all files to disk and commit them
++ * as well.</p>
++ */
++
++public class NRTCachingDirectory extends Directory implements MergeListener {
++
++  private final RAMDirectory cache = new RAMDirectory();
++
++  private final Directory delegate;
++
++  private final long maxMergeSizeBytes;
++
++  private static final boolean VERBOSE = true;
++
++  public NRTCachingDirectory(Directory delegate, double maxMergeSizeMB) {
++    this.delegate = delegate;
++    this.maxMergeSizeBytes = (long) (maxMergeSizeMB*1024*1024);
++  }
++
++  @Override
++  public synchronized String[] listAll() throws IOException {
++    final Set<String> files = new HashSet<String>();
++    for(String f : cache.listAll()) {
++      files.add(f);
++    }
++    for(String f : delegate.listAll()) {
++      assert !files.contains(f);
++      files.add(f);
++    }
++    return files.toArray(new String[files.size()]);
++  }
++
++  @Override
++  public synchronized boolean fileExists(String name) throws IOException {
++    return cache.fileExists(name) || delegate.fileExists(name);
++  }
++
++  @Override
++  public synchronized long fileModified(String name) throws IOException {
++    if (cache.fileExists(name)) {
++      return cache.fileModified(name);
++    } else {
++      return delegate.fileModified(name);
++    }
++  }
++
++  @Override
++  public synchronized void touchFile(String name) throws IOException {
++    if (cache.fileExists(name)) {
++      cache.touchFile(name);
++    } else {
++      delegate.touchFile(name);
++    }
++  }
++
++  @Override
++  public synchronized void deleteFile(String name) throws IOException {
++    if (cache.fileExists(name)) {
++      cache.deleteFile(name);
++    } else {
++      delegate.deleteFile(name);
++    }
++  }
++
++  @Override
++  public synchronized long fileLength(String name) throws IOException {
++    if (cache.fileExists(name)) {
++      return cache.fileLength(name);
++    } else {
++      return delegate.fileLength(name);
++    }
++  }
++
++  @Override
++  public synchronized IndexOutput createOutput(String name) throws IOException {
++    // nocommit -- future IOContext
++    // can be useful here too...
++    if (doCacheWrite(name)) {
++      if (VERBOSE) {
++        System.out.println("YES-CACHE: " + name);
++      }
++      return cache.createOutput(name);
++    } else {
++      if (VERBOSE) {
++        System.out.println("NO-CACHE: " + name);
++      }
++      return delegate.createOutput(name);
++    }
++  }
++
++  @Override
++  // nocommit -- costly to sync here
++  public synchronized void sync(Collection<String> fileNames) throws IOException {
++    for(String fileName : fileNames) {
++      if (cache.fileExists(fileName)) {
++        unCache(fileName);
++      }
++    }
++    delegate.sync(fileNames);
++  }
++
++  @Override
++  public synchronized IndexInput openInput(String name) throws IOException {
++    if (cache.fileExists(name)) {
++      return cache.openInput(name);
++    } else {
++      return delegate.openInput(name);
++    }
++  }
++
++  @Override
++  public synchronized IndexInput openInput(String name, int bufferSize) throws IOException {
++    if (cache.fileExists(name)) {
++      return cache.openInput(name, bufferSize);
++    } else {
++      return delegate.openInput(name, bufferSize);
++    }
++  }
++
++  @Override
++  public Lock makeLock(String name) {
++    return delegate.makeLock(name);
++  }
++
++  @Override
++  public void clearLock(String name) throws IOException {
++    delegate.clearLock(name);
++  }
++
++  @Override
++  public synchronized void close() throws IOException {
++    for(String fileName : cache.listAll()) {
++      unCache(fileName);
++    }
++    cache.close();
++    delegate.close();
++  }
++
++  private final ConcurrentHashMap<Thread,MergePolicy.OneMerge> merges = new ConcurrentHashMap<Thread,MergePolicy.OneMerge>();
++
++  public void mergeStarted(MergeEvent mergeEvent) {
++    merges.put(mergeEvent.getMergingThread(), mergeEvent.getMerge());
++  }
++
++  public void mergeFinished(MergeEvent mergeEvent) {
++    merges.remove(mergeEvent.getMergingThread());
++  }
++
++  // Replaced by the the listening events
++//  public MergeScheduler getMergeScheduler() {
++//    return new ConcurrentMergeScheduler() {
++//      @Override
++//      protected void doMerge(MergePolicy.OneMerge merge) throws IOException {
++//        try {
++//          merges.put(Thread.currentThread(), merge);
++//          super.doMerge(merge);
++//        } finally {
++//          merges.remove(Thread.currentThread());
++//        }
++//      }
++//    };
++//  }
++
++  protected boolean doCacheWrite(String name) {
++    final MergePolicy.OneMerge merge = merges.get(Thread.currentThread());
++    //System.out.println(Thread.currentThread().getName() + ": CACHE check merge=" + merge + " size=" + (merge==null ? 0 : merge.estimatedMergeBytes));
++    return merge == null || merge.estimatedMergeBytes < maxMergeSizeBytes;
++  }
++
++  private void unCache(String fileName) throws IOException {
++    final IndexOutput out = delegate.createOutput(fileName);
++    final IndexInput in = cache.openInput(fileName);
++    in.copyBytes(out, in.length());
++    // nocommit closeSafely in finally:
++    in.close();
++    out.close();
++    cache.deleteFile(fileName);
++  }
++}
++
+Index: lucene/src/java/org/apache/lucene/index/ConcurrentMergeScheduler.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/index/ConcurrentMergeScheduler.java	(revision 1101574)
++++ lucene/src/java/org/apache/lucene/index/ConcurrentMergeScheduler.java	Fri May 13 16:18:25 NZST 2011
+@@ -68,6 +68,12 @@
+   protected IndexWriter writer;
+   protected int mergeThreadCount;
+ 
++  private List<MergeListener> mergeListeners = new ArrayList<MergeListener>();
++
++  public void registerMergeListener(MergeListener mergeListener) {
++    mergeListeners.add(mergeListener);
++  }
++
+   /** Sets the max # simultaneous merge threads that should
+    *  be running at once.  This must be <= {@link
+    *  #setMaxMergeCount}. */
+@@ -376,8 +382,19 @@
+ 
+   /** Does the actual merge, by calling {@link IndexWriter#merge} */
+   protected void doMerge(MergePolicy.OneMerge merge) throws IOException {
++    MergeEvent mergeEvent = new MergeEvent(Thread.currentThread(), merge);
++    for (MergeListener mergeListener : mergeListeners) {
++      mergeListener.mergeStarted(mergeEvent);
++    }
++
++    try {
+-    writer.merge(merge);
++      writer.merge(merge);
++    } finally {
++      for (MergeListener mergeListener : mergeListeners) {
++        mergeListener.mergeFinished(mergeEvent);
+-  }
++      }
++    }
++  }
+ 
+   /** Create and return a new MergeThread */
+   protected synchronized MergeThread getMergeThread(IndexWriter writer, MergePolicy.OneMerge merge) throws IOException {
+Index: lucene/src/java/org/apache/lucene/index/MergeEvent.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/index/MergeEvent.java	Fri May 13 16:09:26 NZST 2011
++++ lucene/src/java/org/apache/lucene/index/MergeEvent.java	Fri May 13 16:09:26 NZST 2011
+@@ -0,0 +1,36 @@
++package org.apache.lucene.index;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++public class MergeEvent {
++
++  private final Thread mergingThread;
++  private final MergePolicy.OneMerge merge;
++
++  public MergeEvent(Thread mergingThread, MergePolicy.OneMerge merge) {
++    this.mergingThread = mergingThread;
++    this.merge = merge;
++  }
++
++  public Thread getMergingThread() {
++    return mergingThread;
++  }
++
++  public MergePolicy.OneMerge getMerge() {
++    return merge;
++  }
++}
+Index: lucene/src/java/org/apache/lucene/index/MergeListener.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/index/MergeListener.java	Fri May 13 16:11:57 NZST 2011
++++ lucene/src/java/org/apache/lucene/index/MergeListener.java	Fri May 13 16:11:57 NZST 2011
+@@ -0,0 +1,24 @@
++package org.apache.lucene.index;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++public interface MergeListener {
++
++  void mergeStarted(MergeEvent mergeEvent);
++
++  void mergeFinished(MergeEvent mergeEvent);
++}
+Index: lucene/src/java/org/apache/lucene/index/MergePolicy.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/index/MergePolicy.java	(revision 1101574)
++++ lucene/src/java/org/apache/lucene/index/MergePolicy.java	Fri May 13 15:56:43 NZST 2011
+@@ -72,7 +72,7 @@
+     long mergeGen;                  // used by IndexWriter
+     boolean isExternal;             // used by IndexWriter
+     int maxNumSegmentsOptimize;     // used by IndexWriter
+-    long estimatedMergeBytes;       // used by IndexWriter
++    public long estimatedMergeBytes;       // used by IndexWriter
+     List<SegmentReader> readers;        // used by IndexWriter
+     List<SegmentReader> readerClones;   // used by IndexWriter
+     public final List<SegmentInfo> segments;

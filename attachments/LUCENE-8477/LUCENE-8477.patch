@@ -1,0 +1,1171 @@
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/ConjunctionIntervalsSource.java b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/ConjunctionIntervalsSource.java
+index 123cc38d43..f28d5ec8c9 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/ConjunctionIntervalsSource.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/ConjunctionIntervalsSource.java
+@@ -19,8 +19,13 @@ package org.apache.lucene.search.intervals;
+ 
+ import java.io.IOException;
+ import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.HashSet;
+ import java.util.List;
+ import java.util.Objects;
++import java.util.Set;
+ import java.util.stream.Collectors;
+ 
+ import org.apache.lucene.index.LeafReaderContext;
+@@ -37,10 +42,26 @@ class ConjunctionIntervalsSource extends IntervalsSource {
+   protected final IntervalFunction function;
+ 
+   ConjunctionIntervalsSource(List<IntervalsSource> subSources, IntervalFunction function) {
+-    this.subSources = subSources;
++    assert subSources.size() > 1;
++    this.subSources = rewrite(subSources, function);
+     this.function = function;
+   }
+ 
++  private static List<IntervalsSource> rewrite(List<IntervalsSource> subSources, IntervalFunction function) {
++    List<IntervalsSource> flattenedSources = new ArrayList<>();
++    for (IntervalsSource source : subSources) {
++      if (source instanceof ConjunctionIntervalsSource) {
++        IntervalFunction wrappedFunction = ((ConjunctionIntervalsSource)source).function;
++        if (wrappedFunction == function) {
++          flattenedSources.addAll(((ConjunctionIntervalsSource)source).subSources);
++          continue;
++        }
++      }
++      flattenedSources.add(source);
++    }
++    return rewriteDisjunctions(flattenedSources, function);
++  }
++
+   @Override
+   public boolean equals(Object o) {
+     if (this == o) return true;
+@@ -73,6 +94,20 @@ class ConjunctionIntervalsSource extends IntervalsSource {
+     return minExtent;
+   }
+ 
++  @Override
++  public Collection<IntervalsSource> getDisjunctions() {
++    if (function.isFiltering() == false) {
++      return Collections.singleton(this);
++    }
++    assert subSources.size() == 2;
++    Collection<IntervalsSource> inner = subSources.get(0).getDisjunctions();
++    if (inner.size() == 1) {
++      return Collections.singleton(this);
++    }
++    IntervalsSource filter = subSources.get(1);
++    return inner.stream().map(s -> new ConjunctionIntervalsSource(Arrays.asList(s, filter), function)).collect(Collectors.toSet());
++  }
++
+   @Override
+   public IntervalIterator intervals(String field, LeafReaderContext ctx) throws IOException {
+     List<IntervalIterator> subIntervals = new ArrayList<>();
+@@ -93,6 +128,9 @@ class ConjunctionIntervalsSource extends IntervalsSource {
+       if (mi == null) {
+         return null;
+       }
++      if (function.isMinimizing()) {
++        mi = new CachingMatchesIterator(mi);
++      }
+       subs.add(mi);
+     }
+     IntervalIterator it = function.apply(subs.stream().map(m -> IntervalMatches.wrapMatches(m, doc)).collect(Collectors.toList()));
+@@ -102,7 +140,7 @@ class ConjunctionIntervalsSource extends IntervalsSource {
+     if (it.nextInterval() == IntervalIterator.NO_MORE_INTERVALS) {
+       return null;
+     }
+-    return new ConjunctionMatchesIterator(it, subs);
++    return function.isMinimizing() ? new MinimizingConjunctionMatchesIterator(it, subs) : new ConjunctionMatchesIterator(it, subs);
+   }
+ 
+   @Override
+@@ -194,4 +232,67 @@ class ConjunctionIntervalsSource extends IntervalsSource {
+     }
+   }
+ 
++  private static class Clauses {
++
++    final Set<IntervalsSource> singletons = new HashSet<>();
++    final Set<IntervalsSource> nonSingletons = new HashSet<>();
++
++    Clauses(IntervalsSource source) {
++      for (IntervalsSource s : source.getDisjunctions()) {
++        if (s.minExtent() == 1) {
++          singletons.add(s);
++        }
++        else {
++          nonSingletons.add(s);
++        }
++      }
++    }
++
++    boolean hasNonSingletons() {
++      if (singletons.size() == 0) {
++        return nonSingletons.size() > 1;
++      }
++      return nonSingletons.size() > 0;
++    }
++
++    IntervalsSource rewrite(IntervalFunction function, IntervalsSource next) {
++      List<IntervalsSource> out = new ArrayList<>();
++      if (singletons.size() > 0) {
++        out.add(new ConjunctionIntervalsSource(Arrays.asList(Intervals.or(singletons.toArray(new IntervalsSource[0])), next), function));
++      }
++      for (IntervalsSource source : nonSingletons) {
++        out.add(new ConjunctionIntervalsSource(Arrays.asList(source, next), function));
++      }
++      return Intervals.or(out.toArray(new IntervalsSource[0]));
++    }
++
++  }
++
++  private static List<IntervalsSource> rewriteDisjunctions(List<IntervalsSource> sources, IntervalFunction function) {
++    if (function.rewriteDisjunctions() == false) {
++      return sources;
++    }
++    // Go backwards through the list, from n - 1 to 0
++    // If n is a disjunction, then collect term counts for each of its subsources
++    // if we have a mixture of single-term and multiple-term subsources, then we need to rewrite
++    // - each subsource with multiple terms becomes function(subsource, subsource(n + 1))
++    // - collect all single term subsources together and create function(or(singletons), subsource(n + 1))
++    // - replace this subsource with disjunction of created functions
++    // - remove subsource(n + 1)
++
++    for (int i = sources.size() - 2; i >= 0; i--) {
++      Clauses clauses = new Clauses(sources.get(i));
++      if (clauses.hasNonSingletons()) {
++        sources.set(i, clauses.rewrite(function, sources.get(i + 1)));
++        sources.remove(i + 1);
++        // if we've rewritten stuff and there are still trailing sources, then we back
++        // up to see if we need to rewrite again
++        if (i < sources.size() - 1) {
++          i++;
++        }
++      }
++    }
++    return sources;
++  }
++
+ }
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/DifferenceIntervalsSource.java b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/DifferenceIntervalsSource.java
+index f1d096c0bc..2b05ebfd65 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/DifferenceIntervalsSource.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/DifferenceIntervalsSource.java
+@@ -18,7 +18,10 @@
+ package org.apache.lucene.search.intervals;
+ 
+ import java.io.IOException;
++import java.util.Collection;
++import java.util.Collections;
+ import java.util.Objects;
++import java.util.stream.Collectors;
+ 
+ import org.apache.lucene.index.LeafReaderContext;
+ import org.apache.lucene.search.BooleanClause;
+@@ -62,6 +65,15 @@ class DifferenceIntervalsSource extends IntervalsSource {
+     return IntervalMatches.asMatches(difference, minIt, doc);
+   }
+ 
++  @Override
++  public Collection<IntervalsSource> getDisjunctions() {
++    Collection<IntervalsSource> inner = minuend.getDisjunctions();
++    if (inner.size() == 1) {
++      return Collections.singleton(this);
++    }
++    return inner.stream().map(s -> new DifferenceIntervalsSource(s, subtrahend, function)).collect(Collectors.toSet());
++  }
++
+   @Override
+   public boolean equals(Object o) {
+     if (this == o) return true;
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/DisjunctionIntervalsSource.java b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/DisjunctionIntervalsSource.java
+index f37dcb60d3..52dd8fd901 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/DisjunctionIntervalsSource.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/DisjunctionIntervalsSource.java
+@@ -19,8 +19,11 @@ package org.apache.lucene.search.intervals;
+ 
+ import java.io.IOException;
+ import java.util.ArrayList;
++import java.util.Collection;
++import java.util.HashSet;
+ import java.util.List;
+ import java.util.Objects;
++import java.util.Set;
+ import java.util.stream.Collectors;
+ 
+ import org.apache.lucene.index.LeafReaderContext;
+@@ -34,10 +37,18 @@ import org.apache.lucene.util.PriorityQueue;
+ 
+ class DisjunctionIntervalsSource extends IntervalsSource {
+ 
+-  final List<IntervalsSource> subSources;
++  final Collection<IntervalsSource> subSources;
+ 
+-  public DisjunctionIntervalsSource(List<IntervalsSource> subSources) {
+-    this.subSources = subSources;
++  public DisjunctionIntervalsSource(Collection<IntervalsSource> subSources) {
++    this.subSources = simplify(subSources);
++  }
++
++  private static Collection<IntervalsSource> simplify(Collection<IntervalsSource> sources) {
++    Set<IntervalsSource> simplified = new HashSet<>();
++    for (IntervalsSource source : sources) {
++      simplified.addAll(source.getDisjunctions());
++    }
++    return simplified;
+   }
+ 
+   @Override
+@@ -95,13 +106,18 @@ class DisjunctionIntervalsSource extends IntervalsSource {
+ 
+   @Override
+   public int minExtent() {
+-    int minExtent = subSources.get(0).minExtent();
+-    for (int i = 1; i < subSources.size(); i++) {
+-      minExtent = Math.min(minExtent, subSources.get(i).minExtent());
++    int minExtent = Integer.MAX_VALUE;
++    for (IntervalsSource subSource : subSources) {
++      minExtent = Math.min(minExtent, subSource.minExtent());
+     }
+     return minExtent;
+   }
+ 
++  @Override
++  public Collection<IntervalsSource> getDisjunctions() {
++    return subSources;
++  }
++
+   static class DisjunctionIntervalIterator extends IntervalIterator {
+ 
+     final DocIdSetIterator approximation;
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/ExtendedIntervalsSource.java b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/ExtendedIntervalsSource.java
+index 41a8829b94..96a3a2bd92 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/ExtendedIntervalsSource.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/ExtendedIntervalsSource.java
+@@ -18,7 +18,10 @@
+ package org.apache.lucene.search.intervals;
+ 
+ import java.io.IOException;
++import java.util.Collection;
++import java.util.Collections;
+ import java.util.Objects;
++import java.util.stream.Collectors;
+ 
+ import org.apache.lucene.index.LeafReaderContext;
+ import org.apache.lucene.search.MatchesIterator;
+@@ -69,6 +72,15 @@ class ExtendedIntervalsSource extends IntervalsSource {
+     return minExtent;
+   }
+ 
++  @Override
++  public Collection<IntervalsSource> getDisjunctions() {
++    Collection<IntervalsSource> inner = source.getDisjunctions();
++    if (inner.size() == 0) {
++      return Collections.singleton(this);
++    }
++    return inner.stream().map(s -> new ExtendedIntervalsSource(s, before, after)).collect(Collectors.toSet());
++  }
++
+   @Override
+   public boolean equals(Object o) {
+     if (this == o) return true;
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/FilteredIntervalsSource.java b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/FilteredIntervalsSource.java
+index b3341297c9..b4db977981 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/FilteredIntervalsSource.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/FilteredIntervalsSource.java
+@@ -18,7 +18,10 @@
+ package org.apache.lucene.search.intervals;
+ 
+ import java.io.IOException;
++import java.util.Collection;
++import java.util.Collections;
+ import java.util.Objects;
++import java.util.stream.Collectors;
+ 
+ import org.apache.lucene.index.LeafReaderContext;
+ import org.apache.lucene.search.MatchesIterator;
+@@ -81,6 +84,24 @@ public abstract class FilteredIntervalsSource extends IntervalsSource {
+     return in.minExtent();
+   }
+ 
++  @Override
++  public Collection<IntervalsSource> getDisjunctions() {
++    Collection<IntervalsSource> inner = in.getDisjunctions();
++    if (inner.size() == 1) {
++      return Collections.singleton(this);
++    }
++    return inner.stream().map(this::wrap).collect(Collectors.toSet());
++  }
++
++  private IntervalsSource wrap(IntervalsSource in) {
++    return new FilteredIntervalsSource(name, in) {
++      @Override
++      protected boolean accept(IntervalIterator it) {
++        return FilteredIntervalsSource.this.accept(it);
++      }
++    };
++  }
++
+   @Override
+   public void visit(String field, QueryVisitor visitor) {
+     in.visit(field, visitor);
+@@ -89,7 +110,7 @@ public abstract class FilteredIntervalsSource extends IntervalsSource {
+   @Override
+   public boolean equals(Object o) {
+     if (this == o) return true;
+-    if (o == null || getClass() != o.getClass()) return false;
++    if (o == null || o instanceof FilteredIntervalsSource == false) return false;
+     FilteredIntervalsSource that = (FilteredIntervalsSource) o;
+     return Objects.equals(name, that.name) &&
+         Objects.equals(in, that.in);
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/FixedFieldIntervalsSource.java b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/FixedFieldIntervalsSource.java
+index ab24ee359e..e21c75ae0d 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/FixedFieldIntervalsSource.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/FixedFieldIntervalsSource.java
+@@ -18,7 +18,10 @@
+ package org.apache.lucene.search.intervals;
+ 
+ import java.io.IOException;
++import java.util.Collection;
++import java.util.Collections;
+ import java.util.Objects;
++import java.util.stream.Collectors;
+ 
+ import org.apache.lucene.index.LeafReaderContext;
+ import org.apache.lucene.search.MatchesIterator;
+@@ -54,6 +57,15 @@ class FixedFieldIntervalsSource extends IntervalsSource {
+     return source.minExtent();
+   }
+ 
++  @Override
++  public Collection<IntervalsSource> getDisjunctions() {
++    Collection<IntervalsSource> inner = source.getDisjunctions();
++    if (inner.size() == 1) {
++      return Collections.singleton(this);
++    }
++    return inner.stream().map(s -> new FixedFieldIntervalsSource(field, s)).collect(Collectors.toSet());
++  }
++
+   @Override
+   public boolean equals(Object o) {
+     if (this == o) return true;
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/IntervalFilter.java b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/IntervalFilter.java
+index 46c030217e..dcb59bccc1 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/IntervalFilter.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/IntervalFilter.java
+@@ -85,7 +85,7 @@ public abstract class IntervalFilter extends IntervalIterator {
+     do {
+       next = in.nextInterval();
+     }
+-    while (accept() == false && next != IntervalIterator.NO_MORE_INTERVALS);
++    while (next != IntervalIterator.NO_MORE_INTERVALS && accept() == false);
+     return next;
+   }
+ 
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/IntervalFunction.java b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/IntervalFunction.java
+index 862e9a86a5..930fd87e86 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/IntervalFunction.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/IntervalFunction.java
+@@ -28,6 +28,25 @@ import org.apache.lucene.util.PriorityQueue;
+  */
+ abstract class IntervalFunction {
+ 
++  /**
++   * BLOCK and ordered near queries may need to rewrite inner disjunctions if they
++   * contain sources that are prefixes of another source
++   *
++   * eg BLOCK(a, OR(b, BLOCK(b, c)), d) must be rewritten, otherwise it will not
++   * match documents containing "a b c d"
++   */
++  abstract boolean rewriteDisjunctions();
++
++  /**
++   * @return {@code true} if the function eagerly advances its subintervals to minimize itself
++   */
++  abstract boolean isMinimizing();
++
++  /**
++   * @return {@code true} if the function returns the values of one subinterval filtered by another
++   */
++  abstract boolean isFiltering();
++
+   @Override
+   public abstract int hashCode();
+ 
+@@ -42,7 +61,7 @@ abstract class IntervalFunction {
+    */
+   public abstract IntervalIterator apply(List<IntervalIterator> iterators);
+ 
+-  static final IntervalFunction BLOCK = new SingletonFunction("BLOCK") {
++  static final IntervalFunction BLOCK = new SingletonFunction("BLOCK", false, true, false) {
+     @Override
+     public IntervalIterator apply(List<IntervalIterator> iterators) {
+       return new BlockIntervalIterator(iterators);
+@@ -105,7 +124,7 @@ abstract class IntervalFunction {
+   /**
+    * Return an iterator over intervals where the subiterators appear in a given order
+    */
+-  static final IntervalFunction ORDERED = new SingletonFunction("ORDERED") {
++  static final IntervalFunction ORDERED = new SingletonFunction("ORDERED", true, true, false) {
+     @Override
+     public IntervalIterator apply(List<IntervalIterator> intervalIterators) {
+       return new OrderedIntervalIterator(intervalIterators);
+@@ -182,7 +201,7 @@ abstract class IntervalFunction {
+   /**
+    * Return an iterator over intervals where the subiterators appear in any order
+    */
+-  static final IntervalFunction UNORDERED = new SingletonFunction("UNORDERED") {
++  static final IntervalFunction UNORDERED = new SingletonFunction("UNORDERED", true, false, false) {
+     @Override
+     public IntervalIterator apply(List<IntervalIterator> intervalIterators) {
+       return new UnorderedIntervalIterator(intervalIterators, true);
+@@ -192,7 +211,7 @@ abstract class IntervalFunction {
+   /**
+    * Return an iterator over intervals where the subiterators appear in any order, and do not overlap
+    */
+-  static final IntervalFunction UNORDERED_NO_OVERLAP = new SingletonFunction("UNORDERED_NO_OVERLAP") {
++  static final IntervalFunction UNORDERED_NO_OVERLAP = new SingletonFunction("UNORDERED_NO_OVERLAP", true, false, false) {
+     @Override
+     public IntervalIterator apply(List<IntervalIterator> iterators) {
+       return new UnorderedIntervalIterator(iterators, false);
+@@ -346,7 +365,7 @@ abstract class IntervalFunction {
+   /**
+    * Returns an interval over iterators where the first iterator contains intervals from the second
+    */
+-  static final IntervalFunction CONTAINING = new SingletonFunction("CONTAINING") {
++  static final IntervalFunction CONTAINING = new SingletonFunction("CONTAINING", false, false, true) {
+     @Override
+     public IntervalIterator apply(List<IntervalIterator> iterators) {
+       if (iterators.size() != 2)
+@@ -375,7 +394,7 @@ abstract class IntervalFunction {
+   /**
+    * Return an iterator over intervals where the first iterator is contained by intervals from the second
+    */
+-  static final IntervalFunction CONTAINED_BY = new SingletonFunction("CONTAINED_BY") {
++  static final IntervalFunction CONTAINED_BY = new SingletonFunction("CONTAINED_BY", false, false, true) {
+     @Override
+     public IntervalIterator apply(List<IntervalIterator> iterators) {
+       if (iterators.size() != 2)
+@@ -404,7 +423,7 @@ abstract class IntervalFunction {
+     }
+   };
+ 
+-  static final IntervalFunction OVERLAPPING = new SingletonFunction("OVERLAPPING") {
++  static final IntervalFunction OVERLAPPING = new SingletonFunction("OVERLAPPING", false, false, true) {
+     @Override
+     public IntervalIterator apply(List<IntervalIterator> iterators) {
+       if (iterators.size() != 2)
+@@ -476,9 +495,30 @@ abstract class IntervalFunction {
+   private static abstract class SingletonFunction extends IntervalFunction {
+ 
+     private final String name;
++    private final boolean rewriteDisjunctions;
++    private final boolean isMinimizing;
++    private final boolean isFiltering;
+ 
+-    protected SingletonFunction(String name) {
++    protected SingletonFunction(String name, boolean isMinimizing, boolean rewriteDisjunctions, boolean isFiltering) {
+       this.name = name;
++      this.rewriteDisjunctions = rewriteDisjunctions;
++      this.isMinimizing = isMinimizing;
++      this.isFiltering = isFiltering;
++    }
++
++    @Override
++    boolean rewriteDisjunctions() {
++      return rewriteDisjunctions;
++    }
++
++    @Override
++    boolean isMinimizing() {
++      return isMinimizing;
++    }
++
++    @Override
++    boolean isFiltering() {
++      return isFiltering;
+     }
+ 
+     @Override
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/Intervals.java b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/Intervals.java
+index cdb6105172..a76d39a3b3 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/Intervals.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/Intervals.java
+@@ -184,7 +184,7 @@ public final class Intervals {
+     if (subSources.length == 1) {
+       return subSources[0];
+     }
+-    return new MinimizingConjunctionIntervalsSource(Arrays.asList(subSources), IntervalFunction.ORDERED);
++    return new ConjunctionIntervalsSource(Arrays.asList(subSources), IntervalFunction.ORDERED);
+   }
+ 
+   /**
+@@ -210,7 +210,7 @@ public final class Intervals {
+     if (subSources.length == 1) {
+       return subSources[0];
+     }
+-    return new MinimizingConjunctionIntervalsSource(Arrays.asList(subSources),
++    return new ConjunctionIntervalsSource(Arrays.asList(subSources),
+         allowOverlaps ? IntervalFunction.UNORDERED : IntervalFunction.UNORDERED_NO_OVERLAP);
+   }
+ 
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/IntervalsSource.java b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/IntervalsSource.java
+index 1c49d248fa..bd9272750e 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/IntervalsSource.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/IntervalsSource.java
+@@ -18,6 +18,7 @@
+ package org.apache.lucene.search.intervals;
+ 
+ import java.io.IOException;
++import java.util.Collection;
+ 
+ import org.apache.lucene.index.LeafReaderContext;
+ import org.apache.lucene.search.MatchesIterator;
+@@ -64,6 +65,13 @@ public abstract class IntervalsSource {
+    */
+   public abstract int minExtent();
+ 
++  /**
++   * Expert: return the set of disjunctions that make up this IntervalsSource
++   *
++   * Most implementations can return {@code Collections.singleton(this)}
++   */
++  public abstract Collection<IntervalsSource> getDisjunctions();
++
+   @Override
+   public abstract int hashCode();
+ 
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/MinimizingConjunctionIntervalsSource.java b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/MinimizingConjunctionIntervalsSource.java
+deleted file mode 100644
+index 6e6f563b3d..0000000000
+--- a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/MinimizingConjunctionIntervalsSource.java
++++ /dev/null
+@@ -1,133 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.lucene.search.intervals;
+-
+-import java.io.IOException;
+-import java.util.ArrayList;
+-import java.util.List;
+-import java.util.stream.Collectors;
+-
+-import org.apache.lucene.index.LeafReaderContext;
+-import org.apache.lucene.search.MatchesIterator;
+-import org.apache.lucene.search.MatchesUtils;
+-import org.apache.lucene.search.Query;
+-
+-/**
+- * A ConjunctionIntervalsSource that attempts to minimize its internal intervals by
+- * eagerly advancing its first subinterval
+- *
+- * Uses caching to expose matches after its first subinterval has been moved on
+- */
+-class MinimizingConjunctionIntervalsSource extends ConjunctionIntervalsSource {
+-
+-  MinimizingConjunctionIntervalsSource(List<IntervalsSource> subSources, IntervalFunction function) {
+-    super(subSources, function);
+-  }
+-
+-  @Override
+-  public MatchesIterator matches(String field, LeafReaderContext ctx, int doc) throws IOException {
+-    List<CachingMatchesIterator> subs = new ArrayList<>();
+-    for (IntervalsSource source : subSources) {
+-      MatchesIterator mi = source.matches(field, ctx, doc);
+-      if (mi == null) {
+-        return null;
+-      }
+-      subs.add(new CachingMatchesIterator(mi));
+-    }
+-    IntervalIterator it = function.apply(subs.stream().map(m -> IntervalMatches.wrapMatches(m, doc)).collect(Collectors.toList()));
+-    if (it.advance(doc) != doc) {
+-      return null;
+-    }
+-    if (it.nextInterval() == IntervalIterator.NO_MORE_INTERVALS) {
+-      return null;
+-    }
+-    return new ConjunctionMatchesIterator(it, subs);
+-  }
+-
+-  private static class ConjunctionMatchesIterator implements IntervalMatchesIterator {
+-
+-    final IntervalIterator iterator;
+-    final List<CachingMatchesIterator> subs;
+-    boolean cached = true;
+-
+-    private ConjunctionMatchesIterator(IntervalIterator iterator, List<CachingMatchesIterator> subs) {
+-      this.iterator = iterator;
+-      this.subs = subs;
+-    }
+-
+-    @Override
+-    public boolean next() throws IOException {
+-      if (cached) {
+-        cached = false;
+-        return true;
+-      }
+-      return iterator.nextInterval() != IntervalIterator.NO_MORE_INTERVALS;
+-    }
+-
+-    @Override
+-    public int startPosition() {
+-      return iterator.start();
+-    }
+-
+-    @Override
+-    public int endPosition() {
+-      return iterator.end();
+-    }
+-
+-    @Override
+-    public int startOffset() throws IOException {
+-      int start = Integer.MAX_VALUE;
+-      int endPos = endPosition();
+-      for (CachingMatchesIterator s : subs) {
+-        start = Math.min(start, s.startOffset(endPos));
+-      }
+-      return start;
+-    }
+-
+-    @Override
+-    public int endOffset() throws IOException {
+-      int end = 0;
+-      int endPos = endPosition();
+-      for (CachingMatchesIterator s : subs) {
+-        end = Math.max(end, s.endOffset(endPos));
+-      }
+-      return end;
+-    }
+-
+-    @Override
+-    public int gaps() {
+-      return iterator.gaps();
+-    }
+-
+-    @Override
+-    public MatchesIterator getSubMatches() throws IOException {
+-      List<MatchesIterator> mis = new ArrayList<>();
+-      int endPos = endPosition();
+-      for (CachingMatchesIterator s : subs) {
+-        mis.add(s.getSubMatches(endPos));
+-      }
+-      return MatchesUtils.disjunction(mis);
+-    }
+-
+-    @Override
+-    public Query getQuery() {
+-      return null;
+-    }
+-  }
+-
+-}
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/MinimizingConjunctionMatchesIterator.java b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/MinimizingConjunctionMatchesIterator.java
+new file mode 100644
+index 0000000000..2460be8d65
+--- /dev/null
++++ b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/MinimizingConjunctionMatchesIterator.java
+@@ -0,0 +1,100 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.lucene.search.intervals;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++
++import org.apache.lucene.search.MatchesIterator;
++import org.apache.lucene.search.MatchesUtils;
++import org.apache.lucene.search.Query;
++
++class MinimizingConjunctionMatchesIterator implements IntervalMatchesIterator {
++
++  final IntervalIterator iterator;
++  private final List<CachingMatchesIterator> subs = new ArrayList<>();
++  private boolean cached = true;
++
++  MinimizingConjunctionMatchesIterator(IntervalIterator iterator, List<MatchesIterator> subs) {
++    this.iterator = iterator;
++    for (MatchesIterator mi : subs) {
++      assert mi instanceof CachingMatchesIterator;
++      this.subs.add((CachingMatchesIterator)mi);
++    }
++  }
++
++  @Override
++  public boolean next() throws IOException {
++    if (cached) {
++      cached = false;
++      return true;
++    }
++    return iterator.nextInterval() != IntervalIterator.NO_MORE_INTERVALS;
++  }
++
++  @Override
++  public int startPosition() {
++    return iterator.start();
++  }
++
++  @Override
++  public int endPosition() {
++    return iterator.end();
++  }
++
++  @Override
++  public int startOffset() throws IOException {
++    int start = Integer.MAX_VALUE;
++    int endPos = endPosition();
++    for (CachingMatchesIterator s : subs) {
++      start = Math.min(start, s.startOffset(endPos));
++    }
++    return start;
++  }
++
++  @Override
++  public int endOffset() throws IOException {
++    int end = 0;
++    int endPos = endPosition();
++    for (CachingMatchesIterator s : subs) {
++      end = Math.max(end, s.endOffset(endPos));
++    }
++    return end;
++  }
++
++  @Override
++  public int gaps() {
++    return iterator.gaps();
++  }
++
++  @Override
++  public MatchesIterator getSubMatches() throws IOException {
++    List<MatchesIterator> mis = new ArrayList<>();
++    int endPos = endPosition();
++    for (CachingMatchesIterator s : subs) {
++      mis.add(s.getSubMatches(endPos));
++    }
++    return MatchesUtils.disjunction(mis);
++  }
++
++  @Override
++  public Query getQuery() {
++    return null;
++  }
++}
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/MinimumShouldMatchIntervalsSource.java b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/MinimumShouldMatchIntervalsSource.java
+index a06c47839b..ed1d898e5e 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/MinimumShouldMatchIntervalsSource.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/MinimumShouldMatchIntervalsSource.java
+@@ -21,6 +21,7 @@ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
++import java.util.Collections;
+ import java.util.IdentityHashMap;
+ import java.util.List;
+ import java.util.Map;
+@@ -107,6 +108,11 @@ class MinimumShouldMatchIntervalsSource extends IntervalsSource {
+     return minExtent;
+   }
+ 
++  @Override
++  public Collection<IntervalsSource> getDisjunctions() {
++    return Collections.singleton(this);
++  }
++
+   @Override
+   public String toString() {
+     return "AtLeast("
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/MultiTermIntervalsSource.java b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/MultiTermIntervalsSource.java
+index 1ee52d4c3a..1f3131cf7a 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/MultiTermIntervalsSource.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/MultiTermIntervalsSource.java
+@@ -19,6 +19,8 @@ package org.apache.lucene.search.intervals;
+ 
+ import java.io.IOException;
+ import java.util.ArrayList;
++import java.util.Collection;
++import java.util.Collections;
+ import java.util.List;
+ import java.util.Objects;
+ 
+@@ -97,6 +99,11 @@ class MultiTermIntervalsSource extends IntervalsSource {
+     return 1;
+   }
+ 
++  @Override
++  public Collection<IntervalsSource> getDisjunctions() {
++    return Collections.singleton(this);
++  }
++
+   @Override
+   public boolean equals(Object o) {
+     if (this == o) return true;
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/OffsetIntervalsSource.java b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/OffsetIntervalsSource.java
+index 078c64b027..92170c672a 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/OffsetIntervalsSource.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/OffsetIntervalsSource.java
+@@ -18,6 +18,8 @@
+ package org.apache.lucene.search.intervals;
+ 
+ import java.io.IOException;
++import java.util.Collection;
++import java.util.Collections;
+ import java.util.Objects;
+ 
+ import org.apache.lucene.index.LeafReaderContext;
+@@ -152,6 +154,11 @@ class OffsetIntervalsSource extends IntervalsSource {
+     return 1;
+   }
+ 
++  @Override
++  public Collection<IntervalsSource> getDisjunctions() {
++    return Collections.singleton(this);
++  }
++
+   @Override
+   public boolean equals(Object o) {
+     if (this == o) return true;
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/PayloadFilteredTermIntervalsSource.java b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/PayloadFilteredTermIntervalsSource.java
+index 4b4b1230d1..4ee60777f4 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/PayloadFilteredTermIntervalsSource.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/PayloadFilteredTermIntervalsSource.java
+@@ -18,6 +18,8 @@
+ package org.apache.lucene.search.intervals;
+ 
+ import java.io.IOException;
++import java.util.Collection;
++import java.util.Collections;
+ import java.util.Objects;
+ import java.util.function.Predicate;
+ 
+@@ -224,6 +226,11 @@ class PayloadFilteredTermIntervalsSource extends IntervalsSource {
+     return 1;
+   }
+ 
++  @Override
++  public Collection<IntervalsSource> getDisjunctions() {
++    return Collections.singleton(this);
++  }
++
+   @Override
+   public int hashCode() {
+     return Objects.hash(term);
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/TermIntervalsSource.java b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/TermIntervalsSource.java
+index 3d6fe20b32..a7752b6f8b 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/search/intervals/TermIntervalsSource.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/search/intervals/TermIntervalsSource.java
+@@ -18,6 +18,8 @@
+ package org.apache.lucene.search.intervals;
+ 
+ import java.io.IOException;
++import java.util.Collection;
++import java.util.Collections;
+ import java.util.Objects;
+ 
+ import org.apache.lucene.codecs.lucene50.Lucene50PostingsFormat;
+@@ -208,6 +210,11 @@ class TermIntervalsSource extends IntervalsSource {
+     return 1;
+   }
+ 
++  @Override
++  public Collection<IntervalsSource> getDisjunctions() {
++    return Collections.singleton(this);
++  }
++
+   @Override
+   public int hashCode() {
+     return Objects.hash(term);
+diff --git a/lucene/sandbox/src/test/org/apache/lucene/search/intervals/TestDisjunctionRewrites.java b/lucene/sandbox/src/test/org/apache/lucene/search/intervals/TestDisjunctionRewrites.java
+new file mode 100644
+index 0000000000..2dbe90ebdf
+--- /dev/null
++++ b/lucene/sandbox/src/test/org/apache/lucene/search/intervals/TestDisjunctionRewrites.java
+@@ -0,0 +1,97 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.lucene.search.intervals;
++
++import org.apache.lucene.util.LuceneTestCase;
++
++public class TestDisjunctionRewrites extends LuceneTestCase {
++
++  public void testPhraseDisjunctionWithDifferentLengthClauses() {
++
++    // BLOCK(a, or(b, BLOCK(b, c)), d) => BLOCK(a, or(BLOCK(b, d), BLOCK(b, c, d)))
++
++    IntervalsSource actual = Intervals.phrase(
++        Intervals.term("a"),
++        Intervals.or(Intervals.term("b"), Intervals.phrase(Intervals.term("b"), Intervals.term("c"))),
++        Intervals.term("d"));
++
++    IntervalsSource expected = Intervals.phrase(
++        Intervals.term("a"),
++        Intervals.or(Intervals.phrase(Intervals.term("b"), Intervals.term("d")),
++            Intervals.phrase(Intervals.term("b"), Intervals.term("c"), Intervals.term("d"))));
++
++    assertEquals(expected, actual);
++
++  }
++
++  public void testPhraseDisjunctionWithNestedDifferentLengthClauses() {
++
++    // BLOCK(a, or(ORDERED(or(b, c), d), b, p, q), f, g)
++    //  => BLOCK(a, or(BLOCK(ordered(or(b, c), d), f, g), BLOCK(or(b, p, q), f, g)))
++
++    IntervalsSource actual = Intervals.phrase(
++        Intervals.term("a"),
++        Intervals.or(
++            Intervals.ordered(Intervals.or(Intervals.term("b"), Intervals.term("c")), Intervals.term("d")),
++            Intervals.term("b"),
++            Intervals.term("p"),
++            Intervals.term("q")
++        ),
++        Intervals.term("f"),
++        Intervals.term("g")
++    );
++
++    IntervalsSource expected = Intervals.phrase(
++        Intervals.term("a"),
++        Intervals.or(
++            Intervals.phrase(
++                Intervals.ordered(Intervals.or(Intervals.term("b"), Intervals.term("c")), Intervals.term("d")),
++                Intervals.term("f")),
++            Intervals.phrase(Intervals.or(Intervals.term("p"), Intervals.term("q"), Intervals.term("b")), Intervals.term("f"))
++        ),
++        Intervals.term("g")
++    );
++
++    assertEquals(expected, actual);
++  }
++
++  public void testDisjunctionRewritePreservesFilters() {
++
++    // BLOCK(a, MAXGAPS/3(OR(BLOCK(a, b), BLOCK(c, d))), c
++    // => BLOCK(a, OR(BLOCK(MAXGAPS/3(BLOCK(a, b)), c), BLOCK(MAXGAPS/3(BLOCK(c, d)), c)))
++
++    IntervalsSource actual = Intervals.phrase(
++        Intervals.term("a"),
++        Intervals.maxgaps(3, Intervals.or(
++            Intervals.phrase("a", "b"),
++            Intervals.phrase("c", "d")
++        )),
++        Intervals.term("c")
++    );
++
++    IntervalsSource expected = Intervals.phrase(
++        Intervals.term("a"),
++        Intervals.or(
++            Intervals.phrase(Intervals.maxgaps(3, Intervals.phrase("a", "b")), Intervals.term("c")),
++            Intervals.phrase(Intervals.maxgaps(3, Intervals.phrase("c", "d")), Intervals.term("c"))));
++
++    assertEquals(expected, actual);
++
++  }
++
++}
+diff --git a/lucene/sandbox/src/test/org/apache/lucene/search/intervals/TestIntervalQuery.java b/lucene/sandbox/src/test/org/apache/lucene/search/intervals/TestIntervalQuery.java
+index 9cea616b3a..eb20769141 100644
+--- a/lucene/sandbox/src/test/org/apache/lucene/search/intervals/TestIntervalQuery.java
++++ b/lucene/sandbox/src/test/org/apache/lucene/search/intervals/TestIntervalQuery.java
+@@ -31,7 +31,6 @@ import org.apache.lucene.search.Query;
+ import org.apache.lucene.search.TopDocs;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.util.LuceneTestCase;
+-import org.junit.Ignore;
+ 
+ public class TestIntervalQuery extends LuceneTestCase {
+ 
+@@ -166,10 +165,6 @@ public class TestIntervalQuery extends LuceneTestCase {
+     checkHits(q, new int[]{});
+   }
+ 
+-  // The Vigna paper doesn't deal with prefix disjunctions.  For now, we keep the same
+-  // logic as detailed in the paper, but we may want to address it in future so that tests
+-  // like the one below will pass
+-  @Ignore
+   public void testNestedOr() throws IOException {
+     Query q = new IntervalQuery(field, Intervals.phrase(
+         Intervals.term("coordinate"),
+@@ -178,6 +173,34 @@ public class TestIntervalQuery extends LuceneTestCase {
+     checkHits(q, new int[]{ 6, 7 });
+   }
+ 
++  public void testNestedOrWithGaps() throws IOException {
++    Query q = new IntervalQuery(field, Intervals.phrase(
++        Intervals.term("coordinate"),
++        Intervals.or(Intervals.term("genome"), Intervals.extend(Intervals.term("mapping"), 1, 0)),
++        Intervals.term("research")));
++    checkHits(q, new int[]{ 6, 7 });
++  }
++
++  public void testNestedOrWithinDifference() throws IOException {
++    Query q = new IntervalQuery(field, Intervals.phrase(
++        Intervals.term("coordinate"),
++        Intervals.notContaining(
++            Intervals.or(Intervals.phrase("genome", "mapping"), Intervals.term("genome")),
++            Intervals.term("wibble")),
++        Intervals.term("research")));
++    checkHits(q, new int[]{ 6, 7 });
++  }
++
++  public void testNestedOrWithinConjunctionFilter() throws IOException {
++    Query q = new IntervalQuery(field, Intervals.phrase(
++        Intervals.term("coordinate"),
++        Intervals.containing(
++            Intervals.or(Intervals.phrase("genome", "mapping"), Intervals.term("genome")),
++            Intervals.term("genome")),
++        Intervals.term("research")));
++    checkHits(q, new int[]{ 6, 7 });
++  }
++
+   public void testUnordered() throws IOException {
+     Query q = new IntervalQuery(field,
+         Intervals.unordered(
+diff --git a/lucene/sandbox/src/test/org/apache/lucene/search/intervals/TestIntervals.java b/lucene/sandbox/src/test/org/apache/lucene/search/intervals/TestIntervals.java
+index c8452a8b67..84858aaeb5 100644
+--- a/lucene/sandbox/src/test/org/apache/lucene/search/intervals/TestIntervals.java
++++ b/lucene/sandbox/src/test/org/apache/lucene/search/intervals/TestIntervals.java
+@@ -762,4 +762,22 @@ public class TestIntervals extends LuceneTestCase {
+     assertMatch(mi, 17, 17, 97, 100);
+   }
+ 
++  public void testWrappedFilters() throws IOException {
++
++    IntervalsSource source = Intervals.or(
++        Intervals.term("nine"),
++        Intervals.maxgaps(1, Intervals.or(
++            Intervals.ordered(Intervals.term("pease"), Intervals.term("hot")),
++            Intervals.ordered(Intervals.term("pease"), Intervals.term("cold")))));
++    checkIntervals(source, "field1", 3, new int[][]{
++        {},
++        { 0, 2, 3, 5, 11, 11, 28, 28 },
++        { 0, 2, 3, 5 },
++        {},
++        { 0, 2, 3, 5, 11, 11 },
++        {}
++    });
++
++  }
++
+ }
+diff --git a/lucene/sandbox/src/test/org/apache/lucene/search/intervals/TestSimplifications.java b/lucene/sandbox/src/test/org/apache/lucene/search/intervals/TestSimplifications.java
+index 3c7293b5c2..9e235e3e06 100644
+--- a/lucene/sandbox/src/test/org/apache/lucene/search/intervals/TestSimplifications.java
++++ b/lucene/sandbox/src/test/org/apache/lucene/search/intervals/TestSimplifications.java
+@@ -22,6 +22,7 @@ import org.apache.lucene.util.LuceneTestCase;
+ public class TestSimplifications extends LuceneTestCase {
+ 
+   public void testStringPhrases() {
++    // BLOCK(term) => term
+     IntervalsSource actual = Intervals.phrase("term");
+     assertEquals(Intervals.term("term"), actual);
+   }
+@@ -32,18 +33,58 @@ public class TestSimplifications extends LuceneTestCase {
+   }
+ 
+   public void testOrdered() {
++    // ORDERED(term) => term
+     IntervalsSource actual = Intervals.ordered(Intervals.term("term"));
+     assertEquals(Intervals.term("term"), actual);
+   }
+ 
+   public void testUnordered() {
++    // UNORDERED(term) => term
+     IntervalsSource actual = Intervals.unordered(Intervals.term("term"));
+     assertEquals(Intervals.term("term"), actual);
+   }
+ 
+   public void testUnorderedOverlaps() {
+-    IntervalsSource actual = Intervals.unordered(true, Intervals.term("term"));
++    // UNORDERED_NO_OVERLAPS(term) => term
++    IntervalsSource actual = Intervals.unordered(false, Intervals.term("term"));
+     assertEquals(Intervals.term("term"), actual);
+   }
+ 
++  public void testDisjunctionRemovesDuplicates() {
++    // or(a, b, a) => or(a, b)
++    IntervalsSource actual = Intervals.or(Intervals.term("a"), Intervals.term("b"), Intervals.term("a"));
++    assertEquals(Intervals.or(Intervals.term("a"), Intervals.term("b")), actual);
++  }
++
++  public void testPhraseSimplification() {
++    // BLOCK(BLOCK(a, b), c) => BLOCK(a, b, c)
++    IntervalsSource actual = Intervals.phrase(Intervals.phrase(Intervals.term("a"), Intervals.term("b")), Intervals.term("c"));
++    assertEquals(Intervals.phrase(Intervals.term("a"), Intervals.term("b"), Intervals.term("c")), actual);
++
++    // BLOCK(a, BLOCK(b, BLOCK(c, d))) => BLOCK(a, b, c, d)
++    actual = Intervals.phrase(Intervals.term("a"), Intervals.phrase(Intervals.term("b"),
++        Intervals.phrase(Intervals.term("c"), Intervals.term("d"))));
++    assertEquals(Intervals.phrase(Intervals.term("a"), Intervals.term("b"), Intervals.term("c"), Intervals.term("d")), actual);
++  }
++
++  public void testDisjunctionSimplification() {
++    // or(a, or(b, or(c, d))) => or(a, b, c, d)
++    IntervalsSource actual = Intervals.or(Intervals.term("a"), Intervals.or(Intervals.term("b"),
++        Intervals.or(Intervals.term("c"), Intervals.term("d"))));
++    assertEquals(Intervals.or(Intervals.term("a"), Intervals.term("b"), Intervals.term("c"), Intervals.term("d")), actual);
++  }
++
++  public void testDisjunctionSimplificationPreservesFilters() {
++    // or(a, MAXGAPS/3(or(c, d)) => or(a, MAXGAPS/3(c), MAXGAPS/3(d))
++    IntervalsSource actual = Intervals.or(
++        Intervals.term("a"),
++        Intervals.maxgaps(3, Intervals.or(Intervals.term("c"), Intervals.term("d"))));
++    IntervalsSource expected = Intervals.or(
++        Intervals.term("a"),
++        Intervals.maxgaps(3, Intervals.term("c")),
++        Intervals.maxgaps(3, Intervals.term("d")));
++    System.out.println(actual);
++    assertEquals(expected, actual);
++  }
++
+ }

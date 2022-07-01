@@ -1,0 +1,264 @@
+Index: lucene/spatial/src/java/org/apache/lucene/spatial/geom/GeometryStrategy.java
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- lucene/spatial/src/java/org/apache/lucene/spatial/geom/GeometryStrategy.java	(revision )
++++ lucene/spatial/src/java/org/apache/lucene/spatial/geom/GeometryStrategy.java	(revision )
+@@ -0,0 +1,256 @@
++package org.apache.lucene.spatial.geom;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import com.spatial4j.core.context.SpatialContext;
++import com.spatial4j.core.io.BinaryCodec;
++import com.spatial4j.core.shape.Point;
++import com.spatial4j.core.shape.Shape;
++import org.apache.lucene.document.BinaryDocValuesField;
++import org.apache.lucene.document.Field;
++import org.apache.lucene.index.AtomicReader;
++import org.apache.lucene.index.AtomicReaderContext;
++import org.apache.lucene.index.BinaryDocValues;
++import org.apache.lucene.queries.function.ValueSource;
++import org.apache.lucene.search.DocIdSet;
++import org.apache.lucene.search.DocIdSetIterator;
++import org.apache.lucene.search.Filter;
++import org.apache.lucene.search.FilteredDocIdSet;
++import org.apache.lucene.spatial.SpatialStrategy;
++import org.apache.lucene.spatial.query.SpatialArgs;
++import org.apache.lucene.util.Bits;
++import org.apache.lucene.util.BytesRef;
++
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.DataInputStream;
++import java.io.DataOutputStream;
++import java.io.FilterOutputStream;
++import java.io.IOException;
++
++
++/** If you won't cache these queries because they are unlikely to yield further hits, then the only
++ * way to get acceptable performance is to use {@link org.apache.lucene.search.FilteredQuery} with
++ * {@link org.apache.lucene.search.FilteredQuery#QUERY_FIRST_FILTER_STRATEGY} such that the filter
++ * returned here is used last.
++ */
++public class GeometryStrategy extends SpatialStrategy {
++
++  /** A cache heuristic of the previous buf size. */
++  //TODO do we make this non-volatile since it's merely a heuristic?
++  private volatile int indexLastBufSize = 8 * 1024;//8KB default on first run
++
++  /**
++   * Constructs the spatial strategy with its mandatory arguments.
++   */
++  public GeometryStrategy(SpatialContext ctx, String fieldName) {
++    super(ctx, fieldName);
++  }
++
++  @Override
++  public Field[] createIndexableFields(Shape shape) {
++    int bufSize = Math.max(128, (int)(this.indexLastBufSize * 1.5));//50% headroom over last
++    ByteArrayOutputStream byteStream = new ByteArrayOutputStream(bufSize);
++    final BytesRef bytesRef = new BytesRef();//receiver of byteStream's bytes
++    try {
++      ctx.getBinaryCodec().writeShape(new DataOutputStream(byteStream), shape);
++      //this is a hack to avoid redundant byte array copying by byteStream.toByteArray()
++      byteStream.writeTo(new FilterOutputStream(null/*not used*/) {
++        @Override
++        public void write(byte[] b, int off, int len) throws IOException {
++          bytesRef.bytes = b;
++          bytesRef.offset = off;
++          bytesRef.length = len;
++        }
++      });
++    } catch (IOException e) {
++      throw new RuntimeException(e);
++    }
++    this.indexLastBufSize = bytesRef.length;//cache heuristic
++    return new Field[] {new BinaryDocValuesField(getFieldName(), bytesRef)};
++  }
++
++  @Override
++  public ValueSource makeDistanceValueSource(Point queryPoint, double multiplier) {
++    return null;//nocommit api change?
++  }
++
++  /**
++   * Returns a Filter that For maximum performance, the returned filter should be evaluated dead-last, such as wrapping
++   * a Query with
++   */
++  @Override
++  public Filter makeFilter(final SpatialArgs args) {
++    return new GeometryFilter(args);
++  }
++
++  private class GeometryFilter extends Filter {
++    private final SpatialArgs args;
++
++    public GeometryFilter(SpatialArgs args) {
++      this.args = args;
++    }
++
++    GeometryStrategy getStrategy() { return GeometryStrategy.this; }
++
++    @Override
++    public DocIdSet getDocIdSet(final AtomicReaderContext context, final Bits acceptDocs) throws IOException {
++      Bits geometryBits = getBits(context, acceptDocs, args);
++      if (geometryBits == null)
++        return null;
++      //FYI if the caller uses DocIdSet.iterator() instead of DocIdSet.bits(), performance will be
++      // terrible!  It might not be terrible if acceptDocs accepts very few docs
++      return new BitsDocIdSet(geometryBits);
++    }
++
++    @Override
++    public boolean equals(Object o) {
++      if (this == o) return true;
++      if (o == null || getClass() != o.getClass()) return false;
++
++      GeometryFilter that = (GeometryFilter) o;
++
++      if (!getStrategy().equals(that.getStrategy())) return false;
++      if (!args.equals(that.args)) return false;
++
++      return true;
++    }
++
++    @Override
++    public int hashCode() {
++      int result = getStrategy().hashCode();
++      result = 31 * result + args.hashCode();
++      return result;
++    }
++
++  }//GeometryFilter
++
++  /**
++   * Returns a {@link Bits} that is backed by an expensive lookup of a shape serialized in DocValues
++   * to see if it satisfies the operator and query shape in {@code args}. This is a mild abuse of
++   * the {@link Bits} interface, which is intended to be returned by {@link
++   * org.apache.lucene.search.DocIdSet#bits()} which further states that it should be fast without
++   * disk access.
++   *
++   * @return null if there are no matches at all
++   */
++  public Bits getBits(AtomicReaderContext context, Bits acceptDocs, SpatialArgs args) {
++    final AtomicReader reader = context.reader();
++    final BinaryDocValues binaryDocValues;
++    try {
++      binaryDocValues = reader.getBinaryDocValues(getFieldName());
++    } catch (IOException e) {
++      throw new RuntimeException(e);
++    }
++    if (binaryDocValues == null)
++      return null;
++    return new GeometryBits(binaryDocValues, acceptDocs, args, reader.maxDoc());
++  }
++
++  /** @see #getBits(org.apache.lucene.index.AtomicReaderContext, org.apache.lucene.util.Bits, org.apache.lucene.spatial.query.SpatialArgs) */
++  private class GeometryBits implements Bits {
++    private final BinaryDocValues docValues;
++    private final Bits acceptDocs;
++    private final SpatialArgs args;
++    private final BytesRef bytesRef = new BytesRef();//scratch
++    private final int maxDocs;
++    private final BinaryCodec binaryCodec;
++
++    GeometryBits(BinaryDocValues docValues, Bits acceptDocs, SpatialArgs args, int maxDocs) {
++      this.docValues = docValues;
++      this.acceptDocs = acceptDocs;
++      this.args = args;
++      this.maxDocs = maxDocs;
++      this.binaryCodec = GeometryStrategy.this.getSpatialContext().getBinaryCodec();
++    }
++
++    @Override
++    public boolean get(int docId) {
++      if (acceptDocs != null && !acceptDocs.get(docId))
++        return false;
++      //expensive!
++      docValues.get(docId, bytesRef);
++      Shape binShape;
++      DataInputStream dataInput = new DataInputStream(
++          new ByteArrayInputStream(bytesRef.bytes, bytesRef.offset, bytesRef.length));
++      try {
++        binShape = binaryCodec.readShape(dataInput);
++      } catch (IOException e) {
++        throw new RuntimeException(e);
++      }
++
++      return args.getOperation().evaluate(binShape, args.getShape());
++    }
++
++    @Override
++    public int length() {
++      return maxDocs;
++    }
++  }
++
++  /** Utility class that wraps a {@link Bits} with a {@link DocIdSet}. */
++  private static class BitsDocIdSet extends DocIdSet {
++    final Bits bits;//not null
++
++    public BitsDocIdSet(Bits bits) {
++      if (bits == null)
++        throw new NullPointerException("bits arg should be non-null");
++      this.bits = bits;
++    }
++
++    @Override
++    public DocIdSetIterator iterator() throws IOException {
++      return new DocIdSetIterator() {
++        final Bits bits = BitsDocIdSet.this.bits;//copy reference to reduce outer class access
++        int docId = -1;
++
++        @Override
++        public int docID() {
++          return docId;
++        }
++
++        @Override
++        public int nextDoc() throws IOException {
++          return advance(docId + 1);
++        }
++
++        @Override
++        public int advance(int target) throws IOException {
++          for (docId = target; docId < bits.length(); docId++) {
++            if (bits.get(docId))
++              return docId;
++          }
++          return NO_MORE_DOCS;
++        }
++
++        @Override
++        public long cost() {
++          return bits.length();
++        }
++      };
++    }
++
++    @Override
++    public Bits bits() throws IOException {
++      return bits;//won't be null
++    }
++
++    //we don't override isCacheable because we want the default of false
++  }//class BitsDocIdSet
++
++}
