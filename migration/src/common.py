@@ -3,12 +3,13 @@ import logging
 from datetime import datetime
 import functools
 import time
-
+import os
+import tempfile
 
 LOG_DIRNAME = "log"
 
 JIRA_DUMP_DIRNAME = "jira-dump"
-JIRA_ATTACHMENTS_DIRNAME = "attachments"
+JIRA_ATTACHMENTS_DIRPATH = os.getenv("ATTACHMENTS_DL_DIR", str(Path(tempfile.gettempdir()).joinpath("attachments")))
 GITHUB_IMPORT_DATA_DIRNAME = "github-import-data"
 MAPPINGS_DATA_DIRNAME = "mappings-data"
 

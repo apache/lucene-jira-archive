@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 import requests
 
-from common import LOG_DIRNAME, JIRA_DUMP_DIRNAME, JIRA_ATTACHMENTS_DIRNAME, logging_setup, jira_dump_file, jira_attachments_dir, jira_issue_id
+from common import LOG_DIRNAME, JIRA_DUMP_DIRNAME, JIRA_ATTACHMENTS_DIRPATH, logging_setup, jira_dump_file, jira_attachments_dir, jira_issue_id
 
 log_dir = Path(__file__).resolve().parent.parent.joinpath(LOG_DIRNAME)
 logger = logging_setup(log_dir, "download_jira")
@@ -94,7 +94,7 @@ if __name__ == "__main__":
         dump_dir.mkdir()
     assert dump_dir.exists()
 
-    att_data_dir = Path(__file__).resolve().parent.parent.parent.joinpath(JIRA_ATTACHMENTS_DIRNAME)
+    att_data_dir = Path(JIRA_ATTACHMENTS_DIRPATH)
     if not att_data_dir.exists():
         att_data_dir.mkdir()
     assert att_data_dir.exists()
@@ -108,10 +108,10 @@ if __name__ == "__main__":
         else:
             issues.append(args.min)
     
-    logger.info(f"Downloading Jira issues in {dump_dir}")
+    logger.info(f"Downloading Jira issues in {dump_dir}. Attachments are saved in {att_data_dir}.")
     for num in issues:
-        download_issue(num, dump_dir)
-        download_attachments(num, dump_dir, att_data_dir)
+        if download_issue(num, dump_dir):
+            download_attachments(num, dump_dir, att_data_dir)
         time.sleep(DOWNLOAD_INTERVAL_SEC)
     
     logger.info("Done.")
