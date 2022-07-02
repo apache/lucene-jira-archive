@@ -4,6 +4,7 @@
 
 You need Python 3.9+. The scripts were tested on Linux; maybe works also on Mac and Windows (not tested).
 
+On Linux/MacOS:
 ```
 python -V
 Python 3.9.13
@@ -14,18 +15,24 @@ source .venv/bin/activate
 (.venv) pip install -r requirements.txt
 ```
 
-You need a GitHub repository and personal access token for testing. Set `GITHUB_PAT` and `GITHUB_REPO` environment variables.
+You need a GitHub repository and personal access token for testing. Set `GITHUB_PAT` and `GITHUB_REPO` environment variables. See `.env.example` for other variables.
 
+On Linux/MacOS:
 ```
+cp .env.example .env
+
+vi .env
 export GITHUB_PAT=<your token>
 export GITHUB_REPO=<your repository location> # e.g. "mocobeta/sandbox-lucene-10557"
+
+source .env
 ```
 
 ## Usage
 
 ### 1. Download Jira issues
 
-`src/download_jira.py` downloads Jira issues and dumps them as JSON files in `migration/jira-dump`.
+`src/download_jira.py` downloads Jira issues and dumps them as JSON files in `migration/jira-dump`. This also downloads attached filed in each issue.
 
 ```
 (.venv) migration $ python src/download_jira.py --min 10500 --max 10600
@@ -110,6 +117,7 @@ You can:
 
 * migrate all texts in issue descriptions and comments to GitHub; browsing/searching old issues should work fine.
 * extract every issue metadata from Jira and port it to labels or issue descriptions (as plain text).
+* Create links to attachments.
 * map Jira cross-issue link "LUCENE-xxx" to GitHub issue mention "#yyy".
 * map Jira user ids to GitHub accounts if the mapping is given.
 * convert Jira markups to Markdown with parser library.
@@ -122,5 +130,3 @@ You can:
 You cannot:
 
 * simulate original issue reporters or comment authors; they have to be preserved in free-text forms.
-* migrate attached files (patches, images, etc.) to GitHub; these have to remain in Jira.
-   * it's not allowed to programmatically upload files and attach them to issues.
