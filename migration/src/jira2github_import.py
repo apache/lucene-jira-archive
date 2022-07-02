@@ -61,9 +61,9 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         pull_requests =extract_pull_requests(o)
 
         reporter_gh = account_map.get(reporter_name)
-        reporter = f"{reporter_dispname} ({reporter_gh})" if reporter_gh else f"{reporter_dispname}"
+        reporter = f"{reporter_dispname} (@{reporter_gh})" if reporter_gh else f"{reporter_dispname}"
         assignee_gh = account_map.get(assignee_name)
-        assignee = f"{assignee_dispname} ({assignee_gh})" if assignee_gh else f"{assignee_dispname}"
+        assignee = f"{assignee_dispname} (@{assignee_gh})" if assignee_gh else f"{assignee_dispname}"
 
         # make attachment list
         attachment_list_items = []
@@ -111,7 +111,7 @@ Pull Requests:
 
         def comment_author(author_name, author_dispname):
             author_gh = account_map.get(author_name)
-            return f"{author_dispname} ({author_gh})" if author_gh else author_dispname
+            return f"{author_dispname} (@{author_gh})" if author_gh else author_dispname
         
         comments = extract_comments(o)
         comments_data = []
@@ -159,6 +159,8 @@ Updated: {comment_updated}
             data["issue"]["updated_at"] = jira_timestamp_to_github_timestamp(updated)
         if resolutiondate:
             data["issue"]["closed_at"] = jira_timestamp_to_github_timestamp(resolutiondate)
+        if assignee_gh:
+            data["issue"]["assignee"] = assignee_gh
 
         data_file = github_data_file(output_dir, num)
         with open(data_file, "w") as fp:
