@@ -32,7 +32,7 @@ source .env
 
 ### 1. Download Jira issues
 
-`src/download_jira.py` downloads Jira issues and dumps them as JSON files in `migration/jira-dump`. This also downloads attached filed in each issue.
+`src/download_jira.py` downloads Jira issues and dumps them as JSON files in `migration/jira-dump`. This also downloads attached files in each issue.
 
 ```
 (.venv) migration $ python src/download_jira.py --min 10500 --max 10600
@@ -51,7 +51,7 @@ source .env
 
 `src/jira2github_import.py` converts Jira dumps into GitHub data that are importable to [issue import API](https://gist.github.com/jonmagic/5282384165e0f86ef105). Converted JSON data is saved in `migration/github-import-data`.
 
-Also this resolves all Jira user ID - GitHub account alignment if the account mapping is given in `mapping-data/account-map.csv`.
+Also this resolves all Jira user ID - GitHub account alignment if the account mapping is given in `mapping-data/account-map.csv`. 
 
 ```
 (.venv) migration $ python src/jira2github_import.py --min 10500 --max 10600
@@ -68,6 +68,8 @@ Also this resolves all Jira user ID - GitHub account alignment if the account ma
 ### 3. Import GitHub issues
 
 First pass: `src/import_github_issues.py` imports GitHub issues and comments via issue import API. This also writes Jira issue key - GitHub issue number mappings to a file in migration/mappings-data.
+
+We confirmed this script does not trigger any notifications.
 
 ```
 (.venv) migration $ python src/import_github_issues.py --min 10500 --max 10600
@@ -91,9 +93,11 @@ LUCENE-10502,https://github.com/mocobeta/migration-test-2/issues/3,3
 
 ### 4. Update GitHub issues and comments
 
-Second pass: `src/update_issue_links.py` 1) iterates all imported GitHub issue descriptions and comments; 2) embed correct GitHub issue number next to the corresponding Jira issue key with previously created issue mapping; 3) updates them if the texts are changed.
+Second pass: `src/update_issue_links.py` 1) iterates all imported GitHub issue descriptions and comments; 2) embed correct GitHub issue number next to the corresponding Jira issue key with previously created issue number mapping; 3) updates them if the texts are changed.
 
 e.g.: if `LUCENE-10500` is mapped to GitHub issue `#100`, then all text fragments `LUCENE-10500`  in issue descriptions and comments will be updated to `LUCENE-10500 (#100)`.
+
+We confirmed this script does not trigger any notifications.
 
 ```
 (.venv) migration $ python src/update_issue_links.py
@@ -117,9 +121,10 @@ You can:
 
 * migrate all texts in issue descriptions and comments to GitHub; browsing/searching old issues should work fine.
 * extract every issue metadata from Jira and port it to labels or issue descriptions (as plain text).
-* Create links to attachments.
+* create links to attachments.
 * map Jira cross-issue link "LUCENE-xxx" to GitHub issue mention "#yyy".
 * map Jira user ids to GitHub accounts if the mapping is given.
+* set assignee field if the account mapping is given.
 * convert Jira markups to Markdown with parser library.
    * not perfect - there can be many conversion errors
 
