@@ -1,0 +1,436 @@
+Index: CHANGES.txt
+===================================================================
+--- CHANGES.txt	(revision 1056780)
++++ CHANGES.txt	(working copy)
+@@ -139,6 +139,10 @@
+   MMapDirectory. Additionally the behavior of MMapDirectory has been
+   changed to enable unmapping by default if supported by the JRE.
+   (Mike McCandless, Uwe Schindler, Robert Muir)
++
++* LUCENE-2829: Improve the performance of "primary key" lookup use
++  case (running a TermQuery that matches one document) on a
++  multi-segment index.  (Robert Muir, Mike McCandless)
+   
+ API Changes
+ 
+Index: src/test/org/apache/lucene/search/TestCachingWrapperFilter.java
+===================================================================
+--- src/test/org/apache/lucene/search/TestCachingWrapperFilter.java	(revision 1056780)
++++ src/test/org/apache/lucene/search/TestCachingWrapperFilter.java	(working copy)
+@@ -111,15 +111,15 @@
+   
+   private static void assertDocIdSetCacheable(IndexReader reader, Filter filter, boolean shouldCacheable) throws IOException {
+     final CachingWrapperFilter cacher = new CachingWrapperFilter(filter);
+-    final DocIdSet originalSet = filter.getDocIdSet(reader);
+-    final DocIdSet cachedSet = cacher.getDocIdSet(reader);
++    final DocIdSet originalSet = filter.getDocIdSet(reader.getSequentialSubReaders()[0]);
++    final DocIdSet cachedSet = cacher.getDocIdSet(reader.getSequentialSubReaders()[0]);
+     assertTrue(cachedSet.isCacheable());
+     assertEquals(shouldCacheable, originalSet.isCacheable());
+     //System.out.println("Original: "+originalSet.getClass().getName()+" -- cached: "+cachedSet.getClass().getName());
+     if (originalSet.isCacheable()) {
+       assertEquals("Cached DocIdSet must be of same class like uncached, if cacheable", originalSet.getClass(), cachedSet.getClass());
+     } else {
+-      assertTrue("Cached DocIdSet must be an OpenBitSet if the original one was not cacheable", cachedSet instanceof OpenBitSetDISI);
++      assertTrue("Cached DocIdSet must be an OpenBitSet if the original one was not cacheable (got " + cachedSet + ")", cachedSet instanceof OpenBitSetDISI || cachedSet == DocIdSet.EMPTY_DOCIDSET);
+     }
+   }
+   
+Index: src/test/org/apache/lucene/search/TestTermScorer.java
+===================================================================
+--- src/test/org/apache/lucene/search/TestTermScorer.java	(revision 1056780)
++++ src/test/org/apache/lucene/search/TestTermScorer.java	(working copy)
+@@ -51,6 +51,7 @@
+               Field.Index.ANALYZED));
+       writer.addDocument(doc);
+     }
++    writer.optimize();
+     indexReader = writer.getReader();
+     writer.close();
+     indexSearcher = new IndexSearcher(indexReader);
+@@ -70,7 +71,7 @@
+     
+     Weight weight = termQuery.weight(indexSearcher);
+     
+-    Scorer ts = weight.scorer(indexSearcher.getIndexReader(), true, true);
++    Scorer ts = weight.scorer(indexSearcher.getIndexReader().getSequentialSubReaders()[0], true, true);
+     // we have 2 documents with the term all in them, one document for all the
+     // other values
+     final List<TestHit> docs = new ArrayList<TestHit>();
+@@ -131,7 +132,7 @@
+     
+     Weight weight = termQuery.weight(indexSearcher);
+     
+-    Scorer ts = weight.scorer(indexSearcher.getIndexReader(), true, true);
++    Scorer ts = weight.scorer(indexSearcher.getIndexReader().getSequentialSubReaders()[0], true, true);
+     assertTrue("next did not return a doc",
+         ts.nextDoc() != DocIdSetIterator.NO_MORE_DOCS);
+     assertTrue("score is not correct", ts.score() == 1.6931472f);
+@@ -149,7 +150,7 @@
+     
+     Weight weight = termQuery.weight(indexSearcher);
+     
+-    Scorer ts = weight.scorer(indexSearcher.getIndexReader(), true, true);
++    Scorer ts = weight.scorer(indexSearcher.getIndexReader().getSequentialSubReaders()[0], true, true);
+     assertTrue("Didn't skip", ts.advance(3) != DocIdSetIterator.NO_MORE_DOCS);
+     // The next doc should be doc 5
+     assertTrue("doc should be number 5", ts.docID() == 5);
+Index: src/test/org/apache/lucene/search/TestFilteredSearch.java
+===================================================================
+--- src/test/org/apache/lucene/search/TestFilteredSearch.java	(revision 1056780)
++++ src/test/org/apache/lucene/search/TestFilteredSearch.java	(working copy)
+@@ -18,6 +18,8 @@
+ package org.apache.lucene.search;
+ 
+ import java.io.IOException;
++import java.util.Map;
++import java.util.HashMap;
+ 
+ import org.apache.lucene.util.LuceneTestCase;
+ import org.apache.lucene.analysis.WhitespaceAnalyzer;
+@@ -59,7 +61,7 @@
+     directory.close();
+   }
+ 
+-  public void searchFiltered(IndexWriter writer, Directory directory, Filter filter, boolean optimize) {
++  public void searchFiltered(IndexWriter writer, Directory directory, SimpleDocIdSetFilter filter, boolean optimize) {
+     try {
+       for (int i = 0; i < 60; i++) {//Simple docs
+         Document doc = new Document();
+@@ -75,6 +77,7 @@
+      
+      
+       IndexSearcher indexSearcher = new IndexSearcher(directory, true);
++      filter.setDocBases(indexSearcher.getIndexReader());
+       ScoreDoc[] hits = indexSearcher.search(booleanQuery, filter, 1000).scoreDocs;
+       assertEquals("Number of matched documents", 1, hits.length);
+       indexSearcher.close();
+@@ -86,29 +89,41 @@
+   }
+  
+   public static final class SimpleDocIdSetFilter extends Filter {
+-    private int docBase;
+     private final int[] docs;
+     private int index;
++    private Map<IndexReader,Integer> docBasePerSub;
++
+     public SimpleDocIdSetFilter(int[] docs) {
+       this.docs = docs;
+     }
++
++    public void setDocBases(IndexReader r) {
++      int maxDoc = 0;
++      docBasePerSub = new HashMap<IndexReader,Integer>();
++      for(IndexReader sub : r.getSequentialSubReaders()) {
++        docBasePerSub.put(sub, maxDoc);
++        maxDoc += sub.maxDoc();
++      }
++    }
++
+     @Override
+     public DocIdSet getDocIdSet(IndexReader reader) {
+-      final OpenBitSet set = new OpenBitSet();
++      final OpenBitSet set = new OpenBitSet(reader.maxDoc());
++      final int docBase = docBasePerSub.get(reader);
+       final int limit = docBase+reader.maxDoc();
+       for (;index < docs.length; index++) {
+         final int docId = docs[index];
+-        if(docId > limit)
++        if (docId > limit)
+           break;
+-        set.set(docId-docBase);
++        if (docId >= docBase) {
++          set.set(docId-docBase);
++        }
+       }
+-      docBase = limit;
+       return set.isEmpty()?null:set;
+     }
+     
+     public void reset(){
+       index = 0;
+-      docBase = 0;
+     }
+   }
+ 
+Index: src/test/org/apache/lucene/search/TestDisjunctionMaxQuery.java
+===================================================================
+--- src/test/org/apache/lucene/search/TestDisjunctionMaxQuery.java	(revision 1056780)
++++ src/test/org/apache/lucene/search/TestDisjunctionMaxQuery.java	(working copy)
+@@ -143,7 +143,8 @@
+                                                                                 // "albino"));
+       writer.addDocument(d4);
+     }
+-    
++
++    writer.optimize();
+     r = writer.getReader();
+     writer.close();
+     s = new IndexSearcher(r);
+@@ -166,7 +167,7 @@
+     QueryUtils.check(random, dq, s);
+     
+     final Weight dw = dq.weight(s);
+-    final Scorer ds = dw.scorer(r, true, false);
++    final Scorer ds = dw.scorer(r.getSequentialSubReaders()[0], true, false);
+     final boolean skipOk = ds.advance(3) != DocIdSetIterator.NO_MORE_DOCS;
+     if (skipOk) {
+       fail("firsttime skipTo found a match? ... "
+@@ -182,7 +183,7 @@
+     QueryUtils.check(random, dq, s);
+     
+     final Weight dw = dq.weight(s);
+-    final Scorer ds = dw.scorer(r, true, false);
++    final Scorer ds = dw.scorer(r.getSequentialSubReaders()[0], true, false);
+     assertTrue("firsttime skipTo found no match",
+         ds.advance(3) != DocIdSetIterator.NO_MORE_DOCS);
+     assertEquals("found wrong docid", "d4", r.document(ds.docID()).get("id"));
+Index: src/java/org/apache/lucene/search/Similarity.java
+===================================================================
+--- src/java/org/apache/lucene/search/Similarity.java	(revision 1056780)
++++ src/java/org/apache/lucene/search/Similarity.java	(working copy)
+@@ -22,6 +22,7 @@
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.search.Explanation.IDFExplanation;
+ import org.apache.lucene.util.SmallFloat;
++import org.apache.lucene.util.VirtualMethod;
+ 
+ import java.io.IOException;
+ import java.io.Serializable;
+@@ -527,11 +528,21 @@
+  * @see Searcher#setSimilarity(Similarity)
+  */
+ public abstract class Similarity implements Serializable {
+-  
++
++  // NOTE: this static code must precede setting the static defaultImpl:
++  private static final VirtualMethod<Similarity> withoutDocFreqMethod =
++    new VirtualMethod<Similarity>(Similarity.class, "idfExplain", Term.class, Searcher.class);
++  private static final VirtualMethod<Similarity> withDocFreqMethod =
++    new VirtualMethod<Similarity>(Similarity.class, "idfExplain", Term.class, Searcher.class, int.class);
++
++  private final boolean hasIDFExplainWithDocFreqAPI =
++    VirtualMethod.compareImplementationDistance(getClass(),
++        withDocFreqMethod, withoutDocFreqMethod) >= 0; // its ok for both to be overridden
+   /**
+    * The Similarity implementation used by default.
+    **/
+   private static Similarity defaultImpl = new DefaultSimilarity();
++
+   public static final int NO_DOC_ID_PROVIDED = -1;
+ 
+   /** Set the default Similarity implementation used by indexing and search
+@@ -749,6 +760,7 @@
+    */
+   public abstract float tf(float freq);
+ 
++
+   /**
+    * Computes a score factor for a simple term and returns an explanation
+    * for that score factor.
+@@ -772,8 +784,13 @@
+              and an explanation for the term.
+    * @throws IOException
+    */
+-  public IDFExplanation idfExplain(final Term term, final Searcher searcher) throws IOException {
+-    final int df = searcher.docFreq(term);
++  public IDFExplanation idfExplain(final Term term, final Searcher searcher, int docFreq) throws IOException {
++
++    if (!hasIDFExplainWithDocFreqAPI) {
++      // Fallback to slow impl
++      return idfExplain(term, searcher);
++    }
++    final int df = docFreq;
+     final int max = searcher.maxDoc();
+     final float idf = idf(df, max);
+     return new IDFExplanation() {
+@@ -786,9 +803,23 @@
+         public float getIdf() {
+           return idf;
+         }};
+-   }
++  }
+ 
+   /**
++   * This method forwards to {@link
++   * #idfExplain(Term,IndexSearcher,int)} by passing
++   * <code>searcher.docFreq(term)</code> as the docFreq.
++   *
++   * WARNING: if you subclass Similariary and override this
++   * method then you may hit a peformance hit for certain
++   * queries.  Better to override {@link
++   * #idfExplain(Term,Searcher,int)} instead.
++   */
++  public IDFExplanation idfExplain(final Term term, final Searcher searcher) throws IOException {
++    return idfExplain(term, searcher, searcher.docFreq(term));
++  }
++
++  /**
+    * Computes a score factor for a phrase.
+    * 
+    * <p>
+Index: src/java/org/apache/lucene/search/TermQuery.java
+===================================================================
+--- src/java/org/apache/lucene/search/TermQuery.java	(revision 1056780)
++++ src/java/org/apache/lucene/search/TermQuery.java	(working copy)
+@@ -18,12 +18,14 @@
+  */
+ 
+ import java.io.IOException;
++import java.util.HashSet;
+ import java.util.Set;
+ 
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.index.TermDocs;
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.search.Explanation.IDFExplanation;
++import org.apache.lucene.util.ReaderUtil;
+ import org.apache.lucene.util.ToStringUtils;
+ 
+ /** A Query that matches documents containing a term.
+@@ -39,11 +41,32 @@
+     private float queryNorm;
+     private float queryWeight;
+     private IDFExplanation idfExp;
++    private final Set<Integer> hash;
+ 
+     public TermWeight(Searcher searcher)
+       throws IOException {
+       this.similarity = getSimilarity(searcher);
+-      idfExp = similarity.idfExplain(term, searcher);
++      if (searcher instanceof IndexSearcher) {
++        hash = new HashSet<Integer>();
++        IndexReader ir = ((IndexSearcher)searcher).getIndexReader();
++        final int dfSum[] = new int[1];
++        new ReaderUtil.Gather(ir) {
++          @Override
++          protected void add(int base, IndexReader r) throws IOException {
++            int df = r.docFreq(term);
++            dfSum[0] += df;
++            if (df > 0) {
++              hash.add(r.hashCode());
++            }
++          }
++        }.run();
++
++        idfExp = similarity.idfExplain(term, searcher, dfSum[0]);
++      } else {
++        idfExp = similarity.idfExplain(term, searcher);
++        hash = null;
++      }
++
+       idf = idfExp.getIdf();
+     }
+ 
+@@ -71,6 +94,10 @@
+ 
+     @Override
+     public Scorer scorer(IndexReader reader, boolean scoreDocsInOrder, boolean topScorer) throws IOException {
++      if (hash != null && !hash.contains(reader.hashCode())) {
++        return null;
++      }
++      
+       TermDocs termDocs = reader.termDocs(term);
+ 
+       if (termDocs == null)
+Index: src/java/org/apache/lucene/util/ReaderUtil.java
+===================================================================
+--- src/java/org/apache/lucene/util/ReaderUtil.java	(revision 1056780)
++++ src/java/org/apache/lucene/util/ReaderUtil.java	(working copy)
+@@ -17,6 +17,7 @@
+  * limitations under the License.
+  */
+ 
++import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.List;
+ 
+@@ -49,6 +50,45 @@
+     }
+   }
+ 
++  /** Recursively visits all sub-readers of a reader.  You
++   *  should subclass this and override the add method to
++   *  gather what you need.
++   *
++   * @lucene.experimental */
++  public static abstract class Gather {
++    private final IndexReader topReader;
++
++    public Gather(IndexReader r) {
++      topReader = r;
++    }
++
++    public int run() throws IOException {
++      return run(0, topReader);
++    }
++
++    public int run(int docBase) throws IOException {
++      return run(docBase, topReader);
++    }
++
++    private int run(int base, IndexReader reader) throws IOException {
++      IndexReader[] subReaders = reader.getSequentialSubReaders();
++      if (subReaders == null) {
++        // atomic reader
++        add(base, reader);
++        base += reader.maxDoc();
++      } else {
++        // composite reader
++        for (int i = 0; i < subReaders.length; i++) {
++          base = run(base, subReaders[i]);
++        }
++      }
++
++      return base;
++    }
++
++    protected abstract void add(int base, IndexReader r) throws IOException;
++  }
++
+   /**
+    * Returns sub IndexReader that contains the given document id.
+    *    
+Index: backwards/src/test/org/apache/lucene/search/TestCachingWrapperFilter.java
+===================================================================
+--- backwards/src/test/org/apache/lucene/search/TestCachingWrapperFilter.java	(revision 1056780)
++++ backwards/src/test/org/apache/lucene/search/TestCachingWrapperFilter.java	(working copy)
+@@ -65,7 +65,7 @@
+     if (originalSet.isCacheable()) {
+       assertEquals("Cached DocIdSet must be of same class like uncached, if cacheable", originalSet.getClass(), cachedSet.getClass());
+     } else {
+-      assertTrue("Cached DocIdSet must be an OpenBitSet if the original one was not cacheable", cachedSet instanceof OpenBitSetDISI);
++      assertTrue("Cached DocIdSet must be an OpenBitSet if the original one was not cacheable", cachedSet instanceof OpenBitSetDISI || cachedSet == DocIdSet.EMPTY_DOCIDSET);
+     }
+   }
+   
+Index: backwards/src/test/org/apache/lucene/search/TestDisjunctionMaxQuery.java
+===================================================================
+--- backwards/src/test/org/apache/lucene/search/TestDisjunctionMaxQuery.java	(revision 1056780)
++++ backwards/src/test/org/apache/lucene/search/TestDisjunctionMaxQuery.java	(working copy)
+@@ -124,6 +124,7 @@
+             writer.addDocument(d4);
+         }
+ 
++        writer.optimize();
+         writer.close();
+ 
+         r = IndexReader.open(index, true);
+@@ -139,7 +140,7 @@
+     QueryUtils.check(dq,s);
+ 
+     final Weight dw = dq.weight(s);
+-    final Scorer ds = dw.scorer(r, true, false);
++    final Scorer ds = dw.scorer(r.getSequentialSubReaders()[0], true, false);
+     final boolean skipOk = ds.advance(3) != DocIdSetIterator.NO_MORE_DOCS;
+     if (skipOk) {
+       fail("firsttime skipTo found a match? ... " + r.document(ds.docID()).get("id"));
+@@ -154,7 +155,7 @@
+     QueryUtils.check(dq,s);
+ 
+     final Weight dw = dq.weight(s);
+-    final Scorer ds = dw.scorer(r, true, false);
++    final Scorer ds = dw.scorer(r.getSequentialSubReaders()[0], true, false);
+     assertTrue("firsttime skipTo found no match", ds.advance(3) != DocIdSetIterator.NO_MORE_DOCS);
+     assertEquals("found wrong docid", "d4", r.document(ds.docID()).get("id"));
+   }

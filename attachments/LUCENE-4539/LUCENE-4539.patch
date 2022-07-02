@@ -1,0 +1,367 @@
+Index: lucene/core/src/java/org/apache/lucene/codecs/lucene40/values/PackedIntValues.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/lucene40/values/PackedIntValues.java	(revision 1405946)
++++ lucene/core/src/java/org/apache/lucene/codecs/lucene40/values/PackedIntValues.java	(working copy)
+@@ -35,6 +35,7 @@
+ import org.apache.lucene.util.Counter;
+ import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.packed.PackedInts;
++import org.apache.lucene.util.packed.PackedInts.Format;
+ 
+ /**
+  * Stores integers using {@link PackedInts}
+@@ -156,6 +157,14 @@
+     private final byte type;
+     private final int numDocs;
+     private final DocValuesArraySource values;
++    
++    // packed ints configuration
++    private final long minValue;
++    private final long defaultValue;
++    private final int version;
++    private final int bitsPerValue;
++    private final int valueCount;
++    private final Format format;
+ 
+     protected PackedIntsReader(Directory dir, String id, int numDocs,
+         IOContext context) throws IOException {
+@@ -167,7 +176,22 @@
+       try {
+         CodecUtil.checkHeader(datIn, CODEC_NAME, VERSION_START, VERSION_START);
+         type = datIn.readByte();
+-        values = type == FIXED_64 ?  DocValuesArraySource.forType(Type.FIXED_INTS_64) : null;
++        // TODO: can we clean this up? have two separate classes, and read the type in up-front instead.
++        if (type == FIXED_64) {
++          values = DocValuesArraySource.forType(Type.FIXED_INTS_64);
++          minValue = defaultValue = -1;
++          version = bitsPerValue = valueCount = -1;
++          format = null;
++        } else {
++          values = null;
++          minValue = datIn.readLong();
++          defaultValue = datIn.readLong();
++          version = CodecUtil.checkHeader(datIn, PackedInts.CODEC_NAME, PackedInts.VERSION_START, PackedInts.VERSION_CURRENT);
++          bitsPerValue = datIn.readVInt();
++          assert bitsPerValue > 0 && bitsPerValue <= 64: "bitsPerValue=" + bitsPerValue;
++          valueCount = datIn.readVInt();
++          format = Format.byId(datIn.readVInt());
++        }
+         success = true;
+       } finally {
+         if (!success) {
+@@ -190,7 +214,7 @@
+         input = datIn.clone();
+         
+         if (values == null) {
+-          source = new PackedIntsSource(input, false);
++          source = new PackedIntsSource(datIn.clone(), minValue, defaultValue, format, version, valueCount, bitsPerValue, false);
+         } else {
+           source = values.newFromInput(input, numDocs);
+         }
+@@ -218,7 +242,11 @@
+ 
+     @Override
+     public Source getDirectSource() throws IOException {
+-      return values != null ? new FixedStraightBytesImpl.DirectFixedStraightSource(datIn.clone(), 8, Type.FIXED_INTS_64) : new PackedIntsSource(datIn.clone(), true);
++      if (values != null) {
++        return new FixedStraightBytesImpl.DirectFixedStraightSource(datIn.clone(), 8, Type.FIXED_INTS_64);
++      } else {
++        return new PackedIntsSource(datIn.clone(), minValue, defaultValue, format, version, valueCount, bitsPerValue, true);
++      }
+     }
+   }
+ 
+@@ -228,11 +256,15 @@
+     private final long defaultValue;
+     private final PackedInts.Reader values;
+ 
+-    public PackedIntsSource(IndexInput dataIn, boolean direct) throws IOException {
++    public PackedIntsSource(IndexInput dataIn, long minValue, long defaultValue, Format format, int version, int valueCount, int bitsPerValue, boolean direct) throws IOException {
+       super(Type.VAR_INTS);
+-      minValue = dataIn.readLong();
+-      defaultValue = dataIn.readLong();
+-      values = direct ? PackedInts.getDirectReader(dataIn) : PackedInts.getReader(dataIn);
++      this.minValue = minValue;
++      this.defaultValue = defaultValue;
++      if (direct) {
++        values = PackedInts.getDirectReaderNoHeader(dataIn, format, version, valueCount, bitsPerValue);
++      } else {
++        values = PackedInts.getReaderNoHeader(dataIn, format, version, valueCount, bitsPerValue);
++      }
+     }
+     
+     @Override
+Index: lucene/core/src/java/org/apache/lucene/codecs/lucene40/values/Bytes.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/lucene40/values/Bytes.java	(revision 1405946)
++++ lucene/core/src/java/org/apache/lucene/codecs/lucene40/values/Bytes.java	(working copy)
+@@ -583,6 +583,9 @@
+       this.pagedBytes.copy(datIn, bytesToRead);
+       data = pagedBytes.freeze(true);
+       this.idxIn = idxIn;
++      // TODO: would be better if we wrote these two headers up-front and read them in initially
++      // instead of doing this per-(Direct)Source: but would need format change? or would be messy
++      // (skipping over the ordToOffset's data, reading the header, seeking back)
+       ordToOffsetIndex = hasOffsets ? PackedInts.getReader(idxIn) : null; 
+       docToOrdIndex = PackedInts.getReader(idxIn);
+     }
+Index: lucene/core/src/java/org/apache/lucene/codecs/lucene40/values/VarDerefBytesImpl.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/lucene40/values/VarDerefBytesImpl.java	(revision 1405946)
++++ lucene/core/src/java/org/apache/lucene/codecs/lucene40/values/VarDerefBytesImpl.java	(working copy)
+@@ -19,6 +19,7 @@
+ 
+ import java.io.IOException;
+ 
++import org.apache.lucene.codecs.CodecUtil;
+ import org.apache.lucene.codecs.lucene40.values.Bytes.BytesReaderBase;
+ import org.apache.lucene.codecs.lucene40.values.Bytes.BytesSourceBase;
+ import org.apache.lucene.codecs.lucene40.values.Bytes.DerefBytesWriterBase;
+@@ -31,6 +32,7 @@
+ import org.apache.lucene.util.Counter;
+ import org.apache.lucene.util.PagedBytes;
+ import org.apache.lucene.util.packed.PackedInts;
++import org.apache.lucene.util.packed.PackedInts.Format;
+ 
+ // Stores variable-length byte[] by deref, ie when two docs
+ // have the same value, they store only 1 byte[] and both
+@@ -93,31 +95,41 @@
+ 
+   public static class VarDerefReader extends BytesReaderBase {
+     private final long totalBytes;
++    // packed ints configuration
++    private final int version;
++    private final int bitsPerValue;
++    private final int valueCount;
++    private final Format format;
+     VarDerefReader(Directory dir, String id, int maxDoc, IOContext context) throws IOException {
+       super(dir, id, CODEC_NAME_IDX, CODEC_NAME_DAT, VERSION_START, true, context, Type.BYTES_VAR_DEREF);
+       totalBytes = idxIn.readLong();
++      version = CodecUtil.checkHeader(idxIn, PackedInts.CODEC_NAME, PackedInts.VERSION_START, PackedInts.VERSION_CURRENT);
++      bitsPerValue = idxIn.readVInt();
++      assert bitsPerValue > 0 && bitsPerValue <= 64: "bitsPerValue=" + bitsPerValue;
++      valueCount = idxIn.readVInt();
++      format = Format.byId(idxIn.readVInt());
+     }
+ 
+     @Override
+     public Source load() throws IOException {
+-      return new VarDerefSource(cloneData(), cloneIndex(), totalBytes);
++      return new VarDerefSource(cloneData(), cloneIndex(), totalBytes, format, version, valueCount, bitsPerValue);
+     }
+    
+     @Override
+     public Source getDirectSource()
+         throws IOException {
+-      return new DirectVarDerefSource(cloneData(), cloneIndex(), getType());
++      return new DirectVarDerefSource(cloneData(), cloneIndex(), getType(), format, version, valueCount, bitsPerValue);
+     }
+   }
+   
+   final static class VarDerefSource extends BytesSourceBase {
+     private final PackedInts.Reader addresses;
+ 
+-    public VarDerefSource(IndexInput datIn, IndexInput idxIn, long totalBytes)
++    public VarDerefSource(IndexInput datIn, IndexInput idxIn, long totalBytes, Format format, int version, int valueCount, int bitsPerValue)
+         throws IOException {
+       super(datIn, idxIn, new PagedBytes(PAGED_BYTES_BITS), totalBytes,
+           Type.BYTES_VAR_DEREF);
+-      addresses = PackedInts.getReader(idxIn);
++      addresses = PackedInts.getReaderNoHeader(idxIn, format, version, valueCount, bitsPerValue);
+     }
+ 
+     @Override
+@@ -131,10 +143,10 @@
+   final static class DirectVarDerefSource extends DirectSource {
+     private final PackedInts.Reader index;
+ 
+-    DirectVarDerefSource(IndexInput data, IndexInput index, Type type)
++    DirectVarDerefSource(IndexInput data, IndexInput index, Type type, Format format, int version, int valueCount, int bitsPerValue)
+         throws IOException {
+       super(data, type);
+-      this.index = PackedInts.getDirectReader(index);
++      this.index = PackedInts.getDirectReaderNoHeader(index, format, version, valueCount, bitsPerValue);
+     }
+     
+     @Override
+Index: lucene/core/src/java/org/apache/lucene/codecs/lucene40/values/VarStraightBytesImpl.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/lucene40/values/VarStraightBytesImpl.java	(revision 1405969)
++++ lucene/core/src/java/org/apache/lucene/codecs/lucene40/values/VarStraightBytesImpl.java	(working copy)
+@@ -19,6 +19,7 @@
+ 
+ import java.io.IOException;
+ 
++import org.apache.lucene.codecs.CodecUtil;
+ import org.apache.lucene.codecs.lucene40.values.Bytes.BytesReaderBase;
+ import org.apache.lucene.codecs.lucene40.values.Bytes.BytesSourceBase;
+ import org.apache.lucene.codecs.lucene40.values.Bytes.BytesWriterBase;
+@@ -40,6 +41,7 @@
+ import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.PagedBytes;
+ import org.apache.lucene.util.RamUsageEstimator;
++import org.apache.lucene.util.packed.PackedInts.Format;
+ import org.apache.lucene.util.packed.PackedInts.ReaderIterator;
+ import org.apache.lucene.util.packed.PackedInts;
+ 
+@@ -117,11 +119,10 @@
+             fill(docBase, address);
+             lastDocID = docBase-1;
+           }
+-          final long numDataBytes;
++          final long numDataBytes = reader.sizeInBytes;
+           final IndexInput cloneIdx = reader.cloneIndex();
+           try {
+-            numDataBytes = cloneIdx.readVLong();
+-            final ReaderIterator iter = PackedInts.getReaderIterator(cloneIdx, PackedInts.DEFAULT_BUFFER_SIZE);
++            final ReaderIterator iter = PackedInts.getReaderIteratorNoHeader(cloneIdx, reader.format, reader.version, reader.valueCount, reader.bitsPerValue, PackedInts.DEFAULT_BUFFER_SIZE);
+             for (int i = 0; i < maxDocs; i++) {
+               long offset = iter.next();
+               ++lastDocID;
+@@ -240,31 +241,44 @@
+ 
+   public static class VarStraightReader extends BytesReaderBase {
+     final int maxDoc;
++    final long sizeInBytes;
++    // packed ints configuration
++    final int version;
++    final int bitsPerValue;
++    final int valueCount;
++    final Format format;
+ 
+     VarStraightReader(Directory dir, String id, int maxDoc, IOContext context) throws IOException {
+       super(dir, id, CODEC_NAME_IDX, CODEC_NAME_DAT, VERSION_START, true, context, Type.BYTES_VAR_STRAIGHT);
+       this.maxDoc = maxDoc;
++      // used only by bulk merge!
++      sizeInBytes = idxIn.readVLong();
++      version = CodecUtil.checkHeader(idxIn, PackedInts.CODEC_NAME, PackedInts.VERSION_START, PackedInts.VERSION_CURRENT);
++      bitsPerValue = idxIn.readVInt();
++      assert bitsPerValue > 0 && bitsPerValue <= 64: "bitsPerValue=" + bitsPerValue;
++      valueCount = idxIn.readVInt();
++      format = Format.byId(idxIn.readVInt());
+     }
+ 
+     @Override
+     public Source load() throws IOException {
+-      return new VarStraightSource(cloneData(), cloneIndex());
++      return new VarStraightSource(cloneData(), cloneIndex(), sizeInBytes, format, version, valueCount, bitsPerValue);
+     }
+ 
+     @Override
+     public Source getDirectSource()
+         throws IOException {
+-      return new DirectVarStraightSource(cloneData(), cloneIndex(), getType());
++      return new DirectVarStraightSource(cloneData(), cloneIndex(), getType(), sizeInBytes, format, version, valueCount, bitsPerValue);
+     }
+   }
+   
+   private static final class VarStraightSource extends BytesSourceBase {
+     private final PackedInts.Reader addresses;
+ 
+-    public VarStraightSource(IndexInput datIn, IndexInput idxIn) throws IOException {
+-      super(datIn, idxIn, new PagedBytes(PAGED_BYTES_BITS), idxIn.readVLong(),
++    public VarStraightSource(IndexInput datIn, IndexInput idxIn, long sizeInBytes, Format format, int version, int valueCount, int bitsPerValue) throws IOException {
++      super(datIn, idxIn, new PagedBytes(PAGED_BYTES_BITS), sizeInBytes,
+           Type.BYTES_VAR_STRAIGHT);
+-      addresses = PackedInts.getReader(idxIn);
++      addresses = PackedInts.getReaderNoHeader(idxIn, format, version, valueCount, bitsPerValue);
+     }
+ 
+     @Override
+@@ -279,11 +293,10 @@
+ 
+     private final PackedInts.Reader index;
+ 
+-    DirectVarStraightSource(IndexInput data, IndexInput index, Type type)
++    DirectVarStraightSource(IndexInput data, IndexInput index, Type type, long sizeInBytes, Format format, int version, int valueCount, int bitsPerValue)
+         throws IOException {
+       super(data, type);
+-      index.readVLong();
+-      this.index = PackedInts.getDirectReader(index);
++      this.index = PackedInts.getDirectReaderNoHeader(index, format, version, valueCount, bitsPerValue);
+     }
+ 
+     @Override
+Index: lucene/core/src/java/org/apache/lucene/codecs/lucene40/values/FixedDerefBytesImpl.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/lucene40/values/FixedDerefBytesImpl.java	(revision 1405946)
++++ lucene/core/src/java/org/apache/lucene/codecs/lucene40/values/FixedDerefBytesImpl.java	(working copy)
+@@ -19,6 +19,7 @@
+ 
+ import java.io.IOException;
+ 
++import org.apache.lucene.codecs.CodecUtil;
+ import org.apache.lucene.codecs.lucene40.values.Bytes.BytesReaderBase;
+ import org.apache.lucene.codecs.lucene40.values.Bytes.BytesSourceBase;
+ import org.apache.lucene.codecs.lucene40.values.Bytes.DerefBytesWriterBase;
+@@ -31,6 +32,7 @@
+ import org.apache.lucene.util.Counter;
+ import org.apache.lucene.util.PagedBytes;
+ import org.apache.lucene.util.packed.PackedInts;
++import org.apache.lucene.util.packed.PackedInts.Format;
+ 
+ // Stores fixed-length byte[] by deref, ie when two docs
+ // have the same value, they store only 1 byte[]
+@@ -72,21 +74,32 @@
+   public static class FixedDerefReader extends BytesReaderBase {
+     private final int size;
+     private final int numValuesStored;
++    // packed ints configuration
++    private final int version;
++    private final int bitsPerValue;
++    private final int valueCount;
++    private final Format format;
+     FixedDerefReader(Directory dir, String id, int maxDoc, IOContext context) throws IOException {
+       super(dir, id, CODEC_NAME_IDX, CODEC_NAME_DAT, VERSION_START, true, context, Type.BYTES_FIXED_DEREF);
+       size = datIn.readInt();
++      // TODO: is this numValuesStored just redundant with valueCount?!
+       numValuesStored = idxIn.readInt();
++      version = CodecUtil.checkHeader(idxIn, PackedInts.CODEC_NAME, PackedInts.VERSION_START, PackedInts.VERSION_CURRENT);
++      bitsPerValue = idxIn.readVInt();
++      assert bitsPerValue > 0 && bitsPerValue <= 64: "bitsPerValue=" + bitsPerValue;
++      valueCount = idxIn.readVInt();
++      format = Format.byId(idxIn.readVInt());
+     }
+ 
+     @Override
+     public Source load() throws IOException {
+-      return new FixedDerefSource(cloneData(), cloneIndex(), size, numValuesStored);
++      return new FixedDerefSource(cloneData(), cloneIndex(), size, numValuesStored, format, version, valueCount, bitsPerValue);
+     }
+ 
+     @Override
+     public Source getDirectSource()
+         throws IOException {
+-      return new DirectFixedDerefSource(cloneData(), cloneIndex(), size, getType());
++      return new DirectFixedDerefSource(cloneData(), cloneIndex(), size, getType(), format, version, valueCount, bitsPerValue);
+     }
+ 
+     @Override
+@@ -100,11 +113,11 @@
+     private final int size;
+     private final PackedInts.Reader addresses;
+ 
+-    protected FixedDerefSource(IndexInput datIn, IndexInput idxIn, int size, long numValues) throws IOException {
++    protected FixedDerefSource(IndexInput datIn, IndexInput idxIn, int size, long numValues, Format format, int version, int valueCount, int bitsPerValue) throws IOException {
+       super(datIn, idxIn, new PagedBytes(PAGED_BYTES_BITS), size * numValues,
+           Type.BYTES_FIXED_DEREF);
+       this.size = size;
+-      addresses = PackedInts.getReader(idxIn);
++      addresses = PackedInts.getReaderNoHeader(idxIn, format, version, valueCount, bitsPerValue);
+     }
+ 
+     @Override
+@@ -118,11 +131,11 @@
+     private final PackedInts.Reader index;
+     private final int size;
+ 
+-    DirectFixedDerefSource(IndexInput data, IndexInput index, int size, Type type)
++    DirectFixedDerefSource(IndexInput data, IndexInput index, int size, Type type, Format format, int version, int valueCount, int bitsPerValue)
+         throws IOException {
+       super(data, type);
+       this.size = size;
+-      this.index = PackedInts.getDirectReader(index);
++      this.index = PackedInts.getDirectReaderNoHeader(index, format, version, valueCount, bitsPerValue);
+     }
+ 
+     @Override

@@ -1,0 +1,586 @@
+Index: lucene/join/src/java/org/apache/lucene/search/join/AbstractTermsCollector.java
+===================================================================
+--- lucene/join/src/java/org/apache/lucene/search/join/AbstractTermsCollector.java	(revision 0)
++++ lucene/join/src/java/org/apache/lucene/search/join/AbstractTermsCollector.java	(working copy)
+@@ -0,0 +1,133 @@
++package org.apache.lucene.search.join;
++
++import java.io.IOException;
++import java.util.function.Consumer;
++import java.util.function.LongConsumer;
++
++import org.apache.lucene.document.FieldType.NumericType;
++import org.apache.lucene.index.BinaryDocValues;
++import org.apache.lucene.index.DocValues;
++import org.apache.lucene.index.LeafReader;
++import org.apache.lucene.index.LeafReaderContext;
++import org.apache.lucene.index.NumericDocValues;
++import org.apache.lucene.index.SortedNumericDocValues;
++import org.apache.lucene.index.SortedSetDocValues;
++import org.apache.lucene.search.SimpleCollector;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.BytesRefBuilder;
++import org.apache.lucene.util.NumericUtils;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++abstract class  AbstractTermsCollector<DV> extends SimpleCollector {
++  
++  @FunctionalInterface
++  static interface Function<R> {
++      R apply(LeafReader t) throws IOException  ;
++  }
++  
++  protected DV docValues;
++  private final Function<DV> docValuesCall;
++  
++  public AbstractTermsCollector(Function<DV> docValuesCall) {
++    this.docValuesCall = docValuesCall;
++  }
++
++  @Override
++  protected final void doSetNextReader(LeafReaderContext context) throws IOException {
++    docValues = docValuesCall.apply(context.reader());
++  }
++  
++  static Function<BinaryDocValues> binaryDocValues(String field) {
++      return (ctx) -> DocValues.getBinary(ctx, field);
++  }
++  static Function<SortedSetDocValues> sortedSetDocValues(String field) {
++    return (ctx) -> DocValues.getSortedSet(ctx, field);
++  }
++  
++  static Function<BinaryDocValues> numericAsBinaryDocValues(String field, NumericType numTyp) {
++    return (ctx) -> {
++      final NumericDocValues numeric = DocValues.getNumeric(ctx, field);
++      final BytesRefBuilder bytes = new BytesRefBuilder();
++      
++      final LongConsumer coder = coder(bytes, numTyp);
++      
++      return new BinaryDocValues() {
++        @Override
++        public BytesRef get(int docID) {
++          final long lVal = numeric.get(docID);
++          coder.accept(lVal);
++          return bytes.get();
++        }
++      };
++    };
++  }
++  
++  static LongConsumer coder(BytesRefBuilder bytes, NumericType type){
++    switch(type){
++      case INT: 
++        return (l) -> NumericUtils.intToPrefixCoded((int)l, 0, bytes);
++      case LONG: 
++        return (l) -> NumericUtils.longToPrefixCoded(l, 0, bytes);
++      default:
++        throw new IllegalArgumentException("Unsupported "+type+
++            ". Only "+NumericType.INT+" and "+NumericType.LONG+" are supported."
++            // sadly can't report field name + "Field "+field
++            );
++    }
++  }
++  
++  /** this adapter is quite weird. ords are per doc index, don't use ords across different docs*/
++  static Function<SortedSetDocValues> sortedNumericAsSortedSetDocValues(String field, NumericType numTyp) {
++    return (ctx) -> {
++      final SortedNumericDocValues numerics = DocValues.getSortedNumeric(ctx, field);
++      final BytesRefBuilder bytes = new BytesRefBuilder();
++      
++      final LongConsumer coder = coder(bytes, numTyp);
++      
++      return new SortedSetDocValues() {
++
++        private int index = -1;
++
++        @Override
++        public long nextOrd() {
++          return index < numerics.count() ? index++ : NO_MORE_ORDS;
++        }
++
++        @Override
++        public void setDocument(int docID) {
++          numerics.setDocument(docID);
++          index=0;
++        }
++
++        @Override
++        public BytesRef lookupOrd(long ord) {
++          assert ord>=0;
++          final long value = numerics.valueAt((int)ord);
++          coder.accept(value);
++          return bytes.get();
++        }
++
++        @Override
++        public long getValueCount() {
++          return numerics.count();
++        }
++      };
++    };
++  }
++}
+Index: lucene/join/src/java/org/apache/lucene/search/join/JoinUtil.java
+===================================================================
+--- lucene/join/src/java/org/apache/lucene/search/join/JoinUtil.java	(revision 1715738)
++++ lucene/join/src/java/org/apache/lucene/search/join/JoinUtil.java	(working copy)
+@@ -1,5 +1,8 @@
+ package org.apache.lucene.search.join;
+ 
++import java.io.IOException;
++import java.util.Locale;
++
+ /*
+  * Licensed to the Apache Software Foundation (ASF) under one or more
+  * contributor license agreements.  See the NOTICE file distributed with
+@@ -25,9 +28,6 @@
+ import org.apache.lucene.search.MatchNoDocsQuery;
+ import org.apache.lucene.search.Query;
+ 
+-import java.io.IOException;
+-import java.util.Locale;
+-
+ /**
+  * Utility for query time joining.
+  *
+@@ -72,18 +72,19 @@
+                                       Query fromQuery,
+                                       IndexSearcher fromSearcher,
+                                       ScoreMode scoreMode) throws IOException {
++   
++    TermsCollectorWithScoreInterface termsWithScoreCollector = 
++        TermsWithScoreCollector.createCollector(fromField, multipleValuesPerDocument, scoreMode);
++    
++    fromSearcher.search(fromQuery, termsWithScoreCollector);
++    
+     switch (scoreMode) {
+       case None:
+-        TermsCollector termsCollector = TermsCollector.create(fromField, multipleValuesPerDocument);
+-        fromSearcher.search(fromQuery, termsCollector);
+-        return new TermsQuery(toField, fromQuery, termsCollector.getCollectorTerms());
++        return new TermsQuery(toField, fromQuery, termsWithScoreCollector.getCollectedTerms());
+       case Total:
+       case Max:
+       case Min:
+       case Avg:
+-        TermsWithScoreCollector termsWithScoreCollector =
+-            TermsWithScoreCollector.create(fromField, multipleValuesPerDocument, scoreMode);
+-        fromSearcher.search(fromQuery, termsWithScoreCollector);
+         return new TermsIncludingScoreQuery(
+             toField,
+             multipleValuesPerDocument,
+@@ -95,7 +96,7 @@
+         throw new IllegalArgumentException(String.format(Locale.ROOT, "Score mode %s isn't supported.", scoreMode));
+     }
+   }
+-
++  
+   /**
+    * Delegates to {@link #createJoinQuery(String, Query, Query, IndexSearcher, ScoreMode, MultiDocValues.OrdinalMap, int, int)},
+    * but disables the min and max filtering.
+Index: lucene/join/src/java/org/apache/lucene/search/join/TermsCollector.java
+===================================================================
+--- lucene/join/src/java/org/apache/lucene/search/join/TermsCollector.java	(revision 1715738)
++++ lucene/join/src/java/org/apache/lucene/search/join/TermsCollector.java	(working copy)
+@@ -19,11 +19,10 @@
+ 
+ import java.io.IOException;
+ 
++import org.apache.lucene.index.BinaryDocValues;
+ import org.apache.lucene.index.LeafReaderContext;
+-import org.apache.lucene.index.BinaryDocValues;
+-import org.apache.lucene.index.DocValues;
+ import org.apache.lucene.index.SortedSetDocValues;
+-import org.apache.lucene.search.SimpleCollector;
++import org.apache.lucene.search.LeafCollector;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.BytesRefHash;
+ 
+@@ -32,19 +31,46 @@
+  *
+  * @lucene.experimental
+  */
+-abstract class TermsCollector extends SimpleCollector {
++abstract class TermsCollector<DV> extends AbstractTermsCollector<DV> {
+ 
+-  final String field;
++  TermsCollector(Function<DV> docValuesCall) {
++    super(docValuesCall);
++  }
++
+   final BytesRefHash collectorTerms = new BytesRefHash();
+ 
+-  TermsCollector(String field) {
+-    this.field = field;
+-  }
+-
+   public BytesRefHash getCollectorTerms() {
+     return collectorTerms;
+   }
+ 
++  static TermsCollectorWithScoreInterface createAsWithScore(String field, boolean multipleValuesPerDocument) {
++    return new TermsCollectorWithScoreInterface(){
++
++      final TermsCollector<?> collector = TermsCollector.create(field, multipleValuesPerDocument);
++      
++      @Override
++      public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
++        return collector.getLeafCollector(context);
++      }
++
++      @Override
++      public boolean needsScores() {
++        return collector.needsScores();
++      }
++
++      @Override
++      public BytesRefHash getCollectedTerms() {
++        return collector.getCollectorTerms();
++      }
++
++      @Override
++      public float[] getScoresPerTerm() {
++        throw new UnsupportedOperationException("scores are not available for "+collector + 
++            " build for field:"+field);
++      }
++    };
++  }
++  
+   /**
+    * Chooses the right {@link TermsCollector} implementation.
+    *
+@@ -52,55 +78,42 @@
+    * @param multipleValuesPerDocument Whether the field to collect terms for has multiple values per document.
+    * @return a {@link TermsCollector} instance
+    */
+-  static TermsCollector create(String field, boolean multipleValuesPerDocument) {
+-    return multipleValuesPerDocument ? new MV(field) : new SV(field);
++  static TermsCollector<?> create(String field, boolean multipleValuesPerDocument) {
++    return multipleValuesPerDocument 
++        ? new MV(sortedSetDocValues(field))
++        : new SV(binaryDocValues(field));
+   }
+ 
+   // impl that works with multiple values per document
+-  static class MV extends TermsCollector {
+-    final BytesRef scratch = new BytesRef();
+-    private SortedSetDocValues docTermOrds;
+-
+-    MV(String field) {
+-      super(field);
++  static class MV extends TermsCollector<SortedSetDocValues> {
++    
++    MV(Function<SortedSetDocValues> docValuesCall) {
++      super(docValuesCall);
+     }
+ 
+     @Override
+     public void collect(int doc) throws IOException {
+-      docTermOrds.setDocument(doc);
+       long ord;
+-      while ((ord = docTermOrds.nextOrd()) != SortedSetDocValues.NO_MORE_ORDS) {
+-        final BytesRef term = docTermOrds.lookupOrd(ord);
++      docValues.setDocument(doc);
++      while ((ord = docValues.nextOrd()) != SortedSetDocValues.NO_MORE_ORDS) {
++        final BytesRef term = docValues.lookupOrd(ord);
+         collectorTerms.add(term);
+       }
+     }
+-
+-    @Override
+-    protected void doSetNextReader(LeafReaderContext context) throws IOException {
+-      docTermOrds = DocValues.getSortedSet(context.reader(), field);
+-    }
+   }
+ 
+   // impl that works with single value per document
+-  static class SV extends TermsCollector {
++  static class SV extends TermsCollector<BinaryDocValues> {
+ 
+-    final BytesRef spare = new BytesRef();
+-    private BinaryDocValues fromDocTerms;
+-
+-    SV(String field) {
+-      super(field);
++    SV(Function<BinaryDocValues> docValuesCall) {
++      super(docValuesCall);
+     }
+ 
+     @Override
+     public void collect(int doc) throws IOException {
+-      final BytesRef term = fromDocTerms.get(doc);
++      final BytesRef term = docValues.get(doc);
+       collectorTerms.add(term);
+     }
+-
+-    @Override
+-    protected void doSetNextReader(LeafReaderContext context) throws IOException {
+-      fromDocTerms = DocValues.getBinary(context.reader(), field);
+-    }
+   }
+ 
+   @Override
+Index: lucene/join/src/java/org/apache/lucene/search/join/TermsCollectorInterface.java
+===================================================================
+--- lucene/join/src/java/org/apache/lucene/search/join/TermsCollectorInterface.java	(revision 0)
++++ lucene/join/src/java/org/apache/lucene/search/join/TermsCollectorInterface.java	(working copy)
+@@ -0,0 +1,29 @@
++package org.apache.lucene.search.join;
++
++import org.apache.lucene.search.Collector;
++import org.apache.lucene.util.BytesRefHash;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++interface TermsCollectorWithScoreInterface extends Collector {
++  
++  BytesRefHash getCollectedTerms() ;
++  
++  float[] getScoresPerTerm();
++
++}
+Index: lucene/join/src/java/org/apache/lucene/search/join/TermsWithScoreCollector.java
+===================================================================
+--- lucene/join/src/java/org/apache/lucene/search/join/TermsWithScoreCollector.java	(revision 1715738)
++++ lucene/join/src/java/org/apache/lucene/search/join/TermsWithScoreCollector.java	(working copy)
+@@ -1,5 +1,8 @@
+ package org.apache.lucene.search.join;
+ 
++import java.io.IOException;
++import java.util.Arrays;
++
+ /*
+  * Licensed to the Apache Software Foundation (ASF) under one or more
+  * contributor license agreements.  See the NOTICE file distributed with
+@@ -18,22 +21,18 @@
+  */
+ 
+ import org.apache.lucene.index.BinaryDocValues;
+-import org.apache.lucene.index.DocValues;
+ import org.apache.lucene.index.LeafReaderContext;
+ import org.apache.lucene.index.SortedSetDocValues;
++import org.apache.lucene.search.LeafCollector;
+ import org.apache.lucene.search.Scorer;
+-import org.apache.lucene.search.SimpleCollector;
+ import org.apache.lucene.util.ArrayUtil;
+ import org.apache.lucene.util.BytesRefHash;
+ 
+-import java.io.IOException;
+-import java.util.Arrays;
++abstract class TermsWithScoreCollector<DV> extends AbstractTermsCollector<DV> 
++                                    implements TermsCollectorWithScoreInterface {
+ 
+-abstract class TermsWithScoreCollector extends SimpleCollector {
+-
+   private final static int INITIAL_ARRAY_SIZE = 0;
+ 
+-  final String field;
+   final BytesRefHash collectedTerms = new BytesRefHash();
+   final ScoreMode scoreMode;
+ 
+@@ -40,8 +39,8 @@
+   Scorer scorer;
+   float[] scoreSums = new float[INITIAL_ARRAY_SIZE];
+ 
+-  TermsWithScoreCollector(String field, ScoreMode scoreMode) {
+-    this.field = field;
++  TermsWithScoreCollector(Function<DV> docValuesCall, ScoreMode scoreMode) {
++    super(docValuesCall);
+     this.scoreMode = scoreMode;
+     if (scoreMode == ScoreMode.Min) {
+       Arrays.fill(scoreSums, Float.POSITIVE_INFINITY);
+@@ -50,10 +49,12 @@
+     }
+   }
+ 
++  @Override
+   public BytesRefHash getCollectedTerms() {
+     return collectedTerms;
+   }
+-
++ 
++  @Override
+   public float[] getScoresPerTerm() {
+     return scoreSums;
+   }
+@@ -70,36 +71,42 @@
+    * @param multipleValuesPerDocument Whether the field to collect terms for has multiple values per document.
+    * @return a {@link TermsWithScoreCollector} instance
+    */
+-  static TermsWithScoreCollector create(String field, boolean multipleValuesPerDocument, ScoreMode scoreMode) {
++  static TermsWithScoreCollector<?> create(String field, boolean multipleValuesPerDocument, ScoreMode scoreMode) {
+     if (multipleValuesPerDocument) {
+       switch (scoreMode) {
+         case Avg:
+-          return new MV.Avg(field);
++          return new MV.Avg(sortedSetDocValues(field));
+         default:
+-          return new MV(field, scoreMode);
++          return new MV(sortedSetDocValues(field), scoreMode);
+       }
+     } else {
+       switch (scoreMode) {
+         case Avg:
+-          return new SV.Avg(field);
++          return new SV.Avg(binaryDocValues(field));
+         default:
+-          return new SV(field, scoreMode);
++          return new SV(binaryDocValues(field), scoreMode);
+       }
+     }
+   }
++ 
++  static TermsCollectorWithScoreInterface createCollector(String field, boolean multipleValuesPerDocument, ScoreMode scoreMode) {
++    if(scoreMode == ScoreMode.None){
++      return TermsCollector.createAsWithScore(field, multipleValuesPerDocument);
++    }else{
++      return TermsWithScoreCollector.create(field, multipleValuesPerDocument, scoreMode);
++    }
++  }
+ 
+   // impl that works with single value per document
+-  static class SV extends TermsWithScoreCollector {
++  static class SV extends TermsWithScoreCollector<BinaryDocValues> {
+ 
+-    BinaryDocValues fromDocTerms;
+-
+-    SV(String field, ScoreMode scoreMode) {
+-      super(field, scoreMode);
++    SV(Function<BinaryDocValues> docValuesCall, ScoreMode scoreMode) {
++      super(docValuesCall, scoreMode);
+     }
+ 
+     @Override
+     public void collect(int doc) throws IOException {
+-      int ord = collectedTerms.add(fromDocTerms.get(doc));
++      int ord = collectedTerms.add(docValues.get(doc));
+       if (ord < 0) {
+         ord = -ord - 1;
+       } else {
+@@ -133,26 +140,23 @@
+               scoreSums[ord] = current;
+             }
+             break;
++          default:
++            throw new AssertionError("unexpected: " + scoreMode);
+         }
+       }
+     }
+ 
+-    @Override
+-    protected void doSetNextReader(LeafReaderContext context) throws IOException {
+-      fromDocTerms = DocValues.getBinary(context.reader(), field);
+-    }
+-
+     static class Avg extends SV {
+ 
+       int[] scoreCounts = new int[INITIAL_ARRAY_SIZE];
+ 
+-      Avg(String field) {
+-        super(field, ScoreMode.Avg);
++      Avg(Function<BinaryDocValues> docValuesCall) {
++        super(docValuesCall, ScoreMode.Avg);
+       }
+ 
+       @Override
+       public void collect(int doc) throws IOException {
+-        int ord = collectedTerms.add(fromDocTerms.get(doc));
++        int ord = collectedTerms.add(docValues.get(doc));
+         if (ord < 0) {
+           ord = -ord - 1;
+         } else {
+@@ -187,20 +191,18 @@
+   }
+ 
+   // impl that works with multiple values per document
+-  static class MV extends TermsWithScoreCollector {
++  static class MV extends TermsWithScoreCollector<SortedSetDocValues> {
+ 
+-    SortedSetDocValues fromDocTermOrds;
+-
+-    MV(String field, ScoreMode scoreMode) {
+-      super(field, scoreMode);
++    MV(Function<SortedSetDocValues> docValuesCall, ScoreMode scoreMode) {
++      super(docValuesCall, scoreMode);
+     }
+ 
+     @Override
+     public void collect(int doc) throws IOException {
+-      fromDocTermOrds.setDocument(doc);
++      docValues.setDocument(doc);
+       long ord;
+-      while ((ord = fromDocTermOrds.nextOrd()) != SortedSetDocValues.NO_MORE_ORDS) {
+-        int termID = collectedTerms.add(fromDocTermOrds.lookupOrd(ord));
++      while ((ord = docValues.nextOrd()) != SortedSetDocValues.NO_MORE_ORDS) {
++        int termID = collectedTerms.add(docValues.lookupOrd(ord));
+         if (termID < 0) {
+           termID = -termID - 1;
+         } else {
+@@ -225,29 +227,26 @@
+           case Max:
+             scoreSums[termID] = Math.max(scoreSums[termID], scorer.score());
+             break;
++          default:
++            throw new AssertionError("unexpected: " + scoreMode);
+         }
+       }
+     }
+ 
+-    @Override
+-    protected void doSetNextReader(LeafReaderContext context) throws IOException {
+-      fromDocTermOrds = DocValues.getSortedSet(context.reader(), field);
+-    }
+-
+     static class Avg extends MV {
+ 
+       int[] scoreCounts = new int[INITIAL_ARRAY_SIZE];
+ 
+-      Avg(String field) {
+-        super(field, ScoreMode.Avg);
++      Avg(Function<SortedSetDocValues> docValuesCall) {
++        super(docValuesCall, ScoreMode.Avg);
+       }
+ 
+       @Override
+       public void collect(int doc) throws IOException {
+-        fromDocTermOrds.setDocument(doc);
++        docValues.setDocument(doc);
+         long ord;
+-        while ((ord = fromDocTermOrds.nextOrd()) != SortedSetDocValues.NO_MORE_ORDS) {
+-          int termID = collectedTerms.add(fromDocTermOrds.lookupOrd(ord));
++        while ((ord = docValues.nextOrd()) != SortedSetDocValues.NO_MORE_ORDS) {
++          int termID = collectedTerms.add(docValues.lookupOrd(ord));
+           if (termID < 0) {
+             termID = -termID - 1;
+           } else {

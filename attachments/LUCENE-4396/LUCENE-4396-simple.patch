@@ -1,0 +1,919 @@
+diff --git a/lucene/core/src/java/org/apache/lucene/search/BooleanArrayScorer.java b/lucene/core/src/java/org/apache/lucene/search/BooleanArrayScorer.java
+new file mode 100644
+index 0000000..ffa6262
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/search/BooleanArrayScorer.java
+@@ -0,0 +1,322 @@
++package org.apache.lucene.search;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.Collection;
++import java.util.List;
++
++import org.apache.lucene.search.BooleanQuery.BooleanWeight;
++
++/**
++ *  This is an improvement of {@link BooleanScorer}.
++ *  It only supports cases where there is at least one MUST clause.
++ */
++final class BooleanArrayScorer extends Scorer {
++
++  private static final class Bucket {
++    int doc;                 // doc id
++    // score is divided into RS and OS, so that its calculating order
++    // can be the same as the DAAT procedure.
++    double requiredScore;    // incremental required score
++    double optionalScore;    // incremental optional score
++    int coord;               // count of terms in score
++    boolean valid;           // valid bucket
++  }
++
++  /** An array of documents. */
++  private final class BucketArray {
++    static final int SIZE = 1 << 8;
++
++    private final Bucket[] buckets = new Bucket[SIZE];
++    // After collecting more documents, if there are more documents not collected.
++    boolean more = true;
++    private int numOfBuckets = 0;       // number of buckets in the array
++    private int numOfValidBuckets = 0;  // number of valid buckets in the array
++
++    BucketArray() {
++      // Pre-fill to save the lazy init when collecting
++      // each sub:
++      for(int idx=0;idx<SIZE;idx++) {
++        buckets[idx] = new Bucket();
++      }
++    }
++
++    /**
++     * Force to collect more docs.
++     * It is not possible that more is true, while first is null.
++     * <code>more</code> will be true if more matching documents may remain.
++     */
++    void collectMoreForce() throws IOException {
++      do {
++        // If there are more docs not collected, but no doc is collected in this iteration,
++        // collect more again.
++        collectMore();
++      } while (more && numOfValidBuckets == 0);
++    }
++
++    /**
++     * Collect more docs to bucket table. After calling this method,
++     * <code>more</code> will be true if more matching documents may remain.
++     */
++    void collectMore() throws IOException {
++      numOfBuckets = 0;
++
++      // Scan requiredDocs to fill the bucket array
++      while (numOfBuckets < SIZE) {
++        final int requiredDocID = requiredScorer.nextDoc();
++        if (requiredDocID == DocIdSetIterator.NO_MORE_DOCS) {
++          more = false;
++          break;
++        }
++        final Bucket bucket = buckets[numOfBuckets ++];
++        bucket.doc = requiredDocID;
++        bucket.coord = requiredNrMatch;
++        bucket.requiredScore = requiredScorer.score();
++        bucket.optionalScore = 0;
++        bucket.valid = true;
++      }
++      numOfValidBuckets = numOfBuckets;
++
++      // Scan prohibitedDocs to remove docs from bucket table.
++      for (Scorer prohibitedScorer : prohibitedScorers) {
++        int i = 0;
++        while (i < numOfBuckets) {
++          final Bucket bucket = buckets[i];
++          int prohibitedDocID = prohibitedScorer.docID();
++          if (prohibitedDocID < bucket.doc) {
++            // According to the definition of .advance(),
++            // prohibitedDocID should be less then bucket.doc,
++            // before calling .advance(bucket.doc);
++
++            // Skip to bucket.doc, so that prohibitedDocID >= bucket.doc
++            prohibitedDocID = prohibitedScorer.advance(bucket.doc);
++          }
++
++          if (prohibitedDocID == DocIdSetIterator.NO_MORE_DOCS) {
++            break;
++
++          } else if (prohibitedDocID == bucket.doc) {
++            // remove the prohibited bucket and decrease number of valid buckets.
++            if (bucket.valid) {
++              numOfValidBuckets --;
++              bucket.valid = false;
++            }
++            i ++;
++
++          } else { // prohibitedDocID > bucket.doc
++            i = skipsTo(i, prohibitedDocID);
++          }
++        }
++      }
++
++      // Scan optionalDocs to add coord and score.
++      for (Scorer optionalScorer : optionalScorers) {
++        int i = 0;
++        while (i < numOfBuckets) {
++          final Bucket bucket = buckets[i];
++          int optionalDocID = optionalScorer.docID();
++          if (optionalDocID < bucket.doc) {
++            // According to the definition of .advance(),
++            // optionalDocID should be less then bucket.doc,
++            // before calling .advance(bucket.doc);
++
++            // Skip to bucket.doc, so that optionalDocID >= bucket.doc
++            optionalDocID = optionalScorer.advance(bucket.doc);
++          }
++
++          if (optionalDocID == DocIdSetIterator.NO_MORE_DOCS) {
++            break;
++
++          } else if (optionalDocID == bucket.doc) {
++            bucket.coord ++;
++            bucket.optionalScore += optionalScorer.score();
++            i ++;
++
++          } else { // optionalDocID > bucket.doc
++            // current bucket skips to optionalDocID.
++            i = skipsTo(i, optionalDocID);
++          }
++        }
++      }
++    }
++
++    /**
++     * Skips to target from begin. <br/>
++     * <b>NOTE:</b> <b>Undefined</b> when buckets[i].doc >= target.
++     * @param begin the index begin to skip, <b>MUST</b> s.t. -1 &le; begin.
++     * @param target the target doc to skip.
++     * @return the first index i s.t. buckets[i].doc >= target.
++     */
++    int skipsTo(int begin, int target) {
++      final int DELTA = 16;
++      int i = begin + DELTA;
++      while (i < numOfBuckets && buckets[i].doc < target) {
++        i += DELTA;
++      }
++
++      int end = i;
++      if (end >= numOfBuckets) {
++        end = numOfBuckets;
++
++      } else if (buckets[end].doc == target) {
++        return end;
++      }
++
++      i = i - DELTA + 1;
++      while (i < end && buckets[i].doc < target) {
++        i ++;
++      }
++      return i;
++    }
++  }
++
++  private final BucketArray bucketArray = new BucketArray();
++  private final float[] coordFactors;
++  private int currentIndex = -1;
++  private int currentDoc = -1;
++
++  // we only keep the conjunction of required scorers
++  final private Scorer requiredScorer;
++  final private List<Scorer> optionalScorers;
++  final private List<Scorer> prohibitedScorers;
++  // requiredNrMatch applies to MUST clauses, it's actually number of required scorers
++  final int requiredNrMatch;
++  // minNrShouldMatch only applies to SHOULD clauses
++  final private int minNrShouldMatch;
++
++  BooleanArrayScorer(BooleanWeight weight, boolean disableCoord, int minNrShouldMatch,
++      List<Scorer> requiredScorers, List<Scorer> optionalScorers, List<Scorer> prohibitedScorers,
++      int maxCoord) throws IOException {
++    this(weight, disableCoord, minNrShouldMatch,
++        // if there're required scorers, we only keep their conjunction
++        requiredScorers.isEmpty() ? null :
++          new ConjunctionScorer(weight, requiredScorers.toArray(new Scorer[requiredScorers.size()])),
++        requiredScorers.size(),
++        optionalScorers, prohibitedScorers, maxCoord);
++  }
++
++  BooleanArrayScorer(BooleanWeight weight, boolean disableCoord, int minNrShouldMatch,
++      Scorer requiredScorer, int requiredNrMatch, List<Scorer> optionalScorers, List<Scorer> prohibitedScorers,
++      int maxCoord) throws IOException {
++    super(weight);
++    if (requiredNrMatch <= 0) {
++      throw new IllegalArgumentException("There should be at least one requiredScorer");
++    }
++    if (minNrShouldMatch < 0) {
++      throw new IllegalArgumentException("Minimum number of optional scorers should not be negative");
++    }
++    this.minNrShouldMatch = minNrShouldMatch;
++
++    this.requiredScorer = requiredScorer;
++    this.requiredNrMatch = requiredNrMatch;
++    this.optionalScorers = optionalScorers;
++    this.prohibitedScorers = prohibitedScorers;
++
++    coordFactors = new float[requiredNrMatch + optionalScorers.size() + 1];
++    for (int i = 0; i < coordFactors.length; i++) {
++      coordFactors[i] = disableCoord ? 1.0f : weight.coord(i, maxCoord);
++    }
++  }
++
++  @Override
++  public String toString() {
++    StringBuffer buffer = new StringBuffer();
++    buffer.append("boolean(");
++    buffer.append("+");
++    buffer.append(requiredScorer.toString());
++    buffer.append(" ");
++    for (Scorer optionalScorer : optionalScorers) {
++      buffer.append(optionalScorer.toString());
++      buffer.append(" ");
++    }
++    for (Scorer prohibitedScorer : prohibitedScorers) {
++      buffer.append("-");
++      buffer.append(prohibitedScorer.toString());
++      buffer.append(" ");
++    }
++    // Delete the last whitespace
++    if (buffer.length() > "boolean(".length()) {
++      buffer.deleteCharAt(buffer.length() - 1);
++    }
++    buffer.append(")");
++    return buffer.toString();
++  }
++
++  @Override
++  public float score() throws IOException {
++    final Bucket bucket = bucketArray.buckets[currentIndex];
++    // Cast required score and optional score to float,
++    // in order to make the calculating procedure is the same as DAAT.
++    return ((float) bucket.requiredScore + (float) bucket.optionalScore) * coordFactors[bucket.coord];
++  }
++
++  @Override
++  public int freq() throws IOException {
++    return bucketArray.buckets[currentIndex].coord;
++  }
++
++  @Override
++  public int docID() {
++    return currentDoc;
++  }
++
++  @Override
++  public int nextDoc() throws IOException {
++    // go to the next
++    currentIndex ++;
++    // if buckets are exhausted, collect more.
++    if (bucketArray.more && currentIndex >= bucketArray.numOfBuckets) {
++      bucketArray.collectMoreForce();
++      currentIndex = 0;
++    }
++
++    // iterate to get the first valid bucket
++    while (currentIndex < bucketArray.numOfBuckets) {
++      final Bucket bucket = bucketArray.buckets[currentIndex];
++
++      if (bucket.valid && bucket.coord - requiredNrMatch >= minNrShouldMatch) {
++        return currentDoc = bucket.doc;
++      }
++
++      currentIndex ++;
++      if (bucketArray.more && currentIndex >= bucketArray.numOfBuckets) {
++        bucketArray.collectMoreForce();
++        currentIndex = 0;
++      }
++    }
++    return currentDoc = DocIdSetIterator.NO_MORE_DOCS;
++  }
++
++  @Override
++  public int advance(int target) throws IOException {
++    // Actually, this method is not supposed to be used,
++    // because we have to collect lots of unused docs in this method.
++    return slowAdvance(target);
++  }
++
++  @Override
++  public long cost() {
++    return requiredScorer.cost();
++  }
++
++  @Override
++  public Collection<ChildScorer> getChildren() {
++    throw new UnsupportedOperationException();
++  }
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/search/BooleanQuery.java b/lucene/core/src/java/org/apache/lucene/search/BooleanQuery.java
+index 4d7635d..f48b7ca 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/BooleanQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/BooleanQuery.java
+@@ -20,6 +20,7 @@ package org.apache.lucene.search;
+ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.Collections;
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Set;
+@@ -42,8 +43,8 @@ public class BooleanQuery extends Query implements Iterable<BooleanClause> {
+ 
+   /** Thrown when an attempt is made to add more than {@link
+    * #getMaxClauseCount()} clauses. This typically happens if
+-   * a PrefixQuery, FuzzyQuery, WildcardQuery, or TermRangeQuery 
+-   * is expanded to many terms during search. 
++   * a PrefixQuery, FuzzyQuery, WildcardQuery, or TermRangeQuery
++   * is expanded to many terms during search.
+    */
+   public static class TooManyClauses extends RuntimeException {
+     public TooManyClauses() {
+@@ -58,7 +59,7 @@ public class BooleanQuery extends Query implements Iterable<BooleanClause> {
+    */
+   public static int getMaxClauseCount() { return maxClauseCount; }
+ 
+-  /** 
++  /**
+    * Set the maximum number of clauses permitted per BooleanQuery.
+    * Default value is 1024.
+    */
+@@ -286,10 +287,10 @@ public class BooleanQuery extends Query implements Iterable<BooleanClause> {
+                                "of optional clauses: " + minShouldMatch);
+         return sumExpl;
+       }
+-      
++
+       sumExpl.setMatch(0 < coord ? Boolean.TRUE : Boolean.FALSE);
+       sumExpl.setValue(sum);
+-      
++
+       final float coordFactor = disableCoord ? 1.0f : coord(coord, maxCoord);
+       if (coordFactor == 1.0f) {
+         return sumExpl;                             // eliminate wrapper
+@@ -307,36 +308,141 @@ public class BooleanQuery extends Query implements Iterable<BooleanClause> {
+     @Override
+     public BulkScorer bulkScorer(AtomicReaderContext context, boolean scoreDocsInOrder,
+                                  Bits acceptDocs) throws IOException {
+-
+-      if (scoreDocsInOrder || minNrShouldMatch > 1) {
++      if (minNrShouldMatch > 1) {
+         // TODO: (LUCENE-4872) in some cases BooleanScorer may be faster for minNrShouldMatch
+         // but the same is even true of pure conjunctions...
+         return super.bulkScorer(context, scoreDocsInOrder, acceptDocs);
+       }
+ 
+-      List<BulkScorer> prohibited = new ArrayList<BulkScorer>();
+-      List<BulkScorer> optional = new ArrayList<BulkScorer>();
++      if (!scoreDocsInOrder) {
++        List<BulkScorer> prohibited = new ArrayList<BulkScorer>();
++        List<BulkScorer> optional = new ArrayList<BulkScorer>();
++        boolean shouldPullScorers = false;
++        Iterator<BooleanClause> cIter = clauses.iterator();
++        for (Weight w : weights) {
++          BooleanClause c = cIter.next();
++          BulkScorer subScorer = w.bulkScorer(context, false, acceptDocs);
++          if (subScorer == null) {
++            if (c.isRequired()) {
++              return null;
++            }
++          } else if (c.isRequired()) {
++            shouldPullScorers = true;
++            break;
++
++          } else if (c.isProhibited()) {
++            prohibited.add(subScorer);
++
++          } else {
++            optional.add(subScorer);
++          }
++        }
++        if (!shouldPullScorers) {
++          // When docs can be out of order and required is empty, BS is the best choice.
++          return new BooleanScorer(this, disableCoord, minNrShouldMatch,
++              optional, prohibited, maxCoord);
++        }
++      }
++
++      // Cost on each type of clauses, we have to calculate these values
++      // and use them to judge which scorer should be used.
++      float requiredCost = Float.MAX_VALUE;
++      float optionalCost = 0F;
++      float prohibitedCost = 0F;
++
++      // reiterate weights in order to get scorers but not bulk scorer.
++      List<Scorer> requiredScorers = new ArrayList<>();
++      List<Scorer> prohibitedScorers = new ArrayList<>();
++      List<Scorer> optionalScorers = new ArrayList<>();
+       Iterator<BooleanClause> cIter = clauses.iterator();
+-      for (Weight w  : weights) {
+-        BooleanClause c =  cIter.next();
+-        BulkScorer subScorer = w.bulkScorer(context, false, acceptDocs);
++      for (Weight w : weights) {
++        BooleanClause c = cIter.next();
++        Scorer subScorer = w.scorer(context, acceptDocs);
+         if (subScorer == null) {
+           if (c.isRequired()) {
+             return null;
+           }
+-        } else if (c.isRequired()) {
+-          // TODO: there are some cases where BooleanScorer
+-          // would handle conjunctions faster than
+-          // BooleanScorer2...
+-          return super.bulkScorer(context, scoreDocsInOrder, acceptDocs);
+-        } else if (c.isProhibited()) {
+-          prohibited.add(subScorer);
+         } else {
+-          optional.add(subScorer);
++          if (c.isRequired()) {
++            // required cost is determined by the minimum value of sub-required cost.
++            requiredScorers.add(subScorer);
++            requiredCost = Math.min(requiredCost, subScorer.cost());
++
++          } else if (c.isProhibited()) {
++            prohibitedScorers.add(subScorer);
++            prohibitedCost += subScorer.cost();
++
++          } else {
++            optionalScorers.add(subScorer);
++            optionalCost += subScorer.cost();
++          }
+         }
+       }
++      // discount on the required cost caused by MUST intersection.
++      requiredCost *= Math.pow(0.97, requiredScorers.size() - 1);
++      // get the average prohibited cost.
++      prohibitedCost /= prohibitedScorers.size();
++      // get the average optional cost.
++      optionalCost /= optionalScorers.size();
+ 
+-      return new BooleanScorer(this, disableCoord, minNrShouldMatch, optional, prohibited, maxCoord);
++      // scorer simplifications:
++      int minShouldMatch = minNrShouldMatch;
++      if (optionalScorers.size() == minShouldMatch) {
++        // any optional clauses are in fact required
++        requiredScorers.addAll(optionalScorers);
++        optionalScorers.clear();
++        minShouldMatch = 0;
++      }
++
++      if (requiredScorers.isEmpty() && optionalScorers.isEmpty()) {
++        // no required and optional clauses.
++        return null;
++      } else if (optionalScorers.size() < minShouldMatch) {
++        // either >1 req scorer, or there are 0 req scorers and at least 1
++        // optional scorer. Therefore if there are not enough optional scorers
++        // no documents will be matched by the query
++        return null;
++      }
++
++      if (requiredScorers.isEmpty()) {
++        // DAAT is the only choice
++        return new DefaultBulkScorer(
++            excl(opt(optionalScorers, minShouldMatch, disableCoord), prohibitedScorers));
++      }
++
++      // conjunction-disjunction mix: similar logics as .scorer().
++      // ex. +a -b1 -b2 c1 c2 => +req opt
++      // Among, req=(+a -b1 -b2), opt=(c1 c2)
++      Scorer req;
++      Class<?> scorerNotClass = scorerClassForNot(requiredCost, prohibitedScorers.size(), prohibitedCost);
++      if (scorerNotClass == BooleanArrayScorer.class) {
++        req = new BooleanArrayScorer(this,
++            // if there's no optional scorer, req will be returned, and thus it should be same as 'disableCoord'.
++            // if there're optional scorers, it should be true, as req is not final scorer.
++            !optionalScorers.isEmpty() || disableCoord,
++            0, // no optional scorer concerned here, thus it should be 0.
++            requiredScorers, Collections.<Scorer> emptyList(), prohibitedScorers, maxCoord);
++      } else {
++        req = excl(req(requiredScorers, !optionalScorers.isEmpty() || disableCoord), prohibitedScorers);
++      }
++
++      if (optionalScorers.isEmpty()) {
++        // we can return req now.
++        return new DefaultBulkScorer(req);
++      }
++
++      // discount on the required cost caused by MUST_NOT.
++      requiredCost *= Math.pow(0.97, prohibitedScorers.size());
++      Scorer opt;
++      Class<?> scorerOrClass = scorerClassForOr(requiredCost, optionalScorers.size(), optionalCost);
++      if (scorerOrClass == BooleanArrayScorer.class) {
++        return new DefaultBulkScorer(new BooleanArrayScorer(this, disableCoord, minShouldMatch,
++            req, requiredScorers.size(), optionalScorers, Collections.<Scorer> emptyList(), maxCoord));
++      }
++      opt = opt(optionalScorers, minShouldMatch, true);
++
++      return new DefaultBulkScorer(
++          getMixScorer(requiredScorers.size(), optionalScorers.size(), req, opt, minShouldMatch));
+     }
+ 
+     @Override
+@@ -366,16 +472,16 @@ public class BooleanQuery extends Query implements Iterable<BooleanClause> {
+           optional.add(subScorer);
+         }
+       }
+-      
++
+       // scorer simplifications:
+-      
++
+       if (optional.size() == minShouldMatch) {
+         // any optional clauses are in fact required
+         required.addAll(optional);
+         optional.clear();
+         minShouldMatch = 0;
+       }
+-      
++
+       if (required.isEmpty() && optional.isEmpty()) {
+         // no required and optional clauses.
+         return null;
+@@ -385,52 +491,94 @@ public class BooleanQuery extends Query implements Iterable<BooleanClause> {
+         // no documents will be matched by the query
+         return null;
+       }
+-      
+-      // three cases: conjunction, disjunction, or mix
+-      
++
++      // three cases: disjunction, conjunction, or mix
++
+       // pure conjunction
+       if (optional.isEmpty()) {
+         return excl(req(required, disableCoord), prohibited);
+       }
+-      
++
+       // pure disjunction
+       if (required.isEmpty()) {
+         return excl(opt(optional, minShouldMatch, disableCoord), prohibited);
+       }
+-      
++
+       // conjunction-disjunction mix:
+       // we create the required and optional pieces with coord disabled, and then
+       // combine the two: if minNrShouldMatch > 0, then its a conjunction: because the
+       // optional side must match. otherwise its required + optional, factoring the
+       // number of optional terms into the coord calculation
+-      
++
+       Scorer req = excl(req(required, true), prohibited);
+       Scorer opt = opt(optional, minShouldMatch, true);
+ 
++      return getMixScorer(required.size(), optional.size(), req, opt, minShouldMatch);
++    }
++
++    /**
++     * ex. +a b -c<br/>
++     * Now we have req=(+a -c) and opt=b,
++     * In this metod, we merge this two scorer to get the final scorer, (+req opt)
++     */
++    private Scorer getMixScorer(int requiredSize, int optionalSize,
++        Scorer req, Scorer opt, int minShouldMatch) {
+       // TODO: clean this up: its horrible
+       if (disableCoord) {
+         if (minShouldMatch > 0) {
+           return new ConjunctionScorer(this, new Scorer[] { req, opt }, 1F);
+         } else {
+-          return new ReqOptSumScorer(req, opt);          
++          return new ReqOptSumScorer(req, opt);
+         }
+-      } else if (optional.size() == 1) {
++      } else if (optionalSize == 1) {
+         if (minShouldMatch > 0) {
+-          return new ConjunctionScorer(this, new Scorer[] { req, opt }, coord(required.size()+1, maxCoord));
++          return new ConjunctionScorer(this, new Scorer[] { req, opt }, coord(requiredSize+1, maxCoord));
+         } else {
+-          float coordReq = coord(required.size(), maxCoord);
+-          float coordBoth = coord(required.size() + 1, maxCoord);
++          float coordReq = coord(requiredSize, maxCoord);
++          float coordBoth = coord(requiredSize + 1, maxCoord);
+           return new BooleanTopLevelScorers.ReqSingleOptScorer(req, opt, coordReq, coordBoth);
+         }
+       } else {
+         if (minShouldMatch > 0) {
+-          return new BooleanTopLevelScorers.CoordinatingConjunctionScorer(this, coords(), req, required.size(), opt);
++          return new BooleanTopLevelScorers.CoordinatingConjunctionScorer(this, coords(), req, requiredSize, opt);
+         } else {
+-          return new BooleanTopLevelScorers.ReqMultiOptScorer(req, opt, required.size(), coords()); 
++          return new BooleanTopLevelScorers.ReqMultiOptScorer(req, opt, requiredSize, coords());
+         }
+       }
+     }
++
++    /**
++     * Choose the best scorer for +a -b1 -b2 -b3 ... cases.<br/>
++     * It is supposed that we should not choose BAS, when MUST is high cost, while MUST_NOT is low cost.
++     * Besides, the more MUST_NOT there're, the higher BAS' performance can reach.
++     * @param requiredCost the estimated required cost
++     * @param prohibitedSize number of prohibited clauses
++     * @param prohibitedCost the estimated prohibited cost
++     * @return the best scorer class for (+a -b1 -b2 -b3 ...)
++     */
++    private Class<?> scorerClassForNot(float requiredCost, int prohibitedSize, float prohibitedCost) {
++      if (requiredCost / prohibitedCost < 2 && prohibitedSize >= 6) {
++        return BooleanArrayScorer.class;
++      }
++      return null;
++    }
+     
++    /**
++     * Choose the best scorer for +a b1 b2 b3 ... cases.<br/>
++     * It is supposed that we should not choose BAS, when MUST is high cost, while SHOULD is low cost.
++     * Besides, the more SHOULD there're, the higher BAS' performance can reach.
++     * @param requiredCost the estimated required cost
++     * @param optionalCost number of optional clauses
++     * @param optionalSize the estimated optional cost
++     * @return the best scorer class for (+a b1 b2 b3 ...)
++     */
++    private Class<?> scorerClassForOr(float requiredCost, int optionalSize, float optionalCost) {
++      if (requiredCost / optionalCost < 2 && optionalSize >= 6) {
++        return BooleanArrayScorer.class;
++      }
++      return null;
++    }
++
+     @Override
+     public boolean scoresDocsOutOfOrder() {
+       if (minNrShouldMatch > 1) {
+@@ -446,15 +594,15 @@ public class BooleanQuery extends Query implements Iterable<BooleanClause> {
+           optionalCount++;
+         }
+       }
+-      
++
+       if (optionalCount == minNrShouldMatch) {
+         return false; // BS2 (in-order) will be used, as this means conjunction
+       }
+-      
++
+       // scorer() will return an out-of-order scorer if requested.
+       return true;
+     }
+-    
++
+     private Scorer req(List<Scorer> required, boolean disableCoord) {
+       if (required.size() == 1) {
+         Scorer req = required.get(0);
+@@ -464,12 +612,12 @@ public class BooleanQuery extends Query implements Iterable<BooleanClause> {
+           return req;
+         }
+       } else {
+-        return new ConjunctionScorer(this, 
++        return new ConjunctionScorer(this,
+                                      required.toArray(new Scorer[required.size()]),
+                                      disableCoord ? 1.0F : coord(required.size(), maxCoord));
+       }
+     }
+-    
++
+     private Scorer excl(Scorer main, List<Scorer> prohibited) throws IOException {
+       if (prohibited.isEmpty()) {
+         return main;
+@@ -478,13 +626,13 @@ public class BooleanQuery extends Query implements Iterable<BooleanClause> {
+       } else {
+         float coords[] = new float[prohibited.size()+1];
+         Arrays.fill(coords, 1F);
+-        return new ReqExclScorer(main, 
+-                                 new DisjunctionSumScorer(this, 
+-                                                          prohibited.toArray(new Scorer[prohibited.size()]), 
++        return new ReqExclScorer(main,
++                                 new DisjunctionSumScorer(this,
++                                                          prohibited.toArray(new Scorer[prohibited.size()]),
+                                                           coords));
+       }
+     }
+-    
++
+     private Scorer opt(List<Scorer> optional, int minShouldMatch, boolean disableCoord) throws IOException {
+       if (optional.size() == 1) {
+         Scorer opt = optional.get(0);
+@@ -504,13 +652,13 @@ public class BooleanQuery extends Query implements Iterable<BooleanClause> {
+         if (minShouldMatch > 1) {
+           return new MinShouldMatchSumScorer(this, optional, minShouldMatch, coords);
+         } else {
+-          return new DisjunctionSumScorer(this, 
+-                                          optional.toArray(new Scorer[optional.size()]), 
++          return new DisjunctionSumScorer(this,
++                                          optional.toArray(new Scorer[optional.size()]),
+                                           coords);
+         }
+       }
+     }
+-    
++
+     private float[] coords() {
+       float[] coords = new float[maxCoord+1];
+       coords[0] = 0F;
+@@ -656,5 +804,5 @@ public class BooleanQuery extends Query implements Iterable<BooleanClause> {
+     return Float.floatToIntBits(getBoost()) ^ clauses.hashCode()
+       + getMinimumNumberShouldMatch() + (disableCoord ? 17:0);
+   }
+-  
++
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/search/ConjunctionScorer.java b/lucene/core/src/java/org/apache/lucene/search/ConjunctionScorer.java
+index 3e81187..e303ed8 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/ConjunctionScorer.java
++++ b/lucene/core/src/java/org/apache/lucene/search/ConjunctionScorer.java
+@@ -102,12 +102,11 @@ class ConjunctionScorer extends Scorer {
+ 
+   @Override
+   public float score() throws IOException {
+-    // TODO: sum into a double and cast to float if we ever send required clauses to BS1
+-    float sum = 0.0f;
++    double sum = 0.0f;
+     for (DocsAndFreqs docs : docsAndFreqs) {
+       sum += docs.scorer.score();
+     }
+-    return sum * coord;
++    return (float) (sum * coord);
+   }
+   
+   @Override
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestSameScore.java b/lucene/core/src/test/org/apache/lucene/search/TestSameScore.java
+new file mode 100644
+index 0000000..4d29d0c
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/search/TestSameScore.java
+@@ -0,0 +1,159 @@
++package org.apache.lucene.search;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.Field;
++import org.apache.lucene.index.AtomicReaderContext;
++import org.apache.lucene.index.FieldInvertState;
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.RandomIndexWriter;
++import org.apache.lucene.index.Term;
++import org.apache.lucene.search.similarities.Similarity;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.LuceneTestCase;
++import org.junit.AfterClass;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++/**
++ * Cases used to test whether the scores of DAAT and BAS(or BS) is exactly the same.
++ */
++public class TestSameScore extends LuceneTestCase {
++  private static Directory dir;
++  private static IndexReader reader;
++  private static IndexSearcher searcher;
++
++  @BeforeClass
++  public static void beforeClass() throws Exception {
++    dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++    Document doc = new Document();
++    // score(a)=1, score(b)=1/8, score(c)=1/3, score(d)=1/2
++    doc.add(newTextField("field", "a b b b b b b b b c c c d d", Field.Store.NO));
++    w.addDocument(doc);
++    reader = w.getReader();
++    searcher = new IndexSearcher(reader);
++    searcher.setSimilarity(new ITFSimilarity());
++    w.close();
++  }
++
++  @AfterClass
++  public static void afterClass() throws Exception {
++    reader.close();
++    dir.close();
++    searcher = null;
++    reader = null;
++    dir = null;
++  }
++
++  @Test
++  public void testSomeClauses() throws Exception {
++    // disable coord so that we can easily check the score value manually.
++    BooleanQuery query = new BooleanQuery(true);
++    query.add(new TermQuery(new Term("field", "a")), BooleanClause.Occur.MUST);
++    query.add(new TermQuery(new Term("field", "a")), BooleanClause.Occur.SHOULD);
++    query.add(new TermQuery(new Term("field", "c")), BooleanClause.Occur.SHOULD);
++    query.add(new TermQuery(new Term("field", "d")), BooleanClause.Occur.SHOULD);
++
++    int[] expDocNrs = {0};
++    queriesTest(query, expDocNrs);
++  }
++
++  @Test
++  public void testManyClauses() throws Exception {
++    // disable coord so that we can easily check the score value manually.
++    BooleanQuery query = new BooleanQuery(true);
++    query.add(new TermQuery(new Term("field", "a")), BooleanClause.Occur.MUST);
++    for (int i=0; i<31; i++) {
++      query.add(new TermQuery(new Term("field", "a")), BooleanClause.Occur.SHOULD);
++    }
++    query.add(new TermQuery(new Term("field", "b")), BooleanClause.Occur.SHOULD);
++    query.add(new TermQuery(new Term("field", "c")), BooleanClause.Occur.SHOULD);
++    query.add(new TermQuery(new Term("field", "d")), BooleanClause.Occur.SHOULD);
++
++    int[] expDocNrs = {0};
++    queriesTest(query, expDocNrs);
++  }
++
++
++  public void queriesTest(BooleanQuery query, int[] expDocNrs) throws Exception {
++    query.setMinimumNumberShouldMatch(2); // force to use DAAT
++    TopScoreDocCollector collector = TopScoreDocCollector.create(1, true);
++    searcher.search(query, null, collector);
++    ScoreDoc[] hits1 = collector.topDocs().scoreDocs;
++
++    query.setMinimumNumberShouldMatch(0);
++    collector = TopScoreDocCollector.create(1, false);
++    searcher.search(query, null, collector);
++    ScoreDoc[] hits2 = collector.topDocs().scoreDocs;
++
++    CheckHits.checkHitsQuery(query, hits1, hits2, expDocNrs);
++  }
++
++
++  /**
++   * Inverse TF Similarity.<br/>
++   * Use this similarity, so that we can easily control the score of a term.
++   */
++  private static class ITFSimilarity extends Similarity {
++
++    @Override
++    public long computeNorm(FieldInvertState state) {
++      return 1; // we dont care
++    }
++
++    @Override
++    public SimWeight computeWeight(float queryBoost,
++        CollectionStatistics collectionStats, TermStatistics... termStats) {
++      return new SimWeight() {
++        @Override
++        public float getValueForNormalization() {
++          return 1; // we don't care
++        }
++        @Override
++        public void normalize(float queryNorm, float topLevelBoost) {
++          // we don't care
++        }
++      };
++    }
++
++    @Override
++    public SimScorer simScorer(SimWeight weight, AtomicReaderContext context) throws IOException {
++      return new SimScorer() {
++        @Override
++        public float score(int doc, float freq) {
++          return 1 / freq; // inverse tf
++        }
++
++        @Override
++        public float computeSlopFactor(int distance) {
++          return 1F;
++        }
++
++        @Override
++        public float computePayloadFactor(int doc, int start, int end, BytesRef payload) {
++          return 1F;
++        }
++      };
++    }
++  }
++}

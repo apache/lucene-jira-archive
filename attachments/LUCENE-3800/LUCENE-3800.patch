@@ -1,0 +1,360 @@
+Index: lucene/core/src/java/org/apache/lucene/index/BaseMultiReader.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/index/BaseMultiReader.java	(revision 1291719)
++++ lucene/core/src/java/org/apache/lucene/index/BaseMultiReader.java	(working copy)
+@@ -36,11 +36,13 @@
+     boolean hasDeletions = false;
+     for (int i = 0; i < subReaders.length; i++) {
+       starts[i] = maxDoc;
+-      maxDoc += subReaders[i].maxDoc();      // compute maxDocs
+-      numDocs += subReaders[i].numDocs();    // compute numDocs
+-      if (subReaders[i].hasDeletions()) {
++      final IndexReader r = subReaders[i];
++      maxDoc += r.maxDoc();      // compute maxDocs
++      numDocs += r.numDocs();    // compute numDocs
++      if (r.hasDeletions()) {
+         hasDeletions = true;
+       }
++      r.registerParentReader(this);
+     }
+     starts[subReaders.length] = maxDoc;
+     this.maxDoc = maxDoc;
+Index: lucene/core/src/java/org/apache/lucene/index/FilterAtomicReader.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/index/FilterAtomicReader.java	(revision 1291719)
++++ lucene/core/src/java/org/apache/lucene/index/FilterAtomicReader.java	(working copy)
+@@ -282,6 +282,7 @@
+   public FilterAtomicReader(AtomicReader in) {
+     super();
+     this.in = in;
++    in.registerParentReader(this);
+   }
+ 
+   @Override
+Index: lucene/core/src/java/org/apache/lucene/index/IndexReader.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/index/IndexReader.java	(revision 1291719)
++++ lucene/core/src/java/org/apache/lucene/index/IndexReader.java	(working copy)
+@@ -21,6 +21,7 @@
+ import java.io.IOException;
+ import java.util.Collections;
+ import java.util.LinkedHashSet;
++import java.util.WeakHashMap;
+ import java.util.Set;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+@@ -72,10 +73,13 @@
+ */
+ public abstract class IndexReader implements Closeable {
+   
++  private boolean closed = false;
++  private boolean closedByChild = false;
++  private final AtomicInteger refCount = new AtomicInteger(1);
++
+   IndexReader() {
+     if (!(this instanceof CompositeReader || this instanceof AtomicReader))
+-      throw new Error("This class should never be directly extended, subclass AtomicReader or CompositeReader instead!");
+-    refCount.set(1);
++      throw new Error("IndexReader should never be directly extended, subclass AtomicReader or CompositeReader instead.");
+   }
+   
+   /**
+@@ -91,6 +95,9 @@
+   private final Set<ReaderClosedListener> readerClosedListeners = 
+       Collections.synchronizedSet(new LinkedHashSet<ReaderClosedListener>());
+ 
++  private final Set<IndexReader> parentReaders = 
++      Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<IndexReader,Boolean>()));
++
+   /** Expert: adds a {@link ReaderClosedListener}.  The
+    * provided listener will be invoked when this reader is closed.
+    *
+@@ -107,8 +114,19 @@
+     ensureOpen();
+     readerClosedListeners.remove(listener);
+   }
++  
++  /** Expert: This method is called by {@code IndexReader}s which wrap other readers
++   * (e.g. {@link CompositeReader} or {@link FilterAtomicReader}) to register the parent
++   * at the child (this reader) on construction of the parent. When this reader is closed,
++   * it will mark all registered parents as closed, too. The references to parent readers
++   * are weak only, so they can be GCed once they are no longer in use.
++   * @lucene.experimental */
++  public final void registerParentReader(IndexReader reader) {
++    ensureOpen();
++    parentReaders.add(reader);
++  }
+ 
+-  private final void notifyReaderClosedListeners() {
++  private void notifyReaderClosedListeners() {
+     synchronized(readerClosedListeners) {
+       for(ReaderClosedListener listener : readerClosedListeners) {
+         listener.onClose(this);
+@@ -116,9 +134,17 @@
+     }
+   }
+ 
+-  private boolean closed = false;
+-  
+-  private final AtomicInteger refCount = new AtomicInteger();
++  private void reportCloseToParentReaders() {
++    synchronized(parentReaders) {
++      for(IndexReader parent : parentReaders) {
++        parent.closedByChild = true;
++        // cross memory barrier by a fake write:
++        parent.refCount.addAndGet(0);
++        // recurse:
++        parent.reportCloseToParentReaders();
++      }
++    }
++  }
+ 
+   /** Expert: returns the current refCount for this reader */
+   public final int getRefCount() {
+@@ -191,7 +217,12 @@
+    * @see #incRef
+    */
+   public final void decRef() throws IOException {
+-    ensureOpen();
++    // only check refcount here (don't call ensureOpen()), so we can
++    // still close the reader if it was made invalid by a child:
++    if (refCount.get() <= 0) {
++      throw new AlreadyClosedException("this IndexReader is closed");
++    }
++    
+     final int rc = refCount.decrementAndGet();
+     if (rc == 0) {
+       boolean success = false;
+@@ -204,6 +235,7 @@
+           refCount.incrementAndGet();
+         }
+       }
++      reportCloseToParentReaders();
+       notifyReaderClosedListeners();
+     } else if (rc < 0) {
+       throw new IllegalStateException("too many decRef calls: refCount is " + rc + " after decrement");
+@@ -217,8 +249,35 @@
+     if (refCount.get() <= 0) {
+       throw new AlreadyClosedException("this IndexReader is closed");
+     }
++    // the happens before rule on reading the refCount, which must be after the fake write,
++    // ensures that we see the value:
++    if (closedByChild) {
++      throw new AlreadyClosedException("this IndexReader cannot be used anymore as one of its child readers was closed");
++    }
+   }
+   
++  /** {@inheritDoc}
++   * <p>For caching purposes, {@code IndexReader} subclasses are not allowed
++   * to implement equals/hashCode, so methods are declared final.
++   * To lookup instances from caches use {@link #getCoreCacheKey} and 
++   * {@link #getCombinedCoreAndDeletesKey}.
++   */
++  @Override
++  public final boolean equals(Object obj) {
++    return (this == obj);
++  }
++  
++  /** {@inheritDoc}
++   * <p>For caching purposes, {@code IndexReader} subclasses are not allowed
++   * to implement equals/hashCode, so methods are declared final.
++   * To lookup instances from caches use {@link #getCoreCacheKey} and 
++   * {@link #getCombinedCoreAndDeletesKey}.
++   */
++  @Override
++  public final int hashCode() {
++    return System.identityHashCode(this);
++  }
++  
+   /** Returns a IndexReader reading the index in the given
+    *  Directory
+    * @param directory the index directory
+Index: lucene/core/src/java/org/apache/lucene/index/ParallelAtomicReader.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/index/ParallelAtomicReader.java	(revision 1291719)
++++ lucene/core/src/java/org/apache/lucene/index/ParallelAtomicReader.java	(working copy)
+@@ -114,10 +114,11 @@
+     } 
+ 
+     // do this finally so any Exceptions occurred before don't affect refcounts:
+-    if (!closeSubReaders) {
+-      for (AtomicReader reader : completeReaderSet) {
++    for (AtomicReader reader : completeReaderSet) {
++      if (!closeSubReaders) {
+         reader.incRef();
+       }
++      reader.registerParentReader(this);
+     }
+   }
+ 
+@@ -199,11 +200,6 @@
+   @Override
+   public Fields fields() {
+     ensureOpen();
+-    // we cache the inner field instances, so we must check
+-    // that the delegate readers are really still open:
+-    for (final AtomicReader reader : parallelReaders) {
+-      reader.ensureOpen();
+-    }
+     return fields;
+   }
+   
+Index: lucene/core/src/java/org/apache/lucene/index/SlowCompositeReaderWrapper.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/index/SlowCompositeReaderWrapper.java	(revision 1291719)
++++ lucene/core/src/java/org/apache/lucene/index/SlowCompositeReaderWrapper.java	(working copy)
+@@ -68,6 +68,7 @@
+     in = reader;
+     fields = MultiFields.getFields(in);
+     liveDocs = MultiFields.getLiveDocs(in);
++    in.registerParentReader(this);
+   }
+ 
+   @Override
+@@ -78,7 +79,6 @@
+   @Override
+   public Fields fields() throws IOException {
+     ensureOpen();
+-    in.ensureOpen(); // as we cached the fields, we better check the original reader
+     return fields;
+   }
+ 
+@@ -127,7 +127,6 @@
+   @Override
+   public Bits getLiveDocs() {
+     ensureOpen();
+-    in.ensureOpen(); // as we cached the liveDocs, we better check the original reader
+     return liveDocs;
+   }
+ 
+Index: lucene/core/src/test/org/apache/lucene/index/TestReaderClosed.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/index/TestReaderClosed.java	(revision 1291719)
++++ lucene/core/src/test/org/apache/lucene/index/TestReaderClosed.java	(working copy)
+@@ -30,7 +30,6 @@
+ import org.apache.lucene.util._TestUtil;
+ 
+ public class TestReaderClosed extends LuceneTestCase {
+-  private IndexSearcher searcher;
+   private IndexReader reader;
+   private Directory dir;
+ 
+@@ -54,12 +53,12 @@
+       writer.addDocument(doc);
+     }
+     reader = writer.getReader();
+-    searcher = newSearcher(reader, /* TODO: change that back to true and add better test,
+-      so wrapped readers are explicitely checked, see LUCENE-3800: */ false);
+     writer.close();
+   }
+   
+   public void test() throws Exception {
++    assertTrue(reader.getRefCount() > 0);
++    IndexSearcher searcher = newSearcher(reader);
+     TermRangeQuery query = TermRangeQuery.newStringRange("field", "a", "z", true, true);
+     searcher.search(query, 5);
+     reader.close();
+@@ -70,6 +69,25 @@
+     }
+   }
+   
++  // LUCENE-3800
++  public void testReaderChaining() throws Exception {
++    assertTrue(reader.getRefCount() > 0);
++    IndexReader wrappedReader = SlowCompositeReaderWrapper.wrap(reader);
++    wrappedReader = new ParallelAtomicReader((AtomicReader) wrappedReader);
++    IndexSearcher searcher = newSearcher(wrappedReader);
++    TermRangeQuery query = TermRangeQuery.newStringRange("field", "a", "z", true, true);
++    searcher.search(query, 5);
++    reader.close(); // close original child reader
++    try {
++      searcher.search(query, 5);
++    } catch (AlreadyClosedException ace) {
++      assertEquals(
++        "this IndexReader cannot be used anymore as one of its child readers was closed",
++        ace.getMessage()
++      );
++    }
++  }
++  
+   public void tearDown() throws Exception {
+     dir.close();
+     super.tearDown();
+Index: solr/core/src/test/org/apache/solr/search/TestDocSet.java
+===================================================================
+--- solr/core/src/test/org/apache/solr/search/TestDocSet.java	(revision 1291719)
++++ solr/core/src/test/org/apache/solr/search/TestDocSet.java	(working copy)
+@@ -22,7 +22,10 @@
+ import java.util.Random;
+ 
+ import org.apache.lucene.index.FieldInfos;
+-import org.apache.lucene.index.FilterAtomicReader;
++import org.apache.lucene.index.DocValues;
++import org.apache.lucene.index.StoredFieldVisitor;
++import org.apache.lucene.index.Fields;
++import org.apache.lucene.index.AtomicReader;
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.AtomicReaderContext;
+ import org.apache.lucene.index.MultiReader;
+@@ -31,6 +34,7 @@
+ import org.apache.lucene.search.DocIdSetIterator;
+ import org.apache.lucene.search.Filter;
+ import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.OpenBitSet;
+ import org.apache.lucene.util.OpenBitSetIterator;
+ 
+@@ -336,9 +340,8 @@
+   }
+   ***/
+ 
+-  public IndexReader dummyIndexReader(final int maxDoc) {
+-    // TODO FIXME: THIS IS HEAVY BROKEN AND ILLEGAL TO DO (null delegate):
+-    IndexReader r = new FilterAtomicReader(null) {
++  public AtomicReader dummyIndexReader(final int maxDoc) {
++    return new AtomicReader() {
+       @Override
+       public int maxDoc() {
+         return maxDoc;
+@@ -358,8 +361,40 @@
+       public FieldInfos getFieldInfos() {
+         return new FieldInfos();
+       }
++
++      @Override
++      public Bits getLiveDocs() {
++        return null;
++      }
++
++      @Override
++      public Fields fields() {
++        return null;
++      }
++
++      @Override
++      public Fields getTermVectors(int doc) {
++        return null;
++      }
++
++      @Override
++      public DocValues normValues(String field) {
++        return null;
++      }
++
++      @Override
++      public DocValues docValues(String field) {
++        return null;
++      }
++
++      @Override
++      protected void doClose() {
++      }
++
++      @Override
++      public void document(int doc, StoredFieldVisitor visitor) {
++      }
+     };
+-    return r;
+   }
+ 
+   public IndexReader dummyMultiReader(int nSeg, int maxDoc) throws IOException {

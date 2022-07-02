@@ -1,0 +1,391 @@
+Index: lucene/CHANGES.txt
+===================================================================
+--- lucene/CHANGES.txt	(revision 1213622)
++++ lucene/CHANGES.txt	(working copy)
+@@ -385,6 +385,10 @@
+   (Mike McCandless, Uwe Schindler, Robert Muir, Chris Male, Yonik Seeley,
+   Jason Rutherglen, Paul Elschot)
+ 
++* LUCENE-3643: FilteredQuery and IndexSearcher.search(Query, Filter,...)
++  now allow null as Query, so it's possible to search an index with only
++  the Filter. Previously, a MatchAllDocsQuery was required.  (Uwe Schindler)
++
+ New features
+ 
+ * LUCENE-2604: Added RegexpQuery support to QueryParser. Regular expressions
+@@ -638,6 +642,10 @@
+   boolean clauses are required and instances of TermQuery. 
+   (Simon Willnauer, Robert Muir)
+   
++* LUCENE-3643: FilteredQuery and IndexSearcher.search(Query, Filter,...)
++  now optimize the special cases query == MatchAllDocsQuery / null to
++  execute as ConstantScoreQuery.  (Uwe Schindler)
++  
+ Bug fixes
+ 
+ * LUCENE-2803: The FieldCache can miss values if an entry for a reader
+Index: lucene/src/java/org/apache/lucene/search/FilteredQuery.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/search/FilteredQuery.java	(revision 1213622)
++++ lucene/src/java/org/apache/lucene/search/FilteredQuery.java	(working copy)
+@@ -33,25 +33,23 @@
+  * <p>Note: the bits are retrieved from the filter each time this
+  * query is used in a search - use a CachingWrapperFilter to avoid
+  * regenerating the bits every time.
+- *
+- * <p>Created: Apr 20, 2004 8:58:29 AM
+- *
+  * @since   1.4
+  * @see     CachingWrapperFilter
+  */
+-public class FilteredQuery
+-extends Query {
++public class FilteredQuery extends Query {
+ 
+-  Query query;
+-  Filter filter;
++  private final Query query;
++  private final Filter filter;
+ 
+   /**
+    * Constructs a new query which applies a filter to the results of the original query.
+-   * Filter.getDocIdSet() will be called every time this query is used in a search.
+-   * @param query  Query to be filtered, cannot be <code>null</code>.
+-   * @param filter Filter to apply to query results, cannot be <code>null</code>.
++   * {@link Filter#getDocIdSet} will be called every time this query is used in a search.
++   * @param query  Query to be filtered, can {@code null} if filter is not {@code null}.
++   * @param filter Filter to apply to query results, can {@code null} if query is not {@code null}.
+    */
+   public FilteredQuery (Query query, Filter filter) {
++    if (query == null && filter == null)
++      throw new IllegalArgumentException("Both query and filter cannot be null.");
+     this.query = query;
+     this.filter = filter;
+   }
+@@ -78,7 +76,9 @@
+    */
+   @Override
+   public Weight createWeight(final IndexSearcher searcher) throws IOException {
+-    final Weight weight = query.createWeight (searcher);
++    if (query == null || filter == null)
++      throw new UnsupportedOperationException("Please rewrite this query first.");
++    final Weight weight = query.createWeight(searcher);
+     return new Weight() {
+       
+       @Override
+@@ -229,58 +229,101 @@
+     };
+   }
+ 
+-  /** Rewrites the wrapped query. */
++  /** Rewrites the query. If the wrapped {@code query == null} or an instance of
++   * {@link MatchAllDocsQuery} it returns a {@link ConstantScoreQuery}, if
++   * {@code filter == null} it returns the rewritten, wrapped query itsself. Otherwise
++   * it returns a new {@code FilteredQuery} wrapping the rewritten query. */
+   @Override
+   public Query rewrite(IndexReader reader) throws IOException {
+-    Query rewritten = query.rewrite(reader);
+-    if (rewritten != query) {
+-      FilteredQuery clone = (FilteredQuery)this.clone();
+-      clone.query = rewritten;
+-      return clone;
++    // rewrite wrapped query and calculate a combined boost of this query and the wrapped one:
++    final Query queryRewritten;
++    final float combinedBoost;
++    if (query == null) {
++      queryRewritten = null;
++      combinedBoost = this.getBoost();
+     } else {
++      queryRewritten = query.rewrite(reader);
++      combinedBoost = this.getBoost() * queryRewritten.getBoost();
++    }
++    
++    if ((filter != null) && (queryRewritten == null || queryRewritten instanceof MatchAllDocsQuery)) {
++      // Special case #1: If we have no query at all or it is
++      // a MatchAllDocsQuery, we only return a CSQ(filter).
++      final Query rewritten = new ConstantScoreQuery(filter);
++      rewritten.setBoost(combinedBoost);
++      return rewritten;
++    }
++    
++    assert queryRewritten != null : "at this place we must have a query, as filter and " +
++      "query cannot be null at same time (checked by ctor)";
++    
++    if (filter == null) {
++      // Special case #2: We have no filter at all, so we can rewrite to the wrapped
++      // query. In that case we must clone, as we need to modify the original query
++      // by including the boost of this FilteredQuery (otherwise boost would get lost):
++      final Query rewritten = (Query) queryRewritten.clone();
++      rewritten.setBoost(combinedBoost);
++      return rewritten;
++    }
++    
++    if (queryRewritten != query) {
++      // rewrite to a new FilteredQuery wrapping the rewritten query
++      final Query rewritten = new FilteredQuery(queryRewritten, filter);
++      rewritten.setBoost(this.getBoost());
++      return rewritten;
++    } else {
++      // nothing to rewrite, we are done!
+       return this;
+     }
+   }
+ 
+-  public Query getQuery() {
++  public final Query getQuery() {
+     return query;
+   }
+ 
+-  public Filter getFilter() {
++  public final Filter getFilter() {
+     return filter;
+   }
+ 
+   // inherit javadoc
+   @Override
+   public void extractTerms(Set<Term> terms) {
+-      getQuery().extractTerms(terms);
++    if (query != null)
++      query.extractTerms(terms);
+   }
+ 
+   /** Prints a user-readable version of this query. */
+   @Override
+   public String toString (String s) {
+-    StringBuilder buffer = new StringBuilder();
+-    buffer.append("filtered(");
+-    buffer.append(query.toString(s));
+-    buffer.append(")->");
+-    buffer.append(filter);
+-    buffer.append(ToStringUtils.boost(getBoost()));
++    StringBuilder buffer = new StringBuilder("filtered(");
++    buffer.append((query == null) ? ((String) null) : query.toString(s));
++    buffer.append(")->").append(filter).append(ToStringUtils.boost(getBoost()));
+     return buffer.toString();
+   }
+ 
+   /** Returns true iff <code>o</code> is equal to this. */
+   @Override
+   public boolean equals(Object o) {
+-    if (o instanceof FilteredQuery) {
+-      FilteredQuery fq = (FilteredQuery) o;
+-      return (query.equals(fq.query) && filter.equals(fq.filter) && getBoost()==fq.getBoost());
+-    }
+-    return false;
++    if (o == this)
++      return true;
++    if (!super.equals(o))
++      return false;
++    assert o instanceof FilteredQuery;
++    final FilteredQuery fq = (FilteredQuery) o;
++    return (
++      (fq.query == null ? this.query == null : fq.query.equals(this.query)) &&
++      (fq.filter == null ? this.filter == null : fq.filter.equals(this.filter))
++    );
+   }
+ 
+   /** Returns a hash code value for this object. */
+   @Override
+   public int hashCode() {
+-    return query.hashCode() ^ filter.hashCode() + Float.floatToRawIntBits(getBoost());
++    int hash = super.hashCode();
++    if (query != null)
++      hash = hash * 31 + query.hashCode();
++    if (filter != null)
++      hash = hash * 31 + filter.hashCode();
++    return hash;
+   }
+ }
+Index: lucene/src/java/org/apache/lucene/search/IndexSearcher.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/search/IndexSearcher.java	(revision 1213622)
++++ lucene/src/java/org/apache/lucene/search/IndexSearcher.java	(working copy)
+@@ -219,6 +219,7 @@
+   /** Finds the top <code>n</code>
+    * hits for <code>query</code>, applying <code>filter</code> if non-null,
+    * where all results are after a previous result (<code>after</code>).
++   * It is also possible to pass a null query and a non-null filter.
+    * <p>
+    * By passing the bottom result from a previous page as <code>after</code>,
+    * this method can be used for efficient 'deep-paging' across potentially
+@@ -243,6 +244,7 @@
+ 
+   /** Finds the top <code>n</code>
+    * hits for <code>query</code>, applying <code>filter</code> if non-null.
++   * It is also possible to pass a null query and a non-null filter.
+    *
+    * @throws BooleanQuery.TooManyClauses
+    */
+@@ -262,7 +264,7 @@
+    * IndexSearcher#search(Query, Filter, int)}) is usually more efficient, as it skips
+    * non-high-scoring hits.
+    *
+-   * @param query to match documents
++   * @param query to match documents, must be non-null if filter is null.
+    * @param filter if non-null, used to permit documents to be collected.
+    * @param results to receive hits
+    * @throws BooleanQuery.TooManyClauses
+@@ -294,6 +296,7 @@
+    * the top <code>n</code> hits for <code>query</code>, applying
+    * <code>filter</code> if non-null, and sorting the hits by the criteria in
+    * <code>sort</code>.
++   * It is also possible to pass a null query and a non-null filter.
+    * 
+    * <p>NOTE: this does not compute scores by default; use
+    * {@link IndexSearcher#setDefaultFieldSortScoring} to
+Index: lucene/src/test-framework/java/org/apache/lucene/search/QueryUtils.java
+===================================================================
+--- lucene/src/test-framework/java/org/apache/lucene/search/QueryUtils.java	(revision 1213622)
++++ lucene/src/test-framework/java/org/apache/lucene/search/QueryUtils.java	(working copy)
+@@ -79,8 +79,8 @@
+   }
+ 
+   public static void checkUnequal(Query q1, Query q2) {
+-    Assert.assertTrue(!q1.equals(q2));
+-    Assert.assertTrue(!q2.equals(q1));
++    Assert.assertFalse(q1 + " equal to " + q2, q1.equals(q2));
++    Assert.assertFalse(q2 + " equal to " + q1, q2.equals(q1));
+ 
+     // possible this test can fail on a hash collision... if that
+     // happens, please change test to use a different example.
+Index: lucene/src/test/org/apache/lucene/search/TestFilteredQuery.java
+===================================================================
+--- lucene/src/test/org/apache/lucene/search/TestFilteredQuery.java	(revision 1213622)
++++ lucene/src/test/org/apache/lucene/search/TestFilteredQuery.java	(working copy)
+@@ -132,6 +132,26 @@
+     assertEquals (2, hits.length);
+     QueryUtils.check(random, filteredquery,searcher);
+ 
++    filteredquery = new FilteredQueryRA(null, filter, useRandomAccess);
++    hits = searcher.search (filteredquery, null, 1000).scoreDocs;
++    assertEquals (2, hits.length);
++    QueryUtils.check(random, filteredquery,searcher);
++
++    filteredquery = new FilteredQueryRA(new MatchAllDocsQuery(), filter, useRandomAccess);
++    hits = searcher.search (filteredquery, null, 1000).scoreDocs;
++    assertEquals (2, hits.length);
++    QueryUtils.check(random, filteredquery,searcher);
++
++    filteredquery = new FilteredQueryRA(new TermQuery (new Term ("field", "one")), null, useRandomAccess);
++    hits = searcher.search (filteredquery, null, 1000).scoreDocs;
++    assertEquals (4, hits.length);
++    QueryUtils.check(random, filteredquery,searcher);
++
++    filteredquery = new FilteredQueryRA(new MatchAllDocsQuery(), null, useRandomAccess);
++    hits = searcher.search (filteredquery, null, 1000).scoreDocs;
++    assertEquals (4, hits.length);
++    QueryUtils.check(random, filteredquery,searcher);
++
+     filteredquery = new FilteredQueryRA(new TermQuery (new Term ("field", "x")), filter, useRandomAccess);
+     hits = searcher.search (filteredquery, null, 1000).scoreDocs;
+     assertEquals (1, hits.length);
+@@ -220,9 +240,9 @@
+ 
+   private void tBooleanMUST(final boolean useRandomAccess) throws Exception {
+     BooleanQuery bq = new BooleanQuery();
+-    Query query = new FilteredQueryRA(new MatchAllDocsQuery(), new SingleDocTestFilter(0), useRandomAccess);
++    Query query = new FilteredQueryRA(new TermQuery(new Term("field", "one")), new SingleDocTestFilter(0), useRandomAccess);
+     bq.add(query, BooleanClause.Occur.MUST);
+-    query = new FilteredQueryRA(new MatchAllDocsQuery(), new SingleDocTestFilter(1), useRandomAccess);
++    query = new FilteredQueryRA(new TermQuery(new Term("field", "one")), new SingleDocTestFilter(1), useRandomAccess);
+     bq.add(query, BooleanClause.Occur.MUST);
+     ScoreDoc[] hits = searcher.search(bq, null, 1000).scoreDocs;
+     assertEquals(0, hits.length);
+@@ -238,9 +258,9 @@
+ 
+   private void tBooleanSHOULD(final boolean useRandomAccess) throws Exception {
+     BooleanQuery bq = new BooleanQuery();
+-    Query query = new FilteredQueryRA(new MatchAllDocsQuery(), new SingleDocTestFilter(0), useRandomAccess);
++    Query query = new FilteredQueryRA(new TermQuery(new Term("field", "one")), new SingleDocTestFilter(0), useRandomAccess);
+     bq.add(query, BooleanClause.Occur.SHOULD);
+-    query = new FilteredQueryRA(new MatchAllDocsQuery(), new SingleDocTestFilter(1), useRandomAccess);
++    query = new FilteredQueryRA(new TermQuery(new Term("field", "one")), new SingleDocTestFilter(1), useRandomAccess);
+     bq.add(query, BooleanClause.Occur.SHOULD);
+     ScoreDoc[] hits = searcher.search(bq, null, 1000).scoreDocs;
+     assertEquals(2, hits.length);
+@@ -288,7 +308,85 @@
+     assertEquals(1, hits.length);
+     QueryUtils.check(random, query, searcher);    
+   }
++  
++  public void testEqualsHashcode() throws Exception {
++    // some tests before, if the used queries and filters work:
++    assertEquals(new PrefixFilter(new Term("field", "o")), new PrefixFilter(new Term("field", "o")));
++    assertFalse(new PrefixFilter(new Term("field", "a")).equals(new PrefixFilter(new Term("field", "o"))));
++    QueryUtils.checkHashEquals(new TermQuery(new Term("field", "one")));
++    QueryUtils.checkUnequal(
++      new TermQuery(new Term("field", "one")), new TermQuery(new Term("field", "two"))
++    );
++    // now test FilteredQuery equals/hashcode:
++    QueryUtils.checkHashEquals(new FilteredQuery(new TermQuery(new Term("field", "one")), new PrefixFilter(new Term("field", "o"))));
++    QueryUtils.checkHashEquals(new FilteredQuery(null, new PrefixFilter(new Term("field", "o"))));
++    QueryUtils.checkHashEquals(new FilteredQuery(new TermQuery(new Term("field", "one")), null));
++    QueryUtils.checkUnequal(
++      new FilteredQuery(new TermQuery(new Term("field", "one")), new PrefixFilter(new Term("field", "o"))), 
++      new FilteredQuery(new TermQuery(new Term("field", "two")), new PrefixFilter(new Term("field", "o")))
++    );
++    QueryUtils.checkUnequal(
++      new FilteredQuery(new TermQuery(new Term("field", "one")), new PrefixFilter(new Term("field", "a"))), 
++      new FilteredQuery(new TermQuery(new Term("field", "one")), new PrefixFilter(new Term("field", "o")))
++    );
++    QueryUtils.checkUnequal(
++      new FilteredQuery(new TermQuery(new Term("field", "one")), new PrefixFilter(new Term("field", "o"))), 
++      new FilteredQuery(null, new PrefixFilter(new Term("field", "o")))
++    );
++    QueryUtils.checkUnequal(
++      new FilteredQuery(new TermQuery(new Term("field", "one")), new PrefixFilter(new Term("field", "o"))), 
++      new FilteredQuery(new TermQuery(new Term("field", "one")), null)
++    );
++  }
++  
++  public void testInvalidArguments() throws Exception {
++    try {
++      new FilteredQuery(null, null);
++      fail("Should throw IllegalArgumentException");
++    } catch (IllegalArgumentException iae) {
++      // pass
++    }
++  }
++  
++  private void assertRewrite(FilteredQuery fq, Class<? extends Query> clazz) throws Exception {
++    // assign crazy boost to FQ
++    final float boost = random.nextFloat() * 100.f;
++    fq.setBoost(boost);
++    
++    // assign crazy boost to inner
++    final float innerBoost;
++    if (fq.getQuery() != null) {
++      innerBoost = random.nextFloat() * 100.f;
++      fq.getQuery().setBoost(innerBoost);
++    } else {
++      innerBoost = 1.f;
++    }
++    
++    // check the class and boosts of rewritten query
++    final Query rewritten = searcher.rewrite(fq);
++    assertTrue("is not instance of " + clazz.getName(), clazz.isInstance(rewritten));
++    if (rewritten instanceof FilteredQuery) {
++      assertEquals(boost, rewritten.getBoost(), 1.E-5f);
++      assertEquals(innerBoost, ((FilteredQuery) rewritten).getQuery().getBoost(), 1.E-5f);
++    } else {
++      assertEquals(boost * innerBoost, rewritten.getBoost(), 1.E-5f);
++    }
++    
++    // check that the original query was not modified
++    assertEquals(boost, fq.getBoost(), 1.E-5f);
++    if (fq.getQuery() != null) {
++      assertEquals(innerBoost, fq.getQuery().getBoost(), 1.E-5f);
++    }
++  }
+ 
++  public void testRewrite() throws Exception {
++    assertRewrite(new FilteredQuery(new TermQuery(new Term("field", "one")), new PrefixFilter(new Term("field", "o"))), FilteredQuery.class);
++    assertRewrite(new FilteredQuery(new MatchAllDocsQuery(), new PrefixFilter(new Term("field", "o"))), ConstantScoreQuery.class);
++    assertRewrite(new FilteredQuery(null, new PrefixFilter(new Term("field", "o"))), ConstantScoreQuery.class);
++    assertRewrite(new FilteredQuery(new MatchAllDocsQuery(), null), MatchAllDocsQuery.class);
++    assertRewrite(new FilteredQuery(new TermQuery(new Term("field", "one")), null), TermQuery.class);
++  }
++
+   public static final class FilteredQueryRA extends FilteredQuery {
+     private final boolean useRandomAccess;
+   

@@ -1,0 +1,506 @@
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/lucene70/IndexedDISI.java b/lucene/core/src/java/org/apache/lucene/codecs/lucene70/IndexedDISI.java
+index 114710e0cd7..5eaefbc84fa 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/lucene70/IndexedDISI.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/lucene70/IndexedDISI.java
+@@ -303,6 +303,9 @@ final class IndexedDISI extends DocIdSetIterator {
+         final int targetInBlock = target & 0xFFFF;
+         final int targetWordIndex = targetInBlock >>> 6;
+ 
++        // If possible, skip ahead using the rank cache
++        disi.rankSkip(disi, target);
++
+         for (int i = disi.wordIndex + 1; i <= targetWordIndex; ++i) {
+           disi.word = disi.slice.readLong();
+           disi.numberOfOnes += Long.bitCount(disi.word);
+@@ -337,6 +340,9 @@ final class IndexedDISI extends DocIdSetIterator {
+         final int targetInBlock = target & 0xFFFF;
+         final int targetWordIndex = targetInBlock >>> 6;
+ 
++        // If possible, skip ahead using the rank cache
++        disi.rankSkip(disi, target);
++
+         for (int i = disi.wordIndex + 1; i <= targetWordIndex; ++i) {
+           disi.word = disi.slice.readLong();
+           disi.numberOfOnes += Long.bitCount(disi.word);
+@@ -373,4 +379,47 @@ final class IndexedDISI extends DocIdSetIterator {
+     abstract boolean advanceExactWithinBlock(IndexedDISI disi, int target) throws IOException;
+   }
+ 
++  /**
++   * If the distance between the current position and the target is > 8 words, the rank cache will
++   * be used to guarantee a worst-case of 1 rank-lookup and 7 word-read-and-count-bits operations.
++   * Note: This does not guarantee a skip up to target, only up to nearest rank boundary. It is the
++   * responsibility of the caller to iterate further to reach target.
++   * @param disi standard DISI.
++   * @param target the wanted docID for which to calculate set-flag and index.
++   * @throws IOException if a disi seek failed.
++   */
++  private void rankSkip(IndexedDISI disi, int target) throws IOException {
++    final int targetInBlock = target & 0xFFFF;
++    final int targetWordIndex = targetInBlock >>> 6;
++
++    // If the distance between the current position and the target is >= 8
++    // then it pays to use the rank to jump
++    if (!(disi.cache.hasRank() && targetWordIndex - disi.wordIndex >= IndexedDISICache.RANK_BLOCK_LONGS)) {
++      return;
++    }
++
++    int rankPos = disi.cache.denseRankPosition(target);
++    if (rankPos == -1) {
++      return;
++    }
++    int rank = disi.cache.getRankInBlock(rankPos);
++    if (rank == -1) {
++      return;
++    }
++    int rankIndex = disi.denseOrigoIndex + rank;
++    int rankWordIndex = (rankPos & 0xFFFF) >> 6;
++    long rankOffset = disi.blockStart + 4 + (rankWordIndex * 8);
++
++    long mark = disi.slice.getFilePointer();
++    disi.slice.seek(rankOffset);
++    long rankWord = disi.slice.readLong();
++    int rankNOO = rankIndex + Long.bitCount(rankWord);
++    rankOffset += Long.BYTES;
++
++
++    //disi.slice.seek(mark);
++    disi.wordIndex = rankWordIndex;
++    disi.word = rankWord;
++    disi.numberOfOnes = rankNOO;
++  }
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/lucene70/IndexedDISICache.java b/lucene/core/src/java/org/apache/lucene/codecs/lucene70/IndexedDISICache.java
+index be0beb76588..fdf93cf43e1 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/lucene70/IndexedDISICache.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/lucene70/IndexedDISICache.java
+@@ -319,4 +319,4 @@ public class IndexedDISICache implements Accountable {
+         RamUsageEstimator.NUM_BYTES_OBJECT_REF*3 +
+         RamUsageEstimator.NUM_BYTES_OBJECT_HEADER + creationStats.length()*2;
+   }
+-}
++}
+\ No newline at end of file
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/lucene70/IndexedDISICacheFactory.java b/lucene/core/src/java/org/apache/lucene/codecs/lucene70/IndexedDISICacheFactory.java
+index 7a857279720..610529abf6f 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/lucene70/IndexedDISICacheFactory.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/lucene70/IndexedDISICacheFactory.java
+@@ -44,6 +44,8 @@ public class IndexedDISICacheFactory implements Accountable {
+ 
+   // jump-table and rank for DISI blocks
+   private final Map<Long, IndexedDISICache> disiPool = new HashMap<>();
++  // jump-table for numerics with variable bits per value (dates, longs...)
++  private final Map<String, VaryingBPVJumpTable> vBPVPool = new HashMap<>();
+ 
+   /**
+    * Create a cached {@link IndexedDISI} instance.
+@@ -74,6 +76,24 @@ public class IndexedDISICacheFactory implements Accountable {
+     return new IndexedDISI(data, offset, length, cost, cache, name);
+   }
+ 
++  /**
++   * Creates a cache (jump table) for variable bits per value numerics and returns it.
++   * If the cache has previously been created, the old cache is returned.
++   * @param name the name for the cache, typically the field name. Used as key for later retrieval.
++   * @param slice the long values with varying bits per value.
++   * @param valuesLength the length in bytes of the slice.
++   * @return a jump table for the longs in the given slice or null if the structure is not suitable for caching.
++   */
++  VaryingBPVJumpTable getVBPVJumpTable(String name, RandomAccessInput slice, long valuesLength) throws IOException {
++    VaryingBPVJumpTable jumpTable = vBPVPool.get(name);
++    if (jumpTable == null) {
++      // TODO: Avoid overlapping builds of the same jump table for performance reasons
++      jumpTable = new VaryingBPVJumpTable(slice, name, valuesLength);
++      vBPVPool.put(name, jumpTable);
++    }
++    return jumpTable;
++  }
++
+   /**
+    * Creates a cache (jump table) for {@link IndexedDISI}.
+    * If the cache has previously been created, the old cache is returned.
+@@ -133,16 +153,26 @@ public class IndexedDISICacheFactory implements Accountable {
+   public long getDISIBlocksWithRankCount() {
+     return disiPool.values().stream().filter(IndexedDISICache::hasRank).count();
+   }
++  public long getVaryingBPVCount() {
++    return vBPVPool.size();
++  }
+ 
+   @Override
+   public long ramBytesUsed() {
+     long mem = RamUsageEstimator.shallowSizeOf(this) +
+-        RamUsageEstimator.shallowSizeOf(disiPool);
++        RamUsageEstimator.shallowSizeOf(disiPool) +
++        RamUsageEstimator.shallowSizeOf(vBPVPool);
+     for (Map.Entry<Long, IndexedDISICache> cacheEntry: disiPool.entrySet()) {
+       mem += RamUsageEstimator.shallowSizeOf(cacheEntry);
+       mem += RamUsageEstimator.sizeOf(cacheEntry.getKey());
+       mem += cacheEntry.getValue().ramBytesUsed();
+     }
++    for (Map.Entry<String, VaryingBPVJumpTable> cacheEntry: vBPVPool.entrySet()) {
++      String key = cacheEntry.getKey();
++      mem += RamUsageEstimator.shallowSizeOf(cacheEntry);
++      mem += RamUsageEstimator.shallowSizeOf(key)+key.length()*2;
++      mem += cacheEntry.getValue().ramBytesUsed();
++    }
+     return mem;
+   }
+ 
+@@ -151,5 +181,63 @@ public class IndexedDISICacheFactory implements Accountable {
+    */
+   void releaseAll() {
+     disiPool.clear();
++    vBPVPool.clear();
++  }
++
++  /**
++   * Jump table used by Lucene70DocValuesProducer.VaryingBPVReader to avoid iterating all blocks from
++   * current to wanted index for numerics with variable bits per value. The jump table holds offsets for all blocks.
++   */
++  public static class VaryingBPVJumpTable implements Accountable {
++    // TODO: It is way overkill to use longs here for practically all indexes. Maybe a PackedInts representation?
++    long[] offsets = new long[10];
++    final String creationStats;
++
++    VaryingBPVJumpTable(RandomAccessInput slice, String name, long valuesLength) throws IOException {
++      final long startTime = System.nanoTime();
++
++      int block = -1;
++      long offset;
++      long blockEndOffset = 0;
++
++      int bitsPerValue;
++      do {
++        offset = blockEndOffset;
++
++        offsets = ArrayUtil.grow(offsets, block+2); // No-op if large enough
++        offsets[block+1] = offset;
++
++        bitsPerValue = slice.readByte(offset++);
++        offset += Long.BYTES; // Skip over delta as we do not resolve the values themselves at this point
++        if (bitsPerValue == 0) {
++          blockEndOffset = offset;
++        } else {
++          final int length = slice.readInt(offset);
++          offset += Integer.BYTES;
++          blockEndOffset = offset + length;
++        }
++        block++;
++      } while (blockEndOffset < valuesLength-Byte.BYTES);
++      offsets = ArrayUtil.copyOfSubArray(offsets, 0, block+1);
++      creationStats = String.format(Locale.ENGLISH,
++          "name=%s, blocks=%d, time=%dms",
++          name, offsets.length, (System.nanoTime()-startTime)/1000000);
++    }
++
++    /**
++     * @param block the logical block in the vBPV structure ( valueindex/16384 ).
++     * @return the index slice offset for the vBPV block (1 block = 16384 values) or -1 if not available.
++     */
++    long getBlockOffset(long block) {
++      // Technically a limitation in caching vs. VaryingBPVReader to limit to 2b blocks of 16K values
++      return offsets[(int) block];
++    }
++
++    @Override
++    public long ramBytesUsed() {
++      return RamUsageEstimator.shallowSizeOf(this) +
++          (offsets == null ? 0 : RamUsageEstimator.sizeOf(offsets)) + // offsets
++          RamUsageEstimator.NUM_BYTES_OBJECT_HEADER + creationStats.length()*2;  // creationStats
++    }
+   }
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/lucene70/Lucene70DocValuesProducer.java b/lucene/core/src/java/org/apache/lucene/codecs/lucene70/Lucene70DocValuesProducer.java
+index 812caba9d37..9b2b9e0406e 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/lucene70/Lucene70DocValuesProducer.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/lucene70/Lucene70DocValuesProducer.java
+@@ -465,44 +465,18 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
+           }
+         };
+       } else {
+-        final RandomAccessInput slice = data.randomAccessSlice(entry.valuesOffset, entry.valuesLength);
+         if (entry.blockShift >= 0) {
+           // dense but split into blocks of different bits per value
+-          final int shift = entry.blockShift;
+-          final long mul = entry.gcd;
+-          final int mask = (1 << shift) - 1;
+           return new DenseNumericDocValues(maxDoc) {
+-            int block = -1;
+-            long delta;
+-            long offset;
+-            long blockEndOffset;
+-            LongValues values;
++            final VaryingBPVReader vBPVReader = new VaryingBPVReader(entry);
+ 
+             @Override
+             public long longValue() throws IOException {
+-              final int block = doc >>> shift;
+-              if (this.block != block) {
+-                int bitsPerValue;
+-                do {
+-                  offset = blockEndOffset;
+-                  bitsPerValue = slice.readByte(offset++);
+-                  delta = slice.readLong(offset);
+-                  offset += Long.BYTES;
+-                  if (bitsPerValue == 0) {
+-                    blockEndOffset = offset;
+-                  } else {
+-                    final int length = slice.readInt(offset);
+-                    offset += Integer.BYTES;
+-                    blockEndOffset = offset + length;
+-                  }
+-                  this.block ++;
+-                } while (this.block != block);
+-                values = bitsPerValue == 0 ? LongValues.ZEROES : DirectReader.getInstance(slice, bitsPerValue, offset);
+-              }
+-              return mul * values.get(doc & mask) + delta;
++              return vBPVReader.getLongValue(doc);
+             }
+           };
+         } else {
++          final RandomAccessInput slice = data.randomAccessSlice(entry.valuesOffset, entry.valuesLength);
+           final LongValues values = DirectReader.getInstance(slice, entry.bitsPerValue);
+           if (entry.table != null) {
+             final long[] table = entry.table;
+@@ -536,45 +510,19 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
+           }
+         };
+       } else {
+-        final RandomAccessInput slice = data.randomAccessSlice(entry.valuesOffset, entry.valuesLength);
+         if (entry.blockShift >= 0) {
+           // sparse and split into blocks of different bits per value
+-          final int shift = entry.blockShift;
+-          final long mul = entry.gcd;
+-          final int mask = (1 << shift) - 1;
+           return new SparseNumericDocValues(disi) {
+-            int block = -1;
+-            long delta;
+-            long offset;
+-            long blockEndOffset;
+-            LongValues values;
++            final VaryingBPVReader vBPVReader = new VaryingBPVReader(entry);
+ 
+             @Override
+             public long longValue() throws IOException {
+               final int index = disi.index();
+-              final int block = index >>> shift;
+-              if (this.block != block) {
+-                int bitsPerValue;
+-                do {
+-                  offset = blockEndOffset;
+-                  bitsPerValue = slice.readByte(offset++);
+-                  delta = slice.readLong(offset);
+-                  offset += Long.BYTES;
+-                  if (bitsPerValue == 0) {
+-                    blockEndOffset = offset;
+-                  } else {
+-                    final int length = slice.readInt(offset);
+-                    offset += Integer.BYTES;
+-                    blockEndOffset = offset + length;
+-                  }
+-                  this.block ++;
+-                } while (this.block != block);
+-                values = bitsPerValue == 0 ? LongValues.ZEROES : DirectReader.getInstance(slice, bitsPerValue, offset);
+-              }
+-              return mul * values.get(index & mask) + delta;
++              return vBPVReader.getLongValue(index);
+             }
+           };
+         } else {
++          final RandomAccessInput slice = data.randomAccessSlice(entry.valuesOffset, entry.valuesLength);
+           final LongValues values = DirectReader.getInstance(slice, entry.bitsPerValue);
+           if (entry.table != null) {
+             final long[] table = entry.table;
+@@ -608,47 +556,20 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
+         }
+       };
+     } else {
+-      final RandomAccessInput slice = data.randomAccessSlice(entry.valuesOffset, entry.valuesLength);
+       if (entry.blockShift >= 0) {
+-        final int shift = entry.blockShift;
+-        final long mul = entry.gcd;
+-        final long mask = (1L << shift) - 1;
+         return new LongValues() {
+-          long block = -1;
+-          long delta;
+-          long offset;
+-          long blockEndOffset;
+-          LongValues values;
+-
++          final VaryingBPVReader vBPVReader = new VaryingBPVReader(entry);
++          @Override
+           public long get(long index) {
+-            final long block = index >>> shift;
+-            if (this.block != block) {
+-              assert block > this.block : "Reading backwards is illegal: " + this.block + " < " + block;
+-              int bitsPerValue;
+-              do {
+-                offset = blockEndOffset;
+-                try {
+-                  bitsPerValue = slice.readByte(offset++);
+-                  delta = slice.readLong(offset);
+-                  offset += Long.BYTES;
+-                  if (bitsPerValue == 0) {
+-                    blockEndOffset = offset;
+-                  } else {
+-                    final int length = slice.readInt(offset);
+-                    offset += Integer.BYTES;
+-                    blockEndOffset = offset + length;
+-                  }
+-                } catch (IOException e) {
+-                  throw new RuntimeException(e);
+-                }
+-                this.block ++;
+-              } while (this.block != block);
+-              values = bitsPerValue == 0 ? LongValues.ZEROES : DirectReader.getInstance(slice, bitsPerValue, offset);
++            try {
++              return vBPVReader.getLongValue(index);
++            } catch (IOException e) {
++              throw new RuntimeException(e);
+             }
+-            return mul * values.get(index & mask) + delta;
+           }
+         };
+       } else {
++        final RandomAccessInput slice = data.randomAccessSlice(entry.valuesOffset, entry.valuesLength);
+         final LongValues values = DirectReader.getInstance(slice, entry.bitsPerValue);
+         if (entry.table != null) {
+           final long[] table = entry.table;
+@@ -1457,4 +1378,64 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
+     CodecUtil.checksumEntireFile(data);
+   }
+ 
++  /**
++   * Reader for longs split into blocks of different bits per values.
++   * The longs are requested by index and must be accessed in monotonically increasing order.
++   */
++  // Note: The order requirement could be removed as the jump-tables allow for backwards iteration.
++  private class VaryingBPVReader {
++    final RandomAccessInput slice;
++    final NumericEntry entry;
++    final int shift;
++    final long mul;
++    final int mask;
++
++    long block = -1;
++    long delta;
++    long offset;
++    long blockEndOffset;
++    LongValues values;
++
++    VaryingBPVReader(NumericEntry entry) throws IOException {
++      this.entry = entry;
++      slice = data.randomAccessSlice(entry.valuesOffset, entry.valuesLength);
++      shift = entry.blockShift;
++      mul = entry.gcd;
++      mask = (1 << shift) - 1;
++    }
++
++    long getLongValue(long index) throws IOException {
++      final long block = index >>> shift;
++      if (this.block != block) {
++        int bitsPerValue;
++        do {
++          // If the needed block is the one directly following the current block, it is cheaper to avoid the cache
++          if (block != this.block+1) {
++            IndexedDISICacheFactory.VaryingBPVJumpTable cache;
++            if ((cache = disiCacheFactory.getVBPVJumpTable(entry.name, slice, entry.valuesLength)) != null) {
++              long candidateOffset;
++              if ((candidateOffset = cache.getBlockOffset(block)) != -1) {
++                blockEndOffset = candidateOffset;
++                this.block = block - 1;
++              }
++            }
++          }
++          offset = blockEndOffset;
++          bitsPerValue = slice.readByte(offset++);
++          delta = slice.readLong(offset);
++          offset += Long.BYTES;
++          if (bitsPerValue == 0) {
++            blockEndOffset = offset;
++          } else {
++            final int length = slice.readInt(offset);
++            offset += Integer.BYTES;
++            blockEndOffset = offset + length;
++          }
++          this.block++;
++        } while (this.block != block);
++        values = bitsPerValue == 0 ? LongValues.ZEROES : DirectReader.getInstance(slice, bitsPerValue, offset);
++      }
++      return mul * values.get(index & mask) + delta;
++    }
++  }
+ }
+diff --git a/lucene/core/src/test/org/apache/lucene/codecs/lucene70/TestIndexedDISI.java b/lucene/core/src/test/org/apache/lucene/codecs/lucene70/TestIndexedDISI.java
+index aae3a7f36ca..5201aad4609 100644
+--- a/lucene/core/src/test/org/apache/lucene/codecs/lucene70/TestIndexedDISI.java
++++ b/lucene/core/src/test/org/apache/lucene/codecs/lucene70/TestIndexedDISI.java
+@@ -246,26 +246,26 @@ public class TestIndexedDISI extends LuceneTestCase {
+ 
+   private void assertAdvanceExactRandomized(IndexedDISI disi, BitSetIterator disi2, int disi2length, int step)
+       throws IOException {
+-        int index = -1;
++    int index = -1;
+     for (int target = 0; target < disi2length; ) {
+-          target += TestUtil.nextInt(random(), 0, step);
+-          int doc = disi2.docID();
+-          while (doc < target) {
+-            doc = disi2.nextDoc();
+-            index++;
+-          }
++      target += TestUtil.nextInt(random(), 0, step);
++      int doc = disi2.docID();
++      while (doc < target) {
++        doc = disi2.nextDoc();
++        index++;
++      }
+ 
+-          boolean exists = disi.advanceExact(target);
+-          assertEquals(doc == target, exists);
+-          if (exists) {
+-            assertEquals(index, disi.index());
+-          } else if (random().nextBoolean()) {
+-            assertEquals(doc, disi.nextDoc());
+-            assertEquals(index, disi.index());
+-            target = doc;
+-          }
+-        }
++      boolean exists = disi.advanceExact(target);
++      assertEquals(doc == target, exists);
++      if (exists) {
++        assertEquals(index, disi.index());
++      } else if (random().nextBoolean()) {
++        assertEquals(doc, disi.nextDoc());
++        assertEquals(index, disi.index());
++        target = doc;
+       }
++    }
++  }
+ 
+   private void assertSingleStepEquality(IndexedDISI disi, BitSetIterator disi2) throws IOException {
+     int i = 0;
+@@ -274,7 +274,7 @@ public class TestIndexedDISI extends LuceneTestCase {
+       assertEquals(i++, disi.index());
+     }
+     assertEquals(DocIdSetIterator.NO_MORE_DOCS, disi.nextDoc());
+-    }
++  }
+ 
+   private void assertAdvanceEquality(IndexedDISI disi, BitSetIterator disi2, int step) throws IOException {
+     int index = -1;
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestDocValues.java b/lucene/core/src/test/org/apache/lucene/index/TestDocValues.java
+index daebad9127e..30100473336 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestDocValues.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestDocValues.java
+@@ -228,8 +228,8 @@ public class TestDocValues extends LuceneTestCase {
+     }
+     dir.close();
+   }
+-  
+-  /** 
++
++  /**
+    * field with binary docvalues
+    */
+   public void testBinaryField() throws Exception {

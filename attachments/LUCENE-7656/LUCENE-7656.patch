@@ -1,0 +1,865 @@
+diff --git a/lucene/core/src/java/org/apache/lucene/geo/GeoEncodingUtils.java b/lucene/core/src/java/org/apache/lucene/geo/GeoEncodingUtils.java
+index 671f779..cc75fbf 100644
+--- a/lucene/core/src/java/org/apache/lucene/geo/GeoEncodingUtils.java
++++ b/lucene/core/src/java/org/apache/lucene/geo/GeoEncodingUtils.java
+@@ -16,7 +16,9 @@
+  */
+ package org.apache.lucene.geo;
+ 
++import org.apache.lucene.index.PointValues.Relation;
+ import org.apache.lucene.util.NumericUtils;
++import org.apache.lucene.util.SloppyMath;
+ 
+ import static org.apache.lucene.geo.GeoUtils.MAX_LAT_INCL;
+ import static org.apache.lucene.geo.GeoUtils.MAX_LON_INCL;
+@@ -144,4 +146,142 @@ public final class GeoEncodingUtils {
+   public static double decodeLongitude(byte[] src, int offset) {
+     return decodeLongitude(NumericUtils.sortableBytesToInt(src, offset));
+   }
++
++  /** Create a predicate that checks whether points are within a distance of a given point.
++   *  It works by computing the bounding box around the circle that is defined
++   *  by the given points/distance and splitting it into between 1024 and 4096
++   *  smaller boxes (4096*0.75^2=2304 on average). Then for each sub box, it
++   *  computes the relation between this box and the distance query. Finally at
++   *  search time, it first computes the sub box that the point belongs to,
++   *  most of the time, no distance computation will need to be performed since
++   *  all points from the sub box will either be in or out of the circle.
++   *  @lucene.internal */
++  public static DistancePredicate createDistancePredicate(double lat, double lon, double radiusMeters) {
++    final Rectangle boundingBox = Rectangle.fromPointDistance(lat, lon, radiusMeters);
++    final int minLat = encodeLatitudeCeil(boundingBox.minLat);
++    final int maxLat = encodeLatitude(boundingBox.maxLat);
++    final int minLon = encodeLongitudeCeil(boundingBox.minLon);
++    final int maxLon = encodeLongitude(boundingBox.maxLon);
++
++    final int latShift, lonShift;
++    final int latBase, lonBase;
++    final int maxLatDelta, maxLonDelta;
++    {
++      long minLat2 = (long) minLat - Integer.MIN_VALUE;
++      long maxLat2 = (long) maxLat - Integer.MIN_VALUE;
++      latShift = computeShift(minLat2, maxLat2);
++      latBase = (int) (minLat2 >>> latShift);
++      maxLatDelta = (int) (maxLat2 >>> latShift) - latBase + 1;
++      assert maxLatDelta > 0;
++    }
++    {
++      long minLon2 = (long) minLon - Integer.MIN_VALUE;
++      long maxLon2 = (long) maxLon - Integer.MIN_VALUE;
++      if (boundingBox.crossesDateline()) {
++        maxLon2 += 1L << 32; // wrap
++      }
++      lonShift = computeShift(minLon2, maxLon2);
++      lonBase = (int) (minLon2 >>> lonShift);
++      maxLonDelta = (int) (maxLon2 >>> lonShift) - lonBase + 1;
++      assert maxLonDelta > 0;
++    }
++
++    final double axisLat = Rectangle.axisLat(lat, radiusMeters);
++    final double distanceSortKey = GeoUtils.distanceQuerySortKey(radiusMeters);
++    final byte[] relations = new byte[maxLatDelta * maxLonDelta];
++    for (int i = 0; i < maxLatDelta; ++i) {
++      for (int j = 0; j < maxLonDelta; ++j) {
++        final int boxMinLat = ((latBase + i) << latShift) + Integer.MIN_VALUE;
++        final int boxMinLon = ((lonBase + j) << lonShift) + Integer.MIN_VALUE;
++        final int boxMaxLat = boxMinLat + (1 << latShift) - 1;
++        final int boxMaxLon = boxMinLon + (1 << lonShift) - 1;
++
++        relations[i * maxLonDelta + j] = (byte) GeoUtils.relate(
++            decodeLatitude(boxMinLat), decodeLatitude(boxMaxLat),
++            decodeLongitude(boxMinLon), decodeLongitude(boxMaxLon),
++            lat, lon, distanceSortKey, axisLat).ordinal();
++      }
++    }
++
++    return new DistancePredicate(
++        latShift, lonShift,
++        latBase, lonBase,
++        maxLatDelta, maxLonDelta,
++        relations,
++        lat, lon, distanceSortKey);
++  }
++
++  /** Compute the minimum shift value so that
++   * {@code (b>>>shift)-(a>>>shift)} is less that {@code ARITY}. */
++  private static int computeShift(long a, long b) {
++    assert a < b;
++    // We enforce a shift of at least 1 so that when we work with unsigned ints
++    // by doing (lat - MIN_VALUE), the result of the shift (lat - MIN_VALUE) >>> shift
++    // can be used for comparisons without particular care: the sign bit has
++    // been cleared so comparisons work the same for signed and unsigned ints
++    for (int shift = 1; ; ++shift) {
++      final long delta = (b >>> shift) - (a >>> shift);
++      if (delta >= 0 && delta < DistancePredicate.ARITY) {
++        return shift;
++      }
++    }
++  }
++
++  /** A predicate that checks whether a given point is within a distance of another point. */
++  public static class DistancePredicate {
++
++    private static final int ARITY = 64;
++
++    private final int latShift, lonShift;
++    private final int latBase, lonBase;
++    private final int maxLatDelta, maxLonDelta;
++    private final byte[] relations;
++    private final double lat, lon;
++    private final double distanceKey;
++
++    private DistancePredicate(
++        int latShift, int lonShift,
++        int latBase, int lonBase,
++        int maxLatDelta, int maxLonDelta,
++        byte[] relations,
++        double lat, double lon, double distanceKey) {
++      this.latShift = latShift;
++      this.lonShift = lonShift;
++      this.latBase = latBase;
++      this.lonBase = lonBase;
++      this.maxLatDelta = maxLatDelta;
++      this.maxLonDelta = maxLonDelta;
++      this.relations = relations;
++      this.lat = lat;
++      this.lon = lon;
++      this.distanceKey = distanceKey;
++    }
++
++    /** Check whether the given point is within a distance of another point.
++     *  NOTE: this operates directly on the encoded representation of points. */
++    public boolean apply(int lat, int lon) {
++      final int lat2 = ((lat - Integer.MIN_VALUE) >>> latShift);
++      if (lat2 < latBase || lat2 >= latBase + maxLatDelta) {
++        return false;
++      }
++      int lon2 = ((lon - Integer.MIN_VALUE) >>> lonShift);
++      if (lon2 < lonBase) { // wrap
++        lon2 += 1L << (32 - lonShift);
++        assert lon2 >= lonBase;
++      }
++      if (lon2 - lonBase >= maxLonDelta) {
++        return false;
++      }
++
++      final int relation = relations[(lat2 - latBase) * maxLonDelta + (lon2 - lonBase)];
++      if (relation == Relation.CELL_CROSSES_QUERY.ordinal()) {
++        return SloppyMath.haversinSortKey(
++            decodeLatitude(lat), decodeLongitude(lon),
++            this.lat, this.lon) <= distanceKey;
++      } else {
++        return relation == Relation.CELL_INSIDE_QUERY.ordinal();
++      }
++    }
++  }
++
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/geo/GeoUtils.java b/lucene/core/src/java/org/apache/lucene/geo/GeoUtils.java
+index 723cbaf..defcb48 100644
+--- a/lucene/core/src/java/org/apache/lucene/geo/GeoUtils.java
++++ b/lucene/core/src/java/org/apache/lucene/geo/GeoUtils.java
+@@ -20,6 +20,10 @@ import static org.apache.lucene.util.SloppyMath.TO_RADIANS;
+ import static org.apache.lucene.util.SloppyMath.cos;
+ import static org.apache.lucene.util.SloppyMath.haversinMeters;
+ 
++import org.apache.lucene.index.PointValues;
++import org.apache.lucene.index.PointValues.Relation;
++import org.apache.lucene.util.SloppyMath;
++
+ /**
+  * Basic reusable geo-spatial utility methods
+  *
+@@ -124,4 +128,39 @@ public final class GeoUtils {
+     assert haversinMeters(ceil) > radius;
+     return ceil;
+   }
++
++  /**
++   * Compute the relation between the provided box and distance query.
++   * This only works for boxes that do not cross the dateline.
++   */
++  public static PointValues.Relation relate(
++      double minLat, double maxLat, double minLon, double maxLon,
++      double lat, double lon, double distanceSortKey, double axisLat) {
++
++    if (minLon > maxLon) {
++      throw new IllegalArgumentException("Box crosses the dateline");
++    }
++
++    if ((lon < minLon || lon > maxLon) && (axisLat + Rectangle.AXISLAT_ERROR < minLat || axisLat - Rectangle.AXISLAT_ERROR > maxLat)) {
++      // circle not fully inside / crossing axis
++      if (SloppyMath.haversinSortKey(lat, lon, minLat, minLon) > distanceSortKey &&
++          SloppyMath.haversinSortKey(lat, lon, minLat, maxLon) > distanceSortKey &&
++          SloppyMath.haversinSortKey(lat, lon, maxLat, minLon) > distanceSortKey &&
++          SloppyMath.haversinSortKey(lat, lon, maxLat, maxLon) > distanceSortKey) {
++        // no points inside
++        return Relation.CELL_OUTSIDE_QUERY;
++      }
++    }
++
++    if (maxLon - lon < 90 && lon - minLon < 90 &&
++        SloppyMath.haversinSortKey(lat, lon, minLat, minLon) <= distanceSortKey &&
++        SloppyMath.haversinSortKey(lat, lon, minLat, maxLon) <= distanceSortKey &&
++        SloppyMath.haversinSortKey(lat, lon, maxLat, minLon) <= distanceSortKey &&
++        SloppyMath.haversinSortKey(lat, lon, maxLat, maxLon) <= distanceSortKey) {
++      // we are fully enclosed, collect everything within this subtree
++      return Relation.CELL_INSIDE_QUERY;
++    }
++
++    return Relation.CELL_CROSSES_QUERY;
++  }
+ }
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/document/LatLonDocValuesBoxQuery.java b/lucene/sandbox/src/java/org/apache/lucene/document/LatLonDocValuesBoxQuery.java
+new file mode 100644
+index 0000000..50ddf1a
+--- /dev/null
++++ b/lucene/sandbox/src/java/org/apache/lucene/document/LatLonDocValuesBoxQuery.java
+@@ -0,0 +1,145 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.document;
++
++import java.io.IOException;
++
++import org.apache.lucene.geo.GeoEncodingUtils;
++import org.apache.lucene.geo.GeoUtils;
++import org.apache.lucene.index.LeafReaderContext;
++import org.apache.lucene.index.SortedNumericDocValues;
++import org.apache.lucene.search.ConstantScoreScorer;
++import org.apache.lucene.search.ConstantScoreWeight;
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.Query;
++import org.apache.lucene.search.Scorer;
++import org.apache.lucene.search.TwoPhaseIterator;
++import org.apache.lucene.search.Weight;
++
++/** Distance query for {@link LatLonDocValuesField}. */
++final class LatLonDocValuesBoxQuery extends Query {
++
++  private final String field;
++  private final int minLatitude, maxLatitude, minLongitude, maxLongitude;
++  private final boolean crossesDateline;
++
++  LatLonDocValuesBoxQuery(String field, double minLatitude, double maxLatitude, double minLongitude, double maxLongitude) {
++    GeoUtils.checkLatitude(minLatitude);
++    GeoUtils.checkLatitude(maxLatitude);
++    GeoUtils.checkLongitude(minLongitude);
++    GeoUtils.checkLongitude(maxLongitude);
++    if (field == null) {
++      throw new IllegalArgumentException("field must not be null");
++    }
++    this.field = field;
++    this.crossesDateline = minLongitude > maxLongitude; // make sure to compute this before rounding
++    this.minLatitude = GeoEncodingUtils.encodeLatitudeCeil(minLatitude);
++    this.maxLatitude = GeoEncodingUtils.encodeLatitude(maxLatitude);
++    this.minLongitude = GeoEncodingUtils.encodeLongitudeCeil(minLongitude);
++    this.maxLongitude = GeoEncodingUtils.encodeLongitude(maxLongitude);
++  }
++
++  @Override
++  public String toString(String field) {
++    StringBuilder sb = new StringBuilder();
++    if (!this.field.equals(field)) {
++      sb.append(this.field);
++      sb.append(':');
++    }
++    sb.append("box(minLat=").append(GeoEncodingUtils.decodeLatitude(minLatitude));
++    sb.append(", maxLat=").append(GeoEncodingUtils.decodeLatitude(maxLatitude));
++    sb.append(", minLon=").append(GeoEncodingUtils.decodeLongitude(minLongitude));
++    sb.append(", maxLon=").append(GeoEncodingUtils.decodeLongitude(maxLongitude));
++    return sb.append(")").toString();
++  }
++
++  @Override
++  public boolean equals(Object obj) {
++    if (sameClassAs(obj) == false) {
++      return false;
++    }
++    LatLonDocValuesBoxQuery other = (LatLonDocValuesBoxQuery) obj;
++    return field.equals(other.field) &&
++        crossesDateline == other.crossesDateline &&
++        minLatitude == other.minLatitude &&
++        maxLatitude == other.maxLatitude &&
++        minLongitude == other.minLongitude &&
++        maxLongitude == other.maxLongitude;
++  }
++
++  @Override
++  public int hashCode() {
++    int h = classHash();
++    h = 31 * h + field.hashCode();
++    h = 31 * h + Boolean.hashCode(crossesDateline);
++    h = 31 * h + Integer.hashCode(minLatitude);
++    h = 31 * h + Integer.hashCode(maxLatitude);
++    h = 31 * h + Integer.hashCode(minLongitude);
++    h = 31 * h + Integer.hashCode(maxLongitude);
++    return h;
++  }
++
++  @Override
++  public Weight createWeight(IndexSearcher searcher, boolean needsScores, float boost) throws IOException {
++    return new ConstantScoreWeight(this, boost) {
++      @Override
++      public Scorer scorer(LeafReaderContext context) throws IOException {
++        final SortedNumericDocValues values = context.reader().getSortedNumericDocValues(field);
++        if (values == null) {
++          return null;
++        }
++
++        final TwoPhaseIterator iterator = new TwoPhaseIterator(values) {
++          @Override
++          public boolean matches() throws IOException {
++            for (int i = 0, count = values.docValueCount(); i < count; ++i) {
++              final long value = values.nextValue();
++              final int lat = (int) (value >>> 32);
++              if (lat < minLatitude || lat > maxLatitude) {
++                // not within latitude range
++                continue;
++              }
++
++              final int lon = (int) (value & 0xFFFFFFFF);
++              if (crossesDateline) {
++                if (lon > maxLongitude && lon < minLongitude) {
++                  // not within longitude range
++                  continue;
++                }
++              } else {
++                if (lon < minLongitude || lon > maxLongitude) {
++                  // not within longitude range
++                  continue;
++                }
++              }
++
++              return true;
++            }
++            return false;
++          }
++
++          @Override
++          public float matchCost() {
++            return 5; // 5 comparisons
++          }
++        };
++        return new ConstantScoreScorer(this, boost, iterator);
++      }
++    };
++  }
++
++}
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/document/LatLonDocValuesDistanceQuery.java b/lucene/sandbox/src/java/org/apache/lucene/document/LatLonDocValuesDistanceQuery.java
+new file mode 100644
+index 0000000..ab05804
+--- /dev/null
++++ b/lucene/sandbox/src/java/org/apache/lucene/document/LatLonDocValuesDistanceQuery.java
+@@ -0,0 +1,132 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.document;
++
++import java.io.IOException;
++
++import org.apache.lucene.geo.GeoEncodingUtils;
++import org.apache.lucene.geo.GeoUtils;
++import org.apache.lucene.index.LeafReaderContext;
++import org.apache.lucene.index.SortedNumericDocValues;
++import org.apache.lucene.search.ConstantScoreScorer;
++import org.apache.lucene.search.ConstantScoreWeight;
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.Query;
++import org.apache.lucene.search.Scorer;
++import org.apache.lucene.search.TwoPhaseIterator;
++import org.apache.lucene.search.Weight;
++
++/** Distance query for {@link LatLonDocValuesField}. */
++final class LatLonDocValuesDistanceQuery extends Query {
++
++  private final String field;
++  private final double latitude, longitude;
++  private final double radiusMeters;
++
++  LatLonDocValuesDistanceQuery(String field, double latitude, double longitude, double radiusMeters) {
++    if (Double.isFinite(radiusMeters) == false || radiusMeters < 0) {
++      throw new IllegalArgumentException("radiusMeters: '" + radiusMeters + "' is invalid");
++    }
++    GeoUtils.checkLatitude(latitude);
++    GeoUtils.checkLongitude(longitude);
++    if (field == null) {
++      throw new IllegalArgumentException("field must not be null");
++    }
++    this.field = field;
++    this.latitude = latitude;
++    this.longitude = longitude;
++    this.radiusMeters = radiusMeters;
++  }
++
++  @Override
++  public String toString(String field) {
++    StringBuilder sb = new StringBuilder();
++    if (!this.field.equals(field)) {
++      sb.append(this.field);
++      sb.append(':');
++    }
++    sb.append(latitude);
++    sb.append(",");
++    sb.append(longitude);
++    sb.append(" +/- ");
++    sb.append(radiusMeters);
++    sb.append(" meters");
++    return sb.toString();
++  }
++
++  @Override
++  public boolean equals(Object obj) {
++    if (sameClassAs(obj) == false) {
++      return false;
++    }
++    LatLonDocValuesDistanceQuery other = (LatLonDocValuesDistanceQuery) obj;
++    return field.equals(other.field) &&
++        Double.doubleToLongBits(latitude) == Double.doubleToLongBits(other.latitude) &&
++        Double.doubleToLongBits(longitude) == Double.doubleToLongBits(other.longitude) &&
++        Double.doubleToLongBits(radiusMeters) == Double.doubleToLongBits(other.radiusMeters);
++  }
++
++  @Override
++  public int hashCode() {
++    int h = classHash();
++    h = 31 * h + field.hashCode();
++    h = 31 * h + Double.hashCode(latitude);
++    h = 31 * h + Double.hashCode(longitude);
++    h = 31 * h + Double.hashCode(radiusMeters);
++    return h;
++  }
++
++  @Override
++  public Weight createWeight(IndexSearcher searcher, boolean needsScores, float boost) throws IOException {
++    return new ConstantScoreWeight(this, boost) {
++
++      private final GeoEncodingUtils.DistancePredicate distancePredicate = GeoEncodingUtils.createDistancePredicate(latitude, longitude, radiusMeters);
++
++      @Override
++      public Scorer scorer(LeafReaderContext context) throws IOException {
++        final SortedNumericDocValues values = context.reader().getSortedNumericDocValues(field);
++        if (values == null) {
++          return null;
++        }
++
++        final TwoPhaseIterator iterator = new TwoPhaseIterator(values) {
++
++          @Override
++          public boolean matches() throws IOException {
++            for (int i = 0, count = values.docValueCount(); i < count; ++i) {
++              final long value = values.nextValue();
++              final int lat = (int) (value >>> 32);
++              final int lon = (int) (value & 0xFFFFFFFF);
++              if (distancePredicate.apply(lat, lon)) {
++                return true;
++              }
++            }
++            return false;
++          }
++
++          @Override
++          public float matchCost() {
++            return 100f; // TODO: what should it be?
++          }
++
++        };
++        return new ConstantScoreScorer(this, boost, iterator);
++      }
++    };
++  }
++
++}
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/document/LatLonDocValuesField.java b/lucene/sandbox/src/java/org/apache/lucene/document/LatLonDocValuesField.java
+index 20154d2..08a7da7 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/document/LatLonDocValuesField.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/document/LatLonDocValuesField.java
+@@ -24,6 +24,9 @@ import static org.apache.lucene.geo.GeoEncodingUtils.encodeLongitude;
+ import org.apache.lucene.index.DocValuesType;
+ import org.apache.lucene.index.FieldInfo;
+ import org.apache.lucene.search.FieldDoc;
++import org.apache.lucene.search.IndexOrDocValuesQuery;
++import org.apache.lucene.search.MatchNoDocsQuery;
++import org.apache.lucene.search.Query;
+ import org.apache.lucene.search.SortField;
+ 
+ /** 
+@@ -132,4 +135,47 @@ public class LatLonDocValuesField extends Field {
+   public static SortField newDistanceSort(String field, double latitude, double longitude) {
+     return new LatLonPointSortField(field, latitude, longitude);
+   }
++
++  /**
++   * Create a query for matching a bounding box using doc values.
++   * This query is usually slow as it does not use an index structure and needs
++   * to verify documents one-by-one in order to know whether they match. It is
++   * best used wrapped in an {@link IndexOrDocValuesQuery} alongside a
++   * {@link LatLonPoint#newBoxQuery}.
++   */
++  public static Query newBoxQuery(String field, double minLatitude, double maxLatitude, double minLongitude, double maxLongitude) {
++    // exact double values of lat=90.0D and lon=180.0D must be treated special as they are not represented in the encoding
++    // and should not drag in extra bogus junk! TODO: should encodeCeil just throw ArithmeticException to be less trappy here?
++    if (minLatitude == 90.0) {
++      // range cannot match as 90.0 can never exist
++      return new MatchNoDocsQuery("LatLonDocValuesField.newBoxQuery with minLatitude=90.0");
++    }
++    if (minLongitude == 180.0) {
++      if (maxLongitude == 180.0) {
++        // range cannot match as 180.0 can never exist
++        return new MatchNoDocsQuery("LatLonDocValuesField.newBoxQuery with minLongitude=maxLongitude=180.0");
++      } else if (maxLongitude < minLongitude) {
++        // encodeCeil() with dateline wrapping!
++        minLongitude = -180.0;
++      }
++    }
++    return new LatLonDocValuesBoxQuery(field, minLatitude, maxLatitude, minLongitude, maxLongitude);
++  }
++
++  /**
++   * Create a query for matching points within the specified distance of the supplied location.
++   * This query is usually slow as it does not use an index structure and needs
++   * to verify documents one-by-one in order to know whether they match. It is
++   * best used wrapped in an {@link IndexOrDocValuesQuery} alongside a
++   * {@link LatLonPoint#newDistanceQuery}.
++   * @param field field name. must not be null.
++   * @param latitude latitude at the center: must be within standard +/-90 coordinate bounds.
++   * @param longitude longitude at the center: must be within standard +/-180 coordinate bounds.
++   * @param radiusMeters maximum distance from the center in meters: must be non-negative and finite.
++   * @return query matching points within this distance
++   * @throws IllegalArgumentException if {@code field} is null, location has invalid coordinates, or radius is invalid.
++   */
++  public static Query newDistanceQuery(String field, double latitude, double longitude, double radiusMeters) {
++    return new LatLonDocValuesDistanceQuery(field, latitude, longitude, radiusMeters);
++  }
+ }
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/document/LatLonPointDistanceQuery.java b/lucene/sandbox/src/java/org/apache/lucene/document/LatLonPointDistanceQuery.java
+index 7a00cef..3d0b82e 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/document/LatLonPointDistanceQuery.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/document/LatLonPointDistanceQuery.java
+@@ -18,6 +18,7 @@ package org.apache.lucene.document;
+ 
+ import java.io.IOException;
+ 
++import org.apache.lucene.geo.GeoEncodingUtils;
+ import org.apache.lucene.geo.GeoUtils;
+ import org.apache.lucene.geo.Rectangle;
+ import org.apache.lucene.index.FieldInfo;
+@@ -31,10 +32,10 @@ import org.apache.lucene.search.ConstantScoreWeight;
+ import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.Query;
+ import org.apache.lucene.search.Scorer;
++import org.apache.lucene.search.ScorerSupplier;
+ import org.apache.lucene.search.Weight;
+ import org.apache.lucene.util.DocIdSetBuilder;
+ import org.apache.lucene.util.NumericUtils;
+-import org.apache.lucene.util.SloppyMath;
+ import org.apache.lucene.util.StringHelper;
+ 
+ import static org.apache.lucene.geo.GeoEncodingUtils.decodeLatitude;
+@@ -102,8 +103,19 @@ final class LatLonPointDistanceQuery extends Query {
+ 
+     return new ConstantScoreWeight(this, boost) {
+ 
++      final GeoEncodingUtils.DistancePredicate distancePredicate = GeoEncodingUtils.createDistancePredicate(latitude, longitude, radiusMeters);
++
+       @Override
+       public Scorer scorer(LeafReaderContext context) throws IOException {
++        ScorerSupplier scorerSupplier = scorerSupplier(context);
++        if (scorerSupplier == null) {
++          return null;
++        }
++        return scorerSupplier.get(false);
++      }
++
++      @Override
++      public ScorerSupplier scorerSupplier(LeafReaderContext context) throws IOException {
+         LeafReader reader = context.reader();
+         PointValues values = reader.getPointValues(field);
+         if (values == null) {
+@@ -119,8 +131,7 @@ final class LatLonPointDistanceQuery extends Query {
+         
+         // matching docids
+         DocIdSetBuilder result = new DocIdSetBuilder(reader.maxDoc(), values, field);
+-
+-        values.intersect(
++        final IntersectVisitor visitor =
+                          new IntersectVisitor() {
+ 
+                            DocIdSetBuilder.BulkAdder adder;
+@@ -151,11 +162,9 @@ final class LatLonPointDistanceQuery extends Query {
+                                return;
+                              }
+ 
+-                             double docLatitude = decodeLatitude(packedValue, 0);
+-                             double docLongitude = decodeLongitude(packedValue, Integer.BYTES);
+-
+-                             // its a match only if its sortKey <= our sortKey
+-                             if (SloppyMath.haversinSortKey(latitude, longitude, docLatitude, docLongitude) <= sortKey) {
++                             int docLatitude = NumericUtils.sortableBytesToInt(packedValue, 0);
++                             int docLongitude = NumericUtils.sortableBytesToInt(packedValue, Integer.BYTES);
++                             if (distancePredicate.apply(docLatitude, docLongitude)) {
+                                adder.add(docID);
+                              }
+                            }
+@@ -185,32 +194,30 @@ final class LatLonPointDistanceQuery extends Query {
+                              double latMax = decodeLatitude(maxPackedValue, 0);
+                              double lonMax = decodeLongitude(maxPackedValue, Integer.BYTES);
+ 
+-                             if ((longitude < lonMin || longitude > lonMax) && (axisLat+ Rectangle.AXISLAT_ERROR < latMin || axisLat- Rectangle.AXISLAT_ERROR > latMax)) {
+-                               // circle not fully inside / crossing axis
+-                               if (SloppyMath.haversinSortKey(latitude, longitude, latMin, lonMin) > sortKey &&
+-                                   SloppyMath.haversinSortKey(latitude, longitude, latMin, lonMax) > sortKey &&
+-                                   SloppyMath.haversinSortKey(latitude, longitude, latMax, lonMin) > sortKey &&
+-                                   SloppyMath.haversinSortKey(latitude, longitude, latMax, lonMax) > sortKey) {
+-                                 // no points inside
+-                                 return Relation.CELL_OUTSIDE_QUERY;
+-                               }
+-                             }
+-
+-                             if (lonMax - longitude < 90 && longitude - lonMin < 90 &&
+-                                 SloppyMath.haversinSortKey(latitude, longitude, latMin, lonMin) <= sortKey &&
+-                                 SloppyMath.haversinSortKey(latitude, longitude, latMin, lonMax) <= sortKey &&
+-                                 SloppyMath.haversinSortKey(latitude, longitude, latMax, lonMin) <= sortKey &&
+-                                 SloppyMath.haversinSortKey(latitude, longitude, latMax, lonMax) <= sortKey) {
+-                               // we are fully enclosed, collect everything within this subtree
+-                               return Relation.CELL_INSIDE_QUERY;
+-                             } else {
+-                               // recurse: its inside our bounding box(es), but not fully, or it wraps around.
+-                               return Relation.CELL_CROSSES_QUERY;
+-                             }
++                             return GeoUtils.relate(latMin, latMax, lonMin, lonMax, latitude, longitude, sortKey, axisLat);
+                            }
+-                         });
++                         };
++        final Weight weight = this;
++        return new ScorerSupplier() {
++
++          long cost = -1;
++
++          @Override
++          public Scorer get(boolean randomAccess) throws IOException {
++            values.intersect(visitor);
++            return new ConstantScoreScorer(weight, score(), result.build().iterator());
++          }
++
++          @Override
++          public long cost() {
++            if (cost == -1) {
++              cost = values.estimatePointCount(visitor);
++            }
++            assert cost >= 0;
++            return cost;
++          }
++        };
+ 
+-        return new ConstantScoreScorer(this, score(), result.build().iterator());
+       }
+     };
+   }
+diff --git a/lucene/sandbox/src/test/org/apache/lucene/search/TestLatLonDocValuesQueries.java b/lucene/sandbox/src/test/org/apache/lucene/search/TestLatLonDocValuesQueries.java
+new file mode 100644
+index 0000000..3c8bf4e
+--- /dev/null
++++ b/lucene/sandbox/src/test/org/apache/lucene/search/TestLatLonDocValuesQueries.java
+@@ -0,0 +1,62 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.search;
++
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.LatLonDocValuesField;
++import org.apache.lucene.geo.BaseGeoPointTestCase;
++import org.apache.lucene.geo.GeoEncodingUtils;
++import org.apache.lucene.geo.Polygon;
++
++public class TestLatLonDocValuesQueries extends BaseGeoPointTestCase {
++
++  @Override
++  protected boolean supportsPolygons() {
++    return false;
++  }
++
++  @Override
++  protected void addPointToDoc(String field, Document doc, double lat, double lon) {
++    doc.add(new LatLonDocValuesField(field, lat, lon));
++  }
++
++  @Override
++  protected Query newRectQuery(String field, double minLat, double maxLat, double minLon, double maxLon) {
++    return LatLonDocValuesField.newBoxQuery(field, minLat, maxLat, minLon, maxLon);
++  }
++
++  @Override
++  protected Query newDistanceQuery(String field, double centerLat, double centerLon, double radiusMeters) {
++    return LatLonDocValuesField.newDistanceQuery(field, centerLat, centerLon, radiusMeters);
++  }
++
++  @Override
++  protected Query newPolygonQuery(String field, Polygon... polygons) {
++    fail();
++    return null;
++  }
++
++  @Override
++  protected double quantizeLat(double latRaw) {
++    return GeoEncodingUtils.decodeLatitude(GeoEncodingUtils.encodeLatitude(latRaw));
++  }
++
++  @Override
++  protected double quantizeLon(double lonRaw) {
++    return GeoEncodingUtils.decodeLongitude(GeoEncodingUtils.encodeLongitude(lonRaw));
++  }
++}
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/geo/BaseGeoPointTestCase.java b/lucene/test-framework/src/java/org/apache/lucene/geo/BaseGeoPointTestCase.java
+index d4896f8..562db8f 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/geo/BaseGeoPointTestCase.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/geo/BaseGeoPointTestCase.java
+@@ -98,7 +98,12 @@ public abstract class BaseGeoPointTestCase extends LuceneTestCase {
+   protected Polygon nextPolygon() {
+     return org.apache.lucene.geo.GeoTestUtil.nextPolygon();
+   }
+-  
++
++  /** Whether this impl supports polygons. */
++  protected boolean supportsPolygons() {
++    return true;
++  }
++
+   /** Valid values that should not cause exception */
+   public void testIndexExtremeValues() {
+     Document document = new Document();
+@@ -284,6 +289,7 @@ public abstract class BaseGeoPointTestCase extends LuceneTestCase {
+   
+   /** test we can search for a polygon */
+   public void testPolygonBasics() throws Exception {
++    assumeTrue("Impl does not support polygons", supportsPolygons());
+     Directory dir = newDirectory();
+     RandomIndexWriter writer = new RandomIndexWriter(random(), dir);
+ 
+@@ -306,6 +312,7 @@ public abstract class BaseGeoPointTestCase extends LuceneTestCase {
+   
+   /** test we can search for a polygon with a hole (but still includes the doc) */
+   public void testPolygonHole() throws Exception {
++    assumeTrue("Impl does not support polygons", supportsPolygons());
+     Directory dir = newDirectory();
+     RandomIndexWriter writer = new RandomIndexWriter(random(), dir);
+ 
+@@ -330,6 +337,7 @@ public abstract class BaseGeoPointTestCase extends LuceneTestCase {
+   
+   /** test we can search for a polygon with a hole (that excludes the doc) */
+   public void testPolygonHoleExcludes() throws Exception {
++    assumeTrue("Impl does not support polygons", supportsPolygons());
+     Directory dir = newDirectory();
+     RandomIndexWriter writer = new RandomIndexWriter(random(), dir);
+ 
+@@ -354,6 +362,7 @@ public abstract class BaseGeoPointTestCase extends LuceneTestCase {
+   
+   /** test we can search for a multi-polygon */
+   public void testMultiPolygonBasics() throws Exception {
++    assumeTrue("Impl does not support polygons", supportsPolygons());
+     Directory dir = newDirectory();
+     RandomIndexWriter writer = new RandomIndexWriter(random(), dir);
+ 
+@@ -378,6 +387,7 @@ public abstract class BaseGeoPointTestCase extends LuceneTestCase {
+   
+   /** null field name not allowed */
+   public void testPolygonNullField() {
++    assumeTrue("Impl does not support polygons", supportsPolygons());
+     IllegalArgumentException expected = expectThrows(IllegalArgumentException.class, () -> {
+       newPolygonQuery(null, new Polygon(
+           new double[] { 18, 18, 19, 19, 18 },
+@@ -739,7 +749,9 @@ public abstract class BaseGeoPointTestCase extends LuceneTestCase {
+     }
+     verifyRandomRectangles(lats, lons);
+     verifyRandomDistances(lats, lons);
+-    verifyRandomPolygons(lats, lons);
++    if (supportsPolygons()) {
++      verifyRandomPolygons(lats, lons);
++    }
+   }
+ 
+   protected void verifyRandomRectangles(double[] lats, double[] lons) throws Exception {
+@@ -844,6 +856,7 @@ public abstract class BaseGeoPointTestCase extends LuceneTestCase {
+ 
+         if (hits.get(docID) != expected) {
+           StringBuilder b = new StringBuilder();
++          b.append("docID=(" + docID + ")\n");
+ 
+           if (expected) {
+             b.append("FAIL: id=" + id + " should match but did not\n");
+@@ -1344,10 +1357,12 @@ public abstract class BaseGeoPointTestCase extends LuceneTestCase {
+     lons[3] = rect.maxLon;
+     lats[4] = rect.minLat;
+     lons[4] = rect.minLon;
+-    q1 = newPolygonQuery("field", new Polygon(lats, lons));
+-    q2 = newPolygonQuery("field", new Polygon(lats, lons));
+-    assertEquals(q1, q2);
+-    assertFalse(q1.equals(newPolygonQuery("field2", new Polygon(lats, lons))));
++    if (supportsPolygons()) {
++      q1 = newPolygonQuery("field", new Polygon(lats, lons));
++      q2 = newPolygonQuery("field", new Polygon(lats, lons));
++      assertEquals(q1, q2);
++      assertFalse(q1.equals(newPolygonQuery("field2", new Polygon(lats, lons))));
++    }
+   }
+   
+   /** return topdocs over a small set of points in field "point" */
+@@ -1436,6 +1451,7 @@ public abstract class BaseGeoPointTestCase extends LuceneTestCase {
+   }
+   
+   public void testSmallSetPoly() throws Exception {
++    assumeTrue("Impl does not support polygons", supportsPolygons());
+     TopDocs td = searchSmallSet(newPolygonQuery("point",
+         new Polygon(
+         new double[]{33.073130, 32.9942669, 32.938386, 33.0374494,
+@@ -1447,6 +1463,7 @@ public abstract class BaseGeoPointTestCase extends LuceneTestCase {
+   }
+ 
+   public void testSmallSetPolyWholeMap() throws Exception {
++    assumeTrue("Impl does not support polygons", supportsPolygons());
+     TopDocs td = searchSmallSet(newPolygonQuery("point",
+                       new Polygon(
+                       new double[] {GeoUtils.MIN_LAT_INCL, GeoUtils.MAX_LAT_INCL, GeoUtils.MAX_LAT_INCL, GeoUtils.MIN_LAT_INCL, GeoUtils.MIN_LAT_INCL},

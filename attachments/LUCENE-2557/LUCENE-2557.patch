@@ -1,0 +1,190 @@
+Index: src/java/org/apache/lucene/search/MultiTermQuery.java
+===================================================================
+--- src/java/org/apache/lucene/search/MultiTermQuery.java	(revision 966727)
++++ src/java/org/apache/lucene/search/MultiTermQuery.java	(working copy)
+@@ -20,7 +20,9 @@
+ import java.io.IOException;
+ import java.io.Serializable;
+ import java.util.ArrayList;
++import java.util.Iterator;
+ import java.util.PriorityQueue;
++import java.util.Queue;
+ 
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.Term;
+@@ -293,6 +295,18 @@
+     /** Return a suitable Query for a MultiTermQuery term. */
+     protected abstract Query getQuery(Term term);
+ 
++		/**
++		 * A boost that is applied to the BooleanQuery returned by
++		 * {@link #rewrite(IndexReader, MultiTermQuery)}, that applies to all
++		 * participating MultiTermQuery terms.
++		 * <p>
++		 * This defaults to 1.0f (no boost) if not overridden.
++		 */
++		protected float getQueryBoost(final IndexReader reader,
++				final MultiTermQuery query, Queue<ScoreTerm> stQueue) throws IOException {
++			return 1.0f;
++		}
++
+     @Override
+     public Query rewrite(final IndexReader reader, final MultiTermQuery query) throws IOException {
+       final int maxSize = Math.min(size, BooleanQuery.getMaxClauseCount());
+@@ -318,6 +332,7 @@
+       
+       final Term placeholderTerm = new Term(query.field);
+       final BooleanQuery bq = new BooleanQuery(true);
++      bq.setBoost(getQueryBoost(reader, query, stQueue));
+       for (final ScoreTerm st : stQueue) {
+         // add new query, we must clone the term, else it may get overwritten!
+         Query tq = getQuery(placeholderTerm.createTerm(st.bytes));
+@@ -346,7 +361,7 @@
+       return true;
+     }
+   
+-    private static class ScoreTerm implements Comparable<ScoreTerm> {
++    protected static class ScoreTerm implements Comparable<ScoreTerm> {
+       public final BytesRef bytes = new BytesRef();
+       public float boost;
+       
+@@ -360,6 +375,65 @@
+     }
+   }
+ 
++	/**
++	 * A rewrite method that attempts to balance the IDF across all terms. If the
++	 * query is a {@link FuzzyQuery} and the term returned by
++	 * {@link FuzzyQuery#getTerm()} exists in the index, then the IDF of
++	 * {@link FuzzyQuery#getTerm()} is used as the IDF for all participating
++	 * terms. In all other cases, the average IDF of all participating terms is
++	 * taken.
++	 * <p>
++	 * The purpose of this is to avoid terms in the {@link MultiTermQuery} which
++	 * are rare from appearing at the top of results, while not completely
++	 * ignoring the IDF in scoring (as occurs with
++	 * {@link TopTermsBoostOnlyBooleanQueryRewrite}. This is especially useful for
++	 * {@link FuzzyQuery}s where fuzzy terms can often appear higher in results as
++	 * misspellings typically have a higher IDF.
++	 */
++	public static final class TopTermsIdfBalancingBooleanQueryRewrite extends
++			TopTermsBooleanQueryRewrite {
++		private static final long serialVersionUID = 1L;
++		private final Similarity similarity;
++
++		public TopTermsIdfBalancingBooleanQueryRewrite() {
++			this(Integer.MAX_VALUE);
++		}
++
++		public TopTermsIdfBalancingBooleanQueryRewrite(int size) {
++			super(size);
++			this.similarity = new DefaultSimilarity();
++		}
++
++		@Override
++		protected float getQueryBoost(final IndexReader reader, final MultiTermQuery query, Queue<ScoreTerm> stQueue)
++			throws IOException {
++			float idf = 1f;
++      float df = 0f;
++      if (query instanceof FuzzyQuery)
++      {
++      	FuzzyQuery fq = (FuzzyQuery) query;
++      	df = reader.docFreq(fq.getTerm());
++      }
++      
++      if (df == 0f)
++      {
++      	// get the average df across all terms
++      	for (final ScoreTerm st : stQueue) {
++          df += reader.docFreq(query.getField(), st.bytes);
++        }
++      	df = df / stQueue.size();
++      }
++      idf = similarity.idf((int) df, reader.numDocs());
++      return idf;
++		}
++		
++		@Override
++		protected Query getQuery(Term term) {
++			// ignore the normally assigned IDF for the term
++			return new ConstantScoreQuery(new QueryWrapperFilter(new TermQuery(term)));
++		}
++	}
++
+   /**
+    * A rewrite method that first translates each term into
+    * {@link BooleanClause.Occur#SHOULD} clause in a BooleanQuery, and keeps the
+Index: src/test/org/apache/lucene/search/TestFuzzyQuery.java
+===================================================================
+--- src/test/org/apache/lucene/search/TestFuzzyQuery.java	(revision 966727)
++++ src/test/org/apache/lucene/search/TestFuzzyQuery.java	(working copy)
+@@ -29,6 +29,7 @@
+ import org.apache.lucene.index.RandomIndexWriter;
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.queryParser.QueryParser;
++import org.apache.lucene.search.BooleanClause.Occur;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.MockRAMDirectory;
+ import org.apache.lucene.store.RAMDirectory;
+@@ -388,6 +389,61 @@
+     index.close();
+   }
+ 
++	/**
++	 * LUCENE-2557: Tests fuzzy query results are as expected when misspellings of
++	 * the exact term have a high IDF (the exact match should be favoured). Also
++	 * checks that IDF is not ignored completely (documents matching the term with
++	 * fewer occurrences in the index should be higher).
++	 */
++  public void testFuzzyIdfScoring() throws Exception {
++    RAMDirectory directory = new RAMDirectory();
++    RandomIndexWriter writer = new RandomIndexWriter(newRandom(), directory, 
++        new IndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer()));
++    addDoc("jones", writer);
++    addDoc("jones", writer);
++    addDoc("jones", writer);
++    addDoc("jones", writer);
++    addDoc("joness", writer);
++    // add docs with higher IDF...
++    addDoc("smith", writer);
++    addDoc("smith", writer);
++    addDoc("smith", writer);
++    addDoc("smiith", writer);
++
++    IndexReader reader = writer.getReader();
++    IndexSearcher searcher = new IndexSearcher(reader);
++    writer.close();
++
++    BooleanQuery bq = new BooleanQuery();
++
++		FuzzyQuery smithQuery = new FuzzyQuery(new Term("field", "smith"),
++				FuzzyQuery.defaultMinSimilarity, 0);
++		smithQuery.setRewriteMethod(new MultiTermQuery.TopTermsIdfBalancingBooleanQueryRewrite());
++		bq.add(smithQuery, Occur.SHOULD);
++
++		FuzzyQuery jonesQuery = new FuzzyQuery(new Term("field", "jones"),
++				FuzzyQuery.defaultMinSimilarity, 0);
++		jonesQuery.setRewriteMethod(new MultiTermQuery.TopTermsIdfBalancingBooleanQueryRewrite());
++		bq.add(jonesQuery, Occur.SHOULD);
++
++		ScoreDoc[] hits = searcher.search(bq, null, 1000).scoreDocs;
++		assertEquals(9, hits.length);
++		
++		// smith results should be higher than jones because of its higher IDF
++    assertEquals("smith", reader.document(hits[0].doc).get("field"));
++    assertEquals("smith", reader.document(hits[1].doc).get("field"));
++    assertEquals("smith", reader.document(hits[2].doc).get("field"));
++    assertEquals("jones", reader.document(hits[3].doc).get("field"));
++    assertEquals("jones", reader.document(hits[4].doc).get("field"));
++    assertEquals("jones", reader.document(hits[5].doc).get("field"));
++    assertEquals("jones", reader.document(hits[6].doc).get("field"));
++    // the "fuzzy" results should appear at the bottom of the results
++    
++    searcher.close();
++    reader.close();
++    directory.close();
++  }
++
+   private void addDoc(String text, RandomIndexWriter writer) throws IOException {
+     Document doc = new Document();
+     doc.add(new Field("field", text, Field.Store.YES, Field.Index.ANALYZED));

@@ -1,0 +1,287 @@
+Index: lucene/core/src/java/org/apache/lucene/search/TopFieldCollector.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/search/TopFieldCollector.java	(revision 1415481)
++++ lucene/core/src/java/org/apache/lucene/search/TopFieldCollector.java	(working copy)
+@@ -20,6 +20,7 @@
+ import java.io.IOException;
+ 
+ import org.apache.lucene.index.AtomicReaderContext;
++import org.apache.lucene.search.FieldComparator.RelevanceComparator;
+ import org.apache.lucene.search.FieldValueHitQueue.Entry;
+ import org.apache.lucene.util.PriorityQueue;
+ 
+@@ -840,7 +841,82 @@
+     }
+ 
+   }
++  
++  /*
++   * Used when the collector is asked to track scores, but also sort by relevance.
++   */
++  private final static class ScoringTwiceCollector
++      extends MultiComparatorScoringMaxScoreCollector {
++    
++    public ScoringTwiceCollector(FieldValueHitQueue<Entry> queue,
++        int numHits, boolean fillFields) {
++      super(queue, numHits, fillFields);
++    }
++    
++    @Override
++    public void collect(int doc) throws IOException {
++      final float score = scorer.score();
++      if (score > maxScore) {
++        maxScore = score;
++      }
++      ++totalHits;
++      if (queueFull) {
++        // Fastmatch: return if this hit is not competitive
++        for (int i = 0;; i++) {
++          final int c = reverseMul[i] * comparators[i].compareBottom(doc);
++          if (c < 0) {
++            // Definitely not competitive.
++            return;
++          } else if (c > 0) {
++            // Definitely competitive.
++            break;
++          } else if (i == comparators.length - 1) {
++            // This is the equals case.
++            if (doc + docBase > bottom.doc) {
++              // Definitely not competitive
++              return;
++            }
++            break;
++          }
++        }
+ 
++        // This hit is competitive - replace bottom element in queue & adjustTop
++        for (int i = 0; i < comparators.length; i++) {
++          comparators[i].copy(bottom.slot, doc);
++        }
++
++        updateBottom(doc, score);
++
++        for (int i = 0; i < comparators.length; i++) {
++          comparators[i].setBottom(bottom.slot);
++        }
++      } else {
++        // Startup transient: queue hasn't gathered numHits yet
++        final int slot = totalHits - 1;
++        // Copy hit into queue
++        for (int i = 0; i < comparators.length; i++) {
++          comparators[i].copy(slot, doc);
++        }
++        add(slot, doc, score);
++        if (queueFull) {
++          for (int i = 0; i < comparators.length; i++) {
++            comparators[i].setBottom(bottom.slot);
++          }
++        }
++      }
++    }
++    
++    @Override
++    public boolean acceptsDocsOutOfOrder() {
++      return true;
++    }
++
++    @Override
++    public void setScorer(Scorer scorer) throws IOException {
++      super.setScorer(new ScoreCachingWrappingScorer(scorer));
++    }
++  }
++
+   /*
+    * Implements a TopFieldCollector when after != null.
+    */
+@@ -855,6 +931,7 @@
+     final boolean trackMaxScore;
+     final FieldDoc after;
+     int afterDoc;
++    boolean hasRelevance;
+     
+     public PagingFieldCollector(
+                                 FieldValueHitQueue<Entry> queue, FieldDoc after, int numHits, boolean fillFields,
+@@ -866,6 +943,11 @@
+       this.after = after;
+       comparators = queue.getComparators();
+       reverseMul = queue.getReverseMul();
++      for (FieldComparator<?> cmp : comparators) {
++        if (cmp instanceof RelevanceComparator) {
++          hasRelevance = true;
++        }
++      }
+ 
+       // Must set maxScore to NEG_INF, or otherwise Math.max always returns NaN.
+       maxScore = Float.NEGATIVE_INFINITY;
+@@ -979,6 +1061,10 @@
+ 
+     @Override
+     public void setScorer(Scorer scorer) {
++      // so we don't call score twice.
++      if (hasRelevance && (trackDocScores | trackMaxScore)) {
++        scorer = new ScoreCachingWrappingScorer(scorer);
++      }
+       this.scorer = scorer;
+       for (int i = 0; i < comparators.length; i++) {
+         comparators[i].setScorer(scorer);
+@@ -1123,6 +1209,13 @@
+     FieldValueHitQueue<Entry> queue = FieldValueHitQueue.create(sort.fields, numHits);
+ 
+     if (after == null) {
++      if (trackMaxScore || trackDocScores) {
++        for (FieldComparator<?> cmp : queue.comparators) {
++          if (cmp instanceof RelevanceComparator) {
++            return new ScoringTwiceCollector(queue, numHits, fillFields);
++          }
++        }
++      }
+       if (queue.getComparators().length == 1) {
+         if (docsScoredInOrder) {
+           if (trackMaxScore) {
+Index: lucene/queries/src/test/org/apache/lucene/queries/function/TestFunctionQuerySort.java
+===================================================================
+--- lucene/queries/src/test/org/apache/lucene/queries/function/TestFunctionQuerySort.java	(revision 1415481)
++++ lucene/queries/src/test/org/apache/lucene/queries/function/TestFunctionQuerySort.java	(working copy)
+@@ -17,14 +17,16 @@
+  * limitations under the License.
+  */
+ 
+-import java.io.IOException;
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.Field;
+ import org.apache.lucene.document.StringField;
++import org.apache.lucene.index.AtomicReaderContext;
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.IndexWriterConfig;
+ import org.apache.lucene.index.RandomIndexWriter;
++import org.apache.lucene.queries.function.docvalues.IntDocValues;
+ import org.apache.lucene.queries.function.valuesource.IntFieldSource;
++import org.apache.lucene.queries.function.valuesource.SingleFunction;
+ import org.apache.lucene.search.FieldDoc;
+ import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.MatchAllDocsQuery;
+@@ -33,12 +35,19 @@
+ import org.apache.lucene.search.Sort;
+ import org.apache.lucene.search.SortField;
+ import org.apache.lucene.search.TopDocs;
++import org.apache.lucene.search.TopFieldCollector;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.util.LuceneTestCase;
+ 
++import java.io.IOException;
++import java.util.Map;
++import java.util.concurrent.atomic.AtomicInteger;
++
+ /** Test that functionquery's getSortField() actually works */
+ public class TestFunctionQuerySort extends LuceneTestCase {
+ 
++  public static final int NUM_VALS = 5;
++
+   public void testSearchAfterWhenSortingByFunctionValues() throws IOException {
+     Directory dir = newDirectory();
+     IndexWriterConfig iwc = newIndexWriterConfig(TEST_VERSION_CURRENT, null);
+@@ -47,10 +56,11 @@
+ 
+     Document doc = new Document();
+     Field field = new StringField("value", "", Field.Store.YES);
++    Field constField = new StringField("const", "SAME", Field.Store.YES);
+     doc.add(field);
++    doc.add(constField);
+ 
+     // Save docs unsorted (decreasing value n, n-1, ...)
+-    final int NUM_VALS = 5;
+     for (int val = NUM_VALS; val > 0; val--) {
+       field.setStringValue(Integer.toString(val));
+       writer.addDocument(doc);
+@@ -61,8 +71,26 @@
+     writer.close();
+     IndexSearcher searcher = new IndexSearcher(reader);
+ 
++    // Lets do a quick search test using FunctionQuery sort score desc
++    {
++      MonitorValueSource src = new MonitorValueSource(new IntFieldSource("value"));
++      Query q = new FunctionQuery(src);
++      Sort orderBy = new Sort();
++      //the const field has no real effect other than to make the sort situation
++      // not as simple
++      SortField sf = new SortField(null, SortField.Type.SCORE, true);
++      SortField sfConst = new SortField("const", SortField.Type.STRING, false);
++      orderBy.setSort(sfConst, sf);
++      TopFieldCollector collector = TopFieldCollector.create(
++          orderBy.rewrite(searcher), reader.maxDoc(), false, true, true, true
++      );
++      searcher.search(q, collector);
++      verifySortHits(reader, src, collector.topDocs());
++    }
++    //good; continue testing...
++
+     // Get ValueSource from FieldCache
+-    IntFieldSource src = new IntFieldSource("value");
++    MonitorValueSource src = new MonitorValueSource(new IntFieldSource("value"));
+     // ...and make it a sort criterion
+     SortField sf = src.getSortField(false).rewrite(searcher);
+     Sort orderBy = new Sort(sf);
+@@ -70,13 +98,7 @@
+     // Get hits sorted by our FunctionValues (ascending values)
+     Query q = new MatchAllDocsQuery();
+     TopDocs hits = searcher.search(q, Integer.MAX_VALUE, orderBy);
+-    assertEquals(NUM_VALS, hits.scoreDocs.length);
+-    // Verify that sorting works in general
+-    int i = 0;
+-    for (ScoreDoc hit : hits.scoreDocs) {
+-      int valueFromDoc = Integer.parseInt(reader.document(hit.doc).get("value"));
+-      assertEquals(++i, valueFromDoc);
+-    }
++    verifySortHits(reader, src, hits);
+ 
+     // Now get hits after hit #2 using IS.searchAfter()
+     int afterIdx = 1;
+@@ -96,4 +118,48 @@
+     reader.close();
+     dir.close();
+   }
++
++  private void verifySortHits(IndexReader reader, MonitorValueSource src, TopDocs hits) throws IOException {
++    assertEquals(NUM_VALS, hits.scoreDocs.length);
++    assertEquals(NUM_VALS, src.callCount.get());
++    // Verify that sorting works in general
++    int i = 0;
++    for (ScoreDoc hit : hits.scoreDocs) {
++      int valueFromDoc = Integer.parseInt(reader.document(hit.doc).get("value"));
++      assertEquals(++i, valueFromDoc);
++    }
++  }
++
++  /** Wraps a ValueSource to increment a counter each time a value is retrieved. */
++  static class MonitorValueSource extends SingleFunction {
++
++    final AtomicInteger callCount = new AtomicInteger();
++
++    public MonitorValueSource(ValueSource source) {
++      super(source);
++    }
++
++    @Override
++    protected String name() {
++      return "monitor";
++    }
++
++    @Override
++    public FunctionValues getValues(Map context, AtomicReaderContext readerContext) throws IOException {
++      final FunctionValues vals =  source.getValues(context, readerContext);
++      return new IntDocValues(this) {
++
++        @Override
++        public int intVal(int doc) {
++          callCount.incrementAndGet();
++          return vals.intVal(doc);
++        }
++
++        @Override
++        public String toString(int doc) {
++          return name() + '(' + vals.toString(doc) + ')';
++        }
++      };
++    }
++  }
+ }

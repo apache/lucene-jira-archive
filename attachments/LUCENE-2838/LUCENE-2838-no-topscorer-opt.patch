@@ -1,0 +1,454 @@
+Index: lucene/CHANGES.txt
+===================================================================
+--- lucene/CHANGES.txt	(revision 1053865)
++++ lucene/CHANGES.txt	(working copy)
+@@ -678,6 +678,12 @@
+   Using this wrapper its easy to add fuzzy/wildcard to e.g. a SpanNearQuery.
+   (Robert Muir, Uwe Schindler)
+   
++* LUCENE-2838: ConstantScoreQuery now directly supports wrapping a Query
++  instance for stripping off scores. The use of a QueryWrapperFilter
++  is no longer needed and discouraged for that use case. Directly wrapping
++  Query improves performance, as out-of-order collection is now supported.
++  (Uwe Schindler)
++  
+ Optimizations
+ 
+ * LUCENE-2075: Terms dict cache is now shared across threads instead
+Index: lucene/contrib/remote/src/test/org/apache/lucene/search/TestRemoteSearchable.java
+===================================================================
+--- lucene/contrib/remote/src/test/org/apache/lucene/search/TestRemoteSearchable.java	(revision 1053865)
++++ lucene/contrib/remote/src/test/org/apache/lucene/search/TestRemoteSearchable.java	(working copy)
+@@ -122,8 +122,7 @@
+     Searchable[] searchables = { lookupRemote() };
+     Searcher searcher = new MultiSearcher(searchables);
+     ScoreDoc[] hits = searcher.search(
+-          new ConstantScoreQuery(new QueryWrapperFilter(
+-                                   new TermQuery(new Term("test", "test")))), null, 1000).scoreDocs;
++          new ConstantScoreQuery(new TermQuery(new Term("test", "test"))), null, 1000).scoreDocs;
+     assertEquals(1, hits.length);
+   }
+ }
+Index: lucene/src/java/org/apache/lucene/search/ConstantScoreAutoRewrite.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/search/ConstantScoreAutoRewrite.java	(revision 1053865)
++++ lucene/src/java/org/apache/lucene/search/ConstantScoreAutoRewrite.java	(working copy)
+@@ -103,7 +103,7 @@
+         addClause(bq, placeholderTerm.createTerm(pendingTerms.get(sort[i], new BytesRef())), 1, 1.0f);
+       }
+       // Strip scores
+-      final Query result = new ConstantScoreQuery(new QueryWrapperFilter(bq));
++      final Query result = new ConstantScoreQuery(bq);
+       result.setBoost(query.getBoost());
+       query.incTotalNumberOfTerms(size);
+       return result;
+Index: lucene/src/java/org/apache/lucene/search/ConstantScoreQuery.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/search/ConstantScoreQuery.java	(revision 1053865)
++++ lucene/src/java/org/apache/lucene/search/ConstantScoreQuery.java	(working copy)
+@@ -19,13 +19,15 @@
+ 
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.Term;
++import org.apache.lucene.util.ToStringUtils;
+ 
+ import java.io.IOException;
+ import java.util.Set;
+ 
+ /**
+- * A query that wraps a filter and simply returns a constant score equal to the
+- * query boost for every document in the filter.
++ * A query that wraps another query or a filter and simply returns a constant score equal to the
++ * query boost for every document that matches the filter or query.
++ * For queries it therefore simply strips of all scores and returns a constant one.
+  *
+  * <p><b>NOTE</b>: if the wrapped filter is an instance of
+  * {@link CachingWrapperFilter}, you'll likely want to
+@@ -35,34 +37,72 @@
+  */
+ public class ConstantScoreQuery extends Query {
+   protected final Filter filter;
++  protected final Query query;
+ 
++  /** Strips off scores from the passed in Query. The hits will get a constant score
++   * dependent on the boost factor of this query. */
++  public ConstantScoreQuery(Query query) {
++    if (query == null)
++      throw new NullPointerException("Query may not be null");
++    this.filter = null;
++    this.query = query;
++  }
++
++  /** Wraps a Filter as a Query. The hits will get a constant score
++   * dependent on the boost factor of this query.
++   * If you simply want to strip off scores from a Query, no longer use
++   * {@code new ConstantScoreQuery(new QueryWrapperFilter(query))}, instead
++   * use {@link #ConstantScoreQuery(Query)}!
++   */
+   public ConstantScoreQuery(Filter filter) {
+-    this.filter=filter;
++    if (filter == null)
++      throw new NullPointerException("Filter may not be null");
++    this.filter = filter;
++    this.query = null;
+   }
+ 
+-  /** Returns the encapsulated filter */
++  /** Returns the encapsulated filter, returns {@code null} if a query is wrapped. */
+   public Filter getFilter() {
+     return filter;
+   }
+ 
++  /** Returns the encapsulated query, returns {@code null} if a filter is wrapped. */
++  public Query getQuery() {
++    return query;
++  }
++
+   @Override
+   public Query rewrite(IndexReader reader) throws IOException {
++    if (query != null) {
++      Query rewritten = query.rewrite(reader);
++      if (rewritten != query) {
++        rewritten = new ConstantScoreQuery(rewritten);
++        rewritten.setBoost(this.getBoost());
++        return rewritten;
++      }
++    }
+     return this;
+   }
+ 
+   @Override
+   public void extractTerms(Set<Term> terms) {
+-    // OK to not add any terms when used for MultiSearcher,
+-    // but may not be OK for highlighting
++    // TODO: OK to not add any terms when wrapped a filter
++    // and used with MultiSearcher, but may not be OK for
++    // highlighting.
++    // If a query was wrapped, we delegate to query.
++    if (query != null)
++      query.extractTerms(terms);
+   }
+ 
+   protected class ConstantWeight extends Weight {
+-    private Similarity similarity;
++    private final Weight innerWeight;
++    private final Similarity similarity;
+     private float queryNorm;
+     private float queryWeight;
+     
+-    public ConstantWeight(Searcher searcher) {
++    public ConstantWeight(Searcher searcher) throws IOException {
+       this.similarity = getSimilarity(searcher);
++      this.innerWeight = (query == null) ? null : query.createWeight(searcher);
+     }
+ 
+     @Override
+@@ -89,27 +129,37 @@
+ 
+     @Override
+     public Scorer scorer(IndexReader reader, boolean scoreDocsInOrder, boolean topScorer) throws IOException {
+-      return new ConstantScorer(similarity, reader, this);
++      final DocIdSetIterator disi;
++      if (filter != null) {
++        assert query == null;
++        final DocIdSet dis = filter.getDocIdSet(reader);
++        if (dis == null)
++          return null;
++        disi = dis.iterator();
++      } else {
++        assert query != null && innerWeight != null;
++        disi =
++          innerWeight.scorer(reader, scoreDocsInOrder, false);
++      }
++      if (disi == null)
++        return null;
++      return new ConstantScorer(similarity, disi, this);
+     }
+ 
+     @Override
+     public Explanation explain(IndexReader reader, int doc) throws IOException {
+-      
+-      ConstantScorer cs = new ConstantScorer(similarity, reader, this);
+-      boolean exists = cs.docIdSetIterator.advance(doc) == doc;
++      final Scorer cs = scorer(reader, true, false);
++      final boolean exists = (cs != null && cs.advance(doc) == doc);
+ 
+-      ComplexExplanation result = new ComplexExplanation();
+-
++      final ComplexExplanation result = new ComplexExplanation();
+       if (exists) {
+-        result.setDescription("ConstantScoreQuery(" + filter
+-        + "), product of:");
++        result.setDescription(ConstantScoreQuery.this.toString() + ", product of:");
+         result.setValue(queryWeight);
+         result.setMatch(Boolean.TRUE);
+         result.addDetail(new Explanation(getBoost(), "boost"));
+-        result.addDetail(new Explanation(queryNorm,"queryNorm"));
++        result.addDetail(new Explanation(queryNorm, "queryNorm"));
+       } else {
+-        result.setDescription("ConstantScoreQuery(" + filter
+-        + ") doesn't match id " + doc);
++        result.setDescription(ConstantScoreQuery.this.toString() + " doesn't match id " + doc);
+         result.setValue(0);
+         result.setMatch(Boolean.FALSE);
+       }
+@@ -120,22 +170,11 @@
+   protected class ConstantScorer extends Scorer {
+     final DocIdSetIterator docIdSetIterator;
+     final float theScore;
+-    int doc = -1;
+ 
+-    public ConstantScorer(Similarity similarity, IndexReader reader, Weight w) throws IOException {
++    public ConstantScorer(Similarity similarity, DocIdSetIterator docIdSetIterator, Weight w) throws IOException {
+       super(similarity,w);
+       theScore = w.getValue();
+-      DocIdSet docIdSet = filter.getDocIdSet(reader);
+-      if (docIdSet == null) {
+-        docIdSetIterator = DocIdSet.EMPTY_DOCIDSET.iterator();
+-      } else {
+-        DocIdSetIterator iter = docIdSet.iterator();
+-        if (iter == null) {
+-          docIdSetIterator = DocIdSet.EMPTY_DOCIDSET.iterator();
+-        } else {
+-          docIdSetIterator = iter;
+-        }
+-      }
++      this.docIdSetIterator = docIdSetIterator;
+     }
+ 
+     @Override
+@@ -160,31 +199,37 @@
+   }
+ 
+   @Override
+-  public Weight createWeight(Searcher searcher) {
++  public Weight createWeight(Searcher searcher) throws IOException {
+     return new ConstantScoreQuery.ConstantWeight(searcher);
+   }
+ 
+-  /** Prints a user-readable version of this query. */
+   @Override
+   public String toString(String field) {
+-    return "ConstantScore(" + filter.toString() + ")"
+-      + (getBoost()==1.0 ? "" : "^" + getBoost());
++    return new StringBuilder("ConstantScore(")
++      .append((query == null) ? filter.toString() : query.toString(field))
++      .append(')')
++      .append(ToStringUtils.boost(getBoost()))
++      .toString();
+   }
+ 
+-  /** Returns true if <code>o</code> is equal to this. */
+   @Override
+   public boolean equals(Object o) {
+     if (this == o) return true;
+-    if (!(o instanceof ConstantScoreQuery)) return false;
+-    ConstantScoreQuery other = (ConstantScoreQuery)o;
+-    return this.getBoost()==other.getBoost() && filter.equals(other.filter);
++    if (!super.equals(o))
++      return false;
++    if (o instanceof ConstantScoreQuery) {
++      final ConstantScoreQuery other = (ConstantScoreQuery) o;
++      return 
++        ((this.filter == null) ? other.filter == null : this.filter.equals(other.filter)) &&
++        ((this.query == null) ? other.query == null : this.query.equals(other.query));
++    }
++    return false;
+   }
+ 
+-  /** Returns a hash code value for this object. */
+   @Override
+   public int hashCode() {
+-    // Simple add is OK since no existing filter hashcode has a float component.
+-    return filter.hashCode() + Float.floatToIntBits(getBoost());
++    return 31 * super.hashCode() +
++      ((query == null) ? filter : query).hashCode();
+   }
+ 
+ }
+Index: lucene/src/java/org/apache/lucene/search/MultiTermQuery.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/search/MultiTermQuery.java	(revision 1053865)
++++ lucene/src/java/org/apache/lucene/search/MultiTermQuery.java	(working copy)
+@@ -201,7 +201,7 @@
+     
+     @Override
+     protected void addClause(BooleanQuery topLevel, Term term, int docFreq, float boost) {
+-      final Query q = new ConstantScoreQuery(new QueryWrapperFilter(new TermQuery(term, docFreq)));
++      final Query q = new ConstantScoreQuery(new TermQuery(term, docFreq));
+       q.setBoost(boost);
+       topLevel.add(q, BooleanClause.Occur.SHOULD);
+     }
+Index: lucene/src/java/org/apache/lucene/search/ScoringRewrite.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/search/ScoringRewrite.java	(revision 1053865)
++++ lucene/src/java/org/apache/lucene/search/ScoringRewrite.java	(working copy)
+@@ -89,7 +89,7 @@
+       if (bq.clauses().isEmpty())
+         return bq;
+       // strip the scores off
+-      final Query result = new ConstantScoreQuery(new QueryWrapperFilter(bq));
++      final Query result = new ConstantScoreQuery(bq);
+       result.setBoost(query.getBoost());
+       return result;
+     }
+Index: lucene/src/test/org/apache/lucene/search/TestBooleanPrefixQuery.java
+===================================================================
+--- lucene/src/test/org/apache/lucene/search/TestBooleanPrefixQuery.java	(revision 1053865)
++++ lucene/src/test/org/apache/lucene/search/TestBooleanPrefixQuery.java	(working copy)
+@@ -1,85 +0,0 @@
+-package org.apache.lucene.search;
+-
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-import org.apache.lucene.util.LuceneTestCase;
+-import org.apache.lucene.index.RandomIndexWriter;
+-import org.apache.lucene.index.Term;
+-import org.apache.lucene.index.IndexReader;
+-import org.apache.lucene.document.Document;
+-import org.apache.lucene.document.Field;
+-import org.apache.lucene.search.PrefixQuery;
+-import org.apache.lucene.search.Query;
+-import org.apache.lucene.search.BooleanQuery;
+-import org.apache.lucene.store.Directory;
+-
+-/**
+- *
+- **/
+-
+-public class TestBooleanPrefixQuery extends LuceneTestCase {
+-
+-  private int getCount(IndexReader r, Query q) throws Exception {
+-    if (q instanceof BooleanQuery) {
+-      return ((BooleanQuery) q).getClauses().length;
+-    } else if (q instanceof ConstantScoreQuery) {
+-      DocIdSetIterator iter = ((ConstantScoreQuery) q).getFilter().getDocIdSet(r).iterator();
+-      int count = 0;
+-      while(iter.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
+-        count++;
+-      }
+-      return count;
+-    } else {
+-      throw new RuntimeException("unepxected query " + q);
+-    }
+-  }
+-
+-  public void testMethod() throws Exception {
+-    Directory directory = newDirectory();
+-
+-    String[] categories = new String[]{"food",
+-                                       "foodanddrink",
+-                                       "foodanddrinkandgoodtimes",
+-                                       "food and drink"};
+-
+-    Query rw1 = null;
+-    Query rw2 = null;
+-    IndexReader reader = null;
+-    RandomIndexWriter writer = new RandomIndexWriter(random, directory);
+-    for (int i = 0; i < categories.length; i++) {
+-      Document doc = new Document();
+-      doc.add(newField("category", categories[i], Field.Store.YES, Field.Index.NOT_ANALYZED));
+-      writer.addDocument(doc);
+-    }
+-    reader = writer.getReader();
+-    writer.close();
+-      
+-    PrefixQuery query = new PrefixQuery(new Term("category", "foo"));
+-    rw1 = query.rewrite(reader);
+-      
+-    BooleanQuery bq = new BooleanQuery();
+-    bq.add(query, BooleanClause.Occur.MUST);
+-      
+-    rw2 = bq.rewrite(reader);
+-
+-    assertEquals("Number of Clauses Mismatch", getCount(reader, rw1), getCount(reader, rw2));
+-    reader.close();
+-    directory.close();
+-  }
+-}
+-
+Index: lucene/src/test/org/apache/lucene/search/TestConstantScoreQuery.java
+===================================================================
+--- lucene/src/test/org/apache/lucene/search/TestConstantScoreQuery.java	(revision 0)
++++ lucene/src/test/org/apache/lucene/search/TestConstantScoreQuery.java	(revision 0)
+@@ -0,0 +1,42 @@
++package org.apache.lucene.search;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.index.Term;
++import org.apache.lucene.util.LuceneTestCase;
++
++/** This class only tests some basic functionality in CSQ, the main parts are mostly
++ * tested by MultiTermQuery tests, explanations seems to be tested in TestExplanations! */
++public class TestConstantScoreQuery extends LuceneTestCase {
++  
++  public void testCSQ() throws Exception {
++    final Query q1 = new ConstantScoreQuery(new TermQuery(new Term("a", "b")));
++    final Query q2 = new ConstantScoreQuery(new TermQuery(new Term("a", "c")));
++    final Query q3 = new ConstantScoreQuery(new TermRangeFilter("a", "b", "c", true, true));
++    QueryUtils.check(q1);
++    QueryUtils.check(q2);
++    QueryUtils.checkEqual(q1,q1);
++    QueryUtils.checkEqual(q2,q2);
++    QueryUtils.checkEqual(q3,q3);
++    QueryUtils.checkUnequal(q1,q2);
++    QueryUtils.checkUnequal(q2,q3);
++    QueryUtils.checkUnequal(q1,q3);
++    QueryUtils.checkUnequal(q1, new TermQuery(new Term("a", "b")));
++  }
++  
++}
+
+Property changes on: lucene\src\test\org\apache\lucene\search\TestConstantScoreQuery.java
+___________________________________________________________________
+Added: svn:keywords
+   + Date Author Id Revision HeadURL
+Added: svn:eol-style
+   + native
+
+Index: lucene/src/test/org/apache/lucene/search/TestMultiTermQueryRewrites.java
+===================================================================
+--- lucene/src/test/org/apache/lucene/search/TestMultiTermQueryRewrites.java	(revision 1053865)
++++ lucene/src/test/org/apache/lucene/search/TestMultiTermQueryRewrites.java	(working copy)
+@@ -87,8 +87,8 @@
+   
+   private Query extractInnerQuery(Query q) {
+     if (q instanceof ConstantScoreQuery) {
+-      // wrapped as ConstantScoreQuery using QueryWrapperFilter
+-      q = ((QueryWrapperFilter) ((ConstantScoreQuery) q).getFilter()).getQuery();
++      // wrapped as ConstantScoreQuery
++      q = ((ConstantScoreQuery) q).getQuery();
+     }
+     return q;
+   }

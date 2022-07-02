@@ -1,0 +1,1539 @@
+Index: lucene/benchmark/src/java/org/apache/lucene/benchmark/byTask/tasks/ReadTask.java
+===================================================================
+--- lucene/benchmark/src/java/org/apache/lucene/benchmark/byTask/tasks/ReadTask.java	(revision 1657278)
++++ lucene/benchmark/src/java/org/apache/lucene/benchmark/byTask/tasks/ReadTask.java	(working copy)
+@@ -123,8 +123,7 @@
+             // Weight public again, we can go back to
+             // pulling the Weight ourselves:
+             TopFieldCollector collector = TopFieldCollector.create(sort, numHits,
+-                                                                   true, withScore(),
+-                                                                   withMaxScore());
++                                                                   true, withMaxScore());
+             searcher.search(q, null, collector);
+             hits = collector.topDocs();
+           } else {
+@@ -223,12 +222,6 @@
+    */
+   public abstract boolean withTraverse();
+ 
+-  /** Whether scores should be computed (only useful with
+-   *  field sort) */
+-  public boolean withScore() {
+-    return true;
+-  }
+-
+   /** Whether maxScores should be computed (only useful with
+    *  field sort) */
+   public boolean withMaxScore() {
+Index: lucene/benchmark/src/java/org/apache/lucene/benchmark/byTask/tasks/SearchWithSortTask.java
+===================================================================
+--- lucene/benchmark/src/java/org/apache/lucene/benchmark/byTask/tasks/SearchWithSortTask.java	(revision 1657278)
++++ lucene/benchmark/src/java/org/apache/lucene/benchmark/byTask/tasks/SearchWithSortTask.java	(working copy)
+@@ -29,7 +29,6 @@
+  */
+ public class SearchWithSortTask extends ReadTask {
+ 
+-  private boolean doScore = true;
+   private boolean doMaxScore = true;
+   private Sort sort;
+ 
+@@ -62,9 +61,6 @@
+       } else if (field.equals("score")) {
+         sortField0 = SortField.FIELD_SCORE;
+       } else if (field.equals("noscore")) {
+-        doScore = false;
+-        continue;
+-      } else if (field.equals("nomaxscore")) {
+         doMaxScore = false;
+         continue;
+       } else {
+@@ -121,11 +117,6 @@
+   }
+ 
+   @Override
+-  public boolean withScore() {
+-    return doScore;
+-  }
+-
+-  @Override
+   public boolean withMaxScore() {
+     return doMaxScore;
+   }
+Index: lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java	(revision 1657278)
++++ lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java	(working copy)
+@@ -20,6 +20,7 @@
+ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.Comparator;
+ import java.util.List;
+ import java.util.Set;
+ import java.util.concurrent.Callable;
+@@ -42,6 +43,7 @@
+ import org.apache.lucene.search.similarities.DefaultSimilarity;
+ import org.apache.lucene.search.similarities.Similarity;
+ import org.apache.lucene.store.NIOFSDirectory;    // javadoc
++import org.apache.lucene.util.CollectionUtil;
+ import org.apache.lucene.util.ThreadInterruptedException;
+ 
+ /** Implements search over a single IndexReader.
+@@ -530,7 +532,6 @@
+     }
+   }
+   
+-  
+   /**
+    * Just like {@link #search(Weight, int, Sort, boolean, boolean)}, but you choose
+    * whether or not the fields in the returned {@link FieldDoc} instances should
+@@ -546,10 +547,18 @@
+     nDocs = Math.min(nDocs, limit);
+ 
+     TopFieldCollector collector = TopFieldCollector.create(sort, nDocs, after,
+-                                                           fillFields, doDocScores,
+-                                                           doMaxScore);
++                                                           fillFields, doMaxScore);
+     search(leaves, weight, collector);
+-    return (TopFieldDocs) collector.topDocs();
++
++    final TopFieldDocs topDocs = (TopFieldDocs) collector.topDocs();
++
++    if (doDocScores && !doMaxScore) {
++      // The collector did not compute scores by itself yet the user wants
++      // scores for the top hits, so we compute them
++      TopFieldCollector.computeScores(leaves, weight, topDocs.scoreDocs);
++    }
++
++    return topDocs;
+   }
+ 
+   /**
+Index: lucene/core/src/java/org/apache/lucene/search/SortRescorer.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/search/SortRescorer.java	(revision 1657278)
++++ lucene/core/src/java/org/apache/lucene/search/SortRescorer.java	(working copy)
+@@ -53,7 +53,7 @@
+ 
+     List<LeafReaderContext> leaves = searcher.getIndexReader().leaves();
+ 
+-    TopFieldCollector collector = TopFieldCollector.create(sort, topN, true, true, true);
++    TopFieldCollector collector = TopFieldCollector.create(sort, topN, true, true);
+ 
+     // Now merge sort docIDs from hits, with reader's leaves:
+     int hitUpto = 0;
+Index: lucene/core/src/java/org/apache/lucene/search/TopFieldCollector.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/search/TopFieldCollector.java	(revision 1657278)
++++ lucene/core/src/java/org/apache/lucene/search/TopFieldCollector.java	(working copy)
+@@ -18,9 +18,14 @@
+  */
+ 
+ import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Comparator;
++import java.util.List;
+ 
+ import org.apache.lucene.index.LeafReaderContext;
++import org.apache.lucene.index.ReaderUtil;
+ import org.apache.lucene.search.FieldValueHitQueue.Entry;
++import org.apache.lucene.util.CollectionUtil;
+ import org.apache.lucene.util.PriorityQueue;
+ 
+ /**
+@@ -27,7 +32,7 @@
+  * A {@link Collector} that sorts by {@link SortField} using
+  * {@link FieldComparator}s.
+  * <p/>
+- * See the {@link #create(org.apache.lucene.search.Sort, int, boolean, boolean, boolean)} method
++ * See the {@link #create(org.apache.lucene.search.Sort, int, boolean, boolean)} method
+  * for instantiating a TopFieldCollector.
+  *
+  * @lucene.experimental
+@@ -39,6 +44,46 @@
+   // always compare lower than a real hit; this would
+   // save having to check queueFull on each insert
+ 
++  /**
++   * Compute and set the scores on the provided {@link ScoreDoc}s. This can be
++   * useful if you want scores on your top docs but are not interested in the
++   * maximum score. In such a case, just pass {@code trackMaxScore=false} to
++   * {@link #create} and then call this method.
++   * @lucene.internal
++   */
++  public static void computeScores(List<LeafReaderContext> leaves, Weight weight, ScoreDoc[] scoreDocs) throws IOException {
++    // 1. Group top docs by the leaf that they belong to
++    @SuppressWarnings("unchecked")
++    final List<ScoreDoc>[] perLeafHits = new List[leaves.size()];
++    for (int i = 0; i < perLeafHits.length; ++i) {
++      perLeafHits[i] = new ArrayList<>();
++    }
++    for (ScoreDoc scoreDoc : scoreDocs) {
++      perLeafHits[ReaderUtil.subIndex(scoreDoc.doc, leaves)].add(scoreDoc);
++    }
++
++    // 2. Sort hits by doc, so that we can iterate over them in order
++    for (List<ScoreDoc> hits : perLeafHits) {
++      CollectionUtil.introSort(hits, new Comparator<ScoreDoc>() {
++        @Override
++        public int compare(ScoreDoc o1, ScoreDoc o2) {
++          return o1.doc - o2.doc;
++        }
++      });
++    }
++
++    // 3. For each leaf, instantiate a scorer and advance it to all top hits
++    for (int i = 0; i < perLeafHits.length; ++i) {
++      final LeafReaderContext ctx = leaves.get(i);
++      final Scorer scorer = weight.scorer(ctx, null);
++      for (ScoreDoc scoreDoc : perLeafHits[i]) {
++        final int doc = scorer.advance(scoreDoc.doc - ctx.docBase);
++        assert doc == scoreDoc.doc - ctx.docBase;
++        scoreDoc.score = scorer.score();
++      }
++    }
++  }
++
+   private static abstract class OneComparatorLeafCollector implements LeafCollector {
+ 
+     final LeafFieldComparator comparator;
+@@ -209,105 +254,6 @@
+   }
+ 
+   /*
+-   * Implements a TopFieldCollector over one SortField criteria, while tracking
+-   * document scores but no maxScore.
+-   */
+-  private static class ScoringNoMaxScoreCollector extends TopFieldCollector {
+-
+-    final FieldValueHitQueue<Entry> queue;
+-
+-    public ScoringNoMaxScoreCollector(FieldValueHitQueue<Entry> queue, int numHits, boolean fillFields) {
+-      super(queue, numHits, fillFields);
+-      this.queue = queue;
+-    }
+-
+-    @Override
+-    public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
+-      docBase = context.docBase;
+-
+-      final LeafFieldComparator[] comparators = queue.getComparators(context);
+-      final int[] reverseMul = queue.getReverseMul();
+-
+-      if (comparators.length == 1) {
+-        return new OneComparatorLeafCollector(comparators[0], reverseMul[0]) {
+-
+-          @Override
+-          public void collect(int doc) throws IOException {
+-            ++totalHits;
+-            if (queueFull) {
+-              if ((reverseMul * comparator.compareBottom(doc)) <= 0) {
+-                // since docs are visited in doc Id order, if compare is 0, it means
+-                // this document is largest than anything else in the queue, and
+-                // therefore not competitive.
+-                return;
+-              }
+-
+-              // Compute the score only if the hit is competitive.
+-              final float score = scorer.score();
+-
+-              // This hit is competitive - replace bottom element in queue & adjustTop
+-              comparator.copy(bottom.slot, doc);
+-              updateBottom(doc, score);
+-              comparator.setBottom(bottom.slot);
+-            } else {
+-              // Compute the score only if the hit is competitive.
+-              final float score = scorer.score();
+-
+-              // Startup transient: queue hasn't gathered numHits yet
+-              final int slot = totalHits - 1;
+-              // Copy hit into queue
+-              comparator.copy(slot, doc);
+-              add(slot, doc, score);
+-              if (queueFull) {
+-                comparator.setBottom(bottom.slot);
+-              }
+-            }
+-          }
+-
+-        };
+-      } else {
+-        return new MultiComparatorLeafCollector(comparators, reverseMul) {
+-
+-          @Override
+-          public void collect(int doc) throws IOException {
+-            ++totalHits;
+-            if (queueFull) {
+-              if ((compareBottom(doc)) <= 0) {
+-                // since docs are visited in doc Id order, if compare is 0, it means
+-                // this document is largest than anything else in the queue, and
+-                // therefore not competitive.
+-                return;
+-              }
+-
+-              // Compute the score only if the hit is competitive.
+-              final float score = scorer.score();
+-
+-              // This hit is competitive - replace bottom element in queue & adjustTop
+-              copy(bottom.slot, doc);
+-              updateBottom(doc, score);
+-              setBottom(bottom.slot);
+-            } else {
+-              // Compute the score only if the hit is competitive.
+-              final float score = scorer.score();
+-
+-              // Startup transient: queue hasn't gathered numHits yet
+-              final int slot = totalHits - 1;
+-              // Copy hit into queue
+-              copy(slot, doc);
+-              add(slot, doc, score);
+-              if (queueFull) {
+-                setBottom(bottom.slot);
+-              }
+-            }
+-          }
+-
+-        };
+-      }
+-    }
+-
+-  }
+-
+-  /*
+    * Implements a TopFieldCollector over one SortField criteria, with tracking
+    * document scores and maxScore.
+    */
+@@ -410,15 +356,13 @@
+ 
+     int collectedHits;
+     final FieldValueHitQueue<Entry> queue;
+-    final boolean trackDocScores;
+     final boolean trackMaxScore;
+     final FieldDoc after;
+ 
+     public PagingFieldCollector(FieldValueHitQueue<Entry> queue, FieldDoc after, int numHits, boolean fillFields,
+-                                boolean trackDocScores, boolean trackMaxScore) {
++                                boolean trackMaxScore) {
+       super(queue, numHits, fillFields);
+       this.queue = queue;
+-      this.trackDocScores = trackDocScores;
+       this.trackMaxScore = trackMaxScore;
+       this.after = after;
+ 
+@@ -474,10 +418,6 @@
+             // This hit is competitive - replace bottom element in queue & adjustTop
+             copy(bottom.slot, doc);
+ 
+-            // Compute score only if it is competitive.
+-            if (trackDocScores && !trackMaxScore) {
+-              score = scorer.score();
+-            }
+             updateBottom(doc, score);
+ 
+             setBottom(bottom.slot);
+@@ -490,10 +430,6 @@
+             // Copy hit into queue
+             copy(slot, doc);
+ 
+-            // Compute score only if it is competitive.
+-            if (trackDocScores && !trackMaxScore) {
+-              score = scorer.score();
+-            }
+             bottom = pq.add(new Entry(slot, docBase + doc, score));
+             queueFull = collectedHits == numHits;
+             if (queueFull) {
+@@ -547,13 +483,6 @@
+    * @param fillFields
+    *          specifies whether the actual field values should be returned on
+    *          the results (FieldDoc).
+-   * @param trackDocScores
+-   *          specifies whether document scores should be tracked and set on the
+-   *          results. Note that if set to false, then the results' scores will
+-   *          be set to Float.NaN. Setting this to true affects performance, as
+-   *          it incurs the score computation on each competitive result.
+-   *          Therefore if document scores are not required by the application,
+-   *          it is recommended to set it to false.
+    * @param trackMaxScore
+    *          specifies whether the query's maxScore should be tracked and set
+    *          on the resulting {@link TopDocs}. Note that if set to false,
+@@ -560,15 +489,15 @@
+    *          {@link TopDocs#getMaxScore()} returns Float.NaN. Setting this to
+    *          true affects performance as it incurs the score computation on
+    *          each result. Also, setting this true automatically sets
+-   *          <code>trackDocScores</code> to true as well.
++   *          the score on every hit as well.
+    * @return a {@link TopFieldCollector} instance which will sort the results by
+    *         the sort criteria.
+    * @throws IOException if there is a low-level I/O error
+    */
+   public static TopFieldCollector create(Sort sort, int numHits,
+-      boolean fillFields, boolean trackDocScores, boolean trackMaxScore)
++      boolean fillFields, boolean trackMaxScore)
+       throws IOException {
+-    return create(sort, numHits, null, fillFields, trackDocScores, trackMaxScore);
++    return create(sort, numHits, null, fillFields, trackMaxScore);
+   }
+ 
+   /**
+@@ -588,13 +517,6 @@
+    * @param fillFields
+    *          specifies whether the actual field values should be returned on
+    *          the results (FieldDoc).
+-   * @param trackDocScores
+-   *          specifies whether document scores should be tracked and set on the
+-   *          results. Note that if set to false, then the results' scores will
+-   *          be set to Float.NaN. Setting this to true affects performance, as
+-   *          it incurs the score computation on each competitive result.
+-   *          Therefore if document scores are not required by the application,
+-   *          it is recommended to set it to false.
+    * @param trackMaxScore
+    *          specifies whether the query's maxScore should be tracked and set
+    *          on the resulting {@link TopDocs}. Note that if set to false,
+@@ -601,13 +523,13 @@
+    *          {@link TopDocs#getMaxScore()} returns Float.NaN. Setting this to
+    *          true affects performance as it incurs the score computation on
+    *          each result. Also, setting this true automatically sets
+-   *          <code>trackDocScores</code> to true as well.
++   *          the score on every hit as well.
+    * @return a {@link TopFieldCollector} instance which will sort the results by
+    *         the sort criteria.
+    * @throws IOException if there is a low-level I/O error
+    */
+   public static TopFieldCollector create(Sort sort, int numHits, FieldDoc after,
+-      boolean fillFields, boolean trackDocScores, boolean trackMaxScore)
++      boolean fillFields, boolean trackMaxScore)
+       throws IOException {
+ 
+     if (sort.fields.length == 0) {
+@@ -623,8 +545,6 @@
+     if (after == null) {
+       if (trackMaxScore) {
+         return new ScoringMaxScoreCollector(queue, numHits, fillFields);
+-      } else if (trackDocScores) {
+-        return new ScoringNoMaxScoreCollector(queue, numHits, fillFields);
+       } else {
+         return new NonScoringCollector(queue, numHits, fillFields);
+       }
+@@ -637,7 +557,7 @@
+         throw new IllegalArgumentException("after.fields has " + after.fields.length + " values but sort has " + sort.getSort().length);
+       }
+ 
+-      return new PagingFieldCollector(queue, after, numHits, fillFields, trackDocScores, trackMaxScore);
++      return new PagingFieldCollector(queue, after, numHits, fillFields, trackMaxScore);
+     }
+   }
+ 
+Index: lucene/core/src/test/org/apache/lucene/search/TestBoolean2.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/search/TestBoolean2.java	(revision 1657278)
++++ lucene/core/src/test/org/apache/lucene/search/TestBoolean2.java	(working copy)
+@@ -285,13 +285,13 @@
+         }
+ 
+         TopFieldCollector collector = TopFieldCollector.create(sort, 1000,
+-            false, true, true);
++            false, true);
+ 
+         searcher.search(q1, null, collector);
+         ScoreDoc[] hits1 = collector.topDocs().scoreDocs;
+ 
+         collector = TopFieldCollector.create(sort, 1000,
+-            false, true, true);
++            false, true);
+         
+         searcher.search(q1, null, collector);
+         ScoreDoc[] hits2 = collector.topDocs().scoreDocs;
+Index: lucene/core/src/test/org/apache/lucene/search/TestElevationComparator.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/search/TestElevationComparator.java	(revision 1657278)
++++ lucene/core/src/test/org/apache/lucene/search/TestElevationComparator.java	(working copy)
+@@ -79,7 +79,7 @@
+         new SortField(null, SortField.Type.SCORE, reversed)
+       );
+ 
+-    TopDocsCollector<Entry> topCollector = TopFieldCollector.create(sort, 50, false, true, true);
++    TopDocsCollector<Entry> topCollector = TopFieldCollector.create(sort, 50, false, true);
+     searcher.search(newq, null, topCollector);
+ 
+     TopDocs topDocs = topCollector.topDocs(0, 10);
+Index: lucene/core/src/test/org/apache/lucene/search/TestIndexSearcher.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/search/TestIndexSearcher.java	(revision 1657278)
++++ lucene/core/src/test/org/apache/lucene/search/TestIndexSearcher.java	(working copy)
+@@ -17,6 +17,7 @@
+  * limitations under the License.
+  */
+ 
++import java.io.IOException;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.LinkedBlockingQueue;
+ import java.util.concurrent.ThreadPoolExecutor;
+@@ -28,6 +29,7 @@
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.RandomIndexWriter;
+ import org.apache.lucene.index.Term;
++import org.apache.lucene.search.BooleanClause.Occur;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.IOUtils;
+@@ -140,5 +142,24 @@
+       IOUtils.close(r, dir);
+     }
+   }
+-  
++
++  public void testSearchScores() throws IOException {
++    BooleanQuery query = new BooleanQuery();
++    query.add(new PrefixQuery(new Term("field", "1")), Occur.SHOULD);
++    query.add(new TermQuery(new Term("field2", "false")), Occur.SHOULD);
++
++    final IndexSearcher searcher = new IndexSearcher(reader);
++    Sort sort = new Sort(new SortField("field2", SortField.Type.STRING));
++    final int size = 10 + random().nextInt(20);
++    TopFieldDocs td1 = searcher.search(query, null, size, sort, true, true);
++    TopFieldDocs td2 = searcher.search(query, null, size, sort, true, false);
++    assertFalse(Float.isNaN(td1.getMaxScore()));
++    assertTrue(Float.isNaN(td2.getMaxScore()));
++    assertEquals(td1.totalHits, td2.totalHits);
++    assertEquals(td1.scoreDocs.length, td2.scoreDocs.length);
++    for (int i = 0; i < td1.scoreDocs.length; ++i) {
++      assertEquals(td1.scoreDocs[i].doc, td2.scoreDocs[i].doc);
++      assertEquals(td1.scoreDocs[i].score, td2.scoreDocs[i].score, 0.0001);
++    }
++  }
+ }
+Index: lucene/core/src/test/org/apache/lucene/search/TestSortRandom.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/search/TestSortRandom.java	(revision 1657278)
++++ lucene/core/src/test/org/apache/lucene/search/TestSortRandom.java	(working copy)
+@@ -22,7 +22,9 @@
+ import java.util.Collections;
+ import java.util.Comparator;
+ import java.util.HashSet;
++import java.util.IdentityHashMap;
+ import java.util.List;
++import java.util.Map;
+ import java.util.Random;
+ import java.util.Set;
+ 
+@@ -30,16 +32,16 @@
+ import org.apache.lucene.document.NumericDocValuesField;
+ import org.apache.lucene.document.SortedDocValuesField;
+ import org.apache.lucene.document.StoredField;
+-import org.apache.lucene.index.LeafReaderContext;
+ import org.apache.lucene.index.DocValues;
+ import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.LeafReaderContext;
+ import org.apache.lucene.index.NumericDocValues;
+ import org.apache.lucene.index.RandomIndexWriter;
+ import org.apache.lucene.search.BooleanClause.Occur;
+ import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.BitDocIdSet;
+ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.BytesRef;
+-import org.apache.lucene.util.BitDocIdSet;
+ import org.apache.lucene.util.FixedBitSet;
+ import org.apache.lucene.util.LuceneTestCase;
+ import org.apache.lucene.util.TestUtil;
+@@ -239,6 +241,7 @@
+     private float density;
+     private final List<BytesRef> docValues;
+     public final List<BytesRef> matchValues = Collections.synchronizedList(new ArrayList<BytesRef>());
++    private final Map<Object, BitDocIdSet> cache = new IdentityHashMap<>();
+ 
+     // density should be 0.0 ... 1.0
+     public RandomFilter(Random random, float density, List<BytesRef> docValues) {
+@@ -249,19 +252,25 @@
+ 
+     @Override
+     public DocIdSet getDocIdSet(LeafReaderContext context, Bits acceptDocs) throws IOException {
+-      final int maxDoc = context.reader().maxDoc();
+-      final NumericDocValues idSource = DocValues.getNumeric(context.reader(), "id");
+-      assertNotNull(idSource);
+-      final FixedBitSet bits = new FixedBitSet(maxDoc);
+-      for(int docID=0;docID<maxDoc;docID++) {
+-        if (random.nextFloat() <= density && (acceptDocs == null || acceptDocs.get(docID))) {
+-          bits.set(docID);
+-          //System.out.println("  acc id=" + idSource.getInt(docID) + " docID=" + docID);
+-          matchValues.add(docValues.get((int) idSource.get(docID)));
++      BitDocIdSet set = cache.get(context.reader().getCoreCacheKey());
++      if (set == null) {
++        final int maxDoc = context.reader().maxDoc();
++        final NumericDocValues idSource = DocValues.getNumeric(context.reader(), "id");
++        assertNotNull(idSource);
++        final FixedBitSet bits = new FixedBitSet(maxDoc);
++        for(int docID=0;docID<maxDoc;docID++) {
++          if (random.nextFloat() <= density) {
++            bits.set(docID);
++            //System.out.println("  acc id=" + idSource.getInt(docID) + " docID=" + docID);
++            matchValues.add(docValues.get((int) idSource.get(docID)));
++          }
+         }
++
++        set = new BitDocIdSet(bits);
++        cache.put(context.reader().getCoreCacheKey(), set);
+       }
+ 
+-      return new BitDocIdSet(bits);
++      return BitsFilteredDocIdSet.wrap(set, acceptDocs);
+     }
+   }
+ }
+Index: lucene/core/src/test/org/apache/lucene/search/TestTopDocsMerge.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/search/TestTopDocsMerge.java	(revision 1657278)
++++ lucene/core/src/test/org/apache/lucene/search/TestTopDocsMerge.java	(working copy)
+@@ -20,8 +20,6 @@
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.Field;
+ import org.apache.lucene.document.FloatDocValuesField;
+-import org.apache.lucene.document.FloatField;
+-import org.apache.lucene.document.IntField;
+ import org.apache.lucene.document.NumericDocValuesField;
+ import org.apache.lucene.document.SortedDocValuesField;
+ import org.apache.lucene.index.LeafReaderContext;
+@@ -217,7 +215,7 @@
+           topHits = searcher.search(query, numHits);
+         }
+       } else {
+-        final TopFieldCollector c = TopFieldCollector.create(sort, numHits, true, true, true);
++        final TopFieldCollector c = TopFieldCollector.create(sort, numHits, true, true);
+         searcher.search(query, c);
+         if (useFrom) {
+           from = TestUtil.nextInt(random(), 0, numHits - 1);
+@@ -261,7 +259,7 @@
+         if (sort == null) {
+           subHits = subSearcher.search(w, numHits);
+         } else {
+-          final TopFieldCollector c = TopFieldCollector.create(sort, numHits, true, true, true);
++          final TopFieldCollector c = TopFieldCollector.create(sort, numHits, true, true);
+           subSearcher.search(w, c);
+           subHits = c.topDocs(0, numHits);
+         }
+Index: lucene/core/src/test/org/apache/lucene/search/TestTopFieldCollector.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/search/TestTopFieldCollector.java	(revision 1657278)
++++ lucene/core/src/test/org/apache/lucene/search/TestTopFieldCollector.java	(working copy)
+@@ -17,10 +17,11 @@
+  * limitations under the License.
+  */
+ 
++import java.io.IOException;
++
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.RandomIndexWriter;
+-import org.apache.lucene.search.BooleanClause.Occur;
+ import org.apache.lucene.search.FieldValueHitQueue.Entry;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.util.LuceneTestCase;
+@@ -62,8 +63,7 @@
+     Sort[] sort = new Sort[] { new Sort(SortField.FIELD_DOC), new Sort() };
+     for(int i = 0; i < sort.length; i++) {
+       Query q = new MatchAllDocsQuery();
+-      TopDocsCollector<Entry> tdc = TopFieldCollector.create(sort[i], 10, false,
+-          false, false);
++      TopDocsCollector<Entry> tdc = TopFieldCollector.create(sort[i], 10, false, false);
+       
+       is.search(q, tdc);
+       
+@@ -81,8 +81,7 @@
+     Sort[] sort = new Sort[] {new Sort(SortField.FIELD_DOC), new Sort() };
+     for(int i = 0; i < sort.length; i++) {
+       Query q = new MatchAllDocsQuery();
+-      TopDocsCollector<Entry> tdc = TopFieldCollector.create(sort[i], 10, true, false,
+-          false);
++      TopDocsCollector<Entry> tdc = TopFieldCollector.create(sort[i], 10, true, false);
+       
+       is.search(q, tdc);
+       
+@@ -95,14 +94,13 @@
+     }
+   }
+   
+-  public void testSortWithScoreNoMaxScoreTracking() throws Exception {
++  public void testSortWithMaxScoreTracking() throws Exception {
+     
+     // Two Sort criteria to instantiate the multi/single comparators.
+     Sort[] sort = new Sort[] {new Sort(SortField.FIELD_DOC), new Sort() };
+     for(int i = 0; i < sort.length; i++) {
+       Query q = new MatchAllDocsQuery();
+-      TopDocsCollector<Entry> tdc = TopFieldCollector.create(sort[i], 10, true, true,
+-          false);
++      TopDocsCollector<Entry> tdc = TopFieldCollector.create(sort[i], 10, true, true);
+       
+       is.search(q, tdc);
+       
+@@ -111,60 +109,51 @@
+       for(int j = 0; j < sd.length; j++) {
+         assertTrue(!Float.isNaN(sd[j].score));
+       }
+-      assertTrue(Float.isNaN(td.getMaxScore()));
++      assertTrue(!Float.isNaN(td.getMaxScore()));
+     }
+   }
+-  
+-  // MultiComparatorScoringNoMaxScoreCollector
+-  public void testSortWithScoreNoMaxScoreTrackingMulti() throws Exception {
++
++  public void testSortWithMaxScoreTrackingNoResults() throws Exception {
+     
+     // Two Sort criteria to instantiate the multi/single comparators.
+-    Sort[] sort = new Sort[] {new Sort(SortField.FIELD_DOC, SortField.FIELD_SCORE) };
++    Sort[] sort = new Sort[] {new Sort(SortField.FIELD_DOC), new Sort() };
+     for(int i = 0; i < sort.length; i++) {
+-      Query q = new MatchAllDocsQuery();
+-      TopDocsCollector<Entry> tdc = TopFieldCollector.create(sort[i], 10, true, true,
+-          false);
+-
+-      is.search(q, tdc);
+-      
++      TopDocsCollector<Entry> tdc = TopFieldCollector.create(sort[i], 10, true, true);
+       TopDocs td = tdc.topDocs();
+-      ScoreDoc[] sd = td.scoreDocs;
+-      for(int j = 0; j < sd.length; j++) {
+-        assertTrue(!Float.isNaN(sd[j].score));
+-      }
++      assertEquals(0, td.totalHits);
+       assertTrue(Float.isNaN(td.getMaxScore()));
+     }
+   }
+-  
+-  public void testSortWithScoreAndMaxScoreTracking() throws Exception {
+-    
++
++  public void testComputeScores() throws IOException {
+     // Two Sort criteria to instantiate the multi/single comparators.
+     Sort[] sort = new Sort[] {new Sort(SortField.FIELD_DOC), new Sort() };
+     for(int i = 0; i < sort.length; i++) {
+       Query q = new MatchAllDocsQuery();
+-      TopDocsCollector<Entry> tdc = TopFieldCollector.create(sort[i], 10, true, true,
+-          true);
++      TopDocsCollector<Entry> tdc1 = TopFieldCollector.create(sort[i], 10, true, true);
++      TopDocsCollector<Entry> tdc2 = TopFieldCollector.create(sort[i], 10, true, false);
+       
+-      is.search(q, tdc);
++      is.search(q, tdc1);
++      is.search(q, tdc2);
+       
+-      TopDocs td = tdc.topDocs();
+-      ScoreDoc[] sd = td.scoreDocs;
+-      for(int j = 0; j < sd.length; j++) {
+-        assertTrue(!Float.isNaN(sd[j].score));
++      TopDocs td1 = tdc1.topDocs();
++      TopDocs td2 = tdc2.topDocs();
++
++      assertEquals(td1.totalHits, td2.totalHits);
++      assertEquals(td1.scoreDocs.length, td2.scoreDocs.length);
++      assertFalse(Float.isNaN(td1.getMaxScore()));
++      assertTrue(Float.isNaN(td2.getMaxScore()));
++      for (int j = 0; j < td1.scoreDocs.length; ++j) {
++        assertEquals(td1.scoreDocs[i].doc, td2.scoreDocs[i].doc);
++        assertFalse(Float.isNaN(td1.scoreDocs[i].score));
++        assertTrue(Float.isNaN(td2.scoreDocs[i].score));
+       }
+-      assertTrue(!Float.isNaN(td.getMaxScore()));
++
++      TopFieldCollector.computeScores(is.getIndexReader().leaves(), is.createNormalizedWeight(new MatchAllDocsQuery()), td2.scoreDocs);
++      for (int j = 0; j < td1.scoreDocs.length; ++j) {
++        assertEquals(td1.scoreDocs[i].doc, td2.scoreDocs[i].doc);
++        assertEquals(td1.scoreDocs[i].score, td2.scoreDocs[i].score, 0.0001);
++      }
+     }
+   }
+-
+-  public void testSortWithScoreAndMaxScoreTrackingNoResults() throws Exception {
+-    
+-    // Two Sort criteria to instantiate the multi/single comparators.
+-    Sort[] sort = new Sort[] {new Sort(SortField.FIELD_DOC), new Sort() };
+-    for(int i = 0; i < sort.length; i++) {
+-      TopDocsCollector<Entry> tdc = TopFieldCollector.create(sort[i], 10, true, true, true);
+-      TopDocs td = tdc.topDocs();
+-      assertEquals(0, td.totalHits);
+-      assertTrue(Float.isNaN(td.getMaxScore()));
+-    }
+-  }  
+ }
+Index: lucene/facet/src/java/org/apache/lucene/facet/DrillSideways.java
+===================================================================
+--- lucene/facet/src/java/org/apache/lucene/facet/DrillSideways.java	(revision 1657278)
++++ lucene/facet/src/java/org/apache/lucene/facet/DrillSideways.java	(working copy)
+@@ -183,8 +183,7 @@
+    * drill down and sideways counts.
+    */
+   public DrillSidewaysResult search(DrillDownQuery query,
+-                                    Filter filter, FieldDoc after, int topN, Sort sort, boolean doDocScores,
+-                                    boolean doMaxScore) throws IOException {
++                                    Filter filter, FieldDoc after, int topN, Sort sort, boolean doScores) throws IOException {
+     if (filter != null) {
+       query = new DrillDownQuery(config, filter, query);
+     }
+@@ -198,8 +197,7 @@
+                                                                       topN,
+                                                                       after,
+                                                                       true,
+-                                                                      doDocScores,
+-                                                                      doMaxScore);
++                                                                      doScores);
+       DrillSidewaysResult r = search(query, hitCollector);
+       return new DrillSidewaysResult(r.facets, hitCollector.topDocs());
+     } else {
+Index: lucene/facet/src/java/org/apache/lucene/facet/FacetsCollector.java
+===================================================================
+--- lucene/facet/src/java/org/apache/lucene/facet/FacetsCollector.java	(revision 1657278)
++++ lucene/facet/src/java/org/apache/lucene/facet/FacetsCollector.java	(working copy)
+@@ -189,13 +189,13 @@
+   /** Utility method, to search and also collect all hits
+    *  into the provided {@link Collector}. */
+   public static TopDocs search(IndexSearcher searcher, Query q, int n, Collector fc) throws IOException {
+-    return doSearch(searcher, null, q, null, n, null, false, false, fc);
++    return doSearch(searcher, null, q, null, n, null, false, fc);
+   }
+ 
+   /** Utility method, to search and also collect all hits
+    *  into the provided {@link Collector}. */
+   public static TopDocs search(IndexSearcher searcher, Query q, Filter filter, int n, Collector fc) throws IOException {
+-    return doSearch(searcher, null, q, filter, n, null, false, false, fc);
++    return doSearch(searcher, null, q, filter, n, null, false, fc);
+   }
+ 
+   /** Utility method, to search and also collect all hits
+@@ -204,28 +204,28 @@
+     if (sort == null) {
+       throw new IllegalArgumentException("sort must not be null");
+     }
+-    return (TopFieldDocs) doSearch(searcher, null, q, filter, n, sort, false, false, fc);
++    return (TopFieldDocs) doSearch(searcher, null, q, filter, n, sort, false, fc);
+   }
+ 
+   /** Utility method, to search and also collect all hits
+    *  into the provided {@link Collector}. */
+-  public static TopFieldDocs search(IndexSearcher searcher, Query q, Filter filter, int n, Sort sort, boolean doDocScores, boolean doMaxScore, Collector fc) throws IOException {
++  public static TopFieldDocs search(IndexSearcher searcher, Query q, Filter filter, int n, Sort sort, boolean doScores, Collector fc) throws IOException {
+     if (sort == null) {
+       throw new IllegalArgumentException("sort must not be null");
+     }
+-    return (TopFieldDocs) doSearch(searcher, null, q, filter, n, sort, doDocScores, doMaxScore, fc);
++    return (TopFieldDocs) doSearch(searcher, null, q, filter, n, sort, doScores, fc);
+   }
+ 
+   /** Utility method, to search and also collect all hits
+    *  into the provided {@link Collector}. */
+   public TopDocs searchAfter(IndexSearcher searcher, ScoreDoc after, Query q, int n, Collector fc) throws IOException {
+-    return doSearch(searcher, after, q, null, n, null, false, false, fc);
++    return doSearch(searcher, after, q, null, n, null, false, fc);
+   }
+ 
+   /** Utility method, to search and also collect all hits
+    *  into the provided {@link Collector}. */
+   public static TopDocs searchAfter(IndexSearcher searcher, ScoreDoc after, Query q, Filter filter, int n, Collector fc) throws IOException {
+-    return doSearch(searcher, after, q, filter, n, null, false, false, fc);
++    return doSearch(searcher, after, q, filter, n, null, false, fc);
+   }
+ 
+   /** Utility method, to search and also collect all hits
+@@ -234,20 +234,20 @@
+     if (sort == null) {
+       throw new IllegalArgumentException("sort must not be null");
+     }
+-    return doSearch(searcher, after, q, filter, n, sort, false, false, fc);
++    return doSearch(searcher, after, q, filter, n, sort, false, fc);
+   }
+ 
+   /** Utility method, to search and also collect all hits
+    *  into the provided {@link Collector}. */
+-  public static TopDocs searchAfter(IndexSearcher searcher, ScoreDoc after, Query q, Filter filter, int n, Sort sort, boolean doDocScores, boolean doMaxScore, Collector fc) throws IOException {
++  public static TopDocs searchAfter(IndexSearcher searcher, ScoreDoc after, Query q, Filter filter, int n, Sort sort, boolean doScores, Collector fc) throws IOException {
+     if (sort == null) {
+       throw new IllegalArgumentException("sort must not be null");
+     }
+-    return doSearch(searcher, after, q, filter, n, sort, doDocScores, doMaxScore, fc);
++    return doSearch(searcher, after, q, filter, n, sort, doScores, fc);
+   }
+ 
+   private static TopDocs doSearch(IndexSearcher searcher, ScoreDoc after, Query q, Filter filter, int n, Sort sort,
+-                                  boolean doDocScores, boolean doMaxScore, Collector fc) throws IOException {
++                                  boolean doScores, Collector fc) throws IOException {
+ 
+     if (filter != null) {
+       q = new FilteredQuery(q, filter);
+@@ -275,8 +275,7 @@
+       hitsCollector = TopFieldCollector.create(sort, n,
+                                                (FieldDoc) after,
+                                                fillFields,
+-                                               doDocScores,
+-                                               doMaxScore);
++                                               doScores);
+     } else {
+       hitsCollector = TopScoreDocCollector.create(n, after);
+     }
+Index: lucene/facet/src/test/org/apache/lucene/facet/TestDrillSideways.java
+===================================================================
+--- lucene/facet/src/test/org/apache/lucene/facet/TestDrillSideways.java	(revision 1657278)
++++ lucene/facet/src/test/org/apache/lucene/facet/TestDrillSideways.java	(working copy)
+@@ -730,7 +730,7 @@
+       }
+ 
+       // Retrieve all facets:
+-      DrillSidewaysResult actual = ds.search(ddq, filter, null, numDocs, sort, true, true);
++      DrillSidewaysResult actual = ds.search(ddq, filter, null, numDocs, sort, true);
+ 
+       TopDocs hits = s.search(baseQuery, numDocs);
+       Map<String,Float> scores = new HashMap<>();
+@@ -1056,7 +1056,7 @@
+     DrillSidewaysResult r = ds.search(ddq, 10); // this used to fail on IllegalArgEx
+     assertEquals(0, r.hits.totalHits);
+ 
+-    r = ds.search(ddq, null, null, 10, new Sort(new SortField("foo", SortField.Type.INT)), false, false); // this used to fail on IllegalArgEx
++    r = ds.search(ddq, null, null, 10, new Sort(new SortField("foo", SortField.Type.INT)), false); // this used to fail on IllegalArgEx
+     assertEquals(0, r.hits.totalHits);
+ 
+     writer.close();
+Index: lucene/grouping/src/java/org/apache/lucene/search/grouping/AbstractSecondPassGroupingCollector.java
+===================================================================
+--- lucene/grouping/src/java/org/apache/lucene/search/grouping/AbstractSecondPassGroupingCollector.java	(revision 1657278)
++++ lucene/grouping/src/java/org/apache/lucene/search/grouping/AbstractSecondPassGroupingCollector.java	(working copy)
+@@ -50,7 +50,7 @@
+   private int totalGroupedHitCount;
+ 
+   public AbstractSecondPassGroupingCollector(Collection<SearchGroup<GROUP_VALUE_TYPE>> groups, Sort groupSort, Sort withinGroupSort,
+-                                             int maxDocsPerGroup, boolean getScores, boolean getMaxScores, boolean fillSortFields)
++                                             int maxDocsPerGroup, boolean getScores, boolean fillSortFields)
+     throws IOException {
+ 
+     //System.out.println("SP init");
+@@ -72,7 +72,7 @@
+         collector = TopScoreDocCollector.create(maxDocsPerGroup);
+       } else {
+         // Sort by fields
+-        collector = TopFieldCollector.create(withinGroupSort, maxDocsPerGroup, fillSortFields, getScores, getMaxScores);
++        collector = TopFieldCollector.create(withinGroupSort, maxDocsPerGroup, fillSortFields, getScores);
+       }
+       groupMap.put(group.groupValue,
+           new SearchGroupDocs<>(group.groupValue,
+Index: lucene/grouping/src/java/org/apache/lucene/search/grouping/BlockGroupingCollector.java
+===================================================================
+--- lucene/grouping/src/java/org/apache/lucene/search/grouping/BlockGroupingCollector.java	(revision 1657278)
++++ lucene/grouping/src/java/org/apache/lucene/search/grouping/BlockGroupingCollector.java	(working copy)
+@@ -348,7 +348,7 @@
+         collector = TopScoreDocCollector.create(maxDocsPerGroup);
+       } else {
+         // Sort by fields
+-        collector = TopFieldCollector.create(withinGroupSort, maxDocsPerGroup, fillSortFields, needsScores, needsScores);
++        collector = TopFieldCollector.create(withinGroupSort, maxDocsPerGroup, fillSortFields, needsScores);
+       }
+ 
+       LeafCollector leafCollector = collector.getLeafCollector(og.readerContext);
+Index: lucene/grouping/src/java/org/apache/lucene/search/grouping/GroupingSearch.java
+===================================================================
+--- lucene/grouping/src/java/org/apache/lucene/search/grouping/GroupingSearch.java	(revision 1657278)
++++ lucene/grouping/src/java/org/apache/lucene/search/grouping/GroupingSearch.java	(working copy)
+@@ -64,7 +64,6 @@
+   private int groupDocsLimit = 1;
+   private boolean fillSortFields;
+   private boolean includeScores = true;
+-  private boolean includeMaxScore = true;
+ 
+   private Double maxCacheRAMMB;
+   private Integer maxDocsToCache;
+@@ -228,9 +227,9 @@
+     int topNInsideGroup = groupDocsOffset + groupDocsLimit;
+     AbstractSecondPassGroupingCollector secondPassCollector;
+     if (groupFunction != null) {
+-      secondPassCollector = new FunctionSecondPassGroupingCollector((Collection) topSearchGroups, groupSort, sortWithinGroup, topNInsideGroup, includeScores, includeMaxScore, fillSortFields, groupFunction, valueSourceContext);
++      secondPassCollector = new FunctionSecondPassGroupingCollector((Collection) topSearchGroups, groupSort, sortWithinGroup, topNInsideGroup, includeScores, fillSortFields, groupFunction, valueSourceContext);
+     } else {
+-      secondPassCollector = new TermSecondPassGroupingCollector(groupField, (Collection) topSearchGroups, groupSort, sortWithinGroup, topNInsideGroup, includeScores, includeMaxScore, fillSortFields);
++      secondPassCollector = new TermSecondPassGroupingCollector(groupField, (Collection) topSearchGroups, groupSort, sortWithinGroup, topNInsideGroup, includeScores, fillSortFields);
+     }
+ 
+     if (cachedCollector != null && cachedCollector.isCached()) {
+@@ -355,7 +354,7 @@
+   }
+ 
+   /**
+-   * Whether to include the scores per doc inside a group.
++   * Whether to track the maximum score and include the scores per doc inside a group.
+    *
+    * @param includeScores Whether to include the scores per doc inside a group
+    * @return <code>this</code>
+@@ -366,17 +365,6 @@
+   }
+ 
+   /**
+-   * Whether to include the score of the most relevant document per group.
+-   *
+-   * @param includeMaxScore Whether to include the score of the most relevant document per group
+-   * @return <code>this</code>
+-   */
+-  public GroupingSearch setIncludeMaxScore(boolean includeMaxScore) {
+-    this.includeMaxScore = includeMaxScore;
+-    return this;
+-  }
+-
+-  /**
+    * Whether to also compute all groups matching the query.
+    * This can be used to determine the number of groups, which can be used for accurate pagination.
+    * <p/>
+Index: lucene/grouping/src/java/org/apache/lucene/search/grouping/function/FunctionSecondPassGroupingCollector.java
+===================================================================
+--- lucene/grouping/src/java/org/apache/lucene/search/grouping/function/FunctionSecondPassGroupingCollector.java	(revision 1657278)
++++ lucene/grouping/src/java/org/apache/lucene/search/grouping/function/FunctionSecondPassGroupingCollector.java	(working copy)
+@@ -51,15 +51,14 @@
+    * @param groupSort The group sort
+    * @param withinGroupSort The sort inside a group
+    * @param maxDocsPerGroup The maximum number of documents to collect inside a group
+-   * @param getScores Whether to include the scores
+-   * @param getMaxScores Whether to include the maximum score
++   * @param getScores Whether to track the max score and include scores
+    * @param fillSortFields Whether to fill the sort values in {@link TopGroups#withinGroupSort}
+    * @param groupByVS The {@link ValueSource} to group by
+    * @param vsContext The value source context
+    * @throws IOException IOException When I/O related errors occur
+    */
+-  public FunctionSecondPassGroupingCollector(Collection<SearchGroup<MutableValue>> searchGroups, Sort groupSort, Sort withinGroupSort, int maxDocsPerGroup, boolean getScores, boolean getMaxScores, boolean fillSortFields, ValueSource groupByVS, Map<?, ?> vsContext) throws IOException {
+-    super(searchGroups, groupSort, withinGroupSort, maxDocsPerGroup, getScores, getMaxScores, fillSortFields);
++  public FunctionSecondPassGroupingCollector(Collection<SearchGroup<MutableValue>> searchGroups, Sort groupSort, Sort withinGroupSort, int maxDocsPerGroup, boolean getScores, boolean fillSortFields, ValueSource groupByVS, Map<?, ?> vsContext) throws IOException {
++    super(searchGroups, groupSort, withinGroupSort, maxDocsPerGroup, getScores, fillSortFields);
+     this.groupByVS = groupByVS;
+     this.vsContext = vsContext;
+   }
+Index: lucene/grouping/src/java/org/apache/lucene/search/grouping/term/TermSecondPassGroupingCollector.java
+===================================================================
+--- lucene/grouping/src/java/org/apache/lucene/search/grouping/term/TermSecondPassGroupingCollector.java	(revision 1657278)
++++ lucene/grouping/src/java/org/apache/lucene/search/grouping/term/TermSecondPassGroupingCollector.java	(working copy)
+@@ -44,9 +44,9 @@
+ 
+   @SuppressWarnings({"unchecked"})
+   public TermSecondPassGroupingCollector(String groupField, Collection<SearchGroup<BytesRef>> groups, Sort groupSort, Sort withinGroupSort,
+-                                         int maxDocsPerGroup, boolean getScores, boolean getMaxScores, boolean fillSortFields)
++                                         int maxDocsPerGroup, boolean getScores, boolean fillSortFields)
+       throws IOException {
+-    super(groups, groupSort, withinGroupSort, maxDocsPerGroup, getScores, getMaxScores, fillSortFields);
++    super(groups, groupSort, withinGroupSort, maxDocsPerGroup, getScores, fillSortFields);
+     ordSet = new SentinelIntSet(groupMap.size(), -2);
+     this.groupField = groupField;
+     groupDocs = (SearchGroupDocs<BytesRef>[]) new SearchGroupDocs[ordSet.keys.length];
+Index: lucene/grouping/src/test/org/apache/lucene/search/grouping/TestGrouping.java
+===================================================================
+--- lucene/grouping/src/test/org/apache/lucene/search/grouping/TestGrouping.java	(revision 1657278)
++++ lucene/grouping/src/test/org/apache/lucene/search/grouping/TestGrouping.java	(working copy)
+@@ -124,7 +124,7 @@
+     final AbstractFirstPassGroupingCollector<?> c1 = createRandomFirstPassCollector(groupField, groupSort, 10);
+     indexSearcher.search(new TermQuery(new Term("content", "random")), c1);
+ 
+-    final AbstractSecondPassGroupingCollector<?> c2 = createSecondPassCollector(c1, groupField, groupSort, null, 0, 5, true, true, true);
++    final AbstractSecondPassGroupingCollector<?> c2 = createSecondPassCollector(c1, groupField, groupSort, null, 0, 5, true, true);
+     indexSearcher.search(new TermQuery(new Term("content", "random")), c2);
+ 
+     final TopGroups<?> groups = c2.getTopGroups(0);
+@@ -203,16 +203,15 @@
+                                                                         int groupOffset,
+                                                                         int maxDocsPerGroup,
+                                                                         boolean getScores,
+-                                                                        boolean getMaxScores,
+                                                                         boolean fillSortFields) throws IOException {
+ 
+     if (TermFirstPassGroupingCollector.class.isAssignableFrom(firstPassGroupingCollector.getClass())) {
+       Collection<SearchGroup<BytesRef>> searchGroups = firstPassGroupingCollector.getTopGroups(groupOffset, fillSortFields);
+-      return (AbstractSecondPassGroupingCollector) new TermSecondPassGroupingCollector(groupField, searchGroups, groupSort, sortWithinGroup, maxDocsPerGroup , getScores, getMaxScores, fillSortFields);
++      return (AbstractSecondPassGroupingCollector) new TermSecondPassGroupingCollector(groupField, searchGroups, groupSort, sortWithinGroup, maxDocsPerGroup , getScores, fillSortFields);
+     } else {
+       ValueSource vs = new BytesRefFieldSource(groupField);
+       Collection<SearchGroup<MutableValue>> searchGroups = firstPassGroupingCollector.getTopGroups(groupOffset, fillSortFields);
+-      return (AbstractSecondPassGroupingCollector) new FunctionSecondPassGroupingCollector(searchGroups, groupSort, sortWithinGroup, maxDocsPerGroup, getScores, getMaxScores, fillSortFields, vs, new HashMap());
++      return (AbstractSecondPassGroupingCollector) new FunctionSecondPassGroupingCollector(searchGroups, groupSort, sortWithinGroup, maxDocsPerGroup, getScores, fillSortFields, vs, new HashMap());
+     }
+   }
+ 
+@@ -228,7 +227,7 @@
+                                                                         boolean getMaxScores,
+                                                                         boolean fillSortFields) throws IOException {
+     if (firstPassGroupingCollector.getClass().isAssignableFrom(TermFirstPassGroupingCollector.class)) {
+-      return new TermSecondPassGroupingCollector(groupField, searchGroups, groupSort, sortWithinGroup, maxDocsPerGroup , getScores, getMaxScores, fillSortFields);
++      return new TermSecondPassGroupingCollector(groupField, searchGroups, groupSort, sortWithinGroup, maxDocsPerGroup , getScores, fillSortFields);
+     } else {
+       ValueSource vs = new BytesRefFieldSource(groupField);
+       List<SearchGroup<MutableValue>> mvalSearchGroups = new ArrayList<>(searchGroups.size());
+@@ -245,7 +244,7 @@
+         mvalSearchGroups.add(sg);
+       }
+ 
+-      return new FunctionSecondPassGroupingCollector(mvalSearchGroups, groupSort, sortWithinGroup, maxDocsPerGroup, getScores, getMaxScores, fillSortFields, vs, new HashMap<>());
++      return new FunctionSecondPassGroupingCollector(mvalSearchGroups, groupSort, sortWithinGroup, maxDocsPerGroup, getScores, fillSortFields, vs, new HashMap<>());
+     }
+   }
+ 
+@@ -939,7 +938,7 @@
+             }
+           }
+           
+-          c2 = createSecondPassCollector(c1, groupField, groupSort, docSort, groupOffset, docOffset + docsPerGroup, getScores, getMaxScores, fillFields);
++          c2 = createSecondPassCollector(c1, groupField, groupSort, docSort, groupOffset, docOffset + docsPerGroup, getScores, fillFields);
+           if (doCache) {
+             if (cCache.isCached()) {
+               if (VERBOSE) {
+Index: lucene/join/src/java/org/apache/lucene/search/join/ToParentBlockJoinCollector.java
+===================================================================
+--- lucene/join/src/java/org/apache/lucene/search/join/ToParentBlockJoinCollector.java	(revision 1657278)
++++ lucene/join/src/java/org/apache/lucene/search/join/ToParentBlockJoinCollector.java	(working copy)
+@@ -87,7 +87,6 @@
+   private final int numParentHits;
+   private final FieldValueHitQueue<OneGroup> queue;
+   private final FieldComparator<?>[] comparators;
+-  private final boolean trackMaxScore;
+   private final boolean trackScores;
+ 
+   private ToParentBlockJoinQuery.BlockJoinScorer[] joinScorers = new ToParentBlockJoinQuery.BlockJoinScorer[0];
+@@ -101,12 +100,11 @@
+    *  not be null.  If you pass true trackScores, all
+    *  ToParentBlockQuery instances must not use
+    *  ScoreMode.None. */
+-  public ToParentBlockJoinCollector(Sort sort, int numParentHits, boolean trackScores, boolean trackMaxScore) throws IOException {
++  public ToParentBlockJoinCollector(Sort sort, int numParentHits, boolean trackScores) throws IOException {
+     // TODO: allow null sort to be specialized to relevance
+     // only collector
+     this.sort = sort;
+-    this.trackMaxScore = trackMaxScore;
+-    if (trackMaxScore) {
++    if (trackScores) {
+       maxScore = Float.MIN_VALUE;
+     }
+     //System.out.println("numParentHits=" + numParentHits);
+@@ -186,7 +184,7 @@
+ 
+         float score = Float.NaN;
+ 
+-        if (trackMaxScore) {
++        if (trackScores) {
+           score = scorer.score();
+           maxScore = Math.max(maxScore, score);
+         }
+@@ -217,9 +215,6 @@
+           for (LeafFieldComparator comparator : comparators) {
+             comparator.copy(bottom.slot, parentDoc);
+           }
+-          if (!trackMaxScore && trackScores) {
+-            score = scorer.score();
+-          }
+           bottom.doc = docBase + parentDoc;
+           bottom.readerContext = context;
+           bottom.score = score;
+@@ -238,9 +233,6 @@
+             comparator.copy(comparatorSlot, parentDoc);
+           }
+           //System.out.println("  startup: new OG doc=" + (docBase+parentDoc));
+-          if (!trackMaxScore && trackScores) {
+-            score = scorer.score();
+-          }
+           final OneGroup og = new OneGroup(comparatorSlot, docBase+parentDoc, score, joinScorers.length, trackScores);
+           og.readerContext = context;
+           copyGroups(og);
+@@ -409,7 +401,7 @@
+         collector = TopScoreDocCollector.create(numDocsInGroup);
+       } else {
+         // Sort by fields
+-        collector = TopFieldCollector.create(withinGroupSort, numDocsInGroup, fillSortFields, trackScores, trackMaxScore);
++        collector = TopFieldCollector.create(withinGroupSort, numDocsInGroup, fillSortFields, trackScores);
+       }
+ 
+       LeafCollector leafCollector = collector.getLeafCollector(og.readerContext);
+@@ -476,7 +468,7 @@
+   /**
+    * Returns the highest score across all collected parent hits, as long as
+    * <code>trackMaxScores=true</code> was passed
+-   * {@link #ToParentBlockJoinCollector(Sort, int, boolean, boolean) on
++   * {@link #ToParentBlockJoinCollector(Sort, int, boolean) on
+    * construction}. Else, this returns <code>Float.NaN</code>
+    */
+   public float getMaxScore() {
+Index: lucene/join/src/test/org/apache/lucene/search/join/TestBlockJoin.java
+===================================================================
+--- lucene/join/src/test/org/apache/lucene/search/join/TestBlockJoin.java	(revision 1657278)
++++ lucene/join/src/test/org/apache/lucene/search/join/TestBlockJoin.java	(working copy)
+@@ -104,7 +104,7 @@
+     BooleanQuery fullQuery = new BooleanQuery();
+     fullQuery.add(new BooleanClause(childJoinQuery, Occur.MUST));
+     fullQuery.add(new BooleanClause(new MatchAllDocsQuery(), Occur.MUST));
+-    ToParentBlockJoinCollector c = new ToParentBlockJoinCollector(Sort.RELEVANCE, 1, true, true);
++    ToParentBlockJoinCollector c = new ToParentBlockJoinCollector(Sort.RELEVANCE, 1, true);
+     s.search(fullQuery, c);
+     TopGroups<Integer> results = c.getTopGroups(childJoinQuery, null, 0, 10, 0, true);
+     assertFalse(Float.isNaN(results.maxScore));
+@@ -164,7 +164,7 @@
+     fullQuery.add(new BooleanClause(parentQuery, Occur.MUST));
+     fullQuery.add(new BooleanClause(childJoinQuery, Occur.MUST));
+ 
+-    ToParentBlockJoinCollector c = new ToParentBlockJoinCollector(Sort.RELEVANCE, 1, true, true);
++    ToParentBlockJoinCollector c = new ToParentBlockJoinCollector(Sort.RELEVANCE, 1, true);
+ 
+     s.search(fullQuery, c);
+     
+@@ -249,7 +249,7 @@
+     assertTrue(h3 != h1);
+ 
+     ToParentBlockJoinQuery qp = new ToParentBlockJoinQuery(qc, parentsFilter, ScoreMode.Max);
+-    ToParentBlockJoinCollector c = new ToParentBlockJoinCollector(Sort.RELEVANCE, 10, true, true);
++    ToParentBlockJoinCollector c = new ToParentBlockJoinCollector(Sort.RELEVANCE, 10, true);
+ 
+     s.search(qp, c);
+     TopGroups<Integer> groups = c.getTopGroups(qp, Sort.INDEXORDER, 0, 10, 0, true);
+@@ -771,15 +771,12 @@
+       }
+ 
+       final boolean trackScores;
+-      final boolean trackMaxScore;
+       if (agg == ScoreMode.None) {
+         trackScores = false;
+-        trackMaxScore = false;
+       } else {
+         trackScores = random().nextBoolean();
+-        trackMaxScore = random().nextBoolean();
+       }
+-      final ToParentBlockJoinCollector c = new ToParentBlockJoinCollector(parentSort, 10, trackScores, trackMaxScore);
++      final ToParentBlockJoinCollector c = new ToParentBlockJoinCollector(parentSort, 10, trackScores);
+ 
+       joinS.search(parentJoinQuery, c);
+ 
+@@ -1090,7 +1087,7 @@
+ 
+     // Collects all job and qualification child docs for
+     // each resume hit in the top N (sorted by score):
+-    ToParentBlockJoinCollector c = new ToParentBlockJoinCollector(Sort.RELEVANCE, 10, true, false);
++    ToParentBlockJoinCollector c = new ToParentBlockJoinCollector(Sort.RELEVANCE, 10, true);
+ 
+     s.search(fullQuery, c);
+ 
+@@ -1221,7 +1218,7 @@
+     // up to corresponding parent:
+     ToParentBlockJoinQuery childJoinQuery = new ToParentBlockJoinQuery(childQuery, parentsFilter, ScoreMode.Avg);
+ 
+-    ToParentBlockJoinCollector c = new ToParentBlockJoinCollector(Sort.RELEVANCE, 2, true, true);
++    ToParentBlockJoinCollector c = new ToParentBlockJoinCollector(Sort.RELEVANCE, 2, true);
+     s.search(childJoinQuery, c);
+ 
+     //Get all child documents within groups
+@@ -1323,7 +1320,7 @@
+     parentQuery.add(new TermQuery(new Term("parentText", "text")), Occur.SHOULD);
+ 
+     ToParentBlockJoinCollector c = new ToParentBlockJoinCollector(new Sort(new SortField("parentID", SortField.Type.STRING)),
+-                                                                  10, true, true);
++                                                                  10, true);
+     searcher.search(parentQuery, c);
+     TopGroups<Integer> groups = c.getTopGroups(childJoinQuery, null, 0, 10, 0, false);
+ 
+@@ -1393,7 +1390,7 @@
+     parentQuery.add(new TermQuery(new Term("parentText", "text")), Occur.SHOULD);
+ 
+     ToParentBlockJoinCollector c = new ToParentBlockJoinCollector(new Sort(new SortField("parentID", SortField.Type.STRING)),
+-                                                                  10, true, true);
++                                                                  10, true);
+     searcher.search(parentQuery, c);
+     TopGroups<Integer> groups = c.getTopGroups(childJoinQuery, null, 0, 10, 0, false);
+ 
+@@ -1458,7 +1455,7 @@
+     parentQuery.add(new TermQuery(new Term("parentText", "text")), Occur.SHOULD);
+ 
+     ToParentBlockJoinCollector c = new ToParentBlockJoinCollector(new Sort(new SortField("parentID", SortField.Type.STRING)),
+-                                                                  10, true, true);
++                                                                  10, true);
+ 
+     try {
+       newSearcher(r).search(parentQuery, c);
+Index: lucene/misc/src/test/org/apache/lucene/search/TestEarlyTerminatingSortingCollector.java
+===================================================================
+--- lucene/misc/src/test/org/apache/lucene/search/TestEarlyTerminatingSortingCollector.java	(revision 1657278)
++++ lucene/misc/src/test/org/apache/lucene/search/TestEarlyTerminatingSortingCollector.java	(working copy)
+@@ -125,9 +125,8 @@
+         final Sort sort = new Sort(new SortField("ndv1", SortField.Type.LONG, false));
+         final boolean fillFields = random().nextBoolean();
+         final boolean trackDocScores = random().nextBoolean();
+-        final boolean trackMaxScore = random().nextBoolean();
+-        final TopFieldCollector collector1 = TopFieldCollector.create(sort, numHits, fillFields, trackDocScores, trackMaxScore);
+-        final TopFieldCollector collector2 = TopFieldCollector.create(sort, numHits, fillFields, trackDocScores, trackMaxScore);
++        final TopFieldCollector collector1 = TopFieldCollector.create(sort, numHits, fillFields, trackDocScores);
++        final TopFieldCollector collector2 = TopFieldCollector.create(sort, numHits, fillFields, trackDocScores);
+ 
+         final Query query;
+         if (random().nextBoolean()) {
+@@ -189,9 +188,8 @@
+       final Sort sort = new Sort(new SortField("ndv2", SortField.Type.LONG, false));
+       final boolean fillFields = random().nextBoolean();
+       final boolean trackDocScores = random().nextBoolean();
+-      final boolean trackMaxScore = random().nextBoolean();
+-      final TopFieldCollector collector1 = TopFieldCollector.create(sort, numHits, fillFields, trackDocScores, trackMaxScore);
+-      final TopFieldCollector collector2 = TopFieldCollector.create(sort, numHits, fillFields, trackDocScores, trackMaxScore);
++      final TopFieldCollector collector1 = TopFieldCollector.create(sort, numHits, fillFields, trackDocScores);
++      final TopFieldCollector collector2 = TopFieldCollector.create(sort, numHits, fillFields, trackDocScores);
+       
+       final Query query;
+       if (random().nextBoolean()) {
+Index: lucene/misc/src/test/org/apache/lucene/uninverting/TestFieldCacheSortRandom.java
+===================================================================
+--- lucene/misc/src/test/org/apache/lucene/uninverting/TestFieldCacheSortRandom.java	(revision 1657278)
++++ lucene/misc/src/test/org/apache/lucene/uninverting/TestFieldCacheSortRandom.java	(working copy)
+@@ -23,6 +23,7 @@
+ import java.util.Comparator;
+ import java.util.HashMap;
+ import java.util.HashSet;
++import java.util.IdentityHashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Random;
+@@ -38,6 +39,7 @@
+ import org.apache.lucene.index.NumericDocValues;
+ import org.apache.lucene.index.RandomIndexWriter;
+ import org.apache.lucene.search.BooleanClause.Occur;
++import org.apache.lucene.search.BitsFilteredDocIdSet;
+ import org.apache.lucene.search.BooleanQuery;
+ import org.apache.lucene.search.ConstantScoreQuery;
+ import org.apache.lucene.search.DocIdSet;
+@@ -269,6 +271,7 @@
+     private float density;
+     private final List<BytesRef> docValues;
+     public final List<BytesRef> matchValues = Collections.synchronizedList(new ArrayList<BytesRef>());
++    private final Map<Object, BitDocIdSet> cache = new IdentityHashMap<>();
+ 
+     // density should be 0.0 ... 1.0
+     public RandomFilter(Random random, float density, List<BytesRef> docValues) {
+@@ -279,19 +282,25 @@
+ 
+     @Override
+     public DocIdSet getDocIdSet(LeafReaderContext context, Bits acceptDocs) throws IOException {
+-      final int maxDoc = context.reader().maxDoc();
+-      final NumericDocValues idSource = DocValues.getNumeric(context.reader(), "id");
+-      assertNotNull(idSource);
+-      final FixedBitSet bits = new FixedBitSet(maxDoc);
+-      for(int docID=0;docID<maxDoc;docID++) {
+-        if (random.nextFloat() <= density && (acceptDocs == null || acceptDocs.get(docID))) {
+-          bits.set(docID);
+-          //System.out.println("  acc id=" + idSource.getInt(docID) + " docID=" + docID);
+-          matchValues.add(docValues.get((int) idSource.get(docID)));
++      BitDocIdSet set = cache.get(context.reader().getCoreCacheKey());
++      if (set == null) {
++        final int maxDoc = context.reader().maxDoc();
++        final NumericDocValues idSource = DocValues.getNumeric(context.reader(), "id");
++        assertNotNull(idSource);
++        final FixedBitSet bits = new FixedBitSet(maxDoc);
++        for(int docID=0;docID<maxDoc;docID++) {
++          if (random.nextFloat() <= density) {
++            bits.set(docID);
++            //System.out.println("  acc id=" + idSource.getInt(docID) + " docID=" + docID);
++            matchValues.add(docValues.get((int) idSource.get(docID)));
++          }
+         }
++
++        set = new BitDocIdSet(bits);
++        cache.put(context.reader().getCoreCacheKey(), set);
+       }
+ 
+-      return new BitDocIdSet(bits);
++      return BitsFilteredDocIdSet.wrap(set, acceptDocs);
+     }
+   }
+ }
+Index: lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/AnalyzingInfixSuggester.java
+===================================================================
+--- lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/AnalyzingInfixSuggester.java	(revision 1657278)
++++ lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/AnalyzingInfixSuggester.java	(working copy)
+@@ -547,7 +547,7 @@
+     //System.out.println("finalQuery=" + query);
+ 
+     // Sort by weight, descending:
+-    TopFieldCollector c = TopFieldCollector.create(SORT, num, true, false, false);
++    TopFieldCollector c = TopFieldCollector.create(SORT, num, true, false);
+ 
+     // We sorted postings by weight during indexing, so we
+     // only retrieve the first num hits now:
+Index: solr/core/src/java/org/apache/solr/handler/component/ExpandComponent.java
+===================================================================
+--- solr/core/src/java/org/apache/solr/handler/component/ExpandComponent.java	(revision 1657278)
++++ solr/core/src/java/org/apache/solr/handler/component/ExpandComponent.java	(working copy)
+@@ -497,7 +497,7 @@
+       DocIdSetIterator iterator = new BitSetIterator(groupBits, 0); // cost is not useful here
+       int group;
+       while ((group = iterator.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+-        Collector collector = (sort == null) ? TopScoreDocCollector.create(limit) : TopFieldCollector.create(sort, limit, false, false, false);
++        Collector collector = (sort == null) ? TopScoreDocCollector.create(limit) : TopFieldCollector.create(sort, limit, false, false);
+         groups.put(group, collector);
+       }
+ 
+@@ -574,7 +574,7 @@
+       Iterator<LongCursor> iterator = groupSet.iterator();
+       while (iterator.hasNext()) {
+         LongCursor cursor = iterator.next();
+-        Collector collector = (sort == null) ? TopScoreDocCollector.create(limit) : TopFieldCollector.create(sort, limit, false, false, false);
++        Collector collector = (sort == null) ? TopScoreDocCollector.create(limit) : TopFieldCollector.create(sort, limit, false, false);
+         groups.put(cursor.value, collector);
+       }
+ 
+Index: solr/core/src/java/org/apache/solr/handler/component/QueryComponent.java
+===================================================================
+--- solr/core/src/java/org/apache/solr/handler/component/QueryComponent.java	(revision 1657278)
++++ solr/core/src/java/org/apache/solr/handler/component/QueryComponent.java	(working copy)
+@@ -420,7 +420,6 @@
+                     .setFirstPhaseGroups(topGroups)
+                     .setMaxDocPerGroup(groupingSpec.getGroupOffset() + groupingSpec.getGroupLimit())
+                     .setNeedScores(needScores)
+-                    .setNeedMaxScore(needScores)
+                     .build()
+             );
+           }
+Index: solr/core/src/java/org/apache/solr/search/Grouping.java
+===================================================================
+--- solr/core/src/java/org/apache/solr/search/Grouping.java	(revision 1657278)
++++ solr/core/src/java/org/apache/solr/search/Grouping.java	(working copy)
+@@ -753,7 +753,7 @@
+       int groupedDocsToCollect = getMax(groupOffset, docsPerGroup, maxDoc);
+       groupedDocsToCollect = Math.max(groupedDocsToCollect, 1);
+       secondPass = new TermSecondPassGroupingCollector(
+-          groupBy, topGroups, sort, groupSort, groupedDocsToCollect, needScores, needScores, false
++          groupBy, topGroups, sort, groupSort, groupedDocsToCollect, needScores, false
+       );
+ 
+       if (totalCount == TotalCount.grouped) {
+@@ -878,7 +878,7 @@
+       if (sort == null || sort == Sort.RELEVANCE) {
+         return TopScoreDocCollector.create(groupDocsToCollect);
+       } else {
+-        return TopFieldCollector.create(searcher.weightSort(sort), groupDocsToCollect, false, needScores, needScores);
++        return TopFieldCollector.create(searcher.weightSort(sort), groupDocsToCollect, false, needScores);
+       }
+     }
+ 
+@@ -973,7 +973,7 @@
+       int groupdDocsToCollect = getMax(groupOffset, docsPerGroup, maxDoc);
+       groupdDocsToCollect = Math.max(groupdDocsToCollect, 1);
+       secondPass = new FunctionSecondPassGroupingCollector(
+-          topGroups, sort, groupSort, groupdDocsToCollect, needScores, needScores, false, groupBy, context
++          topGroups, sort, groupSort, groupdDocsToCollect, needScores, false, groupBy, context
+       );
+ 
+       if (totalCount == TotalCount.grouped) {
+Index: solr/core/src/java/org/apache/solr/search/ReRankQParserPlugin.java
+===================================================================
+--- solr/core/src/java/org/apache/solr/search/ReRankQParserPlugin.java	(revision 1657278)
++++ solr/core/src/java/org/apache/solr/search/ReRankQParserPlugin.java	(working copy)
+@@ -251,7 +251,7 @@
+         this.mainCollector = TopScoreDocCollector.create(Math.max(this.reRankDocs, length));
+       } else {
+         sort = sort.rewrite(searcher);
+-        this.mainCollector = TopFieldCollector.create(sort, Math.max(this.reRankDocs, length), false, true, true);
++        this.mainCollector = TopFieldCollector.create(sort, Math.max(this.reRankDocs, length), false, true);
+       }
+       this.searcher = searcher;
+       this.reRankWeight = reRankWeight;
+Index: solr/core/src/java/org/apache/solr/search/SolrIndexSearcher.java
+===================================================================
+--- solr/core/src/java/org/apache/solr/search/SolrIndexSearcher.java	(revision 1657278)
++++ solr/core/src/java/org/apache/solr/search/SolrIndexSearcher.java	(working copy)
+@@ -1606,7 +1606,7 @@
+       final boolean fillFields = (null != cursor);
+       final FieldDoc searchAfter = (null != cursor ? cursor.getSearchAfterFieldDoc() : null);
+       return TopFieldCollector.create(weightedSort, len, searchAfter,
+-                                      fillFields, needScores, needScores); 
++                                      fillFields, needScores); 
+     }
+   }
+ 
+Index: solr/core/src/java/org/apache/solr/search/grouping/distributed/command/QueryCommand.java
+===================================================================
+--- solr/core/src/java/org/apache/solr/search/grouping/distributed/command/QueryCommand.java	(revision 1657278)
++++ solr/core/src/java/org/apache/solr/search/grouping/distributed/command/QueryCommand.java	(working copy)
+@@ -128,7 +128,7 @@
+     if (sort == null || sort == Sort.RELEVANCE) {
+       collector = TopScoreDocCollector.create(docsToCollect);
+     } else {
+-      collector = TopFieldCollector.create(sort, docsToCollect, true, needScores, needScores);
++      collector = TopFieldCollector.create(sort, docsToCollect, true, needScores);
+     }
+     filterCollector = new FilterCollector(docSet, collector);
+     return Arrays.asList((Collector) filterCollector);
+Index: solr/core/src/java/org/apache/solr/search/grouping/distributed/command/TopGroupsFieldCommand.java
+===================================================================
+--- solr/core/src/java/org/apache/solr/search/grouping/distributed/command/TopGroupsFieldCommand.java	(revision 1657278)
++++ solr/core/src/java/org/apache/solr/search/grouping/distributed/command/TopGroupsFieldCommand.java	(working copy)
+@@ -52,7 +52,6 @@
+     private Collection<SearchGroup<BytesRef>> firstPhaseGroups;
+     private Integer maxDocPerGroup;
+     private boolean needScores = false;
+-    private boolean needMaxScore = false;
+ 
+     public Builder setField(SchemaField field) {
+       this.field = field;
+@@ -84,11 +83,6 @@
+       return this;
+     }
+ 
+-    public Builder setNeedMaxScore(Boolean needMaxScore) {
+-      this.needMaxScore = needMaxScore;
+-      return this;
+-    }
+-
+     public TopGroupsFieldCommand build() {
+       if (field == null || groupSort == null ||  sortWithinGroup == null || firstPhaseGroups == null ||
+           maxDocPerGroup == null) {
+@@ -95,7 +89,7 @@
+         throw new IllegalStateException("All required fields must be set");
+       }
+ 
+-      return new TopGroupsFieldCommand(field, groupSort, sortWithinGroup, firstPhaseGroups, maxDocPerGroup, needScores, needMaxScore);
++      return new TopGroupsFieldCommand(field, groupSort, sortWithinGroup, firstPhaseGroups, maxDocPerGroup, needScores);
+     }
+ 
+   }
+@@ -106,7 +100,6 @@
+   private final Collection<SearchGroup<BytesRef>> firstPhaseGroups;
+   private final int maxDocPerGroup;
+   private final boolean needScores;
+-  private final boolean needMaxScore;
+   private AbstractSecondPassGroupingCollector secondPassCollector;
+ 
+   private TopGroupsFieldCommand(SchemaField field,
+@@ -114,8 +107,7 @@
+                                 Sort sortWithinGroup,
+                                 Collection<SearchGroup<BytesRef>> firstPhaseGroups,
+                                 int maxDocPerGroup,
+-                                boolean needScores,
+-                                boolean needMaxScore) {
++                                boolean needScores) {
+     this.field = field;
+     this.groupSort = groupSort;
+     this.sortWithinGroup = sortWithinGroup;
+@@ -122,7 +114,6 @@
+     this.firstPhaseGroups = firstPhaseGroups;
+     this.maxDocPerGroup = maxDocPerGroup;
+     this.needScores = needScores;
+-    this.needMaxScore = needMaxScore;
+   }
+ 
+   @Override
+@@ -137,11 +128,11 @@
+       ValueSource vs = fieldType.getValueSource(field, null);
+       Collection<SearchGroup<MutableValue>> v = GroupConverter.toMutable(field, firstPhaseGroups);
+       secondPassCollector = new FunctionSecondPassGroupingCollector(
+-          v, groupSort, sortWithinGroup, maxDocPerGroup, needScores, needMaxScore, true, vs, new HashMap<Object,Object>()
++          v, groupSort, sortWithinGroup, maxDocPerGroup, needScores, true, vs, new HashMap<Object,Object>()
+       );
+     } else {
+       secondPassCollector = new TermSecondPassGroupingCollector(
+-          field.getName(), firstPhaseGroups, groupSort, sortWithinGroup, maxDocPerGroup, needScores, needMaxScore, true
++          field.getName(), firstPhaseGroups, groupSort, sortWithinGroup, maxDocPerGroup, needScores, true
+       );
+     }
+     collectors.add(secondPassCollector);
+Index: solr/core/src/test/org/apache/solr/search/TestSort.java
+===================================================================
+--- solr/core/src/test/org/apache/solr/search/TestSort.java	(revision 1657278)
++++ solr/core/src/test/org/apache/solr/search/TestSort.java	(working copy)
+@@ -268,9 +268,8 @@
+         final String nullRep2 = luceneSort2 || sortMissingFirst2 && !reverse2 || sortMissingLast2 && reverse2 ? "" : "zzz";
+ 
+         boolean trackScores = r.nextBoolean();
+-        boolean trackMaxScores = r.nextBoolean();
+         boolean scoreInOrder = r.nextBoolean();
+-        final TopFieldCollector topCollector = TopFieldCollector.create(sort, top, true, trackScores, trackMaxScores);
++        final TopFieldCollector topCollector = TopFieldCollector.create(sort, top, true, trackScores);
+ 
+         final List<MyDoc> collectedDocs = new ArrayList<>();
+         // delegate and collect docs ourselves

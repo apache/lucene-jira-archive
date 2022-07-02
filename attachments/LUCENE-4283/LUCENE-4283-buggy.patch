@@ -1,0 +1,1762 @@
+Index: lucene/core/src/test/org/apache/lucene/codecs/pfor/TestPForUtil.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/codecs/pfor/TestPForUtil.java	(revision 1365112)
++++ lucene/core/src/test/org/apache/lucene/codecs/pfor/TestPForUtil.java	(working copy)
+@@ -47,6 +47,7 @@
+     this.gen = random();
+   }
+ 
++
+   /**
+    * Should not encode extra information other than single int
+    */
+@@ -197,6 +198,24 @@
+   }
+ 
+   /**
++   * Test correctness when we decode block partially
++   * Here we use ForUtil only
++   * TODO: support PFor
++   */
++  public void testFineGrainAccess() throws Exception {
++    initRandom();
++    int sz = ForPostingsFormat.DEFAULT_BLOCK_SIZE;
++    int[] data = new int[sz];
++    for (int i=0; i<=32; ++i) { // try to test every kinds of distribution
++      double alpha=gen.nextDouble(); // rate of normal value
++      for (int j=i; j<=32; ++j) {
++        createDistribution(data,sz,alpha,MASK[i],MASK[j]);
++        tryCompressAndDecompressPart(data, sz);
++      }
++    }
++  }
++
++  /**
+    * Test correctness of compressing and decompressing.
+    * Here we randomly assign a rate of exception (i.e. 1-alpha), 
+    * and test different scale of normal/exception values.
+@@ -242,6 +261,19 @@
+ 
+     assert cmp(data,sz,copy,sz)==true;
+   }
++
++  public void tryCompressAndDecompressPart(final int[] data, int sz) throws Exception {
++    byte[] res = new byte[sz*8];      // loosely upperbound
++    IntBuffer resBuffer = ByteBuffer.wrap(res).asIntBuffer();
++    int[] copy = new int[sz];
++
++    int header = ForUtil.compress(data,resBuffer);
++    int ensz = ForUtil.getEncodedSize(header);
++
++    ForUtil.decompress(resBuffer,copy,header,1);
++    assert cmp(data,32,copy,32)==true;
++  }
++
+   public boolean cmp(int[] a, int sza, int[] b, int szb) {
+     if (sza!=szb)
+       return false;
+Index: lucene/core/src/java/org/apache/lucene/codecs/block/BlockPostingsWriter.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/block/BlockPostingsWriter.java	(revision 1365112)
++++ lucene/core/src/java/org/apache/lucene/codecs/block/BlockPostingsWriter.java	(working copy)
+@@ -22,6 +22,7 @@
+ import java.nio.IntBuffer;
+ import java.util.ArrayList;
+ import java.util.List;
++import java.util.Arrays;
+ 
+ import org.apache.lucene.codecs.CodecUtil;
+ import org.apache.lucene.codecs.PostingsWriterBase;
+@@ -42,7 +43,7 @@
+ 
+ public final class BlockPostingsWriter extends PostingsWriterBase {
+ 
+-  private boolean DEBUG = BlockPostingsReader.DEBUG;
++  private boolean DEBUG = false; //BlockPostingsReader.DEBUG;
+ 
+   // nocommit move these constants to the PF:
+ 
+@@ -64,7 +65,11 @@
+   static final int DEFAULT_BLOCK_SIZE = 128;
+ 
+   final int blockSize;
++  final int skipInterval;
+ 
++  // how many slices(or intervals) one block holds
++  final int skipsPerBlock;
++
+   private IndexOutput termsOut;
+ 
+   // How current field indexes postings:
+@@ -91,13 +96,13 @@
+   private byte[] payloadBytes;
+   private int payloadByteUpto;
+ 
+-  private int lastBlockDocID;
+-  private boolean saveNextPosBlock;
+-  private long lastBlockPosFP;
+-  private long lastBlockPayFP;
+-  private int lastBlockPosBufferUpto;
+-  private int lastBlockEndOffset;
+-  private int lastBlockPayloadByteUpto;
++  final int[] lastBlockDocIDs;
++  private long[] lastBlockPosFPs;
++  private long[] lastBlockPayFPs;
++  private int[] lastBlockPosBufferUptos;
++  private int[] lastBlockEndOffsets;
++  private int[] lastBlockPayloadByteUptos;
++
+   private int lastDocID;
+   private int lastPosition;
+   private int lastEndOffset;
+@@ -106,6 +111,7 @@
+   final byte[] encoded;
+   final IntBuffer encodedBuffer;
+ 
++
+   private final BlockSkipWriter skipWriter;
+   
+   public BlockPostingsWriter(SegmentWriteState state, int blockSize) throws IOException {
+@@ -165,7 +171,19 @@
+     docDeltaBuffer = new int[blockSize];
+     freqBuffer = new int[blockSize];
+ 
+-    skipWriter = new BlockSkipWriter(blockSize,
++    // we use 32 as skip interval, and manually record these skip points
++    // for each block
++    skipInterval = 32;
++    skipsPerBlock = blockSize/skipInterval;
++    assert blockSize % skipInterval == 0;
++    lastBlockDocIDs = new int[skipsPerBlock];
++    lastBlockPosFPs = new long[skipsPerBlock];
++    lastBlockPayFPs = new long[skipsPerBlock];
++    lastBlockPosBufferUptos = new int[skipsPerBlock];
++    lastBlockEndOffsets = new int[skipsPerBlock];
++    lastBlockPayloadByteUptos = new int[skipsPerBlock];
++
++    skipWriter = new BlockSkipWriter(skipInterval,
+                                      maxSkipLevels, 
+                                      state.segmentInfo.getDocCount(),
+                                      docOut,
+@@ -202,7 +220,6 @@
+         payTermStartFP = payOut.getFilePointer();
+       }
+     }
+-    lastBlockDocID = -1;
+     lastDocID = 0;
+     if (DEBUG) {
+       System.out.println("FPW.startTerm startFP=" + docTermStartFP);
+@@ -212,7 +229,6 @@
+ 
+   private void writeBlock(int[] buffer, IndexOutput out) throws IOException {
+     final int header = ForUtil.compress(buffer, encodedBuffer);
+-    //System.out.println("    block has " + numBytes + " bytes");
+     out.writeVInt(header);
+     out.writeBytes(encoded, ForUtil.getEncodedSize(header));
+   }
+@@ -220,61 +236,39 @@
+   @Override
+   public void startDoc(int docID, int termDocFreq) throws IOException {
+     if (DEBUG) {
+-      System.out.println("FPW.startDoc docID=" + docID);
++      System.out.println("FPW.startDoc docID["+docBufferUpto+"]=" + docID);
+     }
+-
+-    // nocommit do this in finishDoc... but does it fail...?
+-    // is it not always called...?
+-    if (posOut != null && saveNextPosBlock) {
+-      lastBlockPosFP = posOut.getFilePointer();
+-      if (payOut != null) {
+-        lastBlockPayFP = payOut.getFilePointer();
+-      }
+-      lastBlockPosBufferUpto = posBufferUpto;
+-      lastBlockEndOffset = lastEndOffset;
+-      lastBlockPayloadByteUpto = payloadByteUpto;
+-      saveNextPosBlock = false;
+-      if (DEBUG) {
+-        System.out.println("  now save lastBlockPosFP=" + lastBlockPosFP + " lastBlockPosBufferUpto=" + lastBlockPosBufferUpto + " lastBlockPayloadByteUpto=" + lastBlockPayloadByteUpto);
+-      }
+-    }
+-
+     final int docDelta = docID - lastDocID;
+     if (docID < 0 || (docCount > 0 && docDelta <= 0)) {
+       throw new CorruptIndexException("docs out of order (" + docID + " <= " + lastDocID + " ) (docOut: " + docOut + ")");
+     }
+-    lastDocID = docID;
+ 
++
+     docDeltaBuffer[docBufferUpto] = docDelta;
+     if (DEBUG) {
+-      System.out.println("  docDeltaBuffer[" + docBufferUpto + "]=" + docDelta);
++    //  System.out.println("  docDeltaBuffer[" + docBufferUpto + "]=" + docDelta);
+     }
+     if (fieldHasFreqs) {
+       freqBuffer[docBufferUpto] = termDocFreq;
+     }
+-
+     docBufferUpto++;
+     docCount++;
+ 
++    // nocommit do this in finishDoc... but does it fail...?
++    // is it not always called...?
++
++    // Since we don't know df for current term, we had to buffer
++    // those skip data for each block, and when a block of docs are
++    // collected, write them to skip file.
++    //
++
++    // have collected a block of docs, should write skip data as well as 
++    // postings list for previous block
+     if (docBufferUpto == blockSize) {
+-      // nocommit maybe instead of buffering skip before
+-      // writing a block based on last block's end data
+-      // ... we could buffer after writing the block?  only
+-      // iffiness with that approach is it could be a
+-      // pointlness skip?  like we may stop adding docs
+-      // right after that, then we have skip point AFTER
+-      // last doc.  the thing is, in finishTerm we are
+-      // already sometimes adding a skip point AFTER the
+-      // last doc?
+-      if (lastBlockDocID != -1) {
+-        if (DEBUG) {
+-          System.out.println("  bufferSkip at writeBlock: lastDocID=" + lastBlockDocID + " docCount=" + (docCount-blockSize));
+-        }
+-        skipWriter.bufferSkip(lastBlockDocID, docCount-blockSize, lastBlockPosFP, lastBlockPayFP, lastBlockPosBufferUpto, lastBlockEndOffset, lastBlockPayloadByteUpto);
++      skipWriter.bufferSkip(lastBlockDocIDs, docCount-blockSize, lastBlockPosFPs, lastBlockPayFPs, lastBlockPosBufferUptos, lastBlockEndOffsets, lastBlockPayloadByteUptos);
++      if (DEBUG) {
++        System.out.println("  bufferSkip at writeBlock: lastDocID=" + lastBlockDocIDs[0] + " docCount=" + (docCount-blockSize));
+       }
+-      lastBlockDocID = docID;
+-      saveNextPosBlock = true;
+-
+       if (DEBUG) {
+         System.out.println("  write docDelta block @ fp=" + docOut.getFilePointer());
+       }
+@@ -288,6 +282,24 @@
+       docBufferUpto = 0;
+     }
+ 
++    int slice = (docBufferUpto-1)/skipInterval;
++    if (docBufferUpto % skipInterval == 1) {
++      lastBlockDocIDs[slice] = lastDocID;
++      if (posOut != null) {
++        if (payOut != null) {
++          lastBlockPayFPs[slice] = payOut.getFilePointer();
++        }
++        lastBlockPosFPs[slice] = posOut.getFilePointer();
++        lastBlockPosBufferUptos[slice] = posBufferUpto;
++        lastBlockEndOffsets[slice] = lastEndOffset;
++        lastBlockPayloadByteUptos[slice] = payloadByteUpto;
++      }
++      if (DEBUG) {
++        System.out.println("  docBufferUpto="+docBufferUpto+" now get lastBlockDocID="+lastBlockDocIDs[slice]+" lastBlockPosFP=" + lastBlockPosFPs[slice] + " lastBlockPosBufferUpto=" + lastBlockPosBufferUptos[slice] + " lastBlockPayloadByteUpto=" + lastBlockPayloadByteUptos[slice]);
++      }
++    }
++
++    lastDocID = docID;
+     lastPosition = 0;
+     lastEndOffset = 0;
+   }
+@@ -383,13 +395,13 @@
+     // postings come after it, but if we don't do this, skip
+     // reader incorrectly thinks it can read another level 0
+     // skip entry here!:
+-    //if (docCount > blockSize && docBufferUpto > 0) {
++
+     if (docCount > blockSize) {
+       final int lastDocCount = blockSize*(docCount/blockSize);
+       if (DEBUG) {
+-        System.out.println("  bufferSkip at finishTerm: lastDocID=" + lastBlockDocID + " docCount=" + lastDocCount);
++        System.out.println("  bufferSkip at finishTerm: lastDocID=" + lastBlockDocIDs[0] + " docCount=" + lastDocCount);
+       }
+-      skipWriter.bufferSkip(lastBlockDocID, lastDocCount, lastBlockPosFP, lastBlockPayFP, lastBlockPosBufferUpto, lastBlockEndOffset, lastBlockPayloadByteUpto);
++      skipWriter.bufferSkip(lastBlockDocIDs[0], lastDocCount, lastBlockPosFPs[0], lastBlockPayFPs[0], lastBlockPosBufferUptos[0], lastBlockEndOffsets[0], lastBlockPayloadByteUptos[0]);
+     }
+ 
+     if (DEBUG) {
+@@ -491,7 +503,7 @@
+       skipOffset = (int) (skipWriter.writeSkip(docOut)-docTermStartFP);
+       
+       if (DEBUG) {
+-        System.out.println("skip packet " + (docOut.getFilePointer() - (docTermStartFP + skipOffset)) + " bytes");
++        System.out.println("skip packet " + (docOut.getFilePointer() - (docTermStartFP + skipOffset)) + " bytes: docCount="+docCount);
+       }
+     } else {
+       skipOffset = -1;
+Index: lucene/core/src/java/org/apache/lucene/codecs/block/BlockSkipWriter.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/block/BlockSkipWriter.java	(revision 1365112)
++++ lucene/core/src/java/org/apache/lucene/codecs/block/BlockSkipWriter.java	(working copy)
+@@ -23,12 +23,30 @@
+ import org.apache.lucene.store.IndexOutput;
+ import org.apache.lucene.codecs.MultiLevelSkipListWriter;
+ 
+-// nocommit do we need more frequent skips at level > 0?
+-// 128*128 is immense?  may need to decouple
++// nocommit we may need to decouple
+ // baseSkipInterval & theRestSkipInterval?
+ 
++
++/**
++ * Write skip lists with multiple levels, and support skip within block ints.
++ *
++ *
++ * Assume that blockSize=12, and skipInterval=3
++ *
++ *  |       block#0       | |      block#1        | 
++ *  d d d d d d d d d d d d d d d d d d d d d d d d (posting list)
++ *          ^     ^     ^     ^     ^     ^     ^     (level 0 skip point)
++ *
++ * Note that skipWriter will ignore first document in block#0, since 
++ * it is useless as a skip point.  
++ *  
++ * For each skip point, we should record: 
++ * lastDocID, start point of fileFP, and last uptos
++ *
++ */
+ final class BlockSkipWriter extends MultiLevelSkipListWriter {
+   private boolean DEBUG = BlockPostingsReader.DEBUG;
++  private int skipInterval;
+   
+   private int[] lastSkipDoc;
+   private long[] lastSkipDocPointer;
+@@ -57,6 +75,7 @@
+     this.docOut = docOut;
+     this.posOut = posOut;
+     this.payOut = payOut;
++    this.skipInterval = skipInterval;
+     
+     lastSkipDoc = new int[maxSkipLevels];
+     lastSkipDocPointer = new long[maxSkipLevels];
+@@ -108,6 +127,23 @@
+     this.curEndOffset = endOffset;
+     bufferSkip(numDocs);
+   }
++  /**
++   * Sets the values for skip data in current block
++   */
++  public void bufferSkip(int[] docs, int numDocs, long[] posFPs, long[] payFPs, int[] posBufferUptos, int[] endOffsets, int[] payloadByteUptos) throws IOException {
++    this.curDocPointer = docOut.getFilePointer();
++    // first doc is useless as skip point
++    // nocommit: ugly use 128/32 as this magic number
++    for (int i=(numDocs==0 ? 1:0); i<4; i++) {
++      this.curPosPointer = posFPs[i];
++      this.curPayPointer = payFPs[i];
++      this.curPosBufferUpto = posBufferUptos[i];
++      this.curPayloadByteUpto = payloadByteUptos[i];
++      this.curEndOffset = endOffsets[i];
++      this.curDoc = docs[i];
++      bufferSkip(numDocs+i*skipInterval);
++    }
++  }
+   
+   @Override
+   protected void writeSkipData(int level, IndexOutput skipBuffer) throws IOException {
+Index: lucene/core/src/java/org/apache/lucene/codecs/block/BlockSkipReader.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/block/BlockSkipReader.java	(revision 1365112)
++++ lucene/core/src/java/org/apache/lucene/codecs/block/BlockSkipReader.java	(working copy)
+@@ -166,18 +166,20 @@
+ 
+   @Override
+   protected int readSkipData(int level, IndexInput skipStream) throws IOException {
+-    if (DEBUG) {
+-      System.out.println("readSkipData level=" + level);
+-    }
+     int delta = skipStream.readVInt();
+-    if (DEBUG) {
+-      System.out.println("  delta=" + delta);
+-    }
+-    docPointer[level] += skipStream.readVInt();
+-    if (DEBUG) {
+-      System.out.println("  docFP=" + docPointer[level]);
+-    }
+ 
++    // nocommit is it somewhat wasteful to write docPointer 4 times for one block?
++    int docPointerDelta = skipStream.readVInt();
++
++      if (DEBUG) {
++        System.out.print("readSkipData: delta=" + delta);
++      }
++      docPointer[level] += docPointerDelta;
++
++      if (DEBUG) {
++        System.out.println("  docFP=" + docPointer[level]);
++      }
++
+     if (posPointer != null) {
+       posPointer[level] += skipStream.readVInt();
+       if (DEBUG) {
+Index: lucene/core/src/java/org/apache/lucene/codecs/block/BlockPostingsReader.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/block/BlockPostingsReader.java	(revision 1365112)
++++ lucene/core/src/java/org/apache/lucene/codecs/block/BlockPostingsReader.java	(working copy)
+@@ -59,6 +59,7 @@
+ 
+   // NOTE: not private to avoid access$NNN methods:
+   final int blockSize;
++  final int skipInterval;
+ 
+   public BlockPostingsReader(Directory dir, FieldInfos fieldInfos, SegmentInfo segmentInfo, IOContext ioContext, String segmentSuffix, int blockSize) throws IOException {
+     boolean success = false;
+@@ -103,6 +104,8 @@
+     }
+ 
+     this.blockSize = blockSize;
++    this.skipInterval = 32;
++    assert blockSize % skipInterval == 0;
+   }
+ 
+   @Override
+@@ -124,6 +127,22 @@
+     ForUtil.decompress(encodedBuffer, buffer, header);
+   }
+ 
++  static void readBlockAndSkip(IndexInput in, byte[] encoded, IntBuffer encodedBuffer, int[] buffer, int slice) throws IOException {
++    int header = in.readVInt();
++    int skipPerBlock = 128/32;                                 // nocommit: why not make these magic num fixed?
++    int sliceSize = ForUtil.getEncodedSize(header)/skipPerBlock;
++    
++    if (sliceSize > 1) { 
++      in.seek(in.getFilePointer() + sliceSize*slice);       // seek to target slice
++      in.readBytes(encoded, 0, sliceSize);                  // read that part of the encoded data
++      ForUtil.decompress(encodedBuffer, buffer, header, 1); // nocommit: skipInterv/32 = 1
++      in.seek(in.getFilePointer() + sliceSize*(skipPerBlock-slice-1)); // skip to the end for further reading
++    } else { // the all-value-same case
++      in.readBytes(encoded, 0, 4);                        // read the symbol int
++      ForUtil.decompress(encodedBuffer, buffer, header, 1);
++    }
++  }
++
+   static void skipBlock(IndexInput in) throws IOException {
+     int header = in.readVInt();
+     in.seek(in.getFilePointer() + ForUtil.getEncodedSize(header));
+@@ -306,8 +325,20 @@
+     private final int[] docDeltaBuffer = new int[blockSize];
+     private final int[] freqBuffer = new int[blockSize];
+ 
+-    private int docBufferUpto;
++    private int docBufferUpto;                      
+ 
++    // somewhat tricky: after partially decoding, we may call nextDoc() to
++    // read new ints, here we should this offset to force a new block loaded 
++    // when those skipInterval ints are consumed
++    private int docBufferOffset;
++
++    // since a block is partilly decoded or fully decoded, another block or part
++    // should be read later if docBufferUpto is equal to this value
++    private int maxDocBufferUpto;
++
++    // how may ints encoded as ForBlock
++    private int blockInts;
++
+     private BlockSkipReader skipper;
+     private boolean skipped;
+ 
+@@ -367,6 +398,9 @@
+       accum = 0;
+       docUpto = 0;
+       docBufferUpto = blockSize;
++      docBufferOffset = 0;
++      maxDocBufferUpto = docBufferUpto;
++      blockInts = docFreq/blockSize*blockSize;
+       skipped = false;
+       return this;
+     }
+@@ -417,18 +451,71 @@
+         }
+       }
+       docBufferUpto = 0;
++      docBufferOffset = 0;
++      maxDocBufferUpto = blockSize;
+     }
+ 
++    private void refillDocsMaybeSkip(int slice) throws IOException {
++      final int left = docFreq - docUpto;
++      assert left > 0;
++
++      // We are still reading inside a block, otherwise we 
++      // should consider to handle the tail after these blocks 
++      if (docUpto < blockInts) {
++        // current block is partly fetched, we may need remaining ints later
++        long lastDocFP = docIn.getFilePointer();
++
++        if (DEBUG) {
++          System.out.println("    fill doc block @"+slice+ "from fp=" + docIn.getFilePointer());
++        }
++        readBlockAndSkip(docIn, encoded, encodedBuffer, docDeltaBuffer, slice);
++
++        if (indexHasFreq) {
++          if (DEBUG) {
++            System.out.println("    fill freq block @"+slice+"from fp=" + docIn.getFilePointer());
++          }
++          readBlockAndSkip(docIn, encoded, encodedBuffer, freqBuffer, slice);
++        }
++        // current buffer is partly filled, may read remaining ints later
++        if (slice != blockSize/skipInterval - 1) {
++          docIn.seek(lastDocFP);
++        }
++        maxDocBufferUpto = (docBufferUpto % blockSize) + skipInterval;
++      } else {
++        // Read vInts:
++        if (DEBUG) {
++          System.out.println("    fill last vInt block from fp=" + docIn.getFilePointer());
++        }
++        for(int i=0;i<left;i++) {
++          final int code = docIn.readVInt();
++          if (indexHasFreq) {
++            docDeltaBuffer[i] = code >>> 1;
++            if ((code & 1) != 0) {
++              freqBuffer[i] = 1;
++            } else {
++              freqBuffer[i] = docIn.readVInt();
++            }
++          } else {
++            docDeltaBuffer[i] = code;
++          }
++        }
++        maxDocBufferUpto = blockSize;
++      }
++      if (slice == 0) {
++        docBufferUpto = 0;
++        docBufferOffset = 0;
++      }
++    }
++
+     @Override
+     public int nextDoc() throws IOException {
+-
+       if (DEBUG) {
+         System.out.println("\nFPR.nextDoc");
+       }
+ 
+       while (true) {
+         if (DEBUG) {
+-          System.out.println("  docUpto=" + docUpto + " (of df=" + docFreq + ") docBufferUpto=" + docBufferUpto);
++          System.out.println("    docUpto=" + docUpto + " (of df=" + docFreq + ") docBufferUpto=" + docBufferUpto+" docBufferOffset="+ docBufferOffset+ " maxBufferUpto="+ maxDocBufferUpto);
+         }
+ 
+         if (docUpto == docFreq) {
+@@ -438,19 +525,29 @@
+           return doc = NO_MORE_DOCS;
+         }
+ 
++        // previous we didn't decode a whole block, should fill docs now, 
++        // but only another skipInterval ints from current block
++        if (maxDocBufferUpto != blockSize) {
++          if (DEBUG) {
++            System.out.println(" reading remaining ints");
++          }
++          return nextDocMaybeSkip();
++        }
++
++        // should fill a whole block 
+         if (docBufferUpto == blockSize) {
+           refillDocs();
+         }
+ 
+         if (DEBUG) {
+-          System.out.println("    accum=" + accum + " docDeltaBuffer[" + docBufferUpto + "]=" + docDeltaBuffer[docBufferUpto]);
++          System.out.println("    accum=" + accum + " docDeltaBuffer[" + docBufferUpto + "-"+docBufferOffset+"]=" + docDeltaBuffer[docBufferUpto - docBufferOffset]);
+         }
+-        accum += docDeltaBuffer[docBufferUpto];
++        accum += docDeltaBuffer[docBufferUpto - docBufferOffset];
+         docUpto++;
+ 
+         if (liveDocs == null || liveDocs.get(accum)) {
+           doc = accum;
+-          freq = freqBuffer[docBufferUpto];
++          freq = freqBuffer[docBufferUpto - docBufferOffset];
+           docBufferUpto++;
+           if (DEBUG) {
+             System.out.println("  return doc=" + doc + " freq=" + freq);
+@@ -465,6 +562,55 @@
+         docBufferUpto++;
+       }
+     }
++    public int nextDocMaybeSkip() throws IOException {
++      if (DEBUG) {
++        System.out.println("\nFPR.nextDocMaybeSkip");
++      }
++
++      while (true) {
++        if (DEBUG) {
++          System.out.println("    docUpto=" + docUpto + " (of df=" + docFreq + ") docBufferUpto=" + docBufferUpto+" docBufferOffset="+ docBufferOffset+ " maxBufferUpto="+ maxDocBufferUpto);
++        }
++        if (docUpto == docFreq) {
++          if (DEBUG) {
++            System.out.println("  return doc=END");
++          }
++          return doc = NO_MORE_DOCS;
++        }
++
++        // we'll use this partial decode iff 
++        // 1. the vInt block isn't read
++        // 2. last time we read only part of block ints
++        // 3. we just consumed the last doc of decoded interval, and are requiring a next interval of block 
++        if (docBufferUpto == maxDocBufferUpto) {
++          docBufferOffset = docBufferUpto % blockSize;
++          refillDocsMaybeSkip(docBufferOffset/skipInterval);
++        }
++
++        if (DEBUG) {
++          System.out.print("    accum=" + accum + " docDeltaBuffer[" + docBufferUpto + "-" + docBufferOffset+"]=");
++          System.out.println(docDeltaBuffer[docBufferUpto - docBufferOffset]);
++        }
++        accum += docDeltaBuffer[docBufferUpto - docBufferOffset];
++        docUpto++;
++
++        if (liveDocs == null || liveDocs.get(accum)) {
++          doc = accum;
++          freq = freqBuffer[docBufferUpto - docBufferOffset];
++          docBufferUpto++;
++          if (DEBUG) {
++            System.out.println("  return doc=" + doc + " freq=" + freq);
++          }
++          return doc;
++        }
++
++        if (DEBUG) {
++          System.out.println("  doc=" + accum + " is deleted; try next doc");
++        }
++
++        docBufferUpto++;
++      }
++    }
+     
+     @Override
+     public int advance(int target) throws IOException {
+@@ -474,17 +620,22 @@
+       // nocommit put cheating back!  does it help?
+       // nocommit use skipper!!!  it has next last doc id!!
+       //if (docFreq > blockSize && target - (blockSize - docBufferUpto) - 2*blockSize > accum) {
+-      if (docFreq > blockSize && target - accum > blockSize) {
+ 
++      // we allow the skipper to run when:
++      // 1. we have enough ints to use partial decode
++      // 2. the target is not within one skip
++      // 3. we'll not skip into vInt block
++      if (docFreq > blockSize && target - accum > skipInterval && accum + skipInterval <= blockInts) {
+         if (DEBUG) {
+           System.out.println("load skipper");
+         }
+ 
+         if (skipper == null) {
+           // Lazy init: first time this enum has ever been used for skipping
++          // we use 32(num of bits for an integer) as interval here
+           skipper = new BlockSkipReader((IndexInput) docIn.clone(),
+                                         BlockPostingsWriter.maxSkipLevels,
+-                                        blockSize,
++                                        skipInterval,
+                                         indexHasPos,
+                                         indexHasOffsets,
+                                         indexHasPayloads);
+@@ -494,8 +645,15 @@
+           assert skipOffset != -1;
+           // This is the first time this enum has skipped
+           // since reset() was called; load the skip data:
+-          skipper.init(docTermStartFP+skipOffset, docTermStartFP, 0, 0, docFreq);
++          
++          // we don't pass the real docFreq to skipper, so that the skipper
++          // will not move forward into the vInt block
++          int fakedf = docFreq % blockSize == 0? docFreq : docFreq/blockSize*blockSize+skipInterval-1;
++          skipper.init(docTermStartFP+skipOffset, docTermStartFP, 0, 0, fakedf);
+           skipped = true;
++          if (DEBUG) {
++            System.out.println("    init skipper"+" skipFP="+(docTermStartFP+skipOffset)+" docBaseFP="+docTermStartFP+" posBaseFP="+0+" payBaseFP="+0+" df="+fakedf);
++          }
+         }
+ 
+         final int newDocUpto = skipper.skipTo(target); 
+@@ -507,18 +665,24 @@
+             System.out.println("skipper moved to docUpto=" + newDocUpto + " vs current=" + docUpto + "; docID=" + skipper.getDoc() + " fp=" + skipper.getDocPointer());
+           }
+ 
+-          assert newDocUpto % blockSize == (blockSize-1): "got " + newDocUpto;
++          assert newDocUpto % skipInterval == (skipInterval-1): "got " + newDocUpto;
+           docUpto = newDocUpto+1;
+ 
+-          // Force block read next:
+-          docBufferUpto = blockSize;
+-          accum = skipper.getDoc();
+-          docIn.seek(skipper.getDocPointer());
++          // now docBufferUpto%blockSize should point to the entry in the block we skipped to
++          // and we judge which slice to fetch depending on current docUpto
++          
++          // nocommit: docBufferUpto have to be forced >0 here, is there a better way around?
++          int skipPerBlock = blockSize/skipInterval;
++          int slice = (docUpto % blockSize) / skipInterval;
++          docBufferUpto = blockSize - (skipPerBlock-slice)*skipInterval%blockSize;
++          maxDocBufferUpto = docBufferUpto;       // force to partially decode
++          accum = skipper.getDoc();               // actually, this is just lastSkipEntry
++          docIn.seek(skipper.getDocPointer());    // now point to the block we want to search
+         }
+       }
+ 
+       // Now scan:
+-      while (nextDoc() != NO_MORE_DOCS) {
++      while (nextDocMaybeSkip() != NO_MORE_DOCS) {
+         if (doc >= target) {
+           if (DEBUG) {
+             System.out.println("  advance return doc=" + doc);
+@@ -546,8 +710,15 @@
+     private final int[] posDeltaBuffer = new int[blockSize];
+ 
+     private int docBufferUpto;
++
++    private int docBufferOffset;
++    private int maxDocBufferUpto;
++    private int blockInts;
++
+     private int posBufferUpto;
+ 
++    private int docPendingCount;
++
+     private BlockSkipReader skipper;
+     private boolean skipped;
+ 
+@@ -566,6 +737,7 @@
+     private int freq;                                 // freq we last read
+     private int position;                             // current position
+ 
++
+     // how many positions "behind" we are; nextPosition must
+     // skip these to "catch up":
+     private int posPendingCount;
+@@ -637,6 +809,9 @@
+       accum = 0;
+       docUpto = 0;
+       docBufferUpto = blockSize;
++      docBufferOffset = 0;
++      maxDocBufferUpto = docBufferUpto;
++      blockInts = docFreq/blockSize*blockSize;
+       skipped = false;
+       return this;
+     }
+@@ -683,7 +858,51 @@
+         }
+       }
+       docBufferUpto = 0;
++      docBufferOffset = 0;
++      maxDocBufferUpto = blockSize;
+     }
++    private void refillDocsMaybeSkip(int slice) throws IOException {
++      final int left = docFreq - docUpto;
++      assert left > 0;
++
++      if (docUpto < blockInts) {
++        long lastDocFP = docIn.getFilePointer();
++
++        if (DEBUG) {
++          System.out.println("    fill doc block @"+slice+ " from fp=" + docIn.getFilePointer());
++        }
++        readBlockAndSkip(docIn, encoded, encodedBuffer, docDeltaBuffer, slice);
++
++        if (DEBUG) {
++          System.out.println("    fill freq block @"+slice+" from fp=" + docIn.getFilePointer());
++        }
++        readBlockAndSkip(docIn, encoded, encodedBuffer, freqBuffer, slice);
++
++        if (slice != blockSize/skipInterval - 1) {
++          docIn.seek(lastDocFP);
++        }
++        maxDocBufferUpto = (docBufferUpto % blockSize) + skipInterval;
++      } else {
++        // Read vInts:
++        if (DEBUG) {
++          System.out.println("    fill last vInt doc block from fp=" + docIn.getFilePointer());
++        }
++        for(int i=0;i<left;i++) {
++          final int code = docIn.readVInt();
++          docDeltaBuffer[i] = code >>> 1;
++          if ((code & 1) != 0) {
++            freqBuffer[i] = 1;
++          } else {
++            freqBuffer[i] = docIn.readVInt();
++          }
++        }
++        maxDocBufferUpto = blockSize;
++      }
++      if (slice == 0) {
++        docBufferUpto = 0;
++        docBufferOffset = 0;
++      }
++    }
+     
+     private void refillPositions() throws IOException {
+       if (DEBUG) {
+@@ -724,29 +943,35 @@
+ 
+     @Override
+     public int nextDoc() throws IOException {
+-
+       if (DEBUG) {
+         System.out.println("  FPR.nextDoc");
+       }
+ 
+       while (true) {
+         if (DEBUG) {
+-          System.out.println("    docUpto=" + docUpto + " (of df=" + docFreq + ") docBufferUpto=" + docBufferUpto);
++          System.out.println("    docUpto=" + docUpto + " (of df=" + docFreq + ") docBufferUpto=" + docBufferUpto+" docBufferOffset="+ docBufferOffset+ " maxBufferUpto="+ maxDocBufferUpto);
+         }
+ 
+         if (docUpto == docFreq) {
+           return doc = NO_MORE_DOCS;
+         }
+ 
++        if (maxDocBufferUpto != blockSize) {
++          if (DEBUG) {
++            System.out.println(" reading remaining ints");
++          }
++          return nextDocMaybeSkip();
++        }
++
+         if (docBufferUpto == blockSize) {
+           refillDocs();
+         }
+ 
+         if (DEBUG) {
+-          System.out.println("    accum=" + accum + " docDeltaBuffer[" + docBufferUpto + "]=" + docDeltaBuffer[docBufferUpto]);
++          System.out.println("    accum=" + accum + " docDeltaBuffer[" + docBufferUpto + "-"+docBufferOffset+"]=" + docDeltaBuffer[docBufferUpto - docBufferOffset]);
+         }
+-        accum += docDeltaBuffer[docBufferUpto];
+-        freq = freqBuffer[docBufferUpto];
++        accum += docDeltaBuffer[docBufferUpto - docBufferOffset];
++        freq = freqBuffer[docBufferUpto - docBufferOffset];
+         posPendingCount += freq;
+         docBufferUpto++;
+         docUpto++;
+@@ -765,6 +990,47 @@
+         }
+       }
+     }
++    public int nextDocMaybeSkip() throws IOException {
++      if (DEBUG) {
++        System.out.println("  FPR.nextDocMaybeSkip");
++      }
++      while (true) {
++        if (DEBUG) {
++          System.out.println("    docUpto=" + docUpto + " (of df=" + docFreq + ") docBufferUpto=" + docBufferUpto+" docBufferOffset="+ docBufferOffset+ " maxBufferUpto="+ maxDocBufferUpto);
++        }
++        if (docUpto == docFreq) {
++          return doc = NO_MORE_DOCS;
++        }
++        if (docBufferUpto == maxDocBufferUpto) {
++          docBufferOffset = docBufferUpto % blockSize;
++          refillDocsMaybeSkip(docBufferOffset/skipInterval);
++        }
++        if (DEBUG) {
++          System.out.print("    accum=" + accum + " docDeltaBuffer[" + docBufferUpto + "-"+docBufferOffset+"]=");
++          System.out.println(docDeltaBuffer[docBufferUpto - docBufferOffset]);
++        }
++        accum += docDeltaBuffer[docBufferUpto - docBufferOffset];
++        freq = freqBuffer[docBufferUpto - docBufferOffset];
++        posPendingCount += freq;
++        docBufferUpto++;
++        docUpto++;
++
++        if (liveDocs == null || liveDocs.get(accum)) {
++          doc = accum;
++          if (DEBUG) {
++            System.out.println("    return doc=" + doc + " freq=" + freq + " posPendingCount=" + posPendingCount);
++          }
++          position = 0;
++          return doc;
++        }
++
++        if (DEBUG) {
++          System.out.println("    doc=" + accum + " is deleted; try next doc");
++        }
++      }
++    }
++
++
+     
+     @Override
+     public int advance(int target) throws IOException {
+@@ -777,7 +1043,7 @@
+       // nocommit put cheating back!  does it help?
+       // nocommit use skipper!!!  it has next last doc id!!
+       //if (docFreq > blockSize && target - (blockSize - docBufferUpto) - 2*blockSize > accum) {
+-      if (docFreq > blockSize && target - accum > blockSize) {
++      if (docFreq > blockSize && target - accum > skipInterval && accum + skipInterval <= blockInts) {
+ 
+         if (DEBUG) {
+           System.out.println("    try skipper");
+@@ -790,7 +1056,7 @@
+           }
+           skipper = new BlockSkipReader((IndexInput) docIn.clone(),
+                                         BlockPostingsWriter.maxSkipLevels,
+-                                        blockSize,
++                                        skipInterval,
+                                         true,
+                                         indexHasOffsets,
+                                         indexHasPayloads);
+@@ -800,11 +1066,13 @@
+           assert skipOffset != -1;
+           // This is the first time this enum has skipped
+           // since reset() was called; load the skip data:
++          
++          int fakedf = docFreq % blockSize == 0? docFreq : docFreq/blockSize*blockSize+skipInterval-1;
++          skipper.init(docTermStartFP+skipOffset, docTermStartFP, posTermStartFP, payTermStartFP, fakedf);
++          skipped = true;
+           if (DEBUG) {
+-            System.out.println("    init skipper");
++            System.out.println("    init skipper"+" skipFP="+(docTermStartFP+skipOffset)+" docBaseFP="+docTermStartFP+" posBaseFP="+posTermStartFP+" payBaseFP="+payTermStartFP+" df="+fakedf);
+           }
+-          skipper.init(docTermStartFP+skipOffset, docTermStartFP, posTermStartFP, payTermStartFP, docFreq);
+-          skipped = true;
+         }
+ 
+         final int newDocUpto = skipper.skipTo(target); 
+@@ -815,12 +1083,17 @@
+           if (DEBUG) {
+             System.out.println("    skipper moved to docUpto=" + newDocUpto + " vs current=" + docUpto + "; docID=" + skipper.getDoc() + " fp=" + skipper.getDocPointer() + " pos.fp=" + skipper.getPosPointer() + " pos.bufferUpto=" + skipper.getPosBufferUpto());
+           }
+-
+-          assert newDocUpto % blockSize == (blockSize-1): "got " + newDocUpto;
++          assert newDocUpto % skipInterval == (skipInterval-1): "got " + newDocUpto;
+           docUpto = newDocUpto+1;
+ 
+-          // Force block read next:
+-          docBufferUpto = blockSize;
++          // now docBufferUpto%blockSize should point to the entry in the block we skipped to
++          // and we judge which slice to fetch depending on current docUpto
++          
++          // nocommit: docBufferUpto have to be forced >0 here, is there a better way around?
++          int skipPerBlock = blockSize/skipInterval;
++          int slice = (docUpto % blockSize) / skipInterval;
++          docBufferUpto = blockSize - (skipPerBlock-slice)*skipInterval%blockSize;
++          maxDocBufferUpto = docBufferUpto;
+           accum = skipper.getDoc();
+           docIn.seek(skipper.getDocPointer());
+           posPendingFP = skipper.getPosPointer();
+@@ -829,7 +1102,7 @@
+       }
+ 
+       // Now scan:
+-      while (nextDoc() != NO_MORE_DOCS) {
++      while (nextDocMaybeSkip() != NO_MORE_DOCS) {
+         if (doc >= target) {
+           if (DEBUG) {
+             System.out.println("  advance return doc=" + doc);
+@@ -959,8 +1232,15 @@
+     private int endOffset;
+ 
+     private int docBufferUpto;
++
++    private int docBufferOffset;
++    private int maxDocBufferUpto;
++    private int blockInts;
++
+     private int posBufferUpto;
+ 
++    private int docPendingCount;
++
+     private BlockSkipReader skipper;
+     private boolean skipped;
+ 
+@@ -1077,6 +1357,9 @@
+       accum = 0;
+       docUpto = 0;
+       docBufferUpto = blockSize;
++      docBufferOffset = 0;
++      maxDocBufferUpto = docBufferUpto;
++      blockInts = docFreq/blockSize*blockSize;
+       skipped = false;
+       return this;
+     }
+@@ -1123,7 +1406,51 @@
+         }
+       }
+       docBufferUpto = 0;
++      docBufferOffset = 0;
++      maxDocBufferUpto = blockSize;
+     }
++    private void refillDocsMaybeSkip(int slice) throws IOException {
++      final int left = docFreq - docUpto;
++      assert left > 0;
++
++      if (docUpto < blockInts) {
++        long lastDocFP = docIn.getFilePointer();
++
++        if (DEBUG) {
++          System.out.println("    fill doc block @"+slice+" from fp=" + docIn.getFilePointer());
++        }
++        readBlockAndSkip(docIn, encoded, encodedBuffer, docDeltaBuffer, slice);
++
++        if (DEBUG) {
++          System.out.println("    fill freq block @"+slice+" from fp=" + docIn.getFilePointer());
++        }
++        readBlockAndSkip(docIn, encoded, encodedBuffer, freqBuffer, slice);
++
++        if (slice != blockSize/skipInterval - 1) {
++          docIn.seek(lastDocFP);
++        }
++        maxDocBufferUpto = (docBufferUpto % blockSize) + skipInterval;
++      } else {
++        // Read vInts:
++        if (DEBUG) {
++          System.out.println("    fill last vInt doc block from fp=" + docIn.getFilePointer());
++        }
++        for(int i=0;i<left;i++) {
++          final int code = docIn.readVInt();
++          docDeltaBuffer[i] = code >>> 1;
++          if ((code & 1) != 0) {
++            freqBuffer[i] = 1;
++          } else {
++            freqBuffer[i] = docIn.readVInt();
++          }
++        }
++        maxDocBufferUpto = blockSize;
++      }
++      if (slice == 0) {
++        docBufferUpto = 0;
++        docBufferOffset = 0;
++      }
++    }
+     
+     private void refillPositions() throws IOException {
+       if (DEBUG) {
+@@ -1205,34 +1532,39 @@
+ 
+     @Override
+     public int nextDoc() throws IOException {
+-
+       if (DEBUG) {
+         System.out.println("  FPR.nextDoc");
+       }
+-
+       if (indexHasPayloads) {
+         payloadByteUpto += payloadLength;
+         payloadLength = 0;
+       }
+-
+       while (true) {
+         if (DEBUG) {
+-          System.out.println("    docUpto=" + docUpto + " (of df=" + docFreq + ") docBufferUpto=" + docBufferUpto);
++          System.out.println("    docUpto=" + docUpto + " (of df=" + docFreq + ") docBufferUpto=" + docBufferUpto+" docBufferOffset="+ docBufferOffset+ " maxBufferUpto="+ maxDocBufferUpto);
+         }
+ 
+         if (docUpto == docFreq) {
+           return doc = NO_MORE_DOCS;
+         }
+ 
++        if (maxDocBufferUpto != blockSize) {
++          if (DEBUG) {
++            System.out.println(" reading remaining ints");
++          }
++          return nextDocMaybeSkip();
++        }
++
++        // nocommit: why docBufferOffset to be 0?
+         if (docBufferUpto == blockSize) {
+           refillDocs();
+         }
+ 
+         if (DEBUG) {
+-          System.out.println("    accum=" + accum + " docDeltaBuffer[" + docBufferUpto + "]=" + docDeltaBuffer[docBufferUpto]);
++          System.out.println("    accum=" + accum + " docDeltaBuffer[" + docBufferUpto + "-"+docBufferOffset+"]=" + docDeltaBuffer[docBufferUpto - docBufferOffset]);
+         }
+-        accum += docDeltaBuffer[docBufferUpto];
+-        freq = freqBuffer[docBufferUpto];
++        accum += docDeltaBuffer[docBufferUpto - docBufferOffset];
++        freq = freqBuffer[docBufferUpto - docBufferOffset];
+         posPendingCount += freq;
+         docBufferUpto++;
+         docUpto++;
+@@ -1253,6 +1585,52 @@
+         }
+       }
+     }
++    public int nextDocMaybeSkip() throws IOException {
++      if (DEBUG) {
++        System.out.println("  FPR.nextDocMaybeSkip");
++      }
++      if (indexHasPayloads) {
++        payloadByteUpto += payloadLength;
++        payloadLength = 0;
++      }
++      while (true) {
++        if (DEBUG) {
++          System.out.println("    docUpto=" + docUpto + " (of df=" + docFreq + ") docBufferUpto=" + docBufferUpto+" docBufferOffset="+ docBufferOffset+ " maxBufferUpto="+ maxDocBufferUpto);
++        }
++        if (docUpto == docFreq) {
++          return doc = NO_MORE_DOCS;
++        }
++
++        if (docBufferUpto == maxDocBufferUpto) {
++          docBufferOffset = docBufferUpto % blockSize;
++          refillDocsMaybeSkip(docBufferOffset/skipInterval);
++        }
++
++        if (DEBUG) {
++          System.out.println("    accum=" + accum + " docDeltaBuffer[" + docBufferUpto + "-"+docBufferOffset+"]=" + docDeltaBuffer[docBufferUpto - docBufferOffset]);
++        }
++        accum += docDeltaBuffer[docBufferUpto - docBufferOffset];
++        freq = freqBuffer[docBufferUpto - docBufferOffset];
++        posPendingCount += freq;
++        docBufferUpto++;
++        docUpto++;
++
++        if (liveDocs == null || liveDocs.get(accum)) {
++          doc = accum;
++          if (DEBUG) {
++            System.out.println("    return doc=" + doc + " freq=" + freq + " posPendingCount=" + posPendingCount);
++          }
++          position = 0;
++          payloadLength = 0;
++          lastEndOffset = 0;
++          return doc;
++        }
++
++        if (DEBUG) {
++          System.out.println("    doc=" + accum + " is deleted; try next doc");
++        }
++      }
++    }
+     
+     @Override
+     public int advance(int target) throws IOException {
+@@ -1265,7 +1643,7 @@
+       // nocommit put cheating back!  does it help?
+       // nocommit use skipper!!!  it has next last doc id!!
+       //if (docFreq > blockSize && target - (blockSize - docBufferUpto) - 2*blockSize > accum) {
+-      if (docFreq > blockSize && target - accum > blockSize) {
++      if (docFreq > blockSize && target - accum > skipInterval && accum + skipInterval <= blockInts) {
+ 
+         if (DEBUG) {
+           System.out.println("    try skipper");
+@@ -1278,7 +1656,7 @@
+           }
+           skipper = new BlockSkipReader((IndexInput) docIn.clone(),
+                                         BlockPostingsWriter.maxSkipLevels,
+-                                        blockSize,
++                                        skipInterval,
+                                         true,
+                                         indexHasOffsets,
+                                         indexHasPayloads);
+@@ -1288,11 +1666,13 @@
+           assert skipOffset != -1;
+           // This is the first time this enum has skipped
+           // since reset() was called; load the skip data:
++
++          int fakedf = docFreq % blockSize == 0? docFreq : docFreq/blockSize*blockSize+skipInterval-1;
++          skipper.init(docTermStartFP+skipOffset, docTermStartFP, posTermStartFP, payTermStartFP, fakedf);
++          skipped = true;
+           if (DEBUG) {
+-            System.out.println("    init skipper");
++            System.out.println("    init skipper"+" skipFP="+(docTermStartFP+skipOffset)+" docBaseFP="+docTermStartFP+" posBaseFP="+posTermStartFP+" payBaseFP="+payTermStartFP+" df="+fakedf);
+           }
+-          skipper.init(docTermStartFP+skipOffset, docTermStartFP, posTermStartFP, payTermStartFP, docFreq);
+-          skipped = true;
+         }
+ 
+         final int newDocUpto = skipper.skipTo(target); 
+@@ -1304,11 +1684,14 @@
+             System.out.println("    skipper moved to docUpto=" + newDocUpto + " vs current=" + docUpto + "; docID=" + skipper.getDoc() + " fp=" + skipper.getDocPointer() + " pos.fp=" + skipper.getPosPointer() + " pos.bufferUpto=" + skipper.getPosBufferUpto() + " pay.fp=" + skipper.getPayPointer() + " lastEndOffset=" + lastEndOffset);
+           }
+ 
+-          assert newDocUpto % blockSize == (blockSize-1): "got " + newDocUpto;
++          assert newDocUpto % skipInterval == (skipInterval-1): "got " + newDocUpto;
+           docUpto = newDocUpto+1;
+ 
+-          // Force block read next:
+-          docBufferUpto = blockSize;
++          // nocommit: docBufferUpto have to be forced >0 here, is there a better way around?
++          int skipPerBlock = blockSize/skipInterval;
++          int slice = (docUpto % blockSize) / skipInterval;
++          docBufferUpto = blockSize - (skipPerBlock-slice)*skipInterval%blockSize;
++          maxDocBufferUpto = docBufferUpto;
+           accum = skipper.getDoc();
+           docIn.seek(skipper.getDocPointer());
+           posPendingFP = skipper.getPosPointer();
+@@ -1320,7 +1703,7 @@
+       }
+ 
+       // Now scan:
+-      while (nextDoc() != NO_MORE_DOCS) {
++      while (nextDocMaybeSkip() != NO_MORE_DOCS) {
+         if (doc >= target) {
+           if (DEBUG) {
+             System.out.println("  advance return doc=" + doc);
+Index: lucene/core/src/java/org/apache/lucene/codecs/pfor/gendecompress.py
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/pfor/gendecompress.py	(revision 1365112)
++++ lucene/core/src/java/org/apache/lucene/codecs/pfor/gendecompress.py	(working copy)
+@@ -82,11 +82,11 @@
+     w('  }\n')
+ 
+     for numFrameBits in xrange(1, 33):
+-      w('  public static void decode%d(final IntBuffer compressedBuffer, final int[] output) {\n' % numFrameBits)
++      w('  public static void decode%d(final IntBuffer compressedBuffer, final int[] output, int iteration) {\n' % numFrameBits)
+       w('    final int numFrameBits = %d;\n' % numFrameBits)
+       w('    final int mask = (int) ((1L<<numFrameBits) - 1);\n')
+       w('    int outputOffset = 0;\n')
+-      w('    for(int step=0;step<4;step++) {\n')
++      w('    for(int step=0;step<iteration;step++) {\n')
+ 
+       for i in range(numFrameBits): # declare int vars and init from buffer
+         w("      int intValue" + str(i) + " = compressedBuffer.get();\n")
+Index: lucene/core/src/java/org/apache/lucene/codecs/pfor/PackedIntsDecompress.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/pfor/PackedIntsDecompress.java	(revision 1365112)
++++ lucene/core/src/java/org/apache/lucene/codecs/pfor/PackedIntsDecompress.java	(working copy)
+@@ -30,11 +30,11 @@
+   public static void decode0(final IntBuffer compressedBuffer, final int[] output) {
+     Arrays.fill(output, compressedBuffer.get());
+   }
+-  public static void decode1(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode1(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 1;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       output[0 + outputOffset] = intValue0 & mask;
+       output[1 + outputOffset] = (intValue0 >>> 1) & mask;
+@@ -71,11 +71,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode2(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode2(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 2;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       output[0 + outputOffset] = intValue0 & mask;
+@@ -113,11 +113,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode3(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode3(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 3;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -156,11 +156,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode4(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode4(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 4;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -200,11 +200,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode5(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode5(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 5;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -245,11 +245,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode6(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode6(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 6;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -291,11 +291,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode7(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode7(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 7;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -338,11 +338,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode8(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode8(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 8;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -386,11 +386,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode9(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode9(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 9;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -435,11 +435,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode10(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode10(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 10;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -485,11 +485,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode11(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode11(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 11;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -536,11 +536,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode12(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode12(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 12;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -588,11 +588,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode13(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode13(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 13;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -641,11 +641,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode14(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode14(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 14;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -695,11 +695,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode15(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode15(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 15;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -750,11 +750,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode16(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode16(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 16;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -806,11 +806,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode17(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode17(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 17;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -863,11 +863,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode18(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode18(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 18;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -921,11 +921,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode19(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode19(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 19;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -980,11 +980,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode20(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode20(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 20;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -1040,11 +1040,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode21(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode21(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 21;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -1101,11 +1101,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode22(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode22(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 22;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -1163,11 +1163,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode23(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode23(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 23;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -1226,11 +1226,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode24(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode24(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 24;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -1290,11 +1290,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode25(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode25(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 25;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -1355,11 +1355,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode26(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode26(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 26;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -1421,11 +1421,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode27(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode27(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 27;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -1488,11 +1488,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode28(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode28(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 28;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -1556,11 +1556,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode29(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode29(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 29;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -1625,11 +1625,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode30(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode30(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 30;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -1695,11 +1695,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode31(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode31(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 31;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+@@ -1766,11 +1766,11 @@
+       outputOffset += 32;
+     }
+   }
+-  public static void decode32(final IntBuffer compressedBuffer, final int[] output) {
++  public static void decode32(final IntBuffer compressedBuffer, final int[] output, int iteration) {
+     final int numFrameBits = 32;
+     final int mask = (int) ((1L<<numFrameBits) - 1);
+     int outputOffset = 0;
+-    for(int step=0;step<4;step++) {
++    for(int step=0;step<iteration;step++) {
+       int intValue0 = compressedBuffer.get();
+       int intValue1 = compressedBuffer.get();
+       int intValue2 = compressedBuffer.get();
+Index: lucene/core/src/java/org/apache/lucene/codecs/pfor/ForUtil.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/pfor/ForUtil.java	(revision 1365112)
++++ lucene/core/src/java/org/apache/lucene/codecs/pfor/ForUtil.java	(working copy)
+@@ -79,50 +79,72 @@
+     decompressCore(intBuffer, data, numBits);
+   }
+ 
++  /** Decompress given Integer buffer into int array.
++   *
++   * @param intBuffer   integer buffer to hold compressed data
++   * @param data        int array to hold uncompressed data
++   * @param header      header for current block
++   * @param iteration   this method will decode iter*32 ints from compressed data.
++   */
++  public static void decompress(IntBuffer intBuffer, int[] data, int header, int iteration) {
++    // since this buffer is reused at upper level, rewind first
++    intBuffer.rewind();
++
++    int numBits = ((header >> 8) & MASK[6]);
++
++    decompressPart(intBuffer, data, numBits, iteration);
++  }
++
++
++
+   /**
+    * IntBuffer will not be rewinded in this method, therefore
+    * caller should ensure that the position is set to the first
+    * encoded int before decoding.
+    */
+   static void decompressCore(IntBuffer intBuffer, int[] data, int numBits) {
+-    assert numBits<=32;
++    assert numBits<=32 : numBits;
+     assert numBits>=0;
++    // 4*32=blockSize=128
++    decompressPart(intBuffer, data, numBits, 4);
++  }
+ 
++  static void decompressPart(IntBuffer intBuffer, int[] data, int numBits, int iteration) {
+     // TODO: PackedIntsDecompress is hardewired to size==128 only
+     switch(numBits) {
+       case 0: PackedIntsDecompress.decode0(intBuffer, data); break;
+-      case 1: PackedIntsDecompress.decode1(intBuffer, data); break;
+-      case 2: PackedIntsDecompress.decode2(intBuffer, data); break;
+-      case 3: PackedIntsDecompress.decode3(intBuffer, data); break;
+-      case 4: PackedIntsDecompress.decode4(intBuffer, data); break;
+-      case 5: PackedIntsDecompress.decode5(intBuffer, data); break;
+-      case 6: PackedIntsDecompress.decode6(intBuffer, data); break;
+-      case 7: PackedIntsDecompress.decode7(intBuffer, data); break;
+-      case 8: PackedIntsDecompress.decode8(intBuffer, data); break;
+-      case 9: PackedIntsDecompress.decode9(intBuffer, data); break;
+-      case 10: PackedIntsDecompress.decode10(intBuffer, data); break;
+-      case 11: PackedIntsDecompress.decode11(intBuffer, data); break;
+-      case 12: PackedIntsDecompress.decode12(intBuffer, data); break;
+-      case 13: PackedIntsDecompress.decode13(intBuffer, data); break;
+-      case 14: PackedIntsDecompress.decode14(intBuffer, data); break;
+-      case 15: PackedIntsDecompress.decode15(intBuffer, data); break;
+-      case 16: PackedIntsDecompress.decode16(intBuffer, data); break;
+-      case 17: PackedIntsDecompress.decode17(intBuffer, data); break;
+-      case 18: PackedIntsDecompress.decode18(intBuffer, data); break;
+-      case 19: PackedIntsDecompress.decode19(intBuffer, data); break;
+-      case 20: PackedIntsDecompress.decode20(intBuffer, data); break;
+-      case 21: PackedIntsDecompress.decode21(intBuffer, data); break;
+-      case 22: PackedIntsDecompress.decode22(intBuffer, data); break;
+-      case 23: PackedIntsDecompress.decode23(intBuffer, data); break;
+-      case 24: PackedIntsDecompress.decode24(intBuffer, data); break;
+-      case 25: PackedIntsDecompress.decode25(intBuffer, data); break;
+-      case 26: PackedIntsDecompress.decode26(intBuffer, data); break;
+-      case 27: PackedIntsDecompress.decode27(intBuffer, data); break;
+-      case 28: PackedIntsDecompress.decode28(intBuffer, data); break;
+-      case 29: PackedIntsDecompress.decode29(intBuffer, data); break;
+-      case 30: PackedIntsDecompress.decode30(intBuffer, data); break;
+-      case 31: PackedIntsDecompress.decode31(intBuffer, data); break;
+-      case 32: PackedIntsDecompress.decode32(intBuffer, data); break;
++      case 1: PackedIntsDecompress.decode1(intBuffer, data, iteration); break;
++      case 2: PackedIntsDecompress.decode2(intBuffer, data, iteration); break;
++      case 3: PackedIntsDecompress.decode3(intBuffer, data, iteration); break;
++      case 4: PackedIntsDecompress.decode4(intBuffer, data, iteration); break;
++      case 5: PackedIntsDecompress.decode5(intBuffer, data, iteration); break;
++      case 6: PackedIntsDecompress.decode6(intBuffer, data, iteration); break;
++      case 7: PackedIntsDecompress.decode7(intBuffer, data, iteration); break;
++      case 8: PackedIntsDecompress.decode8(intBuffer, data, iteration); break;
++      case 9: PackedIntsDecompress.decode9(intBuffer, data, iteration); break;
++      case 10: PackedIntsDecompress.decode10(intBuffer, data, iteration); break;
++      case 11: PackedIntsDecompress.decode11(intBuffer, data, iteration); break;
++      case 12: PackedIntsDecompress.decode12(intBuffer, data, iteration); break;
++      case 13: PackedIntsDecompress.decode13(intBuffer, data, iteration); break;
++      case 14: PackedIntsDecompress.decode14(intBuffer, data, iteration); break;
++      case 15: PackedIntsDecompress.decode15(intBuffer, data, iteration); break;
++      case 16: PackedIntsDecompress.decode16(intBuffer, data, iteration); break;
++      case 17: PackedIntsDecompress.decode17(intBuffer, data, iteration); break;
++      case 18: PackedIntsDecompress.decode18(intBuffer, data, iteration); break;
++      case 19: PackedIntsDecompress.decode19(intBuffer, data, iteration); break;
++      case 20: PackedIntsDecompress.decode20(intBuffer, data, iteration); break;
++      case 21: PackedIntsDecompress.decode21(intBuffer, data, iteration); break;
++      case 22: PackedIntsDecompress.decode22(intBuffer, data, iteration); break;
++      case 23: PackedIntsDecompress.decode23(intBuffer, data, iteration); break;
++      case 24: PackedIntsDecompress.decode24(intBuffer, data, iteration); break;
++      case 25: PackedIntsDecompress.decode25(intBuffer, data, iteration); break;
++      case 26: PackedIntsDecompress.decode26(intBuffer, data, iteration); break;
++      case 27: PackedIntsDecompress.decode27(intBuffer, data, iteration); break;
++      case 28: PackedIntsDecompress.decode28(intBuffer, data, iteration); break;
++      case 29: PackedIntsDecompress.decode29(intBuffer, data, iteration); break;
++      case 30: PackedIntsDecompress.decode30(intBuffer, data, iteration); break;
++      case 31: PackedIntsDecompress.decode31(intBuffer, data, iteration); break;
++      case 32: PackedIntsDecompress.decode32(intBuffer, data, iteration); break;
+     }
+   }
+ 

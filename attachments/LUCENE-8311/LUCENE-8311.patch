@@ -1,0 +1,848 @@
+diff --git a/lucene/core/src/java/org/apache/lucene/search/ExactPhraseMatcher.java b/lucene/core/src/java/org/apache/lucene/search/ExactPhraseMatcher.java
+index b95077d..e4e509a 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/ExactPhraseMatcher.java
++++ b/lucene/core/src/java/org/apache/lucene/search/ExactPhraseMatcher.java
+@@ -19,9 +19,21 @@ package org.apache.lucene.search;
+ 
+ import java.io.IOException;
+ import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.Iterator;
+ import java.util.List;
++import java.util.SortedMap;
++import java.util.TreeMap;
++import java.util.stream.Collectors;
+ 
++import org.apache.lucene.index.Impact;
++import org.apache.lucene.index.Impacts;
++import org.apache.lucene.index.ImpactsEnum;
++import org.apache.lucene.index.ImpactsSource;
+ import org.apache.lucene.index.PostingsEnum;
++import org.apache.lucene.search.similarities.Similarity.SimScorer;
++import org.apache.lucene.util.PriorityQueue;
+ 
+ final class ExactPhraseMatcher extends PhraseMatcher {
+ 
+@@ -37,9 +49,21 @@ final class ExactPhraseMatcher extends PhraseMatcher {
+   }
+ 
+   private final PostingsAndPosition[] postings;
++  private final DocIdSetIterator approximation;
++  private final ImpactsDISI impactsApproximation;
+ 
+-  ExactPhraseMatcher(PhraseQuery.PostingsAndFreq[] postings, float matchCost) {
+-    super(approximation(postings), matchCost);
++  ExactPhraseMatcher(PhraseQuery.PostingsAndFreq[] postings, ScoreMode scoreMode, SimScorer scorer, float matchCost) {
++    super(matchCost);
++
++    final DocIdSetIterator approximation = ConjunctionDISI.intersectIterators(Arrays.stream(postings).map(p -> p.postings).collect(Collectors.toList()));
++    final ImpactsSource impactsSource = mergeImpacts(Arrays.stream(postings).map(p -> p.impacts).toArray(ImpactsEnum[]::new));
++
++    if (scoreMode == ScoreMode.TOP_SCORES) {
++      this.approximation = this.impactsApproximation = new ImpactsDISI(approximation, impactsSource, scorer);
++    } else {
++      this.approximation = approximation;
++      this.impactsApproximation = new ImpactsDISI(approximation, impactsSource, scorer);
++    }
+ 
+     List<PostingsAndPosition> postingsAndPositions = new ArrayList<>();
+     for(PhraseQuery.PostingsAndFreq posting : postings) {
+@@ -48,12 +72,14 @@ final class ExactPhraseMatcher extends PhraseMatcher {
+     this.postings = postingsAndPositions.toArray(new PostingsAndPosition[postingsAndPositions.size()]);
+   }
+ 
+-  private static DocIdSetIterator approximation(PhraseQuery.PostingsAndFreq[] postings) {
+-    List<DocIdSetIterator> iterators = new ArrayList<>();
+-    for (PhraseQuery.PostingsAndFreq posting : postings) {
+-      iterators.add(posting.postings);
+-    }
+-    return ConjunctionDISI.intersectIterators(iterators);
++  @Override
++  DocIdSetIterator approximation() {
++    return approximation;
++  }
++
++  @Override
++  ImpactsDISI impactsApproximation() {
++    return impactsApproximation;
+   }
+ 
+   @Override
+@@ -149,4 +175,177 @@ final class ExactPhraseMatcher extends PhraseMatcher {
+     return postings[postings.length - 1].postings.endOffset();
+   }
+ 
++  /**
++   * Merge impacts for multiple terms of an exact phrase.
++   */
++  static ImpactsSource mergeImpacts(ImpactsEnum[] impactsEnums) {
++    // Iteration of block boundaries uses the impacts enum with the lower cost.
++    // This is consistent with BlockMaxConjunctionScorer.
++    int tmpLeadIndex = -1;
++    for (int i = 0; i < impactsEnums.length; ++i) {
++      if (tmpLeadIndex == -1 || impactsEnums[i].cost() < impactsEnums[tmpLeadIndex].cost()) {
++        tmpLeadIndex = i;
++      }
++    }
++    final int leadIndex = tmpLeadIndex;
++
++    return new ImpactsSource() {
++
++      class SubIterator {
++        final Iterator<Impact> iterator;
++        int previousFreq;
++        Impact current;
++
++        SubIterator(Iterator<Impact> iterator) {
++          this.iterator = iterator;
++          this.current = iterator.next();
++        }
++
++        void next() {
++          previousFreq = current.freq;
++          if (iterator.hasNext() == false) {
++            current = null;
++          } else {
++            current = iterator.next();
++          }
++        }
++
++      }
++
++      @Override
++      public Impacts getImpacts() throws IOException {
++        final Impacts[] impacts = new Impacts[impactsEnums.length];
++        for (int i = 0; i < impactsEnums.length; ++i) {
++          impacts[i] = impactsEnums[i].getImpacts();
++        }
++        final Impacts lead = impacts[leadIndex];
++        return new Impacts() {
++
++          @Override
++          public int numLevels() {
++            // Delegate to the lead
++            return lead.numLevels();
++          }
++
++          @Override
++          public int getDocIdUpTo(int level) {
++            // Delegate to the lead
++            return lead.getDocIdUpTo(level);
++          }
++
++          /**
++           * Return the minimum level whose impacts are valid up to {@code docIdUpTo},
++           * or {@code -1} if there is no such level.
++           */
++          private int getLevel(Impacts impacts, int docIdUpTo) {
++            for (int level = 0, numLevels = impacts.numLevels(); level < numLevels; ++level) {
++              if (impacts.getDocIdUpTo(level) >= docIdUpTo) {
++                return level;
++              }
++            }
++            return -1;
++          }
++
++          @Override
++          public List<Impact> getImpacts(int level) {
++            final int docIdUpTo = getDocIdUpTo(level);
++
++            List<List<Impact>> toMerge = new ArrayList<>();
++
++            for (int i = 0; i < impactsEnums.length; ++i) {
++              int impactsLevel = getLevel(impacts[i], docIdUpTo);
++              if (impactsLevel == -1) {
++                // One instance doesn't have impacts that cover up to docIdUpTo
++                // Use impacts that trigger the maximum score.
++                toMerge.add(Collections.singletonList(new Impact(Integer.MAX_VALUE, 1L)));
++              } else {
++                toMerge.add(impacts[i].getImpacts(impactsLevel));
++              }
++            }
++
++            PriorityQueue<SubIterator> pq = new PriorityQueue<SubIterator>(impacts.length) {
++              @Override
++              protected boolean lessThan(SubIterator a, SubIterator b) {
++                if (a.current == null) { // means iteration is finished
++                  return false;
++                }
++                if (b.current == null) {
++                  return true;
++                }
++                return Long.compareUnsigned(a.current.norm, b.current.norm) < 0;
++              }
++            };
++            for (List<Impact> impacts : toMerge) {
++              pq.add(new SubIterator(impacts.iterator()));
++            }
++
++            List<Impact> mergedImpacts = new ArrayList<>();
++
++            // Idea: merge impacts by norm. The tricky thing is that we need to
++            // consider norm values that are not in the impacts too. For
++            // instance if the list of impacts is [{freq=2,norm=10}, {freq=4,norm=12}],
++            // there might well be a document that has a freq of 2 and a length of 11,
++            // which was just not added to the list of impacts because {freq=2,norm=10}
++            // is more competitive. So the way it works is that we track current term
++            // freqs in a sorted multi-set and use the minimum freq for the merged impacts.
++
++            final SortedMultiSet<Integer> freqs = new SortedMultiSet<>();
++            SubIterator top = pq.top();
++            do {
++              final long norm = top.current.norm;
++              do {
++                freqs.remove(top.previousFreq);
++                freqs.add(top.current.freq);
++                top.next();
++                top = pq.updateTop();
++              } while (top.current != null && top.current.norm == norm);
++
++              int minFreq = freqs.firstKey();
++              assert minFreq >= 1;
++
++              if (mergedImpacts.isEmpty()) {
++                mergedImpacts.add(new Impact(minFreq, norm));
++              } else {
++                Impact prevImpact = mergedImpacts.get(mergedImpacts.size() - 1);
++                assert Long.compareUnsigned(prevImpact.norm, norm) < 0;
++                if (minFreq > prevImpact.freq) {
++                  mergedImpacts.add(new Impact(minFreq, norm));
++                } // otherwise the previous impact is already more competitive
++              }
++            } while (top.current != null);
++
++            return mergedImpacts;
++          }
++        };
++      }
++
++      @Override
++      public void advanceShallow(int target) throws IOException {
++        for (ImpactsEnum impactsEnum : impactsEnums) {
++          impactsEnum.advanceShallow(target);
++        }
++      }
++    };
++  }
++
++  private static class SortedMultiSet<T> {
++
++    private final SortedMap<T, Integer> map;
++
++    SortedMultiSet() {
++      map = new TreeMap<>();
++    }
++
++    T firstKey() {
++      return map.firstKey();
++    }
++
++    void add(T element) {
++      map.compute(element, (v, c) -> c == null ? 1 : c + 1);
++    }
++
++    void remove(T element) {
++      map.computeIfPresent(element, (v, c) -> c.intValue() == 1 ? null : c - 1);
++    }
++  }
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/search/MultiPhraseQuery.java b/lucene/core/src/java/org/apache/lucene/search/MultiPhraseQuery.java
+index 22b7127..3cf8de2 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/MultiPhraseQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/MultiPhraseQuery.java
+@@ -33,12 +33,14 @@ import org.apache.lucene.index.IndexReaderContext;
+ import org.apache.lucene.index.LeafReader;
+ import org.apache.lucene.index.LeafReaderContext;
+ import org.apache.lucene.index.PostingsEnum;
++import org.apache.lucene.index.SlowImpactsEnum;
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.index.TermState;
+ import org.apache.lucene.index.TermStates;
+ import org.apache.lucene.index.Terms;
+ import org.apache.lucene.index.TermsEnum;
+ import org.apache.lucene.search.similarities.Similarity;
++import org.apache.lucene.search.similarities.Similarity.SimScorer;
+ import org.apache.lucene.util.ArrayUtil;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.PriorityQueue;
+@@ -240,7 +242,7 @@ public class MultiPhraseQuery extends Query {
+       }
+ 
+       @Override
+-      protected PhraseMatcher getPhraseMatcher(LeafReaderContext context, boolean exposeOffsets) throws IOException {
++      protected PhraseMatcher getPhraseMatcher(LeafReaderContext context, SimScorer scorer, boolean exposeOffsets) throws IOException {
+         assert termArrays.length != 0;
+         final LeafReader reader = context.reader();
+ 
+@@ -285,16 +287,16 @@ public class MultiPhraseQuery extends Query {
+             postingsEnum = exposeOffsets ? new UnionFullPostingsEnum(postings) : new UnionPostingsEnum(postings);
+           }
+ 
+-          postingsFreqs[pos] = new PhraseQuery.PostingsAndFreq(postingsEnum, positions[pos], terms);
++          postingsFreqs[pos] = new PhraseQuery.PostingsAndFreq(postingsEnum, new SlowImpactsEnum(postingsEnum), positions[pos], terms);
+         }
+ 
+         // sort by increasing docFreq order
+         if (slop == 0) {
+           ArrayUtil.timSort(postingsFreqs);
+-          return new ExactPhraseMatcher(postingsFreqs, totalMatchCost);
++          return new ExactPhraseMatcher(postingsFreqs, scoreMode, scorer, totalMatchCost);
+         }
+         else {
+-          return new SloppyPhraseMatcher(postingsFreqs, slop, totalMatchCost);
++          return new SloppyPhraseMatcher(postingsFreqs, slop, scoreMode, scorer, totalMatchCost);
+         }
+ 
+       }
+diff --git a/lucene/core/src/java/org/apache/lucene/search/PhraseMatcher.java b/lucene/core/src/java/org/apache/lucene/search/PhraseMatcher.java
+index 81040d5..935695a 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/PhraseMatcher.java
++++ b/lucene/core/src/java/org/apache/lucene/search/PhraseMatcher.java
+@@ -28,16 +28,23 @@ import java.io.IOException;
+  */
+ abstract class PhraseMatcher {
+ 
+-  protected final DocIdSetIterator approximation;
+   private final float matchCost;
+ 
+-  PhraseMatcher(DocIdSetIterator approximation, float matchCost) {
+-    assert TwoPhaseIterator.unwrap(approximation) == null;
+-    this.approximation = approximation;
++  PhraseMatcher(float matchCost) {
+     this.matchCost = matchCost;
+   }
+ 
+   /**
++   * Approximation that only matches documents that have all terms.
++   */
++  abstract DocIdSetIterator approximation();
++
++  /**
++   * Approximation that is aware of impacts.
++   */
++  abstract ImpactsDISI impactsApproximation();
++
++  /**
+    * An upper bound on the number of possible matches on this document
+    */
+   abstract float maxFreq() throws IOException;
+diff --git a/lucene/core/src/java/org/apache/lucene/search/PhraseQuery.java b/lucene/core/src/java/org/apache/lucene/search/PhraseQuery.java
+index 16642e5..1c3010c 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/PhraseQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/PhraseQuery.java
+@@ -26,17 +26,20 @@ import java.util.Set;
+ 
+ import org.apache.lucene.codecs.lucene50.Lucene50PostingsFormat;
+ import org.apache.lucene.codecs.lucene50.Lucene50PostingsReader;
++import org.apache.lucene.index.ImpactsEnum;
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.IndexReaderContext;
+ import org.apache.lucene.index.LeafReader;
+ import org.apache.lucene.index.LeafReaderContext;
+ import org.apache.lucene.index.PostingsEnum;
++import org.apache.lucene.index.SlowImpactsEnum;
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.index.TermState;
+ import org.apache.lucene.index.TermStates;
+ import org.apache.lucene.index.Terms;
+ import org.apache.lucene.index.TermsEnum;
+ import org.apache.lucene.search.similarities.Similarity;
++import org.apache.lucene.search.similarities.Similarity.SimScorer;
+ import org.apache.lucene.util.ArrayUtil;
+ import org.apache.lucene.util.BytesRef;
+ 
+@@ -286,12 +289,14 @@ public class PhraseQuery extends Query {
+ 
+   static class PostingsAndFreq implements Comparable<PostingsAndFreq> {
+     final PostingsEnum postings;
++    final ImpactsEnum impacts;
+     final int position;
+     final Term[] terms;
+     final int nTerms; // for faster comparisons
+ 
+-    public PostingsAndFreq(PostingsEnum postings, int position, Term... terms) {
++    public PostingsAndFreq(PostingsEnum postings, ImpactsEnum impacts, int position, Term... terms) {
+       this.postings = postings;
++      this.impacts = impacts;
+       this.position = position;
+       nTerms = terms==null ? 0 : terms.length;
+       if (nTerms>0) {
+@@ -420,7 +425,7 @@ public class PhraseQuery extends Query {
+       }
+ 
+       @Override
+-      protected PhraseMatcher getPhraseMatcher(LeafReaderContext context, boolean exposeOffsets) throws IOException {
++      protected PhraseMatcher getPhraseMatcher(LeafReaderContext context, SimScorer scorer, boolean exposeOffsets) throws IOException {
+         assert terms.length > 0;
+         final LeafReader reader = context.reader();
+         PostingsAndFreq[] postingsFreqs = new PostingsAndFreq[terms.length];
+@@ -446,18 +451,25 @@ public class PhraseQuery extends Query {
+             return null;
+           }
+           te.seekExact(t.bytes(), state);
+-          PostingsEnum postingsEnum = te.postings(null, exposeOffsets ? PostingsEnum.OFFSETS : PostingsEnum.POSITIONS);
+-          postingsFreqs[i] = new PostingsAndFreq(postingsEnum, positions[i], t);
++          PostingsEnum postingsEnum;
++          ImpactsEnum impactsEnum;
++          if (scoreMode == ScoreMode.TOP_SCORES) {
++            postingsEnum = impactsEnum = te.impacts(exposeOffsets ? PostingsEnum.OFFSETS : PostingsEnum.POSITIONS);
++          } else {
++            postingsEnum = te.postings(null, exposeOffsets ? PostingsEnum.OFFSETS : PostingsEnum.POSITIONS);
++            impactsEnum = new SlowImpactsEnum(postingsEnum);
++          }
++          postingsFreqs[i] = new PostingsAndFreq(postingsEnum, impactsEnum, positions[i], t);
+           totalMatchCost += termPositionsCost(te);
+         }
+ 
+         // sort by increasing docFreq order
+         if (slop == 0) {
+           ArrayUtil.timSort(postingsFreqs);
+-          return new ExactPhraseMatcher(postingsFreqs, totalMatchCost);
++          return new ExactPhraseMatcher(postingsFreqs, scoreMode, scorer, totalMatchCost);
+         }
+         else {
+-          return new SloppyPhraseMatcher(postingsFreqs, slop, totalMatchCost);
++          return new SloppyPhraseMatcher(postingsFreqs, slop, scoreMode, scorer, totalMatchCost);
+         }
+       }
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/search/PhraseScorer.java b/lucene/core/src/java/org/apache/lucene/search/PhraseScorer.java
+index 807a9dd..2bcf737 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/PhraseScorer.java
++++ b/lucene/core/src/java/org/apache/lucene/search/PhraseScorer.java
+@@ -21,6 +21,8 @@ import java.io.IOException;
+ 
+ class PhraseScorer extends Scorer {
+ 
++  final DocIdSetIterator approximation;
++  final ImpactsDISI impactsApproximation;
+   final PhraseMatcher matcher;
+   final ScoreMode scoreMode;
+   private final LeafSimScorer simScorer;
+@@ -35,11 +37,13 @@ class PhraseScorer extends Scorer {
+     this.scoreMode = scoreMode;
+     this.simScorer = simScorer;
+     this.matchCost = matcher.getMatchCost();
++    this.approximation = matcher.approximation();
++    this.impactsApproximation = matcher.impactsApproximation();
+   }
+ 
+   @Override
+   public TwoPhaseIterator twoPhaseIterator() {
+-    return new TwoPhaseIterator(matcher.approximation) {
++    return new TwoPhaseIterator(approximation) {
+       @Override
+       public boolean matches() throws IOException {
+         matcher.reset();
+@@ -63,7 +67,7 @@ class PhraseScorer extends Scorer {
+ 
+   @Override
+   public int docID() {
+-    return matcher.approximation.docID();
++    return approximation.docID();
+   }
+ 
+   @Override
+@@ -85,12 +89,17 @@ class PhraseScorer extends Scorer {
+   @Override
+   public void setMinCompetitiveScore(float minScore) {
+     this.minCompetitiveScore = minScore;
++    impactsApproximation.setMinCompetitiveScore(minScore);
++  }
++
++  @Override
++  public int advanceShallow(int target) throws IOException {
++    return impactsApproximation.advanceShallow(target);
+   }
+ 
+   @Override
+   public float getMaxScore(int upTo) throws IOException {
+-    // TODO: merge impacts of all clauses to get better score upper bounds
+-    return simScorer.getSimScorer().score(Integer.MAX_VALUE, 1L);
++    return impactsApproximation.getMaxScore(upTo);
+   }
+ 
+   @Override
+@@ -98,5 +107,4 @@ class PhraseScorer extends Scorer {
+     return "PhraseScorer(" + weight + ")";
+   }
+ 
+-
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/search/PhraseWeight.java b/lucene/core/src/java/org/apache/lucene/search/PhraseWeight.java
+index 90fa537..3ddd727 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/PhraseWeight.java
++++ b/lucene/core/src/java/org/apache/lucene/search/PhraseWeight.java
+@@ -49,11 +49,11 @@ abstract class PhraseWeight extends Weight {
+ 
+   protected abstract Similarity.SimScorer getStats(IndexSearcher searcher) throws IOException;
+ 
+-  protected abstract PhraseMatcher getPhraseMatcher(LeafReaderContext context, boolean exposeOffsets) throws IOException;
++  protected abstract PhraseMatcher getPhraseMatcher(LeafReaderContext context, SimScorer scorer, boolean exposeOffsets) throws IOException;
+ 
+   @Override
+   public Scorer scorer(LeafReaderContext context) throws IOException {
+-    PhraseMatcher matcher = getPhraseMatcher(context, false);
++    PhraseMatcher matcher = getPhraseMatcher(context, stats, false);
+     if (matcher == null)
+       return null;
+     LeafSimScorer simScorer = new LeafSimScorer(stats, context.reader(), field, scoreMode.needsScores());
+@@ -62,8 +62,8 @@ abstract class PhraseWeight extends Weight {
+ 
+   @Override
+   public Explanation explain(LeafReaderContext context, int doc) throws IOException {
+-    PhraseMatcher matcher = getPhraseMatcher(context, false);
+-    if (matcher == null || matcher.approximation.advance(doc) != doc) {
++    PhraseMatcher matcher = getPhraseMatcher(context, stats, false);
++    if (matcher == null || matcher.approximation().advance(doc) != doc) {
+       return Explanation.noMatch("no matching terms");
+     }
+     matcher.reset();
+@@ -86,8 +86,8 @@ abstract class PhraseWeight extends Weight {
+   @Override
+   public Matches matches(LeafReaderContext context, int doc) throws IOException {
+     return Matches.forField(field, () -> {
+-      PhraseMatcher matcher = getPhraseMatcher(context, true);
+-      if (matcher == null || matcher.approximation.advance(doc) != doc) {
++      PhraseMatcher matcher = getPhraseMatcher(context, stats, true);
++      if (matcher == null || matcher.approximation().advance(doc) != doc) {
+         return null;
+       }
+       matcher.reset();
+diff --git a/lucene/core/src/java/org/apache/lucene/search/SloppyPhraseMatcher.java b/lucene/core/src/java/org/apache/lucene/search/SloppyPhraseMatcher.java
+index 85d4473..50028eb 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/SloppyPhraseMatcher.java
++++ b/lucene/core/src/java/org/apache/lucene/search/SloppyPhraseMatcher.java
+@@ -20,13 +20,19 @@ package org.apache.lucene.search;
+ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.Collections;
+ import java.util.Comparator;
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.stream.Collectors;
+ 
++import org.apache.lucene.index.Impact;
++import org.apache.lucene.index.Impacts;
++import org.apache.lucene.index.ImpactsSource;
+ import org.apache.lucene.index.Term;
++import org.apache.lucene.search.similarities.Similarity.SimScorer;
+ import org.apache.lucene.util.FixedBitSet;
+ 
+ /**
+@@ -55,6 +61,9 @@ final class SloppyPhraseMatcher extends PhraseMatcher {
+   private final int numPostings;
+   private final PhraseQueue pq; // for advancing min position
+ 
++  private final DocIdSetIterator approximation;
++  private final ImpactsDISI impactsApproximation;
++
+   private int end; // current largest phrase position
+ 
+   private int leadPosition;
+@@ -71,8 +80,8 @@ final class SloppyPhraseMatcher extends PhraseMatcher {
+   private boolean positioned;
+   private int matchLength;
+ 
+-  SloppyPhraseMatcher(PhraseQuery.PostingsAndFreq[] postings, int slop, float matchCost) {
+-    super(approximation(postings), matchCost);
++  SloppyPhraseMatcher(PhraseQuery.PostingsAndFreq[] postings, int slop, ScoreMode scoreMode, SimScorer scorer, float matchCost) {
++    super(matchCost);
+     this.slop = slop;
+     this.numPostings = postings.length;
+     pq = new PhraseQueue(postings.length);
+@@ -80,14 +89,49 @@ final class SloppyPhraseMatcher extends PhraseMatcher {
+     for (int i = 0; i < postings.length; ++i) {
+       phrasePositions[i] = new PhrasePositions(postings[i].postings, postings[i].position, i, postings[i].terms);
+     }
++
++    approximation = ConjunctionDISI.intersectIterators(Arrays.stream(postings).map(p -> p.postings).collect(Collectors.toList()));
++    // What would be a good upper bound of the sloppy frequency? A sum of the
++    // sub frequencies would be correct, but it is usually so much higher than
++    // the actual sloppy frequency that it doesn't help skip irrelevant
++    // documents. As a consequence for now, sloppy phrase queries use dummy
++    // impacts:
++    final ImpactsSource impactsSource = new ImpactsSource() {
++      @Override
++      public Impacts getImpacts() throws IOException {
++        return new Impacts() {
++
++          @Override
++          public int numLevels() {
++            return 1;
++          }
++
++          @Override
++          public List<Impact> getImpacts(int level) {
++            return Collections.singletonList(new Impact(Integer.MAX_VALUE, 1L));
++          }
++
++          @Override
++          public int getDocIdUpTo(int level) {
++            return DocIdSetIterator.NO_MORE_DOCS;
++          }
++        };
++      }
++
++      @Override
++      public void advanceShallow(int target) throws IOException {}
++    };
++    impactsApproximation = new ImpactsDISI(approximation, impactsSource, scorer);
+   }
+ 
+-  private static DocIdSetIterator approximation(PhraseQuery.PostingsAndFreq[] postings) {
+-    List<DocIdSetIterator> iterators = new ArrayList<>();
+-    for (PhraseQuery.PostingsAndFreq posting : postings) {
+-      iterators.add(posting.postings);
+-    }
+-    return ConjunctionDISI.intersectIterators(iterators);
++  @Override
++  DocIdSetIterator approximation() {
++    return approximation;
++  }
++
++  @Override
++  ImpactsDISI impactsApproximation() {
++    return impactsApproximation;
+   }
+ 
+   @Override
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestPhraseQuery.java b/lucene/core/src/test/org/apache/lucene/search/TestPhraseQuery.java
+index eb31128..b6adb49 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestPhraseQuery.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestPhraseQuery.java
+@@ -23,6 +23,8 @@ import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.List;
+ import java.util.Random;
++import java.util.stream.Collectors;
++import java.util.stream.IntStream;
+ 
+ import org.apache.lucene.analysis.Analyzer;
+ import org.apache.lucene.analysis.CannedTokenStream;
+@@ -37,14 +39,20 @@ import org.apache.lucene.document.Field;
+ import org.apache.lucene.document.TextField;
+ import org.apache.lucene.document.Field.Store;
+ import org.apache.lucene.index.DirectoryReader;
++import org.apache.lucene.index.Impact;
++import org.apache.lucene.index.Impacts;
++import org.apache.lucene.index.ImpactsEnum;
++import org.apache.lucene.index.ImpactsSource;
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.IndexWriter;
+ import org.apache.lucene.index.IndexWriterConfig.OpenMode;
+ import org.apache.lucene.index.RandomIndexWriter;
+ import org.apache.lucene.index.Term;
++import org.apache.lucene.search.BooleanClause.Occur;
+ import org.apache.lucene.search.similarities.BM25Similarity;
+ import org.apache.lucene.search.similarities.ClassicSimilarity;
+ import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.LuceneTestCase;
+ import org.apache.lucene.util.TestUtil;
+ import org.junit.AfterClass;
+@@ -760,4 +768,200 @@ public class TestPhraseQuery extends LuceneTestCase {
+     r.close();
+     dir.close();
+   }
++
++  public void testMergeImpacts() throws IOException {
++    DummyImpactsEnum impacts1 = new DummyImpactsEnum(1000);
++    impacts1.reset(
++        new Impact[][] {
++          new Impact[] { new Impact(3, 10), new Impact(5, 12), new Impact(8, 13) },
++          new Impact[] { new Impact(3, 10), new Impact(5, 11), new Impact(8, 13),  new Impact(12, 14) }
++        },
++        new int[] {
++            110,
++            945
++        });
++    DummyImpactsEnum impacts2 = new DummyImpactsEnum(2000);
++    impacts2.reset(
++        new Impact[][] {
++          new Impact[] { new Impact(2, 10), new Impact(6, 13) },
++          new Impact[] { new Impact(3, 9), new Impact(5, 11), new Impact(7, 13) }
++        },
++        new int[] {
++            90,
++            1000
++        });
++
++    ImpactsSource mergedImpacts = ExactPhraseMatcher.mergeImpacts(new ImpactsEnum[] { impacts1, impacts2 });
++    assertEquals(
++        new Impact[][] {
++          new Impact[] { new Impact(3, 9), new Impact(5, 12), new Impact(7, 13) },
++          new Impact[] { new Impact(3, 9), new Impact(5, 11), new Impact(7, 13) }
++        },
++        new int[] {
++            110,
++            945
++        },
++        mergedImpacts.getImpacts());
++
++    impacts2.reset(
++        new Impact[][] {
++          new Impact[] { new Impact(2, 10), new Impact(6, 11) },
++          new Impact[] { new Impact(3, 9), new Impact(5, 11), new Impact(7, 13) }
++        },
++        new int[] {
++            150,
++            900
++        });
++    assertEquals(
++        new Impact[][] {
++          new Impact[] { new Impact(2, 10), new Impact(3, 11), new Impact(5, 12), new Impact(6, 13) },
++          new Impact[] { new Impact(Integer.MAX_VALUE, 1L) }
++        },
++        new int[] {
++            110,
++            945
++        },
++        mergedImpacts.getImpacts());
++  }
++
++  private static void assertEquals(Impact[][] impacts, int[] docIdUpTo, Impacts actual) {
++    assertEquals(impacts.length, actual.numLevels());
++    for (int i = 0; i < impacts.length; ++i) {
++      assertEquals(docIdUpTo[i], actual.getDocIdUpTo(i));
++      assertEquals(Arrays.asList(impacts[i]), actual.getImpacts(i));
++    }
++  }
++
++  private static class DummyImpactsEnum extends ImpactsEnum {
++
++    private final long cost;
++    private Impact[][] impacts;
++    private int[] docIdUpTo;
++
++    DummyImpactsEnum(long cost) {
++      this.cost = cost;
++    }
++
++    void reset(Impact[][] impacts, int[] docIdUpTo) {
++      this.impacts = impacts;
++      this.docIdUpTo = docIdUpTo;
++    }
++
++    @Override
++    public void advanceShallow(int target) throws IOException {
++      throw new UnsupportedOperationException();
++    }
++
++    @Override
++    public Impacts getImpacts() throws IOException {
++      return new Impacts() {
++
++        @Override
++        public int numLevels() {
++          return impacts.length;
++        }
++
++        @Override
++        public int getDocIdUpTo(int level) {
++          return docIdUpTo[level];
++        }
++
++        @Override
++        public List<Impact> getImpacts(int level) {
++          return Arrays.asList(impacts[level]);
++        }
++
++      };
++    }
++
++    @Override
++    public int freq() throws IOException {
++      throw new UnsupportedOperationException();
++    }
++
++    @Override
++    public int nextPosition() throws IOException {
++      throw new UnsupportedOperationException();
++    }
++
++    @Override
++    public int startOffset() throws IOException {
++      throw new UnsupportedOperationException();
++    }
++
++    @Override
++    public int endOffset() throws IOException {
++      throw new UnsupportedOperationException();
++    }
++
++    @Override
++    public BytesRef getPayload() throws IOException {
++      throw new UnsupportedOperationException();
++    }
++
++    @Override
++    public int docID() {
++      throw new UnsupportedOperationException();
++    }
++
++    @Override
++    public int nextDoc() throws IOException {
++      throw new UnsupportedOperationException();
++    }
++
++    @Override
++    public int advance(int target) throws IOException {
++      throw new UnsupportedOperationException();
++    }
++
++    @Override
++    public long cost() {
++      return cost;
++    }
++
++  }
++
++  public void testRandomTopDocs() throws IOException {
++    Directory dir = newDirectory();
++    IndexWriter w = new IndexWriter(dir, newIndexWriterConfig());
++    int numDocs = atLeast(128 * 8 * 8 * 3); // make sure some terms have skip data
++    for (int i = 0; i < numDocs; ++i) {
++      Document doc = new Document();
++      int numTerms = random().nextInt(1 << random().nextInt(5));
++      String text = IntStream.range(0, numTerms)
++          .mapToObj(index -> random().nextBoolean() ? "a" : random().nextBoolean() ? "b" : "c")
++          .collect(Collectors.joining(" "));
++      doc.add(new TextField("foo", text, Store.NO));
++      w.addDocument(doc);
++    }
++    IndexReader reader = DirectoryReader.open(w);
++    w.close();
++    IndexSearcher searcher = newSearcher(reader);
++
++    for (String firstTerm : new String[] {"a", "b", "c"}) {
++      for (String secondTerm : new String[] {"a", "b", "c"}) {
++        Query query = new PhraseQuery("foo", new BytesRef(firstTerm), new BytesRef(secondTerm));
++
++        TopScoreDocCollector collector1 = TopScoreDocCollector.create(10, null, true); // COMPLETE
++        TopScoreDocCollector collector2 = TopScoreDocCollector.create(10, null, false); // TOP_SCORES
++
++        searcher.search(query, collector1);
++        searcher.search(query, collector2);
++        CheckHits.checkEqual(query, collector1.topDocs().scoreDocs, collector2.topDocs().scoreDocs);
++
++        Query filteredQuery = new BooleanQuery.Builder()
++            .add(query, Occur.MUST)
++            .add(new TermQuery(new Term("foo", "b")), Occur.FILTER)
++            .build();
++
++        collector1 = TopScoreDocCollector.create(10, null, true); // COMPLETE
++        collector2 = TopScoreDocCollector.create(10, null, false); // TOP_SCORES
++        searcher.search(filteredQuery, collector1);
++        searcher.search(filteredQuery, collector2);
++        CheckHits.checkEqual(query, collector1.topDocs().scoreDocs, collector2.topDocs().scoreDocs);
++      }
++    }
++    reader.close();
++    dir.close();
++  }
+ }

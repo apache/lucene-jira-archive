@@ -1,0 +1,3380 @@
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index e6125cec33..8c1aad2ca5 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -123,6 +123,14 @@ Changes in Runtime Behavior:
+ * LUCENE-7976: TieredMergePolicy now respects maxSegmentSizeMB by default when executing
+   findForcedMerges and findForcedDeletesMerges (Erick Erickson)
+ 
++API Changes
++
++* LUCENE-8364: Refactor and clean up core geo api
++
++  Create a simple geometry core hierarchy (based on a simple Shape geometry implementation)
++  including Point, Polygon, Circle, and Rectangle implementations. Refactors relation predicates
++  from GeoUtils to appropriate Polygon and Circle geometry classes. Refactors test framework and
++  adds tests for each geometry type. (Nick Knize)
+ 
+ ======================= Lucene 7.4.1 =======================
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/geo/BasePredicate.java b/lucene/core/src/java/org/apache/lucene/geo/BasePredicate.java
+new file mode 100644
+index 0000000000..43da737277
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/geo/BasePredicate.java
+@@ -0,0 +1,142 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.geo;
++
++import java.util.Arrays;
++import java.util.Objects;
++import java.util.function.Function;
++
++import org.apache.lucene.index.PointValues.Relation;
++
++import static org.apache.lucene.geo.GeoEncodingUtils.decodeLatitude;
++import static org.apache.lucene.geo.GeoEncodingUtils.decodeLongitude;
++import static org.apache.lucene.geo.GeoEncodingUtils.encodeLatitude;
++import static org.apache.lucene.geo.GeoEncodingUtils.encodeLatitudeCeil;
++import static org.apache.lucene.geo.GeoEncodingUtils.encodeLongitude;
++import static org.apache.lucene.geo.GeoEncodingUtils.encodeLongitudeCeil;
++
++/**
++ * Used to speed up point-in-polygon and point-distance computations
++ *
++ * @lucene.experimental
++ */
++abstract class BasePredicate {
++  static final int ARITY = 64;
++
++  final int latShift, lonShift;
++  final int latBase, lonBase;
++  final int maxLatDelta, maxLonDelta;
++  final byte[] relations;
++
++  protected BasePredicate(Rectangle boundingBox, Function<Rectangle, Relation> boxToRelation) {
++    final int minLat = encodeLatitudeCeil(boundingBox.minLat);
++    final int maxLat = encodeLatitude(boundingBox.maxLat);
++    final int minLon = encodeLongitudeCeil(boundingBox.minLon);
++    final int maxLon = encodeLongitude(boundingBox.maxLon);
++
++    int latShift = 1;
++    int lonShift = 1;
++    int latBase = 0;
++    int lonBase = 0;
++    int maxLatDelta = 0;
++    int maxLonDelta = 0;
++    byte[] relations;
++
++    if (maxLat < minLat || (boundingBox.crossesDateline() == false && maxLon < minLon)) {
++      // the box cannot match any quantized point
++      relations = new byte[0];
++    } else {
++      {
++        long minLat2 = (long) minLat - Integer.MIN_VALUE;
++        long maxLat2 = (long) maxLat - Integer.MIN_VALUE;
++        latShift = computeShift(minLat2, maxLat2);
++        latBase = (int) (minLat2 >>> latShift);
++        maxLatDelta = (int) (maxLat2 >>> latShift) - latBase + 1;
++        assert maxLatDelta > 0;
++      }
++      {
++        long minLon2 = (long) minLon - Integer.MIN_VALUE;
++        long maxLon2 = (long) maxLon - Integer.MIN_VALUE;
++        if (boundingBox.crossesDateline()) {
++          maxLon2 += 1L << 32; // wrap
++        }
++        lonShift = computeShift(minLon2, maxLon2);
++        lonBase = (int) (minLon2 >>> lonShift);
++        maxLonDelta = (int) (maxLon2 >>> lonShift) - lonBase + 1;
++        assert maxLonDelta > 0;
++      }
++
++      relations = new byte[maxLatDelta * maxLonDelta];
++      for (int i = 0; i < maxLatDelta; ++i) {
++        for (int j = 0; j < maxLonDelta; ++j) {
++          final int boxMinLat = ((latBase + i) << latShift) + Integer.MIN_VALUE;
++          final int boxMinLon = ((lonBase + j) << lonShift) + Integer.MIN_VALUE;
++          final int boxMaxLat = boxMinLat + (1 << latShift) - 1;
++          final int boxMaxLon = boxMinLon + (1 << lonShift) - 1;
++
++          relations[i * maxLonDelta + j] = (byte) boxToRelation.apply(new Rectangle(
++              decodeLatitude(boxMinLat), decodeLatitude(boxMaxLat),
++              decodeLongitude(boxMinLon), decodeLongitude(boxMaxLon))).ordinal();
++        }
++      }
++    }
++    this.latShift = latShift;
++    this.lonShift = lonShift;
++    this.latBase = latBase;
++    this.lonBase = lonBase;
++    this.maxLatDelta = maxLatDelta;
++    this.maxLonDelta = maxLonDelta;
++    this.relations = relations;
++  }
++
++  /** Compute the minimum shift value so that
++   * {@code (b>>>shift)-(a>>>shift)} is less that {@code ARITY}. */
++  private static int computeShift(long a, long b) {
++    assert a <= b;
++    // We enforce a shift of at least 1 so that when we work with unsigned ints
++    // by doing (lat - MIN_VALUE), the result of the shift (lat - MIN_VALUE) >>> shift
++    // can be used for comparisons without particular care: the sign bit has
++    // been cleared so comparisons work the same for signed and unsigned ints
++    for (int shift = 1; ; ++shift) {
++      final long delta = (b >>> shift) - (a >>> shift);
++      if (delta >= 0 && delta < ARITY) {
++        return shift;
++      }
++    }
++  }
++
++  @Override
++  public boolean equals(Object o) {
++    if (this == o) return true;
++    if (!(o instanceof BasePredicate)) return false;
++    BasePredicate that = (BasePredicate) o;
++    return latShift == that.latShift &&
++        lonShift == that.lonShift &&
++        latBase == that.latBase &&
++        lonBase == that.lonBase &&
++        maxLatDelta == that.maxLatDelta &&
++        maxLonDelta == that.maxLonDelta &&
++        Arrays.equals(relations, that.relations);
++  }
++
++  @Override
++  public int hashCode() {
++    int result = Objects.hash(latShift, lonShift, latBase, lonBase, maxLatDelta, maxLonDelta);
++    result = 31 * result + Arrays.hashCode(relations);
++    return result;
++  }
++}
+\ No newline at end of file
+diff --git a/lucene/core/src/java/org/apache/lucene/geo/Circle.java b/lucene/core/src/java/org/apache/lucene/geo/Circle.java
+new file mode 100644
+index 0000000000..150a4f7931
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/geo/Circle.java
+@@ -0,0 +1,344 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.geo;
++
++import java.util.Objects;
++import java.util.function.Function;
++
++import org.apache.lucene.index.PointValues.Relation;
++import org.apache.lucene.util.SloppyMath;
++
++import static org.apache.lucene.geo.GeoEncodingUtils.decodeLatitude;
++import static org.apache.lucene.geo.GeoEncodingUtils.decodeLongitude;
++import static org.apache.lucene.geo.GeoUtils.EARTH_MEAN_RADIUS_METERS;
++import static org.apache.lucene.geo.GeoUtils.MAX_LAT_INCL;
++import static org.apache.lucene.geo.GeoUtils.MAX_LAT_RADIANS;
++import static org.apache.lucene.geo.GeoUtils.MIN_LAT_INCL;
++import static org.apache.lucene.util.SloppyMath.TO_DEGREES;
++import static org.apache.lucene.util.SloppyMath.cos;
++import static org.apache.lucene.util.SloppyMath.haversinMeters;
++import static org.apache.lucene.util.SloppyMath.toDegrees;
++import static org.apache.lucene.util.SloppyMath.toRadians;
++
++/**
++ * Represents a circle (aka point-distance) on the earth's surface using the WGS-84 ellipsoid.
++ * <p>
++ * NOTES:
++ *<ol>
++ *   <li>Center of circle is provided by {@link Shape} base class and in lat/lon decimal degrees
++ *   <li>Circle may cross the 180 meridian but relating rectangles may not
++ *</ol>
++ *
++ * @lucene.experimental
++ **/
++public class Circle extends Shape {
++  /** radius of circle in meters */
++  private final double radiusMeters;
++  /** predicate used to determine if a point is within the circle (note: this is lazy loaded) */
++  private Predicate predicate;
++
++  /** constructs a circle from provided lat/lon (in decimal degrees) and radius (in meters) */
++  public Circle(final double lat, final double lon, final double radiusMeters) {
++    this.center = new Point(lat, lon);
++    // validate radius
++    if (Double.isFinite(radiusMeters) == false || radiusMeters < 0) {
++      throw new IllegalArgumentException("radiusMeters: '" + radiusMeters + "' is invalid");
++    }
++    this.radiusMeters = radiusMeters;
++    this.boundingBox = Rectangle.fromPointDistance(lat, lon, radiusMeters);
++  }
++
++  /** center latitude (in decimal degrees) accessor */
++  public double getLat() {
++    return center.lat();
++  }
++
++  /** center longitude (in decimal degrees) accessor */
++  public double getLon() {
++    return center.lon();
++  }
++
++  /** radius (in meters) accessor */
++  public double getRadiusMeters() {
++    return radiusMeters;
++  }
++
++  /**
++   * relate a box to the circle
++   * NOTE: this is an extremely conservative relation algorithm. Since circle's are not
++   * uniform on the WGS84 ellipsoid we err on the side of caution and assume crossing.
++   * Precise point distance checks are made at a later phase
++   */
++  @Override
++  public Relation relate(final double minLat, final double maxLat, final double minLon, final double maxLon) {
++    // check bounding boxes
++    if (Rectangle.relate(boundingBox.minLat, boundingBox.maxLat, boundingBox.minLon, boundingBox.maxLon,
++        minLat, maxLat, minLon, maxLon) == Relation.CELL_OUTSIDE_QUERY) {
++      return Relation.CELL_OUTSIDE_QUERY;
++    }
++    // use conservative predicate algorithm
++    return predicate().relate(minLat, maxLat, minLon, maxLon);
++  }
++
++  /** computes whether a point (as index encoded values) is within the circle */
++  public boolean pointInside(final int encodedLat, final int encodedLon) {
++    return predicate().test(encodedLat, encodedLon);
++  }
++
++  /** lazy load the predicate */
++  private Predicate predicate() {
++    if (predicate == null) {
++      this.predicate = Predicate.create(center.lat(), center.lon(), radiusMeters);
++    }
++    return predicate;
++  }
++
++  /** A predicate that checks whether a given point is within a distance of another point. */
++  final static class Predicate extends BasePredicate {
++
++    private final double lat, lon;
++    private final double distanceKey;
++    private final double axisLat;
++
++    private Predicate(double lat, double lon, double distanceKey, double axisLat, Rectangle boundingBox,
++                              Function<Rectangle, Relation> boxToRelation) {
++      super(boundingBox, boxToRelation);
++      this.lat = lat;
++      this.lon = lon;
++      this.distanceKey = distanceKey;
++      this.axisLat = axisLat;
++    }
++
++    /** Create a predicate that checks whether points are within a distance of a given point.
++     *  It works by computing the bounding box around the circle that is defined
++     *  by the given points/distance and splitting it into between 1024 and 4096
++     *  smaller boxes (4096*0.75^2=2304 on average). Then for each sub box, it
++     *  computes the relation between this box and the distance query. Finally at
++     *  search time, it first computes the sub box that the point belongs to,
++     *  most of the time, no distance computation will need to be performed since
++     *  all points from the sub box will either be in or out of the circle.
++     *  @lucene.internal */
++    static public Predicate create(double lat, double lon, double radiusMeters) {
++      final Rectangle boundingBox = Rectangle.fromPointDistance(lat, lon, radiusMeters);
++      final double axisLat = axisLat(lat, radiusMeters);
++      final double distanceSortKey = distanceQuerySortKey(radiusMeters);
++      final Function<Rectangle, Relation> boxToRelation = box -> relate(
++          box.minLat, box.maxLat, box.minLon, box.maxLon, lat, lon, distanceSortKey, axisLat);
++      return new Predicate(lat, lon, distanceSortKey, axisLat, boundingBox, boxToRelation);
++    }
++
++    /** relates a bounding box to a circle */
++    protected Relation relate(double minLat, double maxLat, double minLon, double maxLon) {
++      return relate(minLat, maxLat, minLon, maxLon, lat, lon, distanceKey, axisLat);
++    }
++
++    /** relates a bounding box to a circle with provide predicate inputs */
++    private static Relation relate(double minLat, double maxLat, double minLon, double maxLon,
++                                   double lat, double lon, double distanceSortKey, double axisLat) {
++      if (minLon > maxLon) {
++        throw new IllegalArgumentException("Box crosses the dateline");
++      }
++
++      if ((lon < minLon || lon > maxLon) && (axisLat + AXISLAT_ERROR < minLat || axisLat - AXISLAT_ERROR > maxLat)) {
++        // circle not fully inside / crossing axis
++        if (SloppyMath.haversinSortKey(lat, lon, minLat, minLon) > distanceSortKey &&
++            SloppyMath.haversinSortKey(lat, lon, minLat, maxLon) > distanceSortKey &&
++            SloppyMath.haversinSortKey(lat, lon, maxLat, minLon) > distanceSortKey &&
++            SloppyMath.haversinSortKey(lat, lon, maxLat, maxLon) > distanceSortKey) {
++          // no points inside
++          return Relation.CELL_OUTSIDE_QUERY;
++        }
++      }
++
++      if (within90LonDegrees(lon, minLon, maxLon) &&
++          SloppyMath.haversinSortKey(lat, lon, minLat, minLon) <= distanceSortKey &&
++          SloppyMath.haversinSortKey(lat, lon, minLat, maxLon) <= distanceSortKey &&
++          SloppyMath.haversinSortKey(lat, lon, maxLat, minLon) <= distanceSortKey &&
++          SloppyMath.haversinSortKey(lat, lon, maxLat, maxLon) <= distanceSortKey) {
++        // we are fully enclosed, collect everything within this subtree
++        return Relation.CELL_INSIDE_QUERY;
++      }
++
++      return Relation.CELL_CROSSES_QUERY;
++    }
++
++    /** Return whether all points of {@code [minLon,maxLon]} are within 90 degrees of {@code lon}. */
++    protected static boolean within90LonDegrees(double lon, double minLon, double maxLon) {
++      if (maxLon <= lon - 180) {
++        lon -= 360;
++      } else if (minLon >= lon + 180) {
++        lon += 360;
++      }
++      return maxLon - lon < 90 && lon - minLon < 90;
++    }
++
++    /**
++     * binary search to find the exact sortKey needed to match the specified radius
++     * any sort key lte this is a query match.
++     */
++    private static double distanceQuerySortKey(double radius) {
++      // effectively infinite
++      if (radius >= haversinMeters(Double.MAX_VALUE)) {
++        return haversinMeters(Double.MAX_VALUE);
++      }
++
++      // this is a search through non-negative long space only
++      long lo = 0;
++      long hi = Double.doubleToRawLongBits(Double.MAX_VALUE);
++      while (lo <= hi) {
++        long mid = (lo + hi) >>> 1;
++        double sortKey = Double.longBitsToDouble(mid);
++        double midRadius = haversinMeters(sortKey);
++        if (midRadius == radius) {
++          return sortKey;
++        } else if (midRadius > radius) {
++          hi = mid - 1;
++        } else {
++          lo = mid + 1;
++        }
++      }
++
++      // not found: this is because a user can supply an arbitrary radius, one that we will never
++      // calculate exactly via our haversin method.
++      double ceil = Double.longBitsToDouble(lo);
++      assert haversinMeters(ceil) > radius;
++      return ceil;
++    }
++
++    /** Check whether the given point is within a distance of another point.
++     *  NOTE: this operates directly on the encoded representation of points. */
++    public boolean test(int lat, int lon) {
++      final int lat2 = ((lat - Integer.MIN_VALUE) >>> latShift);
++      if (lat2 < latBase || lat2 >= latBase + maxLatDelta) {
++        return false;
++      }
++      int lon2 = ((lon - Integer.MIN_VALUE) >>> lonShift);
++      if (lon2 < lonBase) { // wrap
++        lon2 += 1 << (32 - lonShift);
++      }
++      assert Integer.toUnsignedLong(lon2) >= lonBase;
++      assert lon2 - lonBase >= 0;
++      if (lon2 - lonBase >= maxLonDelta) {
++        return false;
++      }
++
++      final int relation = relations[(lat2 - latBase) * maxLonDelta + (lon2 - lonBase)];
++      if (relation == Relation.CELL_CROSSES_QUERY.ordinal()) {
++        return SloppyMath.haversinSortKey(
++            decodeLatitude(lat), decodeLongitude(lon),
++            this.lat, this.lon) <= distanceKey;
++      } else {
++        return relation == Relation.CELL_INSIDE_QUERY.ordinal();
++      }
++    }
++
++    @Override
++    public boolean equals(Object o) {
++      if (this == o) return true;
++      if (!(o instanceof Predicate)) return false;
++      Predicate predicate = (Predicate) o;
++      return Double.compare(predicate.lat, lat) == 0 &&
++          Double.compare(predicate.lon, lon) == 0 &&
++          Double.compare(predicate.distanceKey, distanceKey) == 0 &&
++          Double.compare(predicate.axisLat, axisLat) == 0;
++    }
++
++    @Override
++    public int hashCode() {
++      return Objects.hash(lat, lon, distanceKey, axisLat);
++    }
++  }
++
++  // some sloppyish stuff, do we really need this to be done in a sloppy way?
++  // unless it is performance sensitive, we should try to remove.
++  private static final double PIO2 = Math.PI / 2D;
++
++  /** maximum error from {@link #axisLat(double, double)}. logic must be prepared to handle this */
++  public static final double AXISLAT_ERROR = 0.1D / EARTH_MEAN_RADIUS_METERS * TO_DEGREES;
++
++  /**
++   * Calculate the latitude of a circle's intersections with its bbox meridians.
++   * <p>
++   * <b>NOTE:</b> the returned value will be +/- {@link #AXISLAT_ERROR} of the actual value.
++   * @param centerLat The latitude of the circle center
++   * @param radiusMeters The radius of the circle in meters
++   * @return A latitude
++   */
++  public static double axisLat(double centerLat, double radiusMeters) {
++    // A spherical triangle with:
++    // r is the radius of the circle in radians
++    // l1 is the latitude of the circle center
++    // l2 is the latitude of the point at which the circle intersect's its bbox longitudes
++    // We know r is tangent to the bbox meridians at l2, therefore it is a right angle.
++    // So from the law of cosines, with the angle of l1 being 90, we have:
++    // cos(l1) = cos(r) * cos(l2) + sin(r) * sin(l2) * cos(90)
++    // The second part cancels out because cos(90) == 0, so we have:
++    // cos(l1) = cos(r) * cos(l2)
++    // Solving for l2, we get:
++    // l2 = acos( cos(l1) / cos(r) )
++    // We ensure r is in the range (0, PI/2) and l1 in the range (0, PI/2]. This means we
++    // cannot divide by 0, and we will always get a positive value in the range [0, 1) as
++    // the argument to arc cosine, resulting in a range (0, PI/2].
++    double l1 = toRadians(centerLat);
++    double r = (radiusMeters + 7E-2) / EARTH_MEAN_RADIUS_METERS;
++
++    // if we are within radius range of a pole, the lat is the pole itself
++    if (Math.abs(l1) + r >= MAX_LAT_RADIANS) {
++      return centerLat >= 0 ? MAX_LAT_INCL : MIN_LAT_INCL;
++    }
++
++    // adjust l1 as distance from closest pole, to form a right triangle with bbox meridians
++    // and ensure it is in the range (0, PI/2]
++    l1 = centerLat >= 0 ? PIO2 - l1 : l1 + PIO2;
++
++    double l2 = Math.acos(Math.cos(l1) / Math.cos(r));
++    assert !Double.isNaN(l2);
++
++    // now adjust back to range [-pi/2, pi/2], ie latitude in radians
++    l2 = centerLat >= 0 ? PIO2 - l2 : l2 - PIO2;
++
++    return toDegrees(l2);
++  }
++
++
++  @Override
++  public boolean equals(Object o) {
++    if (this == o) return true;
++    if (!(o instanceof Circle)) return false;
++    if (!super.equals(o)) return false;
++    Circle circle = (Circle) o;
++    return Double.compare(circle.radiusMeters, radiusMeters) == 0 &&
++        Objects.equals(predicate, circle.predicate);
++  }
++
++  @Override
++  public int hashCode() {
++    return Objects.hash(super.hashCode(), radiusMeters, predicate);
++  }
++
++  @Override
++  public String toString() {
++    StringBuilder sb = new StringBuilder();
++    sb.append(getLat());
++    sb.append(",");
++    sb.append(getLon());
++    sb.append(" +/- ");
++    sb.append(radiusMeters);
++    sb.append(" meters");
++    return sb.toString();
++  }
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/geo/Polygon2D.java b/lucene/core/src/java/org/apache/lucene/geo/GeoEdgeTree.java
+similarity index 84%
+rename from lucene/core/src/java/org/apache/lucene/geo/Polygon2D.java
+rename to lucene/core/src/java/org/apache/lucene/geo/GeoEdgeTree.java
+index 699b874ff2..652f3a2a32 100644
+--- a/lucene/core/src/java/org/apache/lucene/geo/Polygon2D.java
++++ b/lucene/core/src/java/org/apache/lucene/geo/GeoEdgeTree.java
+@@ -18,8 +18,8 @@ package org.apache.lucene.geo;
+ 
+ import java.util.Arrays;
+ import java.util.Comparator;
++import java.util.Objects;
+ 
+-import org.apache.lucene.geo.Polygon;
+ import org.apache.lucene.index.PointValues.Relation;
+ import org.apache.lucene.util.ArrayUtil;
+ 
+@@ -27,16 +27,16 @@ import org.apache.lucene.util.ArrayUtil;
+  * 2D polygon implementation represented as a balanced interval tree of edges.
+  * <p>
+  * Construction takes {@code O(n log n)} time for sorting and tree construction.
+- * {@link #contains contains()} and {@link #relate relate()} are {@code O(n)}, but for most 
++ * {@link #contains contains()} and {@link #relate relate()} are {@code O(n)}, but for most
+  * practical polygons are much faster than brute force.
+  * <p>
+  * Loosely based on the algorithm described in <a href="http://www-ma2.upc.es/geoc/Schirra-pointPolygon.pdf">
+  * http://www-ma2.upc.es/geoc/Schirra-pointPolygon.pdf</a>.
+- * @lucene.internal
++ * @lucene.experimental
+  */
+ // Both Polygon.contains() and Polygon.crossesSlowly() loop all edges, and first check that the edge is within a range.
+-// we just organize the edges to do the same computations on the same subset of edges more efficiently. 
+-public final class Polygon2D {
++// we just organize the edges to do the same computations on the same subset of edges more efficiently.
++public final class GeoEdgeTree {
+   /** minimum latitude of this polygon's bounding box area */
+   public final double minLat;
+   /** maximum latitude of this polygon's bounding box area */
+@@ -45,7 +45,7 @@ public final class Polygon2D {
+   public final double minLon;
+   /** maximum longitude of this polygon's bounding box area */
+   public final double maxLon;
+-  
++
+   // each component/hole is a node in an augmented 2d kd-tree: we alternate splitting between latitude/longitude,
+   // and pull up max values for both dimensions to each parent node (regardless of split).
+ 
+@@ -58,29 +58,29 @@ public final class Polygon2D {
+   private boolean splitX;
+ 
+   // child components, or null
+-  private Polygon2D left;
+-  private Polygon2D right;
+-  
++  private GeoEdgeTree left;
++  private GeoEdgeTree right;
++
+   /** tree of holes, or null */
+-  private final Polygon2D holes;
+-  
++  private final GeoEdgeTree holes;
++
+   /** root node of edge tree */
+   private final Edge tree;
+ 
+-  private Polygon2D(Polygon polygon, Polygon2D holes) {
++  private GeoEdgeTree(Polygon polygon, GeoEdgeTree holes) {
+     this.holes = holes;
+-    this.minLat = polygon.minLat;
+-    this.maxLat = polygon.maxLat;
+-    this.minLon = polygon.minLon;
+-    this.maxLon = polygon.maxLon;
++    this.minLat = polygon.boundingBox.minLat;
++    this.maxLat = polygon.boundingBox.maxLat;
++    this.minLon = polygon.boundingBox.minLon;
++    this.maxLon = polygon.boundingBox.maxLon;
+     this.maxY = maxLat;
+     this.maxX = maxLon;
+-    
++
+     // create interval tree of edges
+     this.tree = createTree(polygon.getPolyLats(), polygon.getPolyLons());
+   }
+ 
+-  /** 
++  /**
+    * Returns true if the point is contained within this polygon.
+    * <p>
+    * See <a href="https://www.ecse.rpi.edu/~wrf/Research/Short_Notes/pnpoly.html">
+@@ -104,24 +104,24 @@ public final class Polygon2D {
+     }
+     return false;
+   }
+-  
++
+   /** Returns true if the point is contained within this polygon component. */
+   private boolean componentContains(double latitude, double longitude) {
+     // check bounding box
+     if (latitude < minLat || latitude > maxLat || longitude < minLon || longitude > maxLon) {
+       return false;
+     }
+-    
++
+     if (tree.contains(latitude, longitude)) {
+       if (holes != null && holes.contains(latitude, longitude)) {
+         return false;
+       }
+       return true;
+     }
+-    
++
+     return false;
+   }
+-  
++
+   /** Returns relation to the provided rectangle */
+   public Relation relate(double minLat, double maxLat, double minLon, double maxLon) {
+     if (minLat <= maxY && minLon <= maxX) {
+@@ -174,15 +174,15 @@ public final class Polygon2D {
+     } else if (numCorners > 0) {
+       return Relation.CELL_CROSSES_QUERY;
+     }
+-    
++
+     // we cross
+     if (tree.crosses(minLat, maxLat, minLon, maxLon)) {
+       return Relation.CELL_CROSSES_QUERY;
+     }
+-    
++
+     return Relation.CELL_OUTSIDE_QUERY;
+   }
+-  
++
+   // returns 0, 4, or something in between
+   private int numberOfCorners(double minLat, double maxLat, double minLon, double maxLon) {
+     int containsCount = 0;
+@@ -206,15 +206,15 @@ public final class Polygon2D {
+     }
+     return containsCount;
+   }
+-  
++
+   /** Creates tree from sorted components (with range low and high inclusive) */
+-  private static Polygon2D createTree(Polygon2D components[], int low, int high, boolean splitX) {
++  private static GeoEdgeTree createTree(GeoEdgeTree components[], int low, int high, boolean splitX) {
+     if (low > high) {
+       return null;
+     }
+     final int mid = (low + high) >>> 1;
+     if (low < high) {
+-      Comparator<Polygon2D> comparator;
++      Comparator<GeoEdgeTree> comparator;
+       if (splitX) {
+         comparator = (left, right) -> {
+           int ret = Double.compare(left.minLon, right.minLon);
+@@ -235,7 +235,7 @@ public final class Polygon2D {
+       ArrayUtil.select(components, low, high + 1, mid, comparator);
+     }
+     // add midpoint
+-    Polygon2D newNode = components[mid];
++    GeoEdgeTree newNode = components[mid];
+     newNode.splitX = splitX;
+     // add children
+     newNode.left = createTree(components, low, mid - 1, !splitX);
+@@ -251,23 +251,23 @@ public final class Polygon2D {
+     }
+     return newNode;
+   }
+-  
+-  /** Builds a Polygon2D from multipolygon */
+-  public static Polygon2D create(Polygon... polygons) {
+-    Polygon2D components[] = new Polygon2D[polygons.length];
++
++  /** Builds an EdgeTree from multipolygon */
++  public static GeoEdgeTree create(Polygon... polygons) {
++    GeoEdgeTree components[] = new GeoEdgeTree[polygons.length];
+     for (int i = 0; i < components.length; i++) {
+       Polygon gon = polygons[i];
+       Polygon gonHoles[] = gon.getHoles();
+-      Polygon2D holes = null;
++      GeoEdgeTree holes = null;
+       if (gonHoles.length > 0) {
+         holes = create(gonHoles);
+       }
+-      components[i] = new Polygon2D(gon, holes);
++      components[i] = new GeoEdgeTree(gon, holes);
+     }
+     return createTree(components, 0, components.length - 1, false);
+   }
+ 
+-  /** 
++  /**
+    * Internal tree node: represents polygon edge from lat1,lon1 to lat2,lon2.
+    * The sort value is {@code low}, which is the minimum latitude of the edge.
+    * {@code max} stores the maximum latitude of this edge or any children.
+@@ -280,7 +280,7 @@ public final class Polygon2D {
+     final double low;
+     /** max latitude of this edge or any children */
+     double max;
+-    
++
+     /** left child edge, or null */
+     Edge left;
+     /** right child edge, or null */
+@@ -294,8 +294,8 @@ public final class Polygon2D {
+       this.low = low;
+       this.max = max;
+     }
+-    
+-    /** 
++
++    /**
+      * Returns true if the point crosses this edge subtree an odd number of times
+      * <p>
+      * See <a href="https://www.ecse.rpi.edu/~wrf/Research/Short_Notes/pnpoly.html">
+@@ -306,25 +306,25 @@ public final class Polygon2D {
+     //
+     // Copyright (c) 1970-2003, Wm. Randolph Franklin
+     //
+-    // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated 
+-    // documentation files (the "Software"), to deal in the Software without restriction, including without limitation 
+-    // the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and 
++    // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
++    // documentation files (the "Software"), to deal in the Software without restriction, including without limitation
++    // the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and
+     // to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+     //
+-    // 1. Redistributions of source code must retain the above copyright 
++    // 1. Redistributions of source code must retain the above copyright
+     //    notice, this list of conditions and the following disclaimers.
+-    // 2. Redistributions in binary form must reproduce the above copyright 
+-    //    notice in the documentation and/or other materials provided with 
++    // 2. Redistributions in binary form must reproduce the above copyright
++    //    notice in the documentation and/or other materials provided with
+     //    the distribution.
+-    // 3. The name of W. Randolph Franklin may not be used to endorse or 
+-    //    promote products derived from this Software without specific 
+-    //    prior written permission. 
++    // 3. The name of W. Randolph Franklin may not be used to endorse or
++    //    promote products derived from this Software without specific
++    //    prior written permission.
+     //
+-    // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED 
+-    // TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL 
+-    // THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF 
+-    // CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS 
+-    // IN THE SOFTWARE. 
++    // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
++    // TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
++    // THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
++    // CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++    // IN THE SOFTWARE.
+     boolean contains(double latitude, double longitude) {
+       // crossings algorithm is an odd-even algorithm, so we descend the tree xor'ing results along our path
+       boolean res = false;
+@@ -343,7 +343,7 @@ public final class Polygon2D {
+       }
+       return res;
+     }
+-    
++
+     /** Returns true if the box crosses any edge in this edge subtree */
+     boolean crosses(double minLat, double maxLat, double minLon, double maxLon) {
+       // we just have to cross one edge to answer the question, so we descend the tree and return when we do.
+@@ -357,7 +357,7 @@ public final class Polygon2D {
+         double dy = lat2;
+         double cx = lon1;
+         double dx = lon2;
+-        
++
+         // optimization: see if the rectangle is outside of the "bounding box" of the polyline at all
+         // if not, don't waste our time trying more complicated stuff
+         boolean outside = (cy < minLat && dy < minLat) ||
+@@ -393,13 +393,13 @@ public final class Polygon2D {
+             return true;
+           }
+         }
+-        
++
+         if (left != null) {
+           if (left.crosses(minLat, maxLat, minLon, maxLon)) {
+             return true;
+           }
+         }
+-        
++
+         if (right != null && maxLat >= low) {
+           if (right.crosses(minLat, maxLat, minLon, maxLon)) {
+             return true;
+@@ -408,9 +408,29 @@ public final class Polygon2D {
+       }
+       return false;
+     }
++
++    @Override
++    public boolean equals(Object o) {
++      if (this == o) return true;
++      if (!(o instanceof Edge)) return false;
++      Edge edge = (Edge) o;
++      return Double.compare(edge.lat1, lat1) == 0 &&
++          Double.compare(edge.lat2, lat2) == 0 &&
++          Double.compare(edge.lon1, lon1) == 0 &&
++          Double.compare(edge.lon2, lon2) == 0 &&
++          Double.compare(edge.low, low) == 0 &&
++          Double.compare(edge.max, max) == 0 &&
++          Objects.equals(left, edge.left) &&
++          Objects.equals(right, edge.right);
++    }
++
++    @Override
++    public int hashCode() {
++      return Objects.hash(lat1, lat2, lon1, lon2, low, max, left, right);
++    }
+   }
+ 
+-  /** 
++  /**
+    * Creates an edge interval tree from a set of polygon vertices.
+    * @return root node of the tree.
+    */
+@@ -474,4 +494,27 @@ public final class Polygon2D {
+       return 0;
+     }
+   }
++
++  @Override
++  public boolean equals(Object o) {
++    if (this == o) return true;
++    if (!(o instanceof GeoEdgeTree)) return false;
++    GeoEdgeTree edgeTree = (GeoEdgeTree) o;
++    return Double.compare(edgeTree.minLat, minLat) == 0 &&
++        Double.compare(edgeTree.maxLat, maxLat) == 0 &&
++        Double.compare(edgeTree.minLon, minLon) == 0 &&
++        Double.compare(edgeTree.maxLon, maxLon) == 0 &&
++        Double.compare(edgeTree.maxY, maxY) == 0 &&
++        Double.compare(edgeTree.maxX, maxX) == 0 &&
++        splitX == edgeTree.splitX &&
++        Objects.equals(left, edgeTree.left) &&
++        Objects.equals(right, edgeTree.right) &&
++        Objects.equals(holes, edgeTree.holes) &&
++        Objects.equals(tree, edgeTree.tree);
++  }
++
++  @Override
++  public int hashCode() {
++    return Objects.hash(minLat, maxLat, minLon, maxLon, maxY, maxX, splitX, left, right, holes, tree);
++  }
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/geo/GeoEncodingUtils.java b/lucene/core/src/java/org/apache/lucene/geo/GeoEncodingUtils.java
+index 663cb2e2d8..671f779ecf 100644
+--- a/lucene/core/src/java/org/apache/lucene/geo/GeoEncodingUtils.java
++++ b/lucene/core/src/java/org/apache/lucene/geo/GeoEncodingUtils.java
+@@ -16,9 +16,7 @@
+  */
+ package org.apache.lucene.geo;
+ 
+-import org.apache.lucene.index.PointValues.Relation;
+ import org.apache.lucene.util.NumericUtils;
+-import org.apache.lucene.util.SloppyMath;
+ 
+ import static org.apache.lucene.geo.GeoUtils.MAX_LAT_INCL;
+ import static org.apache.lucene.geo.GeoUtils.MAX_LON_INCL;
+@@ -27,8 +25,6 @@ import static org.apache.lucene.geo.GeoUtils.MIN_LAT_INCL;
+ import static org.apache.lucene.geo.GeoUtils.checkLatitude;
+ import static org.apache.lucene.geo.GeoUtils.checkLongitude;
+ 
+-import java.util.function.Function;
+-
+ /**
+  * reusable geopoint encoding methods
+  *
+@@ -148,233 +144,4 @@ public final class GeoEncodingUtils {
+   public static double decodeLongitude(byte[] src, int offset) {
+     return decodeLongitude(NumericUtils.sortableBytesToInt(src, offset));
+   }
+-
+-  /** Create a predicate that checks whether points are within a distance of a given point.
+-   *  It works by computing the bounding box around the circle that is defined
+-   *  by the given points/distance and splitting it into between 1024 and 4096
+-   *  smaller boxes (4096*0.75^2=2304 on average). Then for each sub box, it
+-   *  computes the relation between this box and the distance query. Finally at
+-   *  search time, it first computes the sub box that the point belongs to,
+-   *  most of the time, no distance computation will need to be performed since
+-   *  all points from the sub box will either be in or out of the circle.
+-   *  @lucene.internal */
+-  public static DistancePredicate createDistancePredicate(double lat, double lon, double radiusMeters) {
+-    final Rectangle boundingBox = Rectangle.fromPointDistance(lat, lon, radiusMeters);
+-    final double axisLat = Rectangle.axisLat(lat, radiusMeters);
+-    final double distanceSortKey = GeoUtils.distanceQuerySortKey(radiusMeters);
+-    final Function<Rectangle, Relation> boxToRelation = box -> GeoUtils.relate(
+-        box.minLat, box.maxLat, box.minLon, box.maxLon, lat, lon, distanceSortKey, axisLat);
+-    final Grid subBoxes = createSubBoxes(boundingBox, boxToRelation);
+-
+-    return new DistancePredicate(
+-        subBoxes.latShift, subBoxes.lonShift,
+-        subBoxes.latBase, subBoxes.lonBase,
+-        subBoxes.maxLatDelta, subBoxes.maxLonDelta,
+-        subBoxes.relations,
+-        lat, lon, distanceSortKey);
+-  }
+-
+-  /** Create a predicate that checks whether points are within a polygon.
+-   *  It works the same way as {@link #createDistancePredicate}.
+-   *  @lucene.internal */
+-  public static PolygonPredicate createPolygonPredicate(Polygon[] polygons, Polygon2D tree) {
+-    final Rectangle boundingBox = Rectangle.fromPolygon(polygons);
+-    final Function<Rectangle, Relation> boxToRelation = box -> tree.relate(
+-        box.minLat, box.maxLat, box.minLon, box.maxLon);
+-    final Grid subBoxes = createSubBoxes(boundingBox, boxToRelation);
+-
+-    return new PolygonPredicate(
+-        subBoxes.latShift, subBoxes.lonShift,
+-        subBoxes.latBase, subBoxes.lonBase,
+-        subBoxes.maxLatDelta, subBoxes.maxLonDelta,
+-        subBoxes.relations,
+-        tree);
+-  }
+-
+-  private static Grid createSubBoxes(Rectangle boundingBox, Function<Rectangle, Relation> boxToRelation) {
+-    final int minLat = encodeLatitudeCeil(boundingBox.minLat);
+-    final int maxLat = encodeLatitude(boundingBox.maxLat);
+-    final int minLon = encodeLongitudeCeil(boundingBox.minLon);
+-    final int maxLon = encodeLongitude(boundingBox.maxLon);
+-
+-    if (maxLat < minLat || (boundingBox.crossesDateline() == false && maxLon < minLon)) {
+-      // the box cannot match any quantized point
+-      return new Grid(1, 1, 0, 0, 0, 0, new byte[0]);
+-    }
+-
+-    final int latShift, lonShift;
+-    final int latBase, lonBase;
+-    final int maxLatDelta, maxLonDelta;
+-    {
+-      long minLat2 = (long) minLat - Integer.MIN_VALUE;
+-      long maxLat2 = (long) maxLat - Integer.MIN_VALUE;
+-      latShift = computeShift(minLat2, maxLat2);
+-      latBase = (int) (minLat2 >>> latShift);
+-      maxLatDelta = (int) (maxLat2 >>> latShift) - latBase + 1;
+-      assert maxLatDelta > 0;
+-    }
+-    {
+-      long minLon2 = (long) minLon - Integer.MIN_VALUE;
+-      long maxLon2 = (long) maxLon - Integer.MIN_VALUE;
+-      if (boundingBox.crossesDateline()) {
+-        maxLon2 += 1L << 32; // wrap
+-      }
+-      lonShift = computeShift(minLon2, maxLon2);
+-      lonBase = (int) (minLon2 >>> lonShift);
+-      maxLonDelta = (int) (maxLon2 >>> lonShift) - lonBase + 1;
+-      assert maxLonDelta > 0;
+-    }
+-
+-    final byte[] relations = new byte[maxLatDelta * maxLonDelta];
+-    for (int i = 0; i < maxLatDelta; ++i) {
+-      for (int j = 0; j < maxLonDelta; ++j) {
+-        final int boxMinLat = ((latBase + i) << latShift) + Integer.MIN_VALUE;
+-        final int boxMinLon = ((lonBase + j) << lonShift) + Integer.MIN_VALUE;
+-        final int boxMaxLat = boxMinLat + (1 << latShift) - 1;
+-        final int boxMaxLon = boxMinLon + (1 << lonShift) - 1;
+-
+-        relations[i * maxLonDelta + j] = (byte) boxToRelation.apply(new Rectangle(
+-            decodeLatitude(boxMinLat), decodeLatitude(boxMaxLat),
+-            decodeLongitude(boxMinLon), decodeLongitude(boxMaxLon))).ordinal();
+-      }
+-    }
+-
+-    return new Grid(
+-        latShift, lonShift,
+-        latBase, lonBase,
+-        maxLatDelta, maxLonDelta,
+-        relations);
+-  }
+-
+-  /** Compute the minimum shift value so that
+-   * {@code (b>>>shift)-(a>>>shift)} is less that {@code ARITY}. */
+-  private static int computeShift(long a, long b) {
+-    assert a <= b;
+-    // We enforce a shift of at least 1 so that when we work with unsigned ints
+-    // by doing (lat - MIN_VALUE), the result of the shift (lat - MIN_VALUE) >>> shift
+-    // can be used for comparisons without particular care: the sign bit has
+-    // been cleared so comparisons work the same for signed and unsigned ints
+-    for (int shift = 1; ; ++shift) {
+-      final long delta = (b >>> shift) - (a >>> shift);
+-      if (delta >= 0 && delta < Grid.ARITY) {
+-        return shift;
+-      }
+-    }
+-  }
+-
+-  private static class Grid {
+-    static final int ARITY = 64;
+-
+-    final int latShift, lonShift;
+-    final int latBase, lonBase;
+-    final int maxLatDelta, maxLonDelta;
+-    final byte[] relations;
+-
+-    private Grid(
+-        int latShift, int lonShift,
+-        int latBase, int lonBase,
+-        int maxLatDelta, int maxLonDelta,
+-        byte[] relations) {
+-      if (latShift < 1 || latShift > 31) {
+-        throw new IllegalArgumentException();
+-      }
+-      if (lonShift < 1 || lonShift > 31) {
+-        throw new IllegalArgumentException();
+-      }
+-      this.latShift = latShift;
+-      this.lonShift = lonShift;
+-      this.latBase = latBase;
+-      this.lonBase = lonBase;
+-      this.maxLatDelta = maxLatDelta;
+-      this.maxLonDelta = maxLonDelta;
+-      this.relations = relations;
+-    }
+-  }
+-
+-  /** A predicate that checks whether a given point is within a distance of another point. */
+-  public static class DistancePredicate extends Grid {
+-
+-    private final double lat, lon;
+-    private final double distanceKey;
+-
+-    private DistancePredicate(
+-        int latShift, int lonShift,
+-        int latBase, int lonBase,
+-        int maxLatDelta, int maxLonDelta,
+-        byte[] relations,
+-        double lat, double lon, double distanceKey) {
+-      super(latShift, lonShift, latBase, lonBase, maxLatDelta, maxLonDelta, relations);
+-      this.lat = lat;
+-      this.lon = lon;
+-      this.distanceKey = distanceKey;
+-    }
+-
+-    /** Check whether the given point is within a distance of another point.
+-     *  NOTE: this operates directly on the encoded representation of points. */
+-    public boolean test(int lat, int lon) {
+-      final int lat2 = ((lat - Integer.MIN_VALUE) >>> latShift);
+-      if (lat2 < latBase || lat2 >= latBase + maxLatDelta) {
+-        return false;
+-      }
+-      int lon2 = ((lon - Integer.MIN_VALUE) >>> lonShift);
+-      if (lon2 < lonBase) { // wrap
+-        lon2 += 1 << (32 - lonShift);
+-      }
+-      assert Integer.toUnsignedLong(lon2) >= lonBase;
+-      assert lon2 - lonBase >= 0;
+-      if (lon2 - lonBase >= maxLonDelta) {
+-        return false;
+-      }
+-
+-      final int relation = relations[(lat2 - latBase) * maxLonDelta + (lon2 - lonBase)];
+-      if (relation == Relation.CELL_CROSSES_QUERY.ordinal()) {
+-        return SloppyMath.haversinSortKey(
+-            decodeLatitude(lat), decodeLongitude(lon),
+-            this.lat, this.lon) <= distanceKey;
+-      } else {
+-        return relation == Relation.CELL_INSIDE_QUERY.ordinal();
+-      }
+-    }
+-  }
+-
+-  /** A predicate that checks whether a given point is within a polygon. */
+-  public static class PolygonPredicate extends Grid {
+-
+-    private final Polygon2D tree;
+-
+-    private PolygonPredicate(
+-        int latShift, int lonShift,
+-        int latBase, int lonBase,
+-        int maxLatDelta, int maxLonDelta,
+-        byte[] relations,
+-        Polygon2D tree) {
+-      super(latShift, lonShift, latBase, lonBase, maxLatDelta, maxLonDelta, relations);
+-      this.tree = tree;
+-    }
+-
+-    /** Check whether the given point is within the considered polygon.
+-     *  NOTE: this operates directly on the encoded representation of points. */
+-    public boolean test(int lat, int lon) {
+-      final int lat2 = ((lat - Integer.MIN_VALUE) >>> latShift);
+-      if (lat2 < latBase || lat2 >= latBase + maxLatDelta) {
+-        return false;
+-      }
+-      int lon2 = ((lon - Integer.MIN_VALUE) >>> lonShift);
+-      if (lon2 < lonBase) { // wrap
+-        lon2 += 1 << (32 - lonShift);
+-      }
+-      assert Integer.toUnsignedLong(lon2) >= lonBase;
+-      assert lon2 - lonBase >= 0;
+-      if (lon2 - lonBase >= maxLonDelta) {
+-        return false;
+-      }
+-
+-      final int relation = relations[(lat2 - latBase) * maxLonDelta + (lon2 - lonBase)];
+-      if (relation == Relation.CELL_CROSSES_QUERY.ordinal()) {
+-        return tree.contains(decodeLatitude(lat), decodeLongitude(lon));
+-      } else {
+-        return relation == Relation.CELL_INSIDE_QUERY.ordinal();
+-      }
+-    }
+-  }
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/geo/GeoUtils.java b/lucene/core/src/java/org/apache/lucene/geo/GeoUtils.java
+index aaca549ce1..32d2368f24 100644
+--- a/lucene/core/src/java/org/apache/lucene/geo/GeoUtils.java
++++ b/lucene/core/src/java/org/apache/lucene/geo/GeoUtils.java
+@@ -17,12 +17,6 @@
+ package org.apache.lucene.geo;
+ 
+ import static org.apache.lucene.util.SloppyMath.TO_RADIANS;
+-import static org.apache.lucene.util.SloppyMath.cos;
+-import static org.apache.lucene.util.SloppyMath.haversinMeters;
+-
+-import org.apache.lucene.index.PointValues;
+-import org.apache.lucene.index.PointValues.Relation;
+-import org.apache.lucene.util.SloppyMath;
+ 
+ /**
+  * Basic reusable geo-spatial utility methods
+@@ -74,104 +68,16 @@ public final class GeoUtils {
+     }
+   }
+ 
+-  // some sloppyish stuff, do we really need this to be done in a sloppy way?
+-  // unless it is performance sensitive, we should try to remove.
+-  private static final double PIO2 = Math.PI / 2D;
+-
+-  /**
+-   * Returns the trigonometric sine of an angle converted as a cos operation.
+-   * <p>
+-   * Note that this is not quite right... e.g. sin(0) != 0
+-   * <p>
+-   * Special cases:
+-   * <ul>
+-   *  <li>If the argument is {@code NaN} or an infinity, then the result is {@code NaN}.
+-   * </ul>
+-   * @param a an angle, in radians.
+-   * @return the sine of the argument.
+-   * @see Math#sin(double)
+-   */
+-  // TODO: deprecate/remove this? at least its no longer public.
+-  public static double sloppySin(double a) {
+-    return cos(a - PIO2);
++  /** computes longitude in range -180 &lt;= lon_deg &lt;= +180. */
++  public static double normalizeLonDegrees(double lonDegrees) {
++    if (lonDegrees >= MIN_LON_INCL && lonDegrees <= MAX_LON_INCL)
++      return lonDegrees;//common case, and avoids slight double precision shifting
++    double off = (lonDegrees + MAX_LON_INCL) % 360d;
++    if (off < 0)
++      return MAX_LON_INCL + off;
++    else if (off == 0 && lonDegrees > 0)
++      return MAX_LON_INCL;
++    else
++      return MIN_LON_INCL + off;
+   }
+-
+-  /**
+-   * binary search to find the exact sortKey needed to match the specified radius
+-   * any sort key lte this is a query match.
+-   */
+-  public static double distanceQuerySortKey(double radius) {
+-    // effectively infinite
+-    if (radius >= haversinMeters(Double.MAX_VALUE)) {
+-      return haversinMeters(Double.MAX_VALUE);
+-    }
+-
+-    // this is a search through non-negative long space only
+-    long lo = 0;
+-    long hi = Double.doubleToRawLongBits(Double.MAX_VALUE);
+-    while (lo <= hi) {
+-      long mid = (lo + hi) >>> 1;
+-      double sortKey = Double.longBitsToDouble(mid);
+-      double midRadius = haversinMeters(sortKey);
+-      if (midRadius == radius) {
+-        return sortKey;
+-      } else if (midRadius > radius) {
+-        hi = mid - 1;
+-      } else {
+-        lo = mid + 1;
+-      }
+-    }
+-
+-    // not found: this is because a user can supply an arbitrary radius, one that we will never
+-    // calculate exactly via our haversin method.
+-    double ceil = Double.longBitsToDouble(lo);
+-    assert haversinMeters(ceil) > radius;
+-    return ceil;
+-  }
+-
+-  /**
+-   * Compute the relation between the provided box and distance query.
+-   * This only works for boxes that do not cross the dateline.
+-   */
+-  public static PointValues.Relation relate(
+-      double minLat, double maxLat, double minLon, double maxLon,
+-      double lat, double lon, double distanceSortKey, double axisLat) {
+-
+-    if (minLon > maxLon) {
+-      throw new IllegalArgumentException("Box crosses the dateline");
+-    }
+-
+-    if ((lon < minLon || lon > maxLon) && (axisLat + Rectangle.AXISLAT_ERROR < minLat || axisLat - Rectangle.AXISLAT_ERROR > maxLat)) {
+-      // circle not fully inside / crossing axis
+-      if (SloppyMath.haversinSortKey(lat, lon, minLat, minLon) > distanceSortKey &&
+-          SloppyMath.haversinSortKey(lat, lon, minLat, maxLon) > distanceSortKey &&
+-          SloppyMath.haversinSortKey(lat, lon, maxLat, minLon) > distanceSortKey &&
+-          SloppyMath.haversinSortKey(lat, lon, maxLat, maxLon) > distanceSortKey) {
+-        // no points inside
+-        return Relation.CELL_OUTSIDE_QUERY;
+-      }
+-    }
+-
+-    if (within90LonDegrees(lon, minLon, maxLon) &&
+-        SloppyMath.haversinSortKey(lat, lon, minLat, minLon) <= distanceSortKey &&
+-        SloppyMath.haversinSortKey(lat, lon, minLat, maxLon) <= distanceSortKey &&
+-        SloppyMath.haversinSortKey(lat, lon, maxLat, minLon) <= distanceSortKey &&
+-        SloppyMath.haversinSortKey(lat, lon, maxLat, maxLon) <= distanceSortKey) {
+-      // we are fully enclosed, collect everything within this subtree
+-      return Relation.CELL_INSIDE_QUERY;
+-    }
+-
+-    return Relation.CELL_CROSSES_QUERY;
+-  }
+-
+-  /** Return whether all points of {@code [minLon,maxLon]} are within 90 degrees of {@code lon}. */
+-  static boolean within90LonDegrees(double lon, double minLon, double maxLon) {
+-    if (maxLon <= lon - 180) {
+-      lon -= 360;
+-    } else if (minLon >= lon + 180) {
+-      lon += 360;
+-    }
+-    return maxLon - lon < 90 && lon - minLon < 90;
+-  }
+-
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/geo/Geometry.java b/lucene/core/src/java/org/apache/lucene/geo/Geometry.java
+new file mode 100644
+index 0000000000..0d29b605aa
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/geo/Geometry.java
+@@ -0,0 +1,39 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.geo;
++
++import org.apache.lucene.index.PointValues.Relation;
++
++/**
++ * Simple interface implemented by geometries. May extend for other supporting utility methods
++ * (e.g., area, parsing)
++ *
++ * @lucene.experimental
++ */
++public interface Geometry {
++  /** get the bounding box of the implementing shape */
++  Rectangle getBoundingBox();
++  /** get the center of the implementing shape (centroid or bbox center) */
++  Point getCenter();
++  /** relates rectangles to the implementing shape */
++  Relation relate(double minLat, double maxLat, double minLon, double maxLon);
++
++  /** utility method to check intersects (any relation other than disjoint) */
++  static boolean intersects(Relation relation) {
++    return relation != Relation.CELL_OUTSIDE_QUERY;
++  }
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/geo/Point.java b/lucene/core/src/java/org/apache/lucene/geo/Point.java
+new file mode 100644
+index 0000000000..3c3433432e
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/geo/Point.java
+@@ -0,0 +1,98 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.geo;
++
++import java.util.Objects;
++
++import org.apache.lucene.index.PointValues.Relation;
++
++/**
++ * Represents a lat/lon point (in decimal degrees) on the earth's surface.
++ * <p>
++ * This geometry type provides relation method for relating lat/lon points to
++ * lat/lon bounding boxes as well as the foundation for point in polygon and distance
++ * relations in {@link Circle} and {@link Polygon} geometry classes.
++ *
++ * @lucene.experimental
++ */
++public class Point implements Geometry {
++  /** latitude location of the point (in decimal degrees) */
++  private final double lat;
++  /** longitude location of the point (in decimal degrees) */
++  private final double lon;
++
++  /** ctor */
++  public Point(final double lat, final double lon) {
++    GeoUtils.checkLatitude(lat);
++    GeoUtils.checkLongitude(lon);
++    this.lat = lat;
++    this.lon = lon;
++  }
++
++  /** accesses latitude (in demimal degrees) */
++  public double lat() {
++    return lat;
++  }
++
++  /** accesses longitude (in decimal degrees) */
++  public double lon() {
++    return lon;
++  }
++
++  /** gets the bounding box of the geometry; but points to not have a bounding box */
++  @Override
++  public Rectangle getBoundingBox() {
++    throw new UnsupportedOperationException("Points do not have a bounding box");
++  }
++
++  /** center of the point is the point itself */
++  @Override
++  public Point getCenter() {
++    return this;
++  }
++
++  /** Relates a point to a rectangle (in decimal degrees) */
++  @Override
++  public Relation relate(final double minLat, final double maxLat, final double minLon, final double maxLon) {
++    if (lat < minLat || lat > maxLat) {
++      return Relation.CELL_OUTSIDE_QUERY;
++    }
++    if (minLon > maxLon) {
++      return lon < minLon && lon > maxLon ? Relation.CELL_OUTSIDE_QUERY : Relation.CELL_INSIDE_QUERY;
++    }
++    return lon < minLon || lon > maxLon ? Relation.CELL_OUTSIDE_QUERY : Relation.CELL_INSIDE_QUERY;
++  }
++
++  @Override
++  public boolean equals(Object o) {
++    if (this == o) return true;
++    if (!(o instanceof Point)) return false;
++    Point point = (Point) o;
++    return Double.compare(point.lat, lat) == 0 &&
++        Double.compare(point.lon, lon) == 0;
++  }
++
++  @Override
++  public int hashCode() {
++    return Objects.hash(lat, lon);
++  }
++
++  @Override
++  public String toString() {
++    return lat + "," + lon;
++  }
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/geo/Polygon.java b/lucene/core/src/java/org/apache/lucene/geo/Polygon.java
+index 99453b9fb4..b900409d6d 100644
+--- a/lucene/core/src/java/org/apache/lucene/geo/Polygon.java
++++ b/lucene/core/src/java/org/apache/lucene/geo/Polygon.java
+@@ -18,6 +18,13 @@ package org.apache.lucene.geo;
+ 
+ import java.text.ParseException;
+ import java.util.Arrays;
++import java.util.Objects;
++import java.util.function.Function;
++
++import org.apache.lucene.index.PointValues.Relation;
++
++import static org.apache.lucene.geo.GeoEncodingUtils.decodeLatitude;
++import static org.apache.lucene.geo.GeoEncodingUtils.decodeLongitude;
+ 
+ /**
+  * Represents a closed polygon on the earth's surface.  You can either construct the Polygon directly yourself with {@code double[]}
+@@ -35,19 +42,15 @@ import java.util.Arrays;
+  * </ol>
+  * @lucene.experimental
+  */
+-public final class Polygon {
+-  private final double[] polyLats;
+-  private final double[] polyLons;
++public final class Polygon extends Shape {
++  /** array of latitudes (in decimal degrees) of the polygon */
++  private final double[] lats;
++  /** array of longitudes (in decimal degrees) of the polygon */
++  private final double[] lons;
++  /** holes of the polygon (represented as polygons that cannot have holes) */
+   private final Polygon[] holes;
+ 
+-  /** minimum latitude of this polygon's bounding box area */
+-  public final double minLat;
+-  /** maximum latitude of this polygon's bounding box area */
+-  public final double maxLat;
+-  /** minimum longitude of this polygon's bounding box area */
+-  public final double minLon;
+-  /** maximum longitude of this polygon's bounding box area */
+-  public final double maxLon;
++  private Predicate predicate;
+ 
+   /**
+    * Creates a new Polygon from the supplied latitude/longitude array, and optionally any holes.
+@@ -87,36 +90,38 @@ public final class Polygon {
+         throw new IllegalArgumentException("holes may not contain holes: polygons may not nest.");
+       }
+     }
+-    this.polyLats = polyLats.clone();
+-    this.polyLons = polyLons.clone();
++    this.lats = polyLats.clone();
++    this.lons = polyLons.clone();
+     this.holes = holes.clone();
+ 
+-    // compute bounding box
++    // compute bounding box & centroid of the polygon
+     double minLat = Double.POSITIVE_INFINITY;
+     double maxLat = Double.NEGATIVE_INFINITY;
+     double minLon = Double.POSITIVE_INFINITY;
+     double maxLon = Double.NEGATIVE_INFINITY;
+-
+-    for (int i = 0;i < polyLats.length; i++) {
++    double sumLat = 0;
++    double sumLon = 0;
++    final int numPoints = polyLats.length;
++    for (int i = 0; i < numPoints; ++i) {
+       minLat = Math.min(polyLats[i], minLat);
+       maxLat = Math.max(polyLats[i], maxLat);
+       minLon = Math.min(polyLons[i], minLon);
+       maxLon = Math.max(polyLons[i], maxLon);
++      sumLat += polyLats[i];
++      sumLon += polyLons[i];
+     }
+-    this.minLat = minLat;
+-    this.maxLat = maxLat;
+-    this.minLon = minLon;
+-    this.maxLon = maxLon;
++    this.boundingBox = new Rectangle(minLat, maxLat, minLon, maxLon);
++    this.center = new Point(sumLat/numPoints, sumLon/numPoints);
+   }
+ 
+   /** Returns a copy of the internal latitude array */
+   public double[] getPolyLats() {
+-    return polyLats.clone();
++    return lats.clone();
+   }
+ 
+   /** Returns a copy of the internal longitude array */
+   public double[] getPolyLons() {
+-    return polyLons.clone();
++    return lons.clone();
+   }
+ 
+   /** Returns a copy of the internal holes array */
+@@ -124,36 +129,89 @@ public final class Polygon {
+     return holes.clone();
+   }
+ 
++  public double minLat() {
++    return boundingBox.minLat;
++  }
++
++  public double maxLat() {
++    return boundingBox.maxLat;
++  }
++
++  public double minLon() {
++    return boundingBox.minLon;
++  }
++
++  public double maxLon() {
++    return boundingBox.maxLon;
++  }
++
++  public int numPoints() {
++    return lats.length;
++  }
++
++  private void checkVertexIndex(final int i) {
++    if (i >= lats.length) {
++      throw new IllegalArgumentException("Index " + i + " is outside the bounds of the " + lats.length + " vertices ");
++    }
++  }
++
++  public double getLat(int vertex) {
++    checkVertexIndex(vertex);
++    return lats[vertex];
++  }
++
++  public double getLon(int vertex) {
++    checkVertexIndex(vertex);
++    return lons[vertex];
++  }
++
+   @Override
+-  public int hashCode() {
+-    final int prime = 31;
+-    int result = 1;
+-    result = prime * result + Arrays.hashCode(holes);
+-    result = prime * result + Arrays.hashCode(polyLats);
+-    result = prime * result + Arrays.hashCode(polyLons);
+-    return result;
++  public Relation relate(double minLat, double maxLat, double minLon, double maxLon) {
++    return this.predicate().relate(minLat, maxLat, minLon, maxLon);
++  }
++
++  public Relation relatePoint(double lat, double lon) {
++    int encodedLat = GeoEncodingUtils.encodeLatitude(lat);
++    int encodedLon = GeoEncodingUtils.encodeLongitude(lon);
++    return this.predicate().test(encodedLat, encodedLon) ? Relation.CELL_INSIDE_QUERY : Relation.CELL_OUTSIDE_QUERY;
++  }
++
++  private Predicate predicate() {
++    if (this.predicate == null) {
++      this.predicate = Predicate.create(this.boundingBox, GeoEdgeTree.create(this));
++    }
++    return this.predicate;
+   }
+ 
+   @Override
+-  public boolean equals(Object obj) {
+-    if (this == obj) return true;
+-    if (obj == null) return false;
+-    if (getClass() != obj.getClass()) return false;
+-    Polygon other = (Polygon) obj;
+-    if (!Arrays.equals(holes, other.holes)) return false;
+-    if (!Arrays.equals(polyLats, other.polyLats)) return false;
+-    if (!Arrays.equals(polyLons, other.polyLons)) return false;
+-    return true;
++  public boolean equals(Object o) {
++    if (this == o) return true;
++    if (!(o instanceof Polygon)) return false;
++    if (!super.equals(o)) return false;
++    Polygon polygon = (Polygon) o;
++    return Arrays.equals(lats, polygon.lats) &&
++        Arrays.equals(lons, polygon.lons) &&
++        Arrays.equals(holes, polygon.holes) &&
++        Objects.equals(predicate, polygon.predicate);
++  }
++
++  @Override
++  public int hashCode() {
++    int result = Objects.hash(super.hashCode(), predicate);
++    result = 31 * result + Arrays.hashCode(lats);
++    result = 31 * result + Arrays.hashCode(lons);
++    result = 31 * result + Arrays.hashCode(holes);
++    return result;
+   }
+ 
+   @Override
+   public String toString() {
+     StringBuilder sb = new StringBuilder();
+-    for (int i = 0; i < polyLats.length; i++) {
++    for (int i = 0; i < lats.length; i++) {
+       sb.append("[")
+-      .append(polyLats[i])
++      .append(lats[i])
+       .append(", ")
+-      .append(polyLons[i])
++      .append(lons[i])
+       .append("] ");
+     }
+     if (holes.length > 0) {
+@@ -170,4 +228,68 @@ public final class Polygon {
+   public static Polygon[] fromGeoJSON(String geojson) throws ParseException {
+     return new SimpleGeoJSONPolygonParser(geojson).parse();
+   }
++
++  /** A predicate that checks whether a given point is within a polygon. */
++  public final static class Predicate extends BasePredicate {
++
++    final GeoEdgeTree tree;
++
++    private Predicate(GeoEdgeTree tree, Rectangle boundingBox, Function<Rectangle, Relation> boxToRelation) {
++      super(boundingBox, boxToRelation);
++      this.tree = tree;
++    }
++
++    /** Create a predicate that checks whether points are within a polygon.
++     *  It works the same way as {@code DistancePredicate.create}.
++     *  @lucene.internal */
++    public static Predicate create(Rectangle boundingBox, GeoEdgeTree tree) {
++      final Function<Rectangle, Relation> boxToRelation = box -> tree.relate(
++          box.minLat, box.maxLat, box.minLon, box.maxLon);
++      return new Predicate(tree, boundingBox, boxToRelation);
++    }
++
++
++    public Relation relate(final double minLat, final double maxLat, final double minLon, final double maxLon) {
++      return tree.relate(minLat, maxLat, minLon, maxLon);
++    }
++
++    /** Check whether the given point is within the considered polygon.
++     *  NOTE: this operates directly on the encoded representation of points. */
++    public boolean test(int lat, int lon) {
++      final int lat2 = ((lat - Integer.MIN_VALUE) >>> latShift);
++      if (lat2 < latBase || lat2 >= latBase + maxLatDelta) {
++        return false;
++      }
++      int lon2 = ((lon - Integer.MIN_VALUE) >>> lonShift);
++      if (lon2 < lonBase) { // wrap
++        lon2 += 1 << (32 - lonShift);
++      }
++      assert Integer.toUnsignedLong(lon2) >= lonBase;
++      assert lon2 - lonBase >= 0;
++      if (lon2 - lonBase >= maxLonDelta) {
++        return false;
++      }
++
++      final int relation = relations[(lat2 - latBase) * maxLonDelta + (lon2 - lonBase)];
++      if (relation == Relation.CELL_CROSSES_QUERY.ordinal()) {
++        return tree.contains(decodeLatitude(lat), decodeLongitude(lon));
++      } else {
++        return relation == Relation.CELL_INSIDE_QUERY.ordinal();
++      }
++    }
++
++    @Override
++    public boolean equals(Object o) {
++      if (this == o) return true;
++      if (!(o instanceof Predicate)) return false;
++      if (!super.equals(o)) return false;
++      Predicate predicate = (Predicate) o;
++      return Objects.equals(tree, predicate.tree);
++    }
++
++    @Override
++    public int hashCode() {
++      return Objects.hash(super.hashCode(), tree);
++    }
++  }
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/geo/Rectangle.java b/lucene/core/src/java/org/apache/lucene/geo/Rectangle.java
+index a8200c6edd..ffef7340ae 100644
+--- a/lucene/core/src/java/org/apache/lucene/geo/Rectangle.java
++++ b/lucene/core/src/java/org/apache/lucene/geo/Rectangle.java
+@@ -16,6 +16,8 @@
+  */
+ package org.apache.lucene.geo;
+ 
++import org.apache.lucene.index.PointValues.Relation;
++
+ import static java.lang.Math.PI;
+ import static java.lang.Math.max;
+ import static java.lang.Math.min;
+@@ -28,7 +30,6 @@ import static org.apache.lucene.geo.GeoUtils.MAX_LON_RADIANS;
+ import static org.apache.lucene.geo.GeoUtils.MIN_LAT_RADIANS;
+ import static org.apache.lucene.geo.GeoUtils.MIN_LON_RADIANS;
+ import static org.apache.lucene.geo.GeoUtils.EARTH_MEAN_RADIUS_METERS;
+-import static org.apache.lucene.geo.GeoUtils.sloppySin;
+ import static org.apache.lucene.util.SloppyMath.TO_DEGREES;
+ import static org.apache.lucene.util.SloppyMath.asin;
+ import static org.apache.lucene.util.SloppyMath.cos;
+@@ -36,7 +37,7 @@ import static org.apache.lucene.util.SloppyMath.toDegrees;
+ import static org.apache.lucene.util.SloppyMath.toRadians;
+ 
+ /** Represents a lat/lon rectangle. */
+-public class Rectangle {
++public class Rectangle extends Shape {
+   /** maximum longitude value (in degrees) */
+   public final double minLat;
+   /** minimum longitude value (in degrees) */
+@@ -61,6 +62,135 @@ public class Rectangle {
+     assert maxLat >= minLat;
+ 
+     // NOTE: cannot assert maxLon >= minLon since this rect could cross the dateline
++    this.boundingBox = this;
++
++    // compute the center of the rectangle
++    final double cntrLat = getHeight() / 2 + minLat;
++    double cntrLon = getWidth() / 2 + minLon;
++    if (crossesDateline()) {
++      cntrLon = GeoUtils.normalizeLonDegrees(cntrLon);
++    }
++    this.center = new Point(cntrLat, cntrLon);
++  }
++
++  @Override
++  public Rectangle getBoundingBox() {
++    return this;
++  }
++
++  public double minLat() {
++    return this.minLat;
++  }
++
++  public double maxLat() {
++    return this.maxLat;
++  }
++
++  public double minLon() {
++    return this.minLon;
++  }
++
++  public double maxLon() {
++    return this.maxLon;
++  }
++
++  public double getWidth() {
++    if (crossesDateline()) {
++      return GeoUtils.MAX_LON_INCL - minLon + maxLon - GeoUtils.MIN_LON_INCL;
++    }
++    return maxLon - minLon;
++  }
++
++  public double getHeight() {
++    return maxLat - minLat;
++  }
++
++  /** relates another rectangle (*that*) with *this* rectangle */
++  @Override
++  public Relation relate(double minLat, double maxLat, double minLon, double maxLon) {
++    return relate(this.minLat, this.maxLat, this.minLon, this.maxLon, minLat, maxLat, minLon, maxLon);
++  }
++
++  /** relates two rectangles (dateline crossing supported for both) */
++  public static Relation relate(double aMinLat, double aMaxLat, double aMinLon, double aMaxLon,
++                                double bMinLat, double bMaxLat, double bMinLon, double bMaxLon) {
++    // fail quickly: check lats for disjoint
++    if (aMinLat > bMaxLat || aMaxLat < bMinLat) {
++      return Relation.CELL_OUTSIDE_QUERY;
++    }
++    // WITHIN: b is full range
++    if (bMinLat == GeoUtils.MIN_LAT_INCL && bMaxLat == GeoUtils.MAX_LAT_INCL &&
++        bMinLon == GeoUtils.MIN_LON_INCL && bMaxLon == GeoUtils.MAX_LON_INCL) {
++      return Relation.CELL_CROSSES_QUERY;
++    }
++    // CONTAINS: a is full range
++    if (aMinLat == GeoUtils.MIN_LAT_INCL && aMaxLat == GeoUtils.MAX_LAT_INCL &&
++        aMinLon == GeoUtils.MIN_LON_INCL && aMaxLon == GeoUtils.MAX_LON_INCL) {
++      return Relation.CELL_INSIDE_QUERY;
++    }
++    // a crosses dateline
++    if (aMinLon > aMaxLon == true) {
++      return relateXDL(aMinLon, aMaxLon, bMinLon, bMaxLon);
++    }
++    // b crosses dateline (transpose result)
++    if (bMinLon > bMaxLon == true) {
++      switch(relateXDL(bMinLon, bMaxLon, aMinLon, aMaxLon)) {
++        case CELL_CROSSES_QUERY: return Relation.CELL_INSIDE_QUERY;
++        case CELL_INSIDE_QUERY: return Relation.CELL_CROSSES_QUERY;
++        default: return Relation.CELL_OUTSIDE_QUERY;
++      }
++    }
++    // simple case: neither cross dateline
++    if (isLonDisjoint(aMinLon, aMaxLon, bMinLon, bMaxLon)) {
++      return Relation.CELL_OUTSIDE_QUERY;  // DISJOINT
++    } else if (isLonWithin(aMinLon, aMaxLon, bMinLon, bMaxLon)) {
++      return Relation.CELL_CROSSES_QUERY;  // WITHIN
++    } else if (isLonWithin(bMinLon, bMaxLon, aMinLon, aMaxLon)) {
++      return Relation.CELL_INSIDE_QUERY;  // CONTAINS
++    }
++    return Relation.CELL_CROSSES_QUERY;  // INTERSECTS
++  }
++
++  /** compute relation for a Rectangle crossing the dateline */
++  private static Relation relateXDL(double aMinLon, double aMaxLon, double bMinLon, double bMaxLon) {
++    if (bMinLon > bMaxLon) {
++      // b also crosses dateline;
++      if (isLonWithin(aMinLon, aMaxLon, bMinLon, bMaxLon)) {
++        return Relation.CELL_CROSSES_QUERY;    // WITHIN
++      } else if (isLonWithin(bMinLon, bMaxLon, aMinLon, aMaxLon)) {
++        return Relation.CELL_INSIDE_QUERY;     // CONTAINS
++      }
++    } else {
++      if (isLonDisjoint(aMinLon, GeoUtils.MAX_LON_INCL, bMinLon, bMaxLon) &&
++          isLonDisjoint(GeoUtils.MIN_LON_INCL, aMaxLon, bMinLon, bMaxLon)) {
++        return Relation.CELL_OUTSIDE_QUERY;  // DISJOINT
++        // WITHIN not possible; a crosses the dateline but b does not
++      } else if (isLonWithin(bMinLon, bMaxLon, aMinLon, GeoUtils.MAX_LON_INCL) ||
++                 isLonWithin(bMinLon, bMaxLon, GeoUtils.MIN_LON_INCL, aMaxLon)) {
++        return Relation.CELL_INSIDE_QUERY;     // CONTAINS
++      }
++    }
++    return Relation.CELL_CROSSES_QUERY;   // INTERSECTS
++  }
++
++  /** Computes whether two rectangles are disjoint */
++  private static boolean isLonDisjoint(final double aMinLon, final double aMaxLon, final double bMinLon, final double bMaxLon) {
++    assert aMinLon <= aMaxLon : "dateline crossing not supported";
++    assert bMinLon <= bMaxLon : "dateline crossing not supported";
++
++    // check sharing dateline
++    if ((aMinLon == GeoUtils.MIN_LON_INCL && bMaxLon == GeoUtils.MAX_LON_INCL) ||
++        (bMinLon == GeoUtils.MIN_LON_INCL && aMaxLon == GeoUtils.MAX_LON_INCL)) {
++      return false;
++    }
++
++    // check longitude
++    return aMaxLon < bMinLon || aMinLon > bMaxLon;
++  }
++
++  /** Computes whether the first (a) rectangle is wholly within another (b) rectangle (shared boundaries allowed) */
++  private static boolean isLonWithin(final double aMinLon, final double aMaxLon, final double bMinLon, final double bMaxLon) {
++    return !(aMinLon < bMinLon || aMaxLon > bMaxLon);
+   }
+ 
+   @Override
+@@ -87,6 +217,24 @@ public class Rectangle {
+     return maxLon < minLon;
+   }
+ 
++  /**
++   * Returns the trigonometric sine of an angle converted as a cos operation.
++   * <p>
++   * Note that this is not quite right... e.g. sin(0) != 0
++   * <p>
++   * Special cases:
++   * <ul>
++   *  <li>If the argument is {@code NaN} or an infinity, then the result is {@code NaN}.
++   * </ul>
++   * @param a an angle, in radians.
++   * @return the sine of the argument.
++   * @see Math#sin(double)
++   */
++  // TODO: deprecate/remove this? at least its no longer public.
++  private static double sloppySin(double a) {
++    return cos(a - (Math.PI / 2D));
++  }
++
+   /** Compute Bounding Box for a circle using WGS-84 parameters */
+   public static Rectangle fromPointDistance(final double centerLat, final double centerLon, final double radiusMeters) {
+     checkLatitude(centerLat);
+@@ -121,54 +269,6 @@ public class Rectangle {
+     return new Rectangle(toDegrees(minLat), toDegrees(maxLat), toDegrees(minLon), toDegrees(maxLon));
+   }
+ 
+-  /** maximum error from {@link #axisLat(double, double)}. logic must be prepared to handle this */
+-  public static final double AXISLAT_ERROR = 0.1D / EARTH_MEAN_RADIUS_METERS * TO_DEGREES;
+-
+-  /**
+-   * Calculate the latitude of a circle's intersections with its bbox meridians.
+-   * <p>
+-   * <b>NOTE:</b> the returned value will be +/- {@link #AXISLAT_ERROR} of the actual value.
+-   * @param centerLat The latitude of the circle center
+-   * @param radiusMeters The radius of the circle in meters
+-   * @return A latitude
+-   */
+-  public static double axisLat(double centerLat, double radiusMeters) {
+-    // A spherical triangle with:
+-    // r is the radius of the circle in radians
+-    // l1 is the latitude of the circle center
+-    // l2 is the latitude of the point at which the circle intersect's its bbox longitudes
+-    // We know r is tangent to the bbox meridians at l2, therefore it is a right angle.
+-    // So from the law of cosines, with the angle of l1 being 90, we have:
+-    // cos(l1) = cos(r) * cos(l2) + sin(r) * sin(l2) * cos(90)
+-    // The second part cancels out because cos(90) == 0, so we have:
+-    // cos(l1) = cos(r) * cos(l2)
+-    // Solving for l2, we get:
+-    // l2 = acos( cos(l1) / cos(r) )
+-    // We ensure r is in the range (0, PI/2) and l1 in the range (0, PI/2]. This means we
+-    // cannot divide by 0, and we will always get a positive value in the range [0, 1) as
+-    // the argument to arc cosine, resulting in a range (0, PI/2].
+-    final double PIO2 = Math.PI / 2D;
+-    double l1 = toRadians(centerLat);
+-    double r = (radiusMeters + 7E-2) / EARTH_MEAN_RADIUS_METERS;
+-
+-    // if we are within radius range of a pole, the lat is the pole itself
+-    if (Math.abs(l1) + r >= MAX_LAT_RADIANS) {
+-      return centerLat >= 0 ? MAX_LAT_INCL : MIN_LAT_INCL;
+-    }
+-
+-    // adjust l1 as distance from closest pole, to form a right triangle with bbox meridians
+-    // and ensure it is in the range (0, PI/2]
+-    l1 = centerLat >= 0 ? PIO2 - l1 : l1 + PIO2;
+-
+-    double l2 = Math.acos(Math.cos(l1) / Math.cos(r));
+-    assert !Double.isNaN(l2);
+-
+-    // now adjust back to range [-pi/2, pi/2], ie latitude in radians
+-    l2 = centerLat >= 0 ? PIO2 - l2 : l2 - PIO2;
+-
+-    return toDegrees(l2);
+-  }
+-
+   /** Returns the bounding box over an array of polygons */
+   public static Rectangle fromPolygon(Polygon[] polygons) {
+     // compute bounding box
+@@ -177,11 +277,13 @@ public class Rectangle {
+     double minLon = Double.POSITIVE_INFINITY;
+     double maxLon = Double.NEGATIVE_INFINITY;
+ 
+-    for (int i = 0;i < polygons.length; i++) {
+-      minLat = Math.min(polygons[i].minLat, minLat);
+-      maxLat = Math.max(polygons[i].maxLat, maxLat);
+-      minLon = Math.min(polygons[i].minLon, minLon);
+-      maxLon = Math.max(polygons[i].maxLon, maxLon);
++    Rectangle bbox;
++    for (Polygon p : polygons) {
++      bbox = p.boundingBox;
++      minLat = Math.min(bbox.minLat, minLat);
++      maxLat = Math.max(bbox.maxLat, maxLat);
++      minLon = Math.min(bbox.minLon, minLon);
++      maxLon = Math.max(bbox.maxLon, maxLon);
+     }
+ 
+     return new Rectangle(minLat, maxLat, minLon, maxLon);
+diff --git a/lucene/core/src/java/org/apache/lucene/geo/Shape.java b/lucene/core/src/java/org/apache/lucene/geo/Shape.java
+new file mode 100644
+index 0000000000..ff975b28f0
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/geo/Shape.java
+@@ -0,0 +1,56 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.geo;
++
++import java.util.Objects;
++
++/**
++ * base class for simple WGS-84 shape implementations
++ *
++ *  @lucene.experimental
++ **/
++public abstract class Shape implements Geometry {
++  /** center of the shape */
++  protected Point center;
++  /** bounding box of the shape */
++  protected Rectangle boundingBox;
++
++  /** access bounding box of the shape */
++  @Override
++  public Rectangle getBoundingBox() {
++    return boundingBox;
++  }
++
++  /** access the center of the shape */
++  @Override
++  public Point getCenter() {
++    return center;
++  }
++
++  @Override
++  public boolean equals(Object o) {
++    if (this == o) return true;
++    if (!(o instanceof Shape)) return false;
++    Shape shape = (Shape) o;
++    return Objects.equals(center, shape.center) && Objects.equals(boundingBox, shape.boundingBox);
++  }
++
++  @Override
++  public int hashCode() {
++    return Objects.hash(center, boundingBox);
++  }
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/geo/package-info.java b/lucene/core/src/java/org/apache/lucene/geo/package-info.java
+index 8d9afc9e4d..e497f0dd0b 100644
+--- a/lucene/core/src/java/org/apache/lucene/geo/package-info.java
++++ b/lucene/core/src/java/org/apache/lucene/geo/package-info.java
+@@ -16,6 +16,6 @@
+  */
+ 
+ /**
+- * Geospatial Utility Implementations for Lucene Core
++ * Geospatial Utility and Simple Geometry Implementations for Lucene Core
+  */
+ package org.apache.lucene.geo;
+\ No newline at end of file
+diff --git a/lucene/core/src/test/org/apache/lucene/geo/BaseGeometryTestCase.java b/lucene/core/src/test/org/apache/lucene/geo/BaseGeometryTestCase.java
+new file mode 100644
+index 0000000000..6cb645857e
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/geo/BaseGeometryTestCase.java
+@@ -0,0 +1,76 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.geo;
++
++import org.apache.lucene.index.PointValues.Relation;
++import org.apache.lucene.util.LuceneTestCase;
++
++/** Base class for testing geometries (point, polygon, circle, rectangle) */
++abstract class BaseGeometryTestCase<T extends Geometry> extends LuceneTestCase {
++  abstract public Geometry getShape();
++
++  /** tests bounding box of shape */
++  abstract public void testBoundingBox();
++  /** tests WITHIN relation */
++  abstract public void testWithin();
++  /** tests CONTAINS relation */
++  abstract public void testContains();
++  /** tests DISJOINT relation */
++  abstract public void testDisjoint();
++  /** tests INTERSECTS relation */
++  abstract public void testIntersects();
++
++  /** tests center of shape */
++  public void testCenter() {
++    Geometry shape = getShape();
++    Rectangle bbox = shape.getBoundingBox();
++    double centerLat = StrictMath.abs(bbox.maxLat() - bbox.minLat()) * 0.5d + bbox.minLat();
++    double centerLon;
++    if (bbox.crossesDateline()) {
++      centerLon = GeoUtils.MAX_LON_INCL - bbox.minLon()  + bbox.maxLon() - GeoUtils.MIN_LON_INCL;
++      centerLon = GeoUtils.normalizeLonDegrees(centerLon * 0.5d + bbox.minLon());
++    } else {
++      centerLon = StrictMath.abs(bbox.maxLon() - bbox.minLon()) * 0.5d + bbox.minLon();
++    }
++    assertEquals(new Point(centerLat, centerLon), shape.getCenter());
++  }
++
++  /** helper method for semi-random relation testing */
++  protected void relationTest(Shape points, Relation r) {
++    Rectangle bbox = points.getBoundingBox();
++    double minLat = bbox.minLat();
++    double maxLat = bbox.maxLat();
++    double minLon = bbox.minLon();
++    double maxLon = bbox.maxLon();
++
++    if (r == Relation.CELL_INSIDE_QUERY) {  // CONTAINS
++      return;
++    } else if (r == Relation.CELL_OUTSIDE_QUERY) {  // DISJOINT
++      // shrink test box
++      minLat -= 20D;
++      maxLat = minLat - 1D;
++      minLon -= 20D;
++      maxLon = minLon - 1D;
++    } else if (r == Relation.CELL_CROSSES_QUERY) {   // WITHIN & INTERSECTS
++      // intersects
++      minLat -= 10D;
++      maxLat = minLat + 10D;
++    }
++
++    assertEquals(r, points.relate(minLat, maxLat, minLon, maxLon));
++  }
++}
+diff --git a/lucene/core/src/test/org/apache/lucene/geo/TestGeoUtils.java b/lucene/core/src/test/org/apache/lucene/geo/TestCircle.java
+similarity index 70%
+rename from lucene/core/src/test/org/apache/lucene/geo/TestGeoUtils.java
+rename to lucene/core/src/test/org/apache/lucene/geo/TestCircle.java
+index 3d95a6d1a5..0c7e2e5914 100644
+--- a/lucene/core/src/test/org/apache/lucene/geo/TestGeoUtils.java
++++ b/lucene/core/src/test/org/apache/lucene/geo/TestCircle.java
+@@ -18,15 +18,83 @@ package org.apache.lucene.geo;
+ 
+ import java.util.Locale;
+ 
+-import org.apache.lucene.util.LuceneTestCase;
++import com.carrotsearch.randomizedtesting.generators.RandomNumbers;
++import org.apache.lucene.geo.Circle.Predicate;
++import org.apache.lucene.index.PointValues.Relation;
+ import org.apache.lucene.util.SloppyMath;
++import org.junit.Ignore;
++
++/** Test coverage for Circle geometries and Point-Distance processing */
++public class TestCircle extends BaseGeometryTestCase<Circle> {
++  @Override
++  public Circle getShape() {
++    // random center around 0,0 to avoid dateline crossing
++    Point pt = new Point(GeoTestUtil.nextLatitudeIn(-20D, 20D), GeoTestUtil.nextLongitudeIn(-20D, 20D));
++    // min radius of 1Km, max radius of 100Km
++    double radiusMeters = RandomNumbers.randomIntBetween(random(), 1000, 100000);
++    return new Circle(pt.lat(), pt.lon(), radiusMeters);
++  }
+ 
+-/**
+- * Tests class for methods in GeoUtils
+- *
+- * @lucene.experimental
+- */
+-public class TestGeoUtils extends LuceneTestCase {
++  @Ignore
++  public void testCenter() {
++    // center is explicitly provided; no need to test
++  }
++
++  @Override
++  public void testBoundingBox() {
++    Circle ptRadius = getShape();
++    Rectangle expected = Rectangle.fromPointDistance(ptRadius.getLat(), ptRadius.getLon(), ptRadius.getRadiusMeters());
++    assertEquals(expected, ptRadius.getBoundingBox());
++  }
++
++  @Override
++  public void testWithin() {
++    Circle ptRadius = getShape();
++    // make a circle that is 100Km larger
++    Rectangle bigger = Rectangle.fromPointDistance(ptRadius.getLat(), ptRadius.getLon(), ptRadius.getRadiusMeters() + 100000);
++    assertEquals(Relation.CELL_CROSSES_QUERY, ptRadius.relate(bigger.minLat(), bigger.maxLat(), bigger.minLon(), bigger.maxLon()));
++  }
++
++  @Override
++  public void testContains() {
++    Circle ptRadius = getShape();
++    double minLat = ptRadius.getLat() - 1E-5;
++    double maxLat = ptRadius.getLat() + 1E-5;
++    double minLon = ptRadius.getLon() - 1E-5;
++    double maxLon = ptRadius.getLon() + 1E-5;
++    assertEquals(Relation.CELL_INSIDE_QUERY, ptRadius.relate(minLat, maxLat, minLon, maxLon));
++  }
++
++  @Override
++  public void testIntersects() {
++    relationTest(getShape(), Relation.CELL_CROSSES_QUERY);
++  }
++
++  @Override
++  public void testDisjoint() {
++    Circle circle = getShape();
++    Rectangle bbox = circle.getBoundingBox();
++    assertEquals(Relation.CELL_OUTSIDE_QUERY, circle.relate(bbox.maxLat + 1D, bbox.maxLat + 2D, bbox.minLon, bbox.maxLon));
++  }
++
++  public void testInvalidRadius() {
++    IllegalArgumentException expected = expectThrows(IllegalArgumentException.class, () -> {
++      new Circle(0d, 0d, -1000d);
++    });
++    assertTrue(expected.getMessage().contains("radiusMeters: '-1000.0' is invalid"));
++  }
++
++  public void testWithin90LonDegrees() {
++    assertTrue(Predicate.within90LonDegrees(0, -80, 80));
++    assertFalse(Predicate.within90LonDegrees(0, -100, 80));
++    assertFalse(Predicate.within90LonDegrees(0, -80, 100));
++
++    assertTrue(Predicate.within90LonDegrees(-150, 140, 170));
++    assertFalse(Predicate.within90LonDegrees(-150, 120, 150));
++
++    assertTrue(Predicate.within90LonDegrees(150, -170, -140));
++    assertFalse(Predicate.within90LonDegrees(150, -150, -120));
++  }
+ 
+   // We rely heavily on GeoUtils.circleToBBox so we test it here:
+   public void testRandomCircleToBBox() throws Exception {
+@@ -118,80 +186,6 @@ public class TestGeoUtils extends LuceneTestCase {
+     }
+   }
+ 
+-  // test we can use haversinSortKey() for distance queries.
+-  public void testHaversinOpto() {
+-    int iters = atLeast(100);
+-    for (int i = 0; i < iters; i++) {
+-      double lat = GeoTestUtil.nextLatitude();
+-      double lon = GeoTestUtil.nextLongitude();
+-      double radius = 50000000 * random().nextDouble();
+-      Rectangle box = Rectangle.fromPointDistance(lat, lon, radius);
+-
+-      if (box.maxLon - lon < 90 && lon - box.minLon < 90) {
+-        double minPartialDistance = Math.max(SloppyMath.haversinSortKey(lat, lon, lat, box.maxLon),
+-                                             SloppyMath.haversinSortKey(lat, lon, box.maxLat, lon));
+-
+-        for (int j = 0; j < 10000; j++) {
+-          double point[] = GeoTestUtil.nextPointNear(box);
+-          double lat2 = point[0];
+-          double lon2 = point[1];
+-          // if the point is within radius, then it should be <= our sort key
+-          if (SloppyMath.haversinMeters(lat, lon, lat2, lon2) <= radius) {
+-            assertTrue(SloppyMath.haversinSortKey(lat, lon, lat2, lon2) <= minPartialDistance);
+-          }
+-        }
+-      }
+-    }
+-  }
+-
+-  /** Test infinite radius covers whole earth */
+-  public void testInfiniteRect() {
+-    for (int i = 0; i < 1000; i++) {
+-      double centerLat = GeoTestUtil.nextLatitude();
+-      double centerLon = GeoTestUtil.nextLongitude();
+-      Rectangle rect = Rectangle.fromPointDistance(centerLat, centerLon, Double.POSITIVE_INFINITY);
+-      assertEquals(-180.0, rect.minLon, 0.0D);
+-      assertEquals(180.0, rect.maxLon, 0.0D);
+-      assertEquals(-90.0, rect.minLat, 0.0D);
+-      assertEquals(90.0, rect.maxLat, 0.0D);
+-      assertFalse(rect.crossesDateline());
+-    }
+-  }
+-
+-  public void testAxisLat() {
+-    double earthCircumference = 2D * Math.PI * GeoUtils.EARTH_MEAN_RADIUS_METERS;
+-    assertEquals(90, Rectangle.axisLat(0, earthCircumference / 4), 0.0D);
+-
+-    for (int i = 0; i < 100; ++i) {
+-      boolean reallyBig = random().nextInt(10) == 0;
+-      final double maxRadius = reallyBig ? 1.1 * earthCircumference : earthCircumference / 8;
+-      final double radius = maxRadius * random().nextDouble();
+-      double prevAxisLat = Rectangle.axisLat(0.0D, radius);
+-      for (double lat = 0.1D; lat < 90D; lat += 0.1D) {
+-        double nextAxisLat = Rectangle.axisLat(lat, radius);
+-        Rectangle bbox = Rectangle.fromPointDistance(lat, 180D, radius);
+-        double dist = SloppyMath.haversinMeters(lat, 180D, nextAxisLat, bbox.maxLon);
+-        if (nextAxisLat < GeoUtils.MAX_LAT_INCL) {
+-          assertEquals("lat = " + lat, dist, radius, 0.1D);
+-        }
+-        assertTrue("lat = " + lat, prevAxisLat <= nextAxisLat);
+-        prevAxisLat = nextAxisLat;
+-      }
+-
+-      prevAxisLat = Rectangle.axisLat(-0.0D, radius);
+-      for (double lat = -0.1D; lat > -90D; lat -= 0.1D) {
+-        double nextAxisLat = Rectangle.axisLat(lat, radius);
+-        Rectangle bbox = Rectangle.fromPointDistance(lat, 180D, radius);
+-        double dist = SloppyMath.haversinMeters(lat, 180D, nextAxisLat, bbox.maxLon);
+-        if (nextAxisLat > GeoUtils.MIN_LAT_INCL) {
+-          assertEquals("lat = " + lat, dist, radius, 0.1D);
+-        }
+-        assertTrue("lat = " + lat, prevAxisLat >= nextAxisLat);
+-        prevAxisLat = nextAxisLat;
+-      }
+-    }
+-  }
+-
+   // TODO: does not really belong here, but we test it like this for now
+   // we can make a fake IndexReader to send boxes directly to Point visitors instead?
+   public void testCircleOpto() throws Exception {
+@@ -207,7 +201,7 @@ public class TestGeoUtils extends LuceneTestCase {
+         --i; // try again...
+         continue;
+       }
+-      final double axisLat = Rectangle.axisLat(centerLat, radius);
++      final double axisLat = Circle.axisLat(centerLat, radius);
+ 
+       for (int k = 0; k < 1000; ++k) {
+ 
+@@ -229,7 +223,7 @@ public class TestGeoUtils extends LuceneTestCase {
+         assert latMax >= latMin;
+         assert lonMax >= lonMin;
+ 
+-        if (isDisjoint(centerLat, centerLon, radius, axisLat, latMin, latMax, lonMin, lonMax)) {
++        if (circleIsDisjoint(centerLat, centerLon, radius, axisLat, latMin, latMax, lonMin, lonMax)) {
+           // intersects says false: test a ton of points
+           for (int j = 0; j < 200; j++) {
+             double lat = latMin + (latMax - latMin) * random().nextDouble();
+@@ -250,18 +244,18 @@ public class TestGeoUtils extends LuceneTestCase {
+             }
+             double distance = SloppyMath.haversinMeters(centerLat, centerLon, lat, lon);
+             try {
+-            assertTrue(String.format(Locale.ROOT, "\nisDisjoint(\n" +
+-                    "centerLat=%s\n" +
+-                    "centerLon=%s\n" +
+-                    "radius=%s\n" +
+-                    "latMin=%s\n" +
+-                    "latMax=%s\n" +
+-                    "lonMin=%s\n" +
+-                    "lonMax=%s) == false BUT\n" +
+-                    "haversin(%s, %s, %s, %s) = %s\nbbox=%s",
+-                centerLat, centerLon, radius, latMin, latMax, lonMin, lonMax,
+-                centerLat, centerLon, lat, lon, distance, Rectangle.fromPointDistance(centerLat, centerLon, radius)),
+-                distance > radius);
++              assertTrue(String.format(Locale.ROOT, "\nisDisjoint(\n" +
++                      "centerLat=%s\n" +
++                      "centerLon=%s\n" +
++                      "radius=%s\n" +
++                      "latMin=%s\n" +
++                      "latMax=%s\n" +
++                      "lonMin=%s\n" +
++                      "lonMax=%s) == false BUT\n" +
++                      "haversin(%s, %s, %s, %s) = %s\nbbox=%s",
++                  centerLat, centerLon, radius, latMin, latMax, lonMin, lonMax,
++                  centerLat, centerLon, lat, lon, distance, Rectangle.fromPointDistance(centerLat, centerLon, radius)),
++                  distance > radius);
+             } catch (AssertionError e) {
+               EarthDebugger ed = new EarthDebugger();
+               ed.addRect(latMin, latMax, lonMin, lonMax);
+@@ -275,12 +269,52 @@ public class TestGeoUtils extends LuceneTestCase {
+     }
+   }
+ 
++  /** Test infinite radius covers whole earth */
++  public void testInfiniteRect() {
++    for (int i = 0; i < 1000; i++) {
++      double centerLat = GeoTestUtil.nextLatitude();
++      double centerLon = GeoTestUtil.nextLongitude();
++      Rectangle rect = Rectangle.fromPointDistance(centerLat, centerLon, Double.POSITIVE_INFINITY);
++      assertEquals(-180.0, rect.minLon, 0.0D);
++      assertEquals(180.0, rect.maxLon, 0.0D);
++      assertEquals(-90.0, rect.minLat, 0.0D);
++      assertEquals(90.0, rect.maxLat, 0.0D);
++      assertFalse(rect.crossesDateline());
++    }
++  }
++
++  // test we can use haversinSortKey() for distance queries.
++  public void testHaversinOpto() {
++    int iters = atLeast(100);
++    for (int i = 0; i < iters; i++) {
++      double lat = GeoTestUtil.nextLatitude();
++      double lon = GeoTestUtil.nextLongitude();
++      double radius = 50000000 * random().nextDouble();
++      Rectangle box = Rectangle.fromPointDistance(lat, lon, radius);
++
++      if (box.maxLon - lon < 90 && lon - box.minLon < 90) {
++        double minPartialDistance = Math.max(SloppyMath.haversinSortKey(lat, lon, lat, box.maxLon),
++            SloppyMath.haversinSortKey(lat, lon, box.maxLat, lon));
++
++        for (int j = 0; j < 10000; j++) {
++          double point[] = GeoTestUtil.nextPointNear(box);
++          double lat2 = point[0];
++          double lon2 = point[1];
++          // if the point is within radius, then it should be <= our sort key
++          if (SloppyMath.haversinMeters(lat, lon, lat2, lon2) <= radius) {
++            assertTrue(SloppyMath.haversinSortKey(lat, lon, lat2, lon2) <= minPartialDistance);
++          }
++        }
++      }
++    }
++  }
++
+   static double randomInRange(double min, double max) {
+     return min + (max - min) * random().nextDouble();
+   }
+ 
+-  static boolean isDisjoint(double centerLat, double centerLon, double radius, double axisLat, double latMin, double latMax, double lonMin, double lonMax) {
+-    if ((centerLon < lonMin || centerLon > lonMax) && (axisLat+ Rectangle.AXISLAT_ERROR < latMin || axisLat- Rectangle.AXISLAT_ERROR > latMax)) {
++  static boolean circleIsDisjoint(double centerLat, double centerLon, double radius, double axisLat, double latMin, double latMax, double lonMin, double lonMax) {
++    if ((centerLon < lonMin || centerLon > lonMax) && (axisLat+ Circle.AXISLAT_ERROR < latMin || axisLat- Circle.AXISLAT_ERROR > latMax)) {
+       // circle not fully inside / crossing axis
+       if (SloppyMath.haversinMeters(centerLat, centerLon, latMin, lonMin) > radius &&
+           SloppyMath.haversinMeters(centerLat, centerLon, latMin, lonMax) > radius &&
+@@ -293,16 +327,4 @@ public class TestGeoUtils extends LuceneTestCase {
+ 
+     return false;
+   }
+-
+-  public void testWithin90LonDegrees() {
+-    assertTrue(GeoUtils.within90LonDegrees(0, -80, 80));
+-    assertFalse(GeoUtils.within90LonDegrees(0, -100, 80));
+-    assertFalse(GeoUtils.within90LonDegrees(0, -80, 100));
+-
+-    assertTrue(GeoUtils.within90LonDegrees(-150, 140, 170));
+-    assertFalse(GeoUtils.within90LonDegrees(-150, 120, 150));
+-
+-    assertTrue(GeoUtils.within90LonDegrees(150, -170, -140));
+-    assertFalse(GeoUtils.within90LonDegrees(150, -150, -120));
+-  }
+ }
+diff --git a/lucene/core/src/test/org/apache/lucene/geo/TestPolygon2D.java b/lucene/core/src/test/org/apache/lucene/geo/TestGeoEdgeTree.java
+similarity index 93%
+rename from lucene/core/src/test/org/apache/lucene/geo/TestPolygon2D.java
+rename to lucene/core/src/test/org/apache/lucene/geo/TestGeoEdgeTree.java
+index 31a42c01ba..af5ab3a1b1 100644
+--- a/lucene/core/src/test/org/apache/lucene/geo/TestPolygon2D.java
++++ b/lucene/core/src/test/org/apache/lucene/geo/TestGeoEdgeTree.java
+@@ -23,22 +23,22 @@ import static org.apache.lucene.geo.GeoTestUtil.nextPolygon;
+ import org.apache.lucene.index.PointValues.Relation;
+ import org.apache.lucene.util.LuceneTestCase;
+ 
+-/** Test Polygon2D impl */
+-public class TestPolygon2D extends LuceneTestCase {
+-  
++/** Test GeoEdgeTree impl */
++public class TestGeoEdgeTree extends LuceneTestCase {
++
+   /** Three boxes, an island inside a hole inside a shape */
+   public void testMultiPolygon() {
+     Polygon hole = new Polygon(new double[] { -10, -10, 10, 10, -10 }, new double[] { -10, 10, 10, -10, -10 });
+     Polygon outer = new Polygon(new double[] { -50, -50, 50, 50, -50 }, new double[] { -50, 50, 50, -50, -50 }, hole);
+     Polygon island = new Polygon(new double[] { -5, -5, 5, 5, -5 }, new double[] { -5, 5, 5, -5, -5 } );
+-    Polygon2D polygon = Polygon2D.create(outer, island);
+-    
++    GeoEdgeTree polygon = GeoEdgeTree.create(outer, island);
++
+     // contains(point)
+     assertTrue(polygon.contains(-2, 2)); // on the island
+     assertFalse(polygon.contains(-6, 6)); // in the hole
+     assertTrue(polygon.contains(-25, 25)); // on the mainland
+     assertFalse(polygon.contains(-51, 51)); // in the ocean
+-    
++
+     // relate(box): this can conservatively return CELL_CROSSES_QUERY
+     assertEquals(Relation.CELL_INSIDE_QUERY, polygon.relate(-2, 2, -2, 2)); // on the island
+     assertEquals(Relation.CELL_OUTSIDE_QUERY, polygon.relate(6, 7, 6, 7)); // in the hole
+@@ -49,7 +49,7 @@ public class TestPolygon2D extends LuceneTestCase {
+     assertEquals(Relation.CELL_CROSSES_QUERY, polygon.relate(9, 11, 9, 11)); // overlapping the hole
+     assertEquals(Relation.CELL_CROSSES_QUERY, polygon.relate(5, 6, 5, 6)); // overlapping the island
+   }
+-  
++
+   public void testPacMan() throws Exception {
+     // pacman
+     double[] px = {0, 10, 10, 0, -8, -10, -8, 0, 10, 10, 0};
+@@ -62,14 +62,14 @@ public class TestPolygon2D extends LuceneTestCase {
+     double yMax = 1;//5;
+ 
+     // test cell crossing poly
+-    Polygon2D polygon = Polygon2D.create(new Polygon(py, px));
++    GeoEdgeTree polygon = GeoEdgeTree.create(new Polygon(py, px));
+     assertEquals(Relation.CELL_CROSSES_QUERY, polygon.relate(yMin, yMax, xMin, xMax));
+   }
+-  
++
+   public void testBoundingBox() throws Exception {
+     for (int i = 0; i < 100; i++) {
+-      Polygon2D polygon = Polygon2D.create(nextPolygon());
+-      
++      GeoEdgeTree polygon = GeoEdgeTree.create(nextPolygon());
++
+       for (int j = 0; j < 100; j++) {
+         double latitude = nextLatitude();
+         double longitude = nextLongitude();
+@@ -81,33 +81,33 @@ public class TestPolygon2D extends LuceneTestCase {
+       }
+     }
+   }
+-  
++
+   // targets the bounding box directly
+   public void testBoundingBoxEdgeCases() throws Exception {
+     for (int i = 0; i < 100; i++) {
+       Polygon polygon = nextPolygon();
+-      Polygon2D impl = Polygon2D.create(polygon);
+-      
++      GeoEdgeTree impl = GeoEdgeTree.create(polygon);
++
+       for (int j = 0; j < 100; j++) {
+         double point[] = GeoTestUtil.nextPointNear(polygon);
+         double latitude = point[0];
+         double longitude = point[1];
+         // if the point is within poly, then it should be in our bounding box
+         if (impl.contains(latitude, longitude)) {
+-          assertTrue(latitude >= polygon.minLat && latitude <= polygon.maxLat);
+-          assertTrue(longitude >= polygon.minLon && longitude <= polygon.maxLon);
++          assertTrue(latitude >= polygon.minLat() && latitude <= polygon.maxLat());
++          assertTrue(longitude >= polygon.minLon() && longitude <= polygon.maxLon());
+         }
+       }
+     }
+   }
+-  
++
+   /** If polygon.contains(box) returns true, then any point in that box should return true as well */
+   public void testContainsRandom() throws Exception {
+     int iters = atLeast(50);
+     for (int i = 0; i < iters; i++) {
+       Polygon polygon = nextPolygon();
+-      Polygon2D impl = Polygon2D.create(polygon);
+-      
++      GeoEdgeTree impl = GeoEdgeTree.create(polygon);
++
+       for (int j = 0; j < 100; j++) {
+         Rectangle rectangle = GeoTestUtil.nextBoxNear(polygon);
+         // allowed to conservatively return false
+@@ -136,14 +136,14 @@ public class TestPolygon2D extends LuceneTestCase {
+       }
+     }
+   }
+-  
++
+   /** If polygon.contains(box) returns true, then any point in that box should return true as well */
+   // different from testContainsRandom in that its not a purely random test. we iterate the vertices of the polygon
+   // and generate boxes near each one of those to try to be more efficient.
+   public void testContainsEdgeCases() throws Exception {
+     for (int i = 0; i < 1000; i++) {
+       Polygon polygon = nextPolygon();
+-      Polygon2D impl = Polygon2D.create(polygon);
++      GeoEdgeTree impl = GeoEdgeTree.create(polygon);
+ 
+       for (int j = 0; j < 10; j++) {
+         Rectangle rectangle = GeoTestUtil.nextBoxNear(polygon);
+@@ -173,14 +173,14 @@ public class TestPolygon2D extends LuceneTestCase {
+       }
+     }
+   }
+-  
++
+   /** If polygon.intersects(box) returns false, then any point in that box should return false as well */
+   public void testIntersectRandom() {
+     int iters = atLeast(10);
+     for (int i = 0; i < iters; i++) {
+       Polygon polygon = nextPolygon();
+-      Polygon2D impl = Polygon2D.create(polygon);
+-      
++      GeoEdgeTree impl = GeoEdgeTree.create(polygon);
++
+       for (int j = 0; j < 100; j++) {
+         Rectangle rectangle = GeoTestUtil.nextBoxNear(polygon);
+         // allowed to conservatively return true.
+@@ -209,14 +209,14 @@ public class TestPolygon2D extends LuceneTestCase {
+       }
+     }
+   }
+-  
++
+   /** If polygon.intersects(box) returns false, then any point in that box should return false as well */
+   // different from testIntersectsRandom in that its not a purely random test. we iterate the vertices of the polygon
+   // and generate boxes near each one of those to try to be more efficient.
+   public void testIntersectEdgeCases() {
+     for (int i = 0; i < 100; i++) {
+       Polygon polygon = nextPolygon();
+-      Polygon2D impl = Polygon2D.create(polygon);
++      GeoEdgeTree impl = GeoEdgeTree.create(polygon);
+ 
+       for (int j = 0; j < 10; j++) {
+         Rectangle rectangle = GeoTestUtil.nextBoxNear(polygon);
+@@ -246,10 +246,10 @@ public class TestPolygon2D extends LuceneTestCase {
+       }
+     }
+   }
+-  
++
+   /** Tests edge case behavior with respect to insideness */
+   public void testEdgeInsideness() {
+-    Polygon2D poly = Polygon2D.create(new Polygon(new double[] { -2, -2, 2, 2, -2 }, new double[] { -2, 2, 2, -2, -2 }));
++    GeoEdgeTree poly = GeoEdgeTree.create(new Polygon(new double[] { -2, -2, 2, 2, -2 }, new double[] { -2, 2, 2, -2, -2 }));
+     assertTrue(poly.contains(-2, -2)); // bottom left corner: true
+     assertFalse(poly.contains(-2, 2));  // bottom right corner: false
+     assertFalse(poly.contains(2, -2));  // top left corner: false
+@@ -267,7 +267,7 @@ public class TestPolygon2D extends LuceneTestCase {
+     assertTrue(poly.contains(0, -2));  // left side: true
+     assertTrue(poly.contains(1, -2));  // left side: true
+   }
+-  
++
+   /** Tests current impl against original algorithm */
+   public void testContainsAgainstOriginal() {
+     int iters = atLeast(100);
+@@ -277,8 +277,8 @@ public class TestPolygon2D extends LuceneTestCase {
+       while (polygon.getHoles().length > 0) {
+         polygon = nextPolygon();
+       }
+-      Polygon2D impl = Polygon2D.create(polygon);
+-      
++      GeoEdgeTree impl = GeoEdgeTree.create(polygon);
++
+       // random lat/lons against polygon
+       for (int j = 0; j < 1000; j++) {
+         double point[] = GeoTestUtil.nextPointNear(polygon);
+diff --git a/lucene/core/src/test/org/apache/lucene/geo/TestPoint.java b/lucene/core/src/test/org/apache/lucene/geo/TestPoint.java
+new file mode 100644
+index 0000000000..8214c10269
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/geo/TestPoint.java
+@@ -0,0 +1,98 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.geo;
++
++import org.apache.lucene.index.PointValues.Relation;
++import org.junit.Ignore;
++
++import static org.apache.lucene.geo.GeoTestUtil.nextLatitudeIn;
++import static org.apache.lucene.geo.GeoTestUtil.nextLongitudeIn;
++
++/** Tests relations and features of simple Point types */
++public class TestPoint extends BaseGeometryTestCase<Point> {
++  @Override
++  public Point getShape() {
++    return new Point(GeoTestUtil.nextLatitude(), GeoTestUtil.nextLongitude());
++  }
++
++  @Ignore
++  @Override
++  public void testWithin() {
++    // for Point types WITHIN == INTERSECTS; so ignore this test
++  }
++
++  @Ignore
++  @Override
++  public void testContains() {
++    // points do not contain other shapes; ignore this test
++  }
++
++  @Override
++  public void testDisjoint() {
++    Point pt = getShape();
++
++    double minLat = pt.lat();
++    double maxLat = pt.lat();
++    double minLon = pt.lon();
++    double maxLon = pt.lon();
++
++    // ensure point latitude is outside of box (with pole as boundary)
++    if (pt.lat() <= GeoUtils.MIN_LAT_INCL + 1D) {
++      minLat = GeoUtils.MIN_LAT_INCL + 2D;
++      maxLat = nextLatitudeIn(minLat, GeoUtils.MAX_LAT_INCL);
++    } else if (pt.lat() >= GeoUtils.MAX_LAT_INCL - 1D) {
++      maxLat -= 2D;
++      minLat = nextLatitudeIn(GeoUtils.MIN_LAT_INCL, maxLat);
++    } else {
++      minLat += 1D;
++      maxLat = nextLatitudeIn(minLat, GeoUtils.MAX_LAT_INCL);
++    }
++
++    // ensure point longitude is disjoint with box (with dateline as boundary)
++    if (pt.lon() <= GeoUtils.MIN_LON_INCL + 1D) {
++      minLon = GeoUtils.MIN_LON_INCL + 2D;
++      maxLon = nextLongitudeIn(minLon, GeoUtils.MAX_LON_INCL);
++    } else if (pt.lon() >= GeoUtils.MAX_LON_INCL - 1D) {
++      maxLon -= 2D;
++      minLon = nextLongitudeIn(GeoUtils.MIN_LON_INCL, maxLon);
++    } else {
++      minLon += 1D;
++      maxLon = nextLongitudeIn(minLon, GeoUtils.MAX_LON_INCL);
++    }
++
++    Rectangle box = new Rectangle(minLat, maxLat, minLon, maxLon);
++    assertEquals(Relation.CELL_OUTSIDE_QUERY, pt.relate(box.minLat(), box.maxLat(), box.minLon(), box.maxLon()));
++  }
++
++  @Override
++  public void testIntersects() {
++    Rectangle box = GeoTestUtil.nextBoxNotCrossingDateline();
++    Point pt = new Point(nextLatitudeIn(box.minLat(), box.maxLat()), nextLongitudeIn(box.minLon(), box.maxLon()));
++    assertTrue(Geometry.intersects(pt.relate(box.minLat(), box.maxLat(), box.minLon(), box.maxLon())));
++  }
++
++  @Override
++  public void testBoundingBox() {
++    expectThrows(UnsupportedOperationException.class, () -> getShape().getBoundingBox());
++  }
++
++  @Override
++  public void testCenter() {
++    Point pt = getShape();
++    assertEquals(pt, new Point(pt.lat(), pt.lon()));
++  }
++}
+diff --git a/lucene/core/src/test/org/apache/lucene/geo/TestPolygon.java b/lucene/core/src/test/org/apache/lucene/geo/TestPolygon.java
+index 8ee62718e6..4e93f53957 100644
+--- a/lucene/core/src/test/org/apache/lucene/geo/TestPolygon.java
++++ b/lucene/core/src/test/org/apache/lucene/geo/TestPolygon.java
+@@ -18,10 +18,92 @@ package org.apache.lucene.geo;
+ 
+ import java.text.ParseException;
+ 
+-import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.index.PointValues.Relation;
++
++import static com.carrotsearch.randomizedtesting.generators.RandomNumbers.randomIntBetween;
++import static org.apache.lucene.geo.GeoTestUtil.nextLatitudeIn;
++import static org.apache.lucene.geo.GeoTestUtil.nextLongitudeIn;
++
++/** Tests relations and features of Polygon and Multipolygons */
++public class TestPolygon extends BaseGeometryTestCase<Polygon> {
++
++  @Override
++  public Polygon getShape() {
++    return GeoTestUtil.nextPolygon();
++  }
++
++  public Polygon getShape(boolean padded) {
++    double minFactor = padded == true ? 20D : 0D;
++    double maxFactor = padded == true ? -20D : 0D;
++
++    // we can't have self crossing lines.
++    // since polygons share this contract we create an unclosed polygon
++    Polygon poly = GeoTestUtil.createRegularPolygon(
++        nextLatitudeIn(GeoUtils.MIN_LAT_INCL + minFactor, GeoUtils.MAX_LAT_INCL + maxFactor),
++        nextLongitudeIn(GeoUtils.MIN_LON_INCL + minFactor, GeoUtils.MAX_LON_INCL + maxFactor),
++        10000D, randomIntBetween(random(), 4, 100));
++    return poly;
++  }
++
++  @Override
++  public void testBoundingBox() {
++    Polygon polygon = getShape();
++    double minLat = Double.POSITIVE_INFINITY;
++    double maxLat = Double.NEGATIVE_INFINITY;
++    double minLon = Double.POSITIVE_INFINITY;
++    double maxLon = Double.NEGATIVE_INFINITY;
++    for (int i = 0; i < polygon.numPoints(); ++i) {
++      minLat = StrictMath.min(minLat, polygon.getLat(i));
++      maxLat = StrictMath.max(maxLat, polygon.getLat(i));
++      minLon = StrictMath.min(minLon, polygon.getLon(i));
++      maxLon = StrictMath.max(maxLon, polygon.getLon(i));
++    }
++
++    Rectangle bbox = new Rectangle(minLat, maxLat, minLon, maxLon);
++    assertEquals(bbox, polygon.getBoundingBox());
++  }
++
++  @Override
++  public void testCenter() {
++    Polygon poly = getShape();
++    int numPoints = poly.numPoints();
++    double sumLat = 0;
++    double sumLon = 0;
++    for (int i = 0; i < poly.numPoints(); ++i) {
++      sumLat += poly.getLat(i);
++      sumLon += poly.getLon(i);
++    }
++    assertEquals(poly.getCenter(), new Point(sumLat / numPoints, sumLon / numPoints));
++  }
++
++  @Override
++  public void testWithin() {
++    relationTest(getShape(true), Relation.CELL_CROSSES_QUERY);
++  }
++
++  @Override
++  public void testContains() {
++    Polygon polygon = getShape(true);
++    Point center = polygon.getCenter();
++    Rectangle box = new Rectangle(center.lat() - 1E-3D, center.lat() + 1E-3D, center.lon() - 1E-3D, center.lon() + 1E-3D);
++    assertEquals(Relation.CELL_INSIDE_QUERY, polygon.relate(box.minLat(), box.maxLat(), box.minLon(), box.maxLon()));
++  }
++
++  @Override
++  public void testDisjoint() {
++    relationTest(getShape(true), Relation.CELL_OUTSIDE_QUERY);
++  }
++
++  @Override
++  public void testIntersects() {
++    Polygon polygon = getShape(true);
++    double minLat = StrictMath.min(polygon.getLat(0), polygon.getLat(1));
++    double maxLat = StrictMath.max(polygon.getLat(0), polygon.getLat(1));
++    double minLon = StrictMath.min(polygon.getLon(0), polygon.getLon(1));
++    double maxLon = StrictMath.max(polygon.getLon(0), polygon.getLon(1));
++    assertTrue(Geometry.intersects(polygon.relate(minLat, maxLat, minLon, maxLon)));
++  }
+ 
+-public class TestPolygon extends LuceneTestCase {
+-  
+   /** null polyLats not allowed */
+   public void testPolygonNullPolyLats() {
+     IllegalArgumentException expected = expectThrows(IllegalArgumentException.class, () -> {
+diff --git a/lucene/core/src/test/org/apache/lucene/geo/TestRectangle.java b/lucene/core/src/test/org/apache/lucene/geo/TestRectangle.java
+new file mode 100644
+index 0000000000..8eed4fd175
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/geo/TestRectangle.java
+@@ -0,0 +1,130 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.geo;
++
++import org.apache.lucene.index.PointValues.Relation;
++import org.apache.lucene.util.SloppyMath;
++
++import static org.apache.lucene.geo.GeoUtils.MAX_LON_INCL;
++import static org.apache.lucene.geo.GeoUtils.MIN_LON_INCL;
++import static org.apache.lucene.geo.GeoUtils.normalizeLonDegrees;
++
++/** tests relations and features of WGS-84 Rectangle type */
++public class TestRectangle extends BaseGeometryTestCase<Rectangle> {
++
++  @Override
++  public Rectangle getShape() {
++    return GeoTestUtil.nextBox();
++  }
++
++  @Override
++  public void testBoundingBox() {
++    Rectangle box = getShape();
++    assertEquals(box, box.getBoundingBox());
++  }
++
++  @Override
++  public void testCenter() {
++    Rectangle box = getShape();
++    double minLat = box.minLat;
++    double maxLat = box.maxLat;
++    double minLon = box.minLon;
++    double maxLon = box.maxLon;
++
++    final double height = (maxLat - minLat);
++    final double width = (box.crossesDateline()) ? MAX_LON_INCL - minLon + maxLon - MIN_LON_INCL : maxLon - minLon;
++    final double centerLat = height / 2d + minLat;
++    double centerLon = width / 2d + minLon;
++    if (box.crossesDateline()) {
++      centerLon = normalizeLonDegrees(centerLon);
++    }
++    assertEquals(new Point(centerLat, centerLon), box.getCenter());
++  }
++
++  @Override
++  public void testWithin() {
++    Rectangle box = getShape();
++    // create a box that is within
++    double height = 0.25 * box.getHeight();
++    double width = 0.25 * box.getWidth();
++    final Point center = box.getCenter();
++    final double minLat = center.lat() - height;
++    final double maxLat = center.lat() + height;
++    final double minLon = normalizeLonDegrees(center.lon() - width);
++    final double maxLon = normalizeLonDegrees(center.lon() + width);
++    Rectangle withinBox = new Rectangle(minLat, maxLat, minLon, maxLon);
++    assertEquals(Relation.CELL_CROSSES_QUERY, withinBox.relate(box.minLat, box.maxLat, box.minLon, box.maxLon));
++  }
++
++  @Override
++  public void testContains() {
++    Rectangle box = getShape();
++    // create a box that is within
++    double height = 0.25 * box.getHeight();
++    double width = 0.25 * box.getWidth();
++    final Point center = box.getCenter();
++    final double minLat = center.lat() - height;
++    final double maxLat = center.lat() + height;
++    final double minLon = normalizeLonDegrees(center.lon() - width);
++    final double maxLon = normalizeLonDegrees(center.lon() + width);
++    assertEquals(Relation.CELL_INSIDE_QUERY, box.relate(minLat, maxLat, minLon, maxLon));
++  }
++
++  @Override
++  public void testDisjoint() {
++    relationTest(getShape(), Relation.CELL_OUTSIDE_QUERY);
++  }
++
++  @Override
++  public void testIntersects() {
++    relationTest(getShape(), Relation.CELL_CROSSES_QUERY);
++  }
++
++  public void testAxisLat() {
++    double earthCircumference = 2D * Math.PI * GeoUtils.EARTH_MEAN_RADIUS_METERS;
++    assertEquals(90, Circle.axisLat(0, earthCircumference / 4), 0.0D);
++
++    for (int i = 0; i < 100; ++i) {
++      boolean reallyBig = random().nextInt(10) == 0;
++      final double maxRadius = reallyBig ? 1.1 * earthCircumference : earthCircumference / 8;
++      final double radius = maxRadius * random().nextDouble();
++      double prevAxisLat = Circle.axisLat(0.0D, radius);
++      for (double lat = 0.1D; lat < 90D; lat += 0.1D) {
++        double nextAxisLat = Circle.axisLat(lat, radius);
++        Rectangle bbox = Rectangle.fromPointDistance(lat, 180D, radius);
++        double dist = SloppyMath.haversinMeters(lat, 180D, nextAxisLat, bbox.maxLon);
++        if (nextAxisLat < GeoUtils.MAX_LAT_INCL) {
++          assertEquals("lat = " + lat, dist, radius, 0.1D);
++        }
++        assertTrue("lat = " + lat, prevAxisLat <= nextAxisLat);
++        prevAxisLat = nextAxisLat;
++      }
++
++      prevAxisLat = Circle.axisLat(-0.0D, radius);
++      for (double lat = -0.1D; lat > -90D; lat -= 0.1D) {
++        double nextAxisLat = Circle.axisLat(lat, radius);
++        Rectangle bbox = Rectangle.fromPointDistance(lat, 180D, radius);
++        double dist = SloppyMath.haversinMeters(lat, 180D, nextAxisLat, bbox.maxLon);
++        if (nextAxisLat > GeoUtils.MIN_LAT_INCL) {
++          assertEquals("lat = " + lat, dist, radius, 0.1D);
++        }
++        assertTrue("lat = " + lat, prevAxisLat >= nextAxisLat);
++        prevAxisLat = nextAxisLat;
++      }
++    }
++  }
++}
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/document/LatLonDocValuesDistanceQuery.java b/lucene/sandbox/src/java/org/apache/lucene/document/LatLonDocValuesDistanceQuery.java
+index df350e6db9..6254336e4c 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/document/LatLonDocValuesDistanceQuery.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/document/LatLonDocValuesDistanceQuery.java
+@@ -18,6 +18,7 @@ package org.apache.lucene.document;
+ 
+ import java.io.IOException;
+ 
++import org.apache.lucene.geo.Circle;
+ import org.apache.lucene.geo.GeoEncodingUtils;
+ import org.apache.lucene.geo.GeoUtils;
+ import org.apache.lucene.index.DocValues;
+@@ -36,22 +37,17 @@ import org.apache.lucene.search.Weight;
+ final class LatLonDocValuesDistanceQuery extends Query {
+ 
+   private final String field;
+-  private final double latitude, longitude;
+-  private final double radiusMeters;
++  private final Circle pointDistance;
+ 
+   LatLonDocValuesDistanceQuery(String field, double latitude, double longitude, double radiusMeters) {
+     if (Double.isFinite(radiusMeters) == false || radiusMeters < 0) {
+       throw new IllegalArgumentException("radiusMeters: '" + radiusMeters + "' is invalid");
+     }
+-    GeoUtils.checkLatitude(latitude);
+-    GeoUtils.checkLongitude(longitude);
++    this.pointDistance = new Circle(latitude, longitude, radiusMeters);
+     if (field == null) {
+       throw new IllegalArgumentException("field must not be null");
+     }
+     this.field = field;
+-    this.latitude = latitude;
+-    this.longitude = longitude;
+-    this.radiusMeters = radiusMeters;
+   }
+ 
+   @Override
+@@ -61,12 +57,7 @@ final class LatLonDocValuesDistanceQuery extends Query {
+       sb.append(this.field);
+       sb.append(':');
+     }
+-    sb.append(latitude);
+-    sb.append(",");
+-    sb.append(longitude);
+-    sb.append(" +/- ");
+-    sb.append(radiusMeters);
+-    sb.append(" meters");
++    sb.append(pointDistance);
+     return sb.toString();
+   }
+ 
+@@ -76,19 +67,14 @@ final class LatLonDocValuesDistanceQuery extends Query {
+       return false;
+     }
+     LatLonDocValuesDistanceQuery other = (LatLonDocValuesDistanceQuery) obj;
+-    return field.equals(other.field) &&
+-        Double.doubleToLongBits(latitude) == Double.doubleToLongBits(other.latitude) &&
+-        Double.doubleToLongBits(longitude) == Double.doubleToLongBits(other.longitude) &&
+-        Double.doubleToLongBits(radiusMeters) == Double.doubleToLongBits(other.radiusMeters);
++    return field.equals(other.field) && pointDistance.equals(other.pointDistance);
+   }
+ 
+   @Override
+   public int hashCode() {
+     int h = classHash();
+     h = 31 * h + field.hashCode();
+-    h = 31 * h + Double.hashCode(latitude);
+-    h = 31 * h + Double.hashCode(longitude);
+-    h = 31 * h + Double.hashCode(radiusMeters);
++    h = 31 * h + pointDistance.hashCode();
+     return h;
+   }
+ 
+@@ -96,8 +82,6 @@ final class LatLonDocValuesDistanceQuery extends Query {
+   public Weight createWeight(IndexSearcher searcher, ScoreMode scoreMode, float boost) throws IOException {
+     return new ConstantScoreWeight(this, boost) {
+ 
+-      private final GeoEncodingUtils.DistancePredicate distancePredicate = GeoEncodingUtils.createDistancePredicate(latitude, longitude, radiusMeters);
+-
+       @Override
+       public Scorer scorer(LeafReaderContext context) throws IOException {
+         final SortedNumericDocValues values = context.reader().getSortedNumericDocValues(field);
+@@ -113,7 +97,7 @@ final class LatLonDocValuesDistanceQuery extends Query {
+               final long value = values.nextValue();
+               final int lat = (int) (value >>> 32);
+               final int lon = (int) (value & 0xFFFFFFFF);
+-              if (distancePredicate.test(lat, lon)) {
++              if (pointDistance.pointInside(lat, lon)) {
+                 return true;
+               }
+             }
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/document/LatLonPointDistanceQuery.java b/lucene/sandbox/src/java/org/apache/lucene/document/LatLonPointDistanceQuery.java
+index a72d458ddc..9ecbfa81c9 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/document/LatLonPointDistanceQuery.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/document/LatLonPointDistanceQuery.java
+@@ -17,8 +17,9 @@
+ package org.apache.lucene.document;
+ 
+ import java.io.IOException;
++import java.util.Objects;
+ 
+-import org.apache.lucene.geo.GeoEncodingUtils;
++import org.apache.lucene.geo.Circle;
+ import org.apache.lucene.geo.GeoUtils;
+ import org.apache.lucene.geo.Rectangle;
+ import org.apache.lucene.index.FieldInfo;
+@@ -39,6 +40,7 @@ import org.apache.lucene.search.Weight;
+ import org.apache.lucene.util.BitSetIterator;
+ import org.apache.lucene.util.DocIdSetBuilder;
+ import org.apache.lucene.util.FixedBitSet;
++import org.apache.lucene.util.FutureArrays;
+ import org.apache.lucene.util.NumericUtils;
+ import org.apache.lucene.util.StringHelper;
+ 
+@@ -52,28 +54,19 @@ import static org.apache.lucene.geo.GeoEncodingUtils.encodeLongitude;
+  */
+ final class LatLonPointDistanceQuery extends Query {
+   final String field;
+-  final double latitude;
+-  final double longitude;
+-  final double radiusMeters;
++  final Circle pointDistance;
+ 
+   public LatLonPointDistanceQuery(String field, double latitude, double longitude, double radiusMeters) {
+     if (field == null) {
+       throw new IllegalArgumentException("field must not be null");
+     }
+-    if (Double.isFinite(radiusMeters) == false || radiusMeters < 0) {
+-      throw new IllegalArgumentException("radiusMeters: '" + radiusMeters + "' is invalid");
+-    }
+-    GeoUtils.checkLatitude(latitude);
+-    GeoUtils.checkLongitude(longitude);
+     this.field = field;
+-    this.latitude = latitude;
+-    this.longitude = longitude;
+-    this.radiusMeters = radiusMeters;
++    this.pointDistance = new Circle(latitude, longitude, radiusMeters);
+   }
+ 
+   @Override
+   public Weight createWeight(IndexSearcher searcher, ScoreMode scoreMode, float boost) throws IOException {
+-    Rectangle box = Rectangle.fromPointDistance(latitude, longitude, radiusMeters);
++    Rectangle box = pointDistance.getBoundingBox();
+     // create bounding box(es) for the distance range
+     // these are pre-encoded with LatLonPoint's encoding
+     final byte minLat[] = new byte[Integer.BYTES];
+@@ -100,15 +93,8 @@ final class LatLonPointDistanceQuery extends Query {
+       NumericUtils.intToSortableBytes(Integer.MAX_VALUE, minLon2, 0);
+     }
+ 
+-    // compute exact sort key: avoid any asin() computations
+-    final double sortKey = GeoUtils.distanceQuerySortKey(radiusMeters);
+-
+-    final double axisLat = Rectangle.axisLat(latitude, radiusMeters);
+-
+     return new ConstantScoreWeight(this, boost) {
+ 
+-      final GeoEncodingUtils.DistancePredicate distancePredicate = GeoEncodingUtils.createDistancePredicate(latitude, longitude, radiusMeters);
+-
+       @Override
+       public Scorer scorer(LeafReaderContext context) throws IOException {
+         ScorerSupplier scorerSupplier = scorerSupplier(context);
+@@ -214,7 +200,7 @@ final class LatLonPointDistanceQuery extends Query {
+ 
+             int docLatitude = NumericUtils.sortableBytesToInt(packedValue, 0);
+             int docLongitude = NumericUtils.sortableBytesToInt(packedValue, Integer.BYTES);
+-            if (distancePredicate.test(docLatitude, docLongitude)) {
++            if (pointDistance.pointInside(docLatitude, docLongitude)) {
+               adder.add(docID);
+             }
+           }
+@@ -226,8 +212,8 @@ final class LatLonPointDistanceQuery extends Query {
+           // 4. recurse naively (subtrees crossing over circle edge)
+           @Override
+           public Relation compare(byte[] minPackedValue, byte[] maxPackedValue) {
+-            if (StringHelper.compare(Integer.BYTES, minPackedValue, 0, maxLat, 0) > 0 ||
+-                StringHelper.compare(Integer.BYTES, maxPackedValue, 0, minLat, 0) < 0) {
++            if (FutureArrays.compareUnsigned(minPackedValue, 0, Integer.BYTES, maxLat, 0, Integer.BYTES) > 0 ||
++                FutureArrays.compareUnsigned(maxPackedValue, 0, Integer.BYTES, minLat, 0, Integer.BYTES) < 0) {
+               // latitude out of bounding box range
+               return Relation.CELL_OUTSIDE_QUERY;
+             }
+@@ -244,7 +230,7 @@ final class LatLonPointDistanceQuery extends Query {
+             double latMax = decodeLatitude(maxPackedValue, 0);
+             double lonMax = decodeLongitude(maxPackedValue, Integer.BYTES);
+ 
+-            return GeoUtils.relate(latMin, latMax, lonMin, lonMax, latitude, longitude, sortKey, axisLat);
++            return pointDistance.relate(latMin, latMax, lonMin, lonMax);
+           }
+         };
+       }
+@@ -283,7 +269,7 @@ final class LatLonPointDistanceQuery extends Query {
+ 
+             int docLatitude = NumericUtils.sortableBytesToInt(packedValue, 0);
+             int docLongitude = NumericUtils.sortableBytesToInt(packedValue, Integer.BYTES);
+-            if (!distancePredicate.test(docLatitude, docLongitude)) {
++            if (!pointDistance.pointInside(docLatitude, docLongitude)) {
+               result.clear(docID);
+               cost[0]--;
+             }
+@@ -309,7 +295,7 @@ final class LatLonPointDistanceQuery extends Query {
+             double latMax = decodeLatitude(maxPackedValue, 0);
+             double lonMax = decodeLongitude(maxPackedValue, Integer.BYTES);
+ 
+-            Relation relation = GeoUtils.relate(latMin, latMax, lonMin, lonMax, latitude, longitude, sortKey, axisLat);
++            Relation relation = pointDistance.relate(latMin, latMax, lonMin, lonMax);
+             switch (relation) {
+               case CELL_INSIDE_QUERY:
+                 // all points match, skip this subtree
+@@ -333,30 +319,20 @@ final class LatLonPointDistanceQuery extends Query {
+   }
+ 
+   public double getLatitude() {
+-    return latitude;
++    return pointDistance.getLat();
+   }
+ 
+   public double getLongitude() {
+-    return longitude;
++    return pointDistance.getLon();
+   }
+ 
+   public double getRadiusMeters() {
+-    return radiusMeters;
++    return pointDistance.getRadiusMeters();
+   }
+ 
+   @Override
+   public int hashCode() {
+-    final int prime = 31;
+-    int result = classHash();
+-    result = prime * result + field.hashCode();
+-    long temp;
+-    temp = Double.doubleToLongBits(latitude);
+-    result = prime * result + (int) (temp ^ (temp >>> 32));
+-    temp = Double.doubleToLongBits(longitude);
+-    result = prime * result + (int) (temp ^ (temp >>> 32));
+-    temp = Double.doubleToLongBits(radiusMeters);
+-    result = prime * result + (int) (temp ^ (temp >>> 32));
+-    return result;
++    return Objects.hash(field, pointDistance);
+   }
+ 
+   @Override
+@@ -366,10 +342,7 @@ final class LatLonPointDistanceQuery extends Query {
+   }
+ 
+   private boolean equalsTo(LatLonPointDistanceQuery other) {
+-    return field.equals(other.field) &&
+-           Double.doubleToLongBits(latitude) == Double.doubleToLongBits(other.latitude) &&
+-           Double.doubleToLongBits(longitude) == Double.doubleToLongBits(other.longitude) &&
+-           Double.doubleToLongBits(radiusMeters) == Double.doubleToLongBits(other.radiusMeters);
++    return field.equals(other.field) && pointDistance.equals(other.pointDistance);
+   }
+ 
+   @Override
+@@ -379,12 +352,7 @@ final class LatLonPointDistanceQuery extends Query {
+       sb.append(this.field);
+       sb.append(':');
+     }
+-    sb.append(latitude);
+-    sb.append(",");
+-    sb.append(longitude);
+-    sb.append(" +/- ");
+-    sb.append(radiusMeters);
+-    sb.append(" meters");
++    sb.append(pointDistance.toString());
+     return sb.toString();
+   }
+ }
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/document/LatLonPointInPolygonQuery.java b/lucene/sandbox/src/java/org/apache/lucene/document/LatLonPointInPolygonQuery.java
+index 1b2e3a6b6d..f3827ca50c 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/document/LatLonPointInPolygonQuery.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/document/LatLonPointInPolygonQuery.java
+@@ -19,9 +19,8 @@ package org.apache.lucene.document;
+ import java.io.IOException;
+ import java.util.Arrays;
+ 
+-import org.apache.lucene.geo.GeoEncodingUtils;
++import org.apache.lucene.geo.GeoEdgeTree;
+ import org.apache.lucene.geo.Polygon;
+-import org.apache.lucene.geo.Polygon2D;
+ import org.apache.lucene.geo.Rectangle;
+ import org.apache.lucene.index.FieldInfo;
+ import org.apache.lucene.index.LeafReader;
+@@ -93,8 +92,8 @@ final class LatLonPointInPolygonQuery extends Query {
+     NumericUtils.intToSortableBytes(encodeLongitude(box.minLon), minLon, 0);
+     NumericUtils.intToSortableBytes(encodeLongitude(box.maxLon), maxLon, 0);
+ 
+-    final Polygon2D tree = Polygon2D.create(polygons);
+-    final GeoEncodingUtils.PolygonPredicate polygonPredicate = GeoEncodingUtils.createPolygonPredicate(polygons, tree);
++    final GeoEdgeTree tree = GeoEdgeTree.create(polygons);
++    final Polygon.Predicate polygonPredicate = Polygon.Predicate.create(box, tree);
+ 
+     return new ConstantScoreWeight(this, boost) {
+ 
+diff --git a/lucene/spatial/src/java/org/apache/lucene/spatial/util/GeoRelationUtils.java b/lucene/spatial/src/java/org/apache/lucene/spatial/util/GeoRelationUtils.java
+deleted file mode 100644
+index a54a304de6..0000000000
+--- a/lucene/spatial/src/java/org/apache/lucene/spatial/util/GeoRelationUtils.java
++++ /dev/null
+@@ -1,75 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.lucene.spatial.util;
+-
+-/**
+- * Reusable geo-relation utility methods
+- */
+-public class GeoRelationUtils {
+-
+-  // No instance:
+-  private GeoRelationUtils() {
+-  }
+-
+-  /**
+-   * Determine if a bbox (defined by minLat, maxLat, minLon, maxLon) contains the provided point (defined by lat, lon)
+-   * NOTE: this is a basic method that does not handle dateline or pole crossing. Unwrapping must be done before
+-   * calling this method.
+-   */
+-  public static boolean pointInRectPrecise(final double lat, final double lon,
+-                                           final double minLat, final double maxLat,
+-                                           final double minLon, final double maxLon) {
+-    return lat >= minLat && lat <= maxLat && lon >= minLon && lon <= maxLon;
+-  }
+-
+-  /////////////////////////
+-  // Rectangle relations
+-  /////////////////////////
+-
+-  /**
+-   * Computes whether two rectangles are disjoint
+-   */
+-  private static boolean rectDisjoint(final double aMinLat, final double aMaxLat, final double aMinLon, final double aMaxLon,
+-                                      final double bMinLat, final double bMaxLat, final double bMinLon, final double bMaxLon) {
+-    return (aMaxLon < bMinLon || aMinLon > bMaxLon || aMaxLat < bMinLat || aMinLat > bMaxLat);
+-  }
+-
+-  /**
+-   * Computes whether the first (a) rectangle is wholly within another (b) rectangle (shared boundaries allowed)
+-   */
+-  public static boolean rectWithin(final double aMinLat, final double aMaxLat, final double aMinLon, final double aMaxLon,
+-                                   final double bMinLat, final double bMaxLat, final double bMinLon, final double bMaxLon) {
+-    return !(aMinLon < bMinLon || aMinLat < bMinLat || aMaxLon > bMaxLon || aMaxLat > bMaxLat);
+-  }
+-
+-  /**
+-   * Computes whether two rectangles cross
+-   */
+-  public static boolean rectCrosses(final double aMinLat, final double aMaxLat, final double aMinLon, final double aMaxLon,
+-                                    final double bMinLat, final double bMaxLat, final double bMinLon, final double bMaxLon) {
+-    return !(rectDisjoint(aMinLat, aMaxLat, aMinLon, aMaxLon, bMinLat, bMaxLat, bMinLon, bMaxLon) ||
+-             rectWithin(aMinLat, aMaxLat, aMinLon, aMaxLon, bMinLat, bMaxLat, bMinLon, bMaxLon));
+-  }
+-
+-  /**
+-   * Computes whether a rectangle intersects another rectangle (crosses, within, touching, etc)
+-   */
+-  public static boolean rectIntersects(final double aMinLat, final double aMaxLat, final double aMinLon, final double aMaxLon,
+-                                       final double bMinLat, final double bMaxLat, final double bMinLon, final double bMaxLon) {
+-    return !((aMaxLon < bMinLon || aMinLon > bMaxLon || aMaxLat < bMinLat || aMinLat > bMaxLat));
+-  }
+-}
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/geo/EarthDebugger.java b/lucene/test-framework/src/java/org/apache/lucene/geo/EarthDebugger.java
+index 3553b1576a..c53adcb3d5 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/geo/EarthDebugger.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/geo/EarthDebugger.java
+@@ -173,7 +173,7 @@ public class EarthDebugger {
+     if (alsoAddBBox) {
+       Rectangle box = Rectangle.fromPointDistance(centerLat, centerLon, radiusMeters);
+       addRect(box.minLat, box.maxLat, box.minLon, box.maxLon);
+-      addLatLine(Rectangle.axisLat(centerLat, radiusMeters), box.minLon, box.maxLon);
++      addLatLine(Circle.axisLat(centerLat, radiusMeters), box.minLon, box.maxLon);
+     }
+   }
+ 
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/geo/GeoTestUtil.java b/lucene/test-framework/src/java/org/apache/lucene/geo/GeoTestUtil.java
+index 3551be3cc8..2856fea997 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/geo/GeoTestUtil.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/geo/GeoTestUtil.java
+@@ -35,11 +35,25 @@ public class GeoTestUtil {
+     return nextDoubleInternal(-90, 90);
+   }
+ 
++  /** returns next pseudorandom latitude within given range */
++  public static double nextLatitudeIn(final double low, final double high) {
++    GeoUtils.checkLatitude(low);
++    GeoUtils.checkLatitude(high);
++    return nextDoubleInternal(low, high);
++  }
++
+   /** returns next pseudorandom longitude (anywhere) */
+   public static double nextLongitude() {
+     return nextDoubleInternal(-180, 180);
+   }
+-  
++
++  /** returns next pseudorandom latitude within given range */
++  public static double nextLongitudeIn(final double low, final double high) {
++    GeoUtils.checkLongitude(low);
++    GeoUtils.checkLongitude(high);
++    return nextDoubleInternal(low, high);
++  }
++
+   /**
+    * Returns next double within range.
+    * <p>
+@@ -239,7 +253,7 @@ public class GeoTestUtil {
+       return new double[] { nextLatitude(), nextLongitude() };
+     } else if (surpriseMe < 5) {
+       // purely random within bounding box
+-      return new double[] { nextLatitudeBetween(polygon.minLat, polygon.maxLat), nextLongitudeBetween(polygon.minLon, polygon.maxLon) };
++      return new double[] { nextLatitudeBetween(polygon.minLat(), polygon.maxLat()), nextLongitudeBetween(polygon.minLon(), polygon.maxLon()) };
+     } else if (surpriseMe < 20) {
+       // target a vertex
+       int vertex = random().nextInt(polyLats.length - 1);
+@@ -247,7 +261,7 @@ public class GeoTestUtil {
+                             nextLongitudeNear(polyLons[vertex], polyLons[vertex+1] - polyLons[vertex]) };
+     } else if (surpriseMe < 30) {
+       // target points around the bounding box edges
+-      Polygon container = boxPolygon(new Rectangle(polygon.minLat, polygon.maxLat, polygon.minLon, polygon.maxLon));
++      Polygon container = boxPolygon(new Rectangle(polygon.minLat(), polygon.maxLat(), polygon.minLon(), polygon.maxLon()));
+       double containerLats[] = container.getPolyLats();
+       double containerLons[] = container.getPolyLons();
+       int startVertex = random().nextInt(containerLats.length - 1);
+@@ -683,7 +697,7 @@ public class GeoTestUtil {
+     double polyLats[] = polygon.getPolyLats();
+     double polyLons[] = polygon.getPolyLons();
+     // bounding box check required due to rounding errors (we don't solve that problem)
+-    if (latitude < polygon.minLat || latitude > polygon.maxLat || longitude < polygon.minLon || longitude > polygon.maxLon) {
++    if (latitude < polygon.minLat() || latitude > polygon.maxLat() || longitude < polygon.minLon() || longitude > polygon.maxLon()) {
+       return false;
+     }
+     

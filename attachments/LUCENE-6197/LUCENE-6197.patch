@@ -1,0 +1,308 @@
+Index: lucene/core/src/java/org/apache/lucene/index/ConcurrentMergeScheduler.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/index/ConcurrentMergeScheduler.java	(revision 1654404)
++++ lucene/core/src/java/org/apache/lucene/index/ConcurrentMergeScheduler.java	(working copy)
+@@ -214,8 +214,9 @@
+     return maxMergeCount;
+   }
+ 
+-  synchronized void removeMergeThread(MergeThread thread) {
+-    boolean result = mergeThreads.remove(thread);
++  /** Removes the calling thread from the active merge threads. */
++  synchronized void removeMergeThread() {
++    boolean result = mergeThreads.remove(Thread.currentThread());
+     assert result;
+   }
+ 
+@@ -392,15 +393,16 @@
+   }
+ 
+   /**
+-   * Returns the number of merge threads that are alive. Note that this number
+-   * is &le; {@link #mergeThreads} size.
++   * Returns the number of merge threads that are alive, ignoring the calling thread
++   * if it is a merge thread.  Note that this number is &le; {@link #mergeThreads} size.
+    *
+    * @lucene.internal
+    */
+   public synchronized int mergeThreadCount() {
++    Thread currentThread = Thread.currentThread();
+     int count = 0;
+     for (MergeThread mergeThread : mergeThreads) {
+-      if (mergeThread.isAlive() && mergeThread.merge.rateLimiter.getAbort() == false) {
++      if (currentThread != mergeThread && mergeThread.isAlive() && mergeThread.merge.rateLimiter.getAbort() == false) {
+         count++;
+       }
+     }
+@@ -436,7 +438,9 @@
+     // pending merges, until it's empty:
+     while (true) {
+ 
+-      maybeStall(writer);
++      if (maybeStall(writer) == false) {
++        break;
++      }
+ 
+       OneMerge merge = writer.getNextMerge();
+       if (merge == null) {
+@@ -481,11 +485,16 @@
+    *  many segments for merging to keep up, to wait until merges catch
+    *  up. Applications that can take other less drastic measures, such
+    *  as limiting how many threads are allowed to index, can do nothing
+-   *  here and throttle elsewhere. */
++   *  here and throttle elsewhere.
++   *
++   *  If this method wants to stall but the calling thread is a merge
++   *  thread, it should return false to tell caller not to kick off
++   *  any new merges. */
+ 
+-  protected synchronized void maybeStall(IndexWriter writer) {
++  protected synchronized boolean maybeStall(IndexWriter writer) {
+     long startStallTime = 0;
+     while (writer.hasPendingMerges() && mergeThreadCount() >= maxMergeCount) {
++
+       // This means merging has fallen too far behind: we
+       // have already created maxMergeCount threads, and
+       // now there's at least one more merge pending.
+@@ -495,25 +504,38 @@
+       // updateMergeThreads).  We stall this producer
+       // thread to prevent creation of new segments,
+       // until merging has caught up:
++
++      if (mergeThreads.contains(Thread.currentThread())) {
++        // Never stall a merge thread since this blocks the thread from
++        // finishing and calling updateMergeThreads, and blocking it
++        // accomplishes nothing anyway (it's not really a segment producer):
++        return false;
++      }
++
+       if (verbose() && startStallTime == 0) {
+         message("    too many merges; stalling...");
+       }
+       startStallTime = System.currentTimeMillis();
+-      try {
+-        // Only wait 0.25 seconds, so if all merges are aborted (by IW.rollback) we notice:
+-        wait(250);
+-      } catch (InterruptedException ie) {
+-        throw new ThreadInterruptedException(ie);
+-      }
++      doStall();
+     }
+ 
+-    if (verbose()) {
+-      if (startStallTime != 0) {
+-        message("  stalled for " + (System.currentTimeMillis()-startStallTime) + " msec");
+-      }
++    if (verbose() && startStallTime != 0) {
++      message("  stalled for " + (System.currentTimeMillis()-startStallTime) + " msec");
+     }
++
++    return true;
+   }
+ 
++  /** Called from {@link #maybeStall} to pause the calling thread for a bit. */
++  protected synchronized void doStall() {
++    try {
++      // Defensively wait for only .25 seconds in case we are missing a .notify/All somewhere:
++      wait(250);
++    } catch (InterruptedException ie) {
++      throw new ThreadInterruptedException(ie);
++    }
++  }
++
+   /** Does the actual merge, by calling {@link IndexWriter#merge} */
+   protected void doMerge(IndexWriter writer, OneMerge merge) throws IOException {
+     writer.merge(merge);
+@@ -560,8 +582,6 @@
+           message("  merge thread: done");
+         }
+ 
+-        removeMergeThread(this);
+-
+         // Let CMS run new merges if necessary:
+         try {
+           merge(writer, MergeTrigger.MERGE_FINISHED, true);
+@@ -583,6 +603,8 @@
+ 
+       } finally {
+         synchronized(ConcurrentMergeScheduler.this) {
++          removeMergeThread();
++
+           updateMergeThreads();
+ 
+           // In case we had stalled indexing, we can now wake up
+Index: lucene/core/src/java/org/apache/lucene/index/MergeTrigger.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/index/MergeTrigger.java	(revision 1654404)
++++ lucene/core/src/java/org/apache/lucene/index/MergeTrigger.java	(working copy)
+@@ -27,11 +27,13 @@
+    * Merge was triggered by a segment flush.
+    */
+   SEGMENT_FLUSH,
++
+   /**
+    * Merge was triggered by a full flush. Full flushes
+    * can be caused by a commit, NRT reader reopen or a close call on the index writer.
+    */
+   FULL_FLUSH,
++
+   /**
+    * Merge has been triggered explicitly by the user.
+    */
+Index: lucene/core/src/test/org/apache/lucene/index/TestConcurrentMergeScheduler.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/index/TestConcurrentMergeScheduler.java	(revision 1654404)
++++ lucene/core/src/test/org/apache/lucene/index/TestConcurrentMergeScheduler.java	(working copy)
+@@ -460,7 +460,6 @@
+ 
+     // No merges should have run so far, because TMP has high segmentsPerTier:
+     assertEquals(0, maxRunningMergeCount.get());
+-
+     w.forceMerge(1);
+ 
+     // At most 5 merge threads should have launched at once:
+@@ -489,8 +488,9 @@
+     IndexWriterConfig iwc = newIndexWriterConfig(new MockAnalyzer(random()));
+     iwc.setMergeScheduler(new ConcurrentMergeScheduler() {
+         @Override
+-        protected void maybeStall(IndexWriter writer) {
++        protected boolean maybeStall(IndexWriter writer) {
+           wasCalled.set(true);
++          return true;
+         }
+       });
+     IndexWriter w = new IndexWriter(dir, iwc);
+@@ -640,4 +640,42 @@
+     assertTrue(threadCount <= 4);
+     assertEquals(5+threadCount, cms.getMaxMergeCount());
+   }
++
++  // LUCENE-6197
++  public void testNoStallMergeThreads() throws Exception {
++    MockDirectoryWrapper dir = newMockDirectory();
++
++    IndexWriterConfig iwc = newIndexWriterConfig(new MockAnalyzer(random()));
++    iwc.setMergePolicy(NoMergePolicy.INSTANCE);
++    iwc.setMaxBufferedDocs(2);
++    IndexWriter w = new IndexWriter(dir, iwc);
++    for(int i=0;i<1000;i++) {
++      Document doc = new Document();
++      doc.add(newStringField("field", ""+i, Field.Store.YES));
++      w.addDocument(doc);
++    }
++    w.close();
++
++    iwc = newIndexWriterConfig(new MockAnalyzer(random()));
++    AtomicBoolean failed = new AtomicBoolean();
++    ConcurrentMergeScheduler cms = new ConcurrentMergeScheduler() {
++        @Override
++        protected void doStall() {
++          if (Thread.currentThread().getName().startsWith("Lucene Merge Thread")) {
++            failed.set(true);
++          }
++          super.doStall();
++        }
++      };
++    cms.setMaxMergesAndThreads(2, 1);
++    iwc.setMergeScheduler(cms);
++    iwc.setMaxBufferedDocs(2);
++
++    w = new IndexWriter(dir, iwc);
++    w.forceMerge(1);
++    w.close();
++    dir.close();
++
++    assertFalse(failed.get());
++  }
+ }
+Index: lucene/test-framework/src/java/org/apache/lucene/util/LuceneTestCase.java
+===================================================================
+--- lucene/test-framework/src/java/org/apache/lucene/util/LuceneTestCase.java	(revision 1654404)
++++ lucene/test-framework/src/java/org/apache/lucene/util/LuceneTestCase.java	(working copy)
+@@ -57,8 +57,8 @@
+ 
+ import org.apache.lucene.analysis.Analyzer;
+ import org.apache.lucene.analysis.MockAnalyzer;
++import org.apache.lucene.document.Field.Store;
+ import org.apache.lucene.document.Field;
+-import org.apache.lucene.document.Field.Store;
+ import org.apache.lucene.document.FieldType;
+ import org.apache.lucene.document.StringField;
+ import org.apache.lucene.document.TextField;
+@@ -77,8 +77,8 @@
+ import org.apache.lucene.index.FieldInfos;
+ import org.apache.lucene.index.Fields;
+ import org.apache.lucene.index.IndexOptions;
++import org.apache.lucene.index.IndexReader.ReaderClosedListener;
+ import org.apache.lucene.index.IndexReader;
+-import org.apache.lucene.index.IndexReader.ReaderClosedListener;
+ import org.apache.lucene.index.IndexWriter;
+ import org.apache.lucene.index.IndexWriterConfig;
+ import org.apache.lucene.index.LeafReader;
+@@ -89,6 +89,7 @@
+ import org.apache.lucene.index.LogMergePolicy;
+ import org.apache.lucene.index.MergePolicy;
+ import org.apache.lucene.index.MergeScheduler;
++import org.apache.lucene.index.MergeTrigger;
+ import org.apache.lucene.index.MismatchedDirectoryReader;
+ import org.apache.lucene.index.MismatchedLeafReader;
+ import org.apache.lucene.index.MockRandomMergePolicy;
+@@ -107,8 +108,8 @@
+ import org.apache.lucene.index.StorableField;
+ import org.apache.lucene.index.StoredDocument;
+ import org.apache.lucene.index.Terms;
++import org.apache.lucene.index.TermsEnum.SeekStatus;
+ import org.apache.lucene.index.TermsEnum;
+-import org.apache.lucene.index.TermsEnum.SeekStatus;
+ import org.apache.lucene.index.TieredMergePolicy;
+ import org.apache.lucene.search.AssertingIndexSearcher;
+ import org.apache.lucene.search.DocIdSet;
+@@ -125,8 +126,8 @@
+ import org.apache.lucene.store.IOContext;
+ import org.apache.lucene.store.LockFactory;
+ import org.apache.lucene.store.MergeInfo;
++import org.apache.lucene.store.MockDirectoryWrapper.Throttling;
+ import org.apache.lucene.store.MockDirectoryWrapper;
+-import org.apache.lucene.store.MockDirectoryWrapper.Throttling;
+ import org.apache.lucene.store.NRTCachingDirectory;
+ import org.apache.lucene.util.automaton.AutomatonTestUtil;
+ import org.apache.lucene.util.automaton.CompiledAutomaton;
+@@ -142,7 +143,6 @@
+ import org.junit.rules.RuleChain;
+ import org.junit.rules.TestRule;
+ import org.junit.runner.RunWith;
+-
+ import com.carrotsearch.randomizedtesting.JUnit4MethodProvider;
+ import com.carrotsearch.randomizedtesting.LifecycleScope;
+ import com.carrotsearch.randomizedtesting.MixWithSuiteName;
+@@ -153,16 +153,16 @@
+ import com.carrotsearch.randomizedtesting.annotations.SeedDecorators;
+ import com.carrotsearch.randomizedtesting.annotations.TestGroup;
+ import com.carrotsearch.randomizedtesting.annotations.TestMethodProviders;
++import com.carrotsearch.randomizedtesting.annotations.ThreadLeakAction.Action;
+ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakAction;
+-import com.carrotsearch.randomizedtesting.annotations.ThreadLeakAction.Action;
+ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
++import com.carrotsearch.randomizedtesting.annotations.ThreadLeakGroup.Group;
+ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakGroup;
+-import com.carrotsearch.randomizedtesting.annotations.ThreadLeakGroup.Group;
+ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakLingering;
++import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope.Scope;
+ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
+-import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope.Scope;
++import com.carrotsearch.randomizedtesting.annotations.ThreadLeakZombies.Consequence;
+ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakZombies;
+-import com.carrotsearch.randomizedtesting.annotations.ThreadLeakZombies.Consequence;
+ import com.carrotsearch.randomizedtesting.annotations.TimeoutSuite;
+ import com.carrotsearch.randomizedtesting.generators.RandomPicks;
+ import com.carrotsearch.randomizedtesting.rules.NoClassHooksShadowingRule;
+@@ -910,7 +910,8 @@
+       } else {
+         cms = new ConcurrentMergeScheduler() {
+             @Override
+-            protected synchronized void maybeStall(IndexWriter writer) {
++            protected synchronized boolean maybeStall(IndexWriter writer) {
++              return true;
+             }
+           };
+       }

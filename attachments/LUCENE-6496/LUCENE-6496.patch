@@ -1,0 +1,641 @@
+Index: lucene/sandbox/src/java/org/apache/lucene/index/UpdateableOrdinalMap.java
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- lucene/sandbox/src/java/org/apache/lucene/index/UpdateableOrdinalMap.java	(revision )
++++ lucene/sandbox/src/java/org/apache/lucene/index/UpdateableOrdinalMap.java	(revision )
+@@ -0,0 +1,346 @@
++package org.apache.lucene.index;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.util.Accountable;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.LongValues;
++import org.apache.lucene.util.packed.PackedLongValues;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++/**
++ * Like {@link org.apache.lucene.index.MultiDocValues.OrdinalMap} but allows a limited number of modifications without rebuilding the entire ordinal map.
++ */
++public final class UpdateableOrdinalMap implements OrdinalMap {
++
++  public static UpdateableOrdinalMap reopen(Object owner, UpdateableOrdinalMap previous, List<LeafReaderContext> leafs, SortedDocValues[] values, float acceptableOverheadRatio) throws IOException {
++    long[] valueCounts = new long[values.length];
++    TermsEnumSource[] tenumSources = new TermsEnumSource[values.length];
++    for (int i = 0; i < values.length; i++) {
++      valueCounts[i] = values[i].getValueCount();
++      final int index = i;
++      tenumSources[i] = new TermsEnumSource() {
++        @Override
++        public TermsEnum getTermsEnum() {
++          return values[index].termsEnum();
++        }
++      };
++    }
++    SortedDocValuesLookup lookup = new SortedDocValuesLookup(previous, values);
++    return reopen(owner, previous, leafs, valueCounts, tenumSources, lookup, acceptableOverheadRatio);
++  }
++
++  public static UpdateableOrdinalMap reopen(Object owner, UpdateableOrdinalMap previous, List<LeafReaderContext> leafs, final SortedSetDocValues[] values, float acceptableOverheadRatio) throws IOException {
++    long[] valueCounts = new long[values.length];
++    TermsEnumSource[] tenumSources = new TermsEnumSource[values.length];
++    for (int i = 0; i < values.length; i++) {
++      valueCounts[i] = values[i].getValueCount();
++      final int index = i;
++      tenumSources[i] = new TermsEnumSource() {
++        @Override
++        public TermsEnum getTermsEnum() {
++          return values[index].termsEnum();
++        }
++      };
++    }
++    SortedSetDocValuesLookup lookup = new SortedSetDocValuesLookup(previous, values);
++    return reopen(owner, previous, leafs, valueCounts, tenumSources, lookup, acceptableOverheadRatio);
++  }
++
++  private static UpdateableOrdinalMap reopen(Object owner, UpdateableOrdinalMap previous, List<LeafReaderContext> leafs, long[] valueCounts, TermsEnumSource[] tenumSources, TermToGlobalOrdinalLookup lookup, float acceptableOverheadRatio) throws IOException {
++    if (previous == null) {
++      return rebuild(owner, leafs, valueCounts, tenumSources, acceptableOverheadRatio, null);
++    }
++
++    List<Integer> segmentsToReopen = new ArrayList<>();
++    for (LeafReaderContext leaf : leafs) {
++      if (previous.leafReaderCacheKeys.contains(leaf.reader().getCoreCacheKey())) {
++        continue;
++      }
++
++      long valueCount = valueCounts[leaf.ord];
++      double ratio = valueCount / (double) previous.ordinalMap.getValueCount();
++      // TODO: should be configurable and the defaults should be tested
++      if (ratio < 0.1 || valueCount < 128 ) {
++        segmentsToReopen.add(leaf.ord);
++      } else {
++        return rebuild(owner, leafs, valueCounts, tenumSources, acceptableOverheadRatio, previous.stats);
++      }
++    }
++
++    if (segmentsToReopen.isEmpty()) {
++      return previous;
++      // TODO: should be configurable and the defaults should be tested
++    } else if (segmentsToReopen.size() > 20) {
++      return rebuild(owner, leafs, valueCounts, tenumSources, acceptableOverheadRatio, previous.stats);
++    }
++
++    Set<Object> leafReaderCacheKeys = new HashSet<>();
++    for (LeafReaderContext leaf : leafs) {
++      leafReaderCacheKeys.add(leaf.reader().getCoreCacheKey());
++    }
++
++    for (Object previousReaderKeys : previous.leafReaderCacheKeys) {
++      if (!leafReaderCacheKeys.contains(previousReaderKeys)) {
++        return rebuild(owner, leafs, valueCounts, tenumSources, acceptableOverheadRatio, previous.stats);
++      }
++    }
++
++    Map<Integer, PackedLongValues.Builder> segmentOrdToGlobalOrdBuilders = new HashMap<>();
++    for (Integer segment : segmentsToReopen) {
++      segmentOrdToGlobalOrdBuilders.put(segment, PackedLongValues.monotonicBuilder(acceptableOverheadRatio));
++    }
++
++    TermsEnum[] newTenums = new TermsEnum[segmentsToReopen.size()];
++    for (int i = 0; i < newTenums.length; i++) {
++      newTenums[i] = tenumSources[segmentsToReopen.get(i)].getTermsEnum();
++    }
++
++    MultiTermsEnum newMte = openMergedView(newTenums);
++    for (BytesRef term = newMte.next(); term != null; term = newMte.next()) {
++      long globalOrd;
++      long existingGlobalOrd = lookup.lookupTerm(term);
++      if (existingGlobalOrd >= 0) {
++        globalOrd = existingGlobalOrd;
++      } else {
++        return rebuild(owner, leafs, valueCounts, tenumSources, acceptableOverheadRatio, previous.stats);
++      }
++
++      MultiTermsEnum.TermsEnumWithSlice matches[] = newMte.getMatchArray();
++      for (int i = 0; i < newMte.getMatchCount(); i++) {
++        int segmentIndex = segmentsToReopen.get(matches[i].index);
++        segmentOrdToGlobalOrdBuilders.get(segmentIndex).add(globalOrd);
++      }
++    }
++
++    Map<Integer, LongValues> segmentOrdToGlobalOrdLookups = new HashMap<>();
++    if (previous.segmentToGlobalOrds != null) {
++      segmentOrdToGlobalOrdLookups.putAll(previous.segmentToGlobalOrds);
++    }
++    for (Map.Entry<Integer, PackedLongValues.Builder> entry : segmentOrdToGlobalOrdBuilders.entrySet()) {
++      segmentOrdToGlobalOrdLookups.put(entry.getKey(), entry.getValue().build());
++    }
++    return new UpdateableOrdinalMap(leafReaderCacheKeys, segmentOrdToGlobalOrdLookups, previous);
++  }
++
++  private static UpdateableOrdinalMap rebuild(Object owner, List<LeafReaderContext> leafs, long[] valueCounts, TermsEnumSource[] tenumSources, float acceptableOverheadRatio, Stats previousStats) throws IOException {
++    Set<Object> leafReaderCacheKeys = new HashSet<>();
++    for (LeafReaderContext leaf : leafs) {
++      leafReaderCacheKeys.add(leaf.reader().getCoreCacheKey());
++    }
++    TermsEnum[] tenums = new TermsEnum[tenumSources.length];
++    for (int i = 0; i < tenumSources.length; i++) {
++      tenums[i] = tenumSources[i].getTermsEnum();
++    }
++    OrdinalMap ordinalMap = MultiDocValues.OrdinalMap.build(owner, tenums, valueCounts, acceptableOverheadRatio);
++    return new UpdateableOrdinalMap(leafReaderCacheKeys, ordinalMap, previousStats);
++  }
++
++  private static MultiTermsEnum openMergedView(TermsEnum[] subs) throws IOException {
++    ReaderSlice slices[] = new ReaderSlice[subs.length];
++    MultiTermsEnum.TermsEnumIndex indexes[] = new MultiTermsEnum.TermsEnumIndex[slices.length];
++    for (int i = 0; i < slices.length; i++) {
++      slices[i] = new ReaderSlice(0, 0, i);
++      indexes[i] = new MultiTermsEnum.TermsEnumIndex(subs[i], i);
++    }
++    MultiTermsEnum mte = new MultiTermsEnum(slices);
++    mte.reset(indexes);
++    return mte;
++  }
++
++  private final Set<Object> leafReaderCacheKeys;
++  private final OrdinalMap ordinalMap;
++  private final Map<Integer, LongValues> segmentToGlobalOrds;
++  private final Stats stats;
++
++  public UpdateableOrdinalMap(Set<Object> leafReaderCacheKeys, OrdinalMap ordinalMap, Stats previousStats) {
++    this.leafReaderCacheKeys = leafReaderCacheKeys;
++    this.ordinalMap = ordinalMap;
++    this.segmentToGlobalOrds = null;
++    if (previousStats != null) {
++      this.stats = new Stats(previousStats, true);
++    } else {
++      this.stats = new Stats();
++    }
++  }
++
++  public UpdateableOrdinalMap(Set<Object> leafReaderCacheKeys, Map<Integer, LongValues> segmentToGlobalOrds, UpdateableOrdinalMap previous) {
++    this.leafReaderCacheKeys = leafReaderCacheKeys;
++    this.segmentToGlobalOrds = segmentToGlobalOrds;
++    this.ordinalMap = previous.ordinalMap;
++    this.stats = new Stats(previous.stats, false);
++  }
++
++  @Override
++  public LongValues getGlobalOrds(int segmentIndex) {
++    // TODO: maybe a better way todo the lookup?
++    LongValues longValues = segmentToGlobalOrds != null ? segmentToGlobalOrds.get(segmentIndex) : null;
++    if (longValues == null) {
++      longValues = ordinalMap.getGlobalOrds(segmentIndex);
++    }
++    return longValues;
++  }
++
++  @Override
++  public long getFirstSegmentOrd(long globalOrd) {
++    return ordinalMap.getFirstSegmentOrd(globalOrd);
++  }
++
++  @Override
++  public int getFirstSegmentNumber(long globalOrd) {
++    return ordinalMap.getFirstSegmentNumber(globalOrd);
++  }
++
++  @Override
++  public long getValueCount() {
++    return ordinalMap.getValueCount();
++  }
++
++  @Override
++  public long ramBytesUsed() {
++    return ordinalMap.ramBytesUsed();
++  }
++
++  @Override
++  public Collection<Accountable> getChildResources() {
++    return ordinalMap.getChildResources();
++  }
++
++  public Stats getStats() {
++    return stats;
++  }
++
++  public static class Stats {
++
++    private final int version;
++    private final long rebuilds;
++
++    private Stats(Stats stats, boolean rebuild) {
++      if (rebuild) {
++        this.version = 0;
++        this.rebuilds = stats.rebuilds + 1;
++      } else {
++        this.version = stats.version + 1;
++        this.rebuilds = stats.rebuilds;
++      }
++    }
++
++    public Stats() {
++      this.version = 0;
++      this.rebuilds = 0;
++    }
++
++    /**
++     * @return The number of times the updateable ordinalmap has been modified without rebuilding it completely
++     */
++    public int getVersion() {
++      return version;
++    }
++
++    /**
++     * @return The number of times the updateable ordinalmap has been rebuild
++     */
++    public long getRebuilds() {
++      return rebuilds;
++    }
++  }
++
++  private static abstract class TermToGlobalOrdinalLookup {
++
++    private final UpdateableOrdinalMap ordinalMap;
++
++    TermToGlobalOrdinalLookup(UpdateableOrdinalMap ordinalMap) {
++      this.ordinalMap = ordinalMap;
++    }
++
++    final long lookupTerm(BytesRef key) {
++      long low = 0;
++      long high = ordinalMap.getValueCount() - 1;
++
++      while (low <= high) {
++        long mid = (low + high) >>> 1;
++        final long segmentOrd = ordinalMap.getFirstSegmentOrd(mid);
++        final int readerIndex = ordinalMap.getFirstSegmentNumber(mid);
++        final BytesRef term = lookupValue(readerIndex, segmentOrd);
++        int cmp = term.compareTo(key);
++
++        if (cmp < 0) {
++          low = mid + 1;
++        } else if (cmp > 0) {
++          high = mid - 1;
++        } else {
++          return mid; // key found
++        }
++      }
++
++      return -(low + 1);  // key not found.
++    }
++    
++    abstract BytesRef lookupValue(int readerIndex, long segmentOrdinal);
++
++  }
++
++  private final static class SortedSetDocValuesLookup extends TermToGlobalOrdinalLookup {
++
++    private final SortedSetDocValues[] values;
++
++    private SortedSetDocValuesLookup(UpdateableOrdinalMap ordinalMap, SortedSetDocValues[] values) {
++      super(ordinalMap);
++      this.values = values;
++    }
++
++    @Override
++    BytesRef lookupValue(int readerIndex, long segmentOrdinal) {
++      return values[readerIndex].lookupOrd(segmentOrdinal);
++    }
++
++  }
++
++  private final static class SortedDocValuesLookup extends TermToGlobalOrdinalLookup {
++
++    private final SortedDocValues[] values;
++
++    private SortedDocValuesLookup(UpdateableOrdinalMap ordinalMap, SortedDocValues[] values) {
++      super(ordinalMap);
++      this.values = values;
++    }
++
++    @Override
++    BytesRef lookupValue(int readerIndex, long segmentOrdinal) {
++      return values[readerIndex].lookupOrd((int) segmentOrdinal);
++    }
++    
++  }
++
++  // Reasons for this interface:
++  // TermsEnum can only be consumed once.
++  // Also we have TermsEnum from SortedSetDocValues and SortedDocValues, which don't share a common interface.
++  private interface TermsEnumSource {
++
++    TermsEnum getTermsEnum();
++
++  }
++}
+Index: lucene/sandbox/src/test/org/apache/lucene/index/TestUpdateableOrdinalMap.java
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- lucene/sandbox/src/test/org/apache/lucene/index/TestUpdateableOrdinalMap.java	(revision )
++++ lucene/sandbox/src/test/org/apache/lucene/index/TestUpdateableOrdinalMap.java	(revision )
+@@ -0,0 +1,205 @@
++package org.apache.lucene.index;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.analysis.MockAnalyzer;
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.SortedSetDocValuesField;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util.TestUtil;
++import org.apache.lucene.util.packed.PackedInts;
++
++import java.io.IOException;
++import java.util.Locale;
++
++/**
++ */
++public class TestUpdateableOrdinalMap extends LuceneTestCase {
++
++  public void testNRTOrdinalMap_noMergeAndNoNewTerms() throws Exception {
++    Directory dir = newDirectory();
++    IndexWriterConfig cfg = new IndexWriterConfig(new MockAnalyzer(random()));
++    cfg.setMergePolicy(NoMergePolicy.INSTANCE);
++    IndexWriter iw = new IndexWriter(dir, cfg);
++
++    int numValues = TestUtil.nextInt(random(), 1, 99);
++    for (int i = 0; i < numValues; i++) {
++      Document d = new Document();
++      d.add(new SortedSetDocValuesField("field", new BytesRef(String.format(Locale.ROOT, "%10d", i))));
++      iw.addDocument(d);
++    }
++    iw.commit();
++
++    DirectoryReader r = DirectoryReader.open(iw, true);
++    UpdateableOrdinalMap ordinalMap = sortedSetReOpen("key", null, "field", r, PackedInts.DEFAULT);
++    assertEquals(numValues, ordinalMap.getValueCount());
++    assertEquals(0, ordinalMap.getStats().getVersion());
++    assertEquals(0, ordinalMap.getStats().getRebuilds());
++    for (int i = 0; i < numValues; i++) {
++      assertEquals(i, ordinalMap.getGlobalOrds(0).get(i));
++      assertEquals(0, ordinalMap.getFirstSegmentNumber(i));
++    }
++
++    int numRounds = TestUtil.nextInt(random(), 1, 10);
++    for (int round = 0; round < numRounds; round++) {
++      for (int i = 0; i < numValues; i++) {
++        Document d = new Document();
++        d.add(new SortedSetDocValuesField("field", new BytesRef(String.format(Locale.ROOT, "%10d", i))));
++        iw.addDocument(d);
++      }
++
++      r.close();
++      r = DirectoryReader.open(iw, true);
++      ordinalMap = sortedSetReOpen("key", ordinalMap, "field", r, PackedInts.DEFAULT);
++      assertEquals(numValues, ordinalMap.getValueCount());
++      assertEquals(round + 1, ordinalMap.getStats().getVersion());
++      assertEquals(0, ordinalMap.getStats().getRebuilds());
++      for (int segment = 0; segment < round + 2; segment++) {
++        for (int i = 0; i < numValues; i++) {
++          assertEquals(i, ordinalMap.getGlobalOrds(0).get(i));
++          assertEquals(0, ordinalMap.getFirstSegmentNumber(i));
++        }
++      }
++    }
++
++    r.close();
++    iw.close();
++    dir.close();
++  }
++
++  public void testNRTOrdinalMap_newTerm() throws Exception {
++    Directory dir = newDirectory();
++    IndexWriterConfig cfg = new IndexWriterConfig(new MockAnalyzer(random()));
++    cfg.setMergePolicy(NoMergePolicy.INSTANCE);
++    IndexWriter iw = new IndexWriter(dir, cfg);
++
++    int numValues = TestUtil.nextInt(random(), 1, 98);
++    for (int i = 0; i < numValues; i++) {
++      Document d = new Document();
++      d.add(new SortedSetDocValuesField("field", new BytesRef(String.format(Locale.ROOT, "%10d", i))));
++      iw.addDocument(d);
++    }
++
++    DirectoryReader r = DirectoryReader.open(iw, true);
++    UpdateableOrdinalMap ordinalMap = sortedSetReOpen("key", null, "field", r, PackedInts.DEFAULT);
++    assertEquals(numValues, ordinalMap.getValueCount());
++    assertEquals(0, ordinalMap.getStats().getVersion());
++    assertEquals(0, ordinalMap.getStats().getRebuilds());
++    for (int i = 0; i < numValues; i++) {
++      assertEquals(i, ordinalMap.getGlobalOrds(0).get(i));
++      assertEquals(0, ordinalMap.getFirstSegmentNumber(i));
++    }
++
++    Document d = new Document();
++    int lastNumber = numValues++;
++    d.add(new SortedSetDocValuesField("field", new BytesRef(String.format(Locale.ROOT, "%10d", lastNumber))));
++    iw.addDocument(d);
++
++    r.close();
++    r = DirectoryReader.open(iw, true);
++    ordinalMap = sortedSetReOpen("key", ordinalMap, "field", r, PackedInts.DEFAULT);
++    assertEquals(numValues, ordinalMap.getValueCount());
++    assertEquals(0, ordinalMap.getStats().getVersion());
++    assertEquals(1, ordinalMap.getStats().getRebuilds());
++
++    for (int i = 0; i < numValues - 1; i++) {
++      assertEquals(i, ordinalMap.getGlobalOrds(0).get(i));
++      assertEquals(0, ordinalMap.getFirstSegmentNumber(i));
++      assertEquals(i, ordinalMap.getFirstSegmentOrd(i));
++    }
++
++    assertEquals(lastNumber, ordinalMap.getGlobalOrds(1).get(0));
++    assertEquals(1, ordinalMap.getFirstSegmentNumber(lastNumber));
++    assertEquals(0, ordinalMap.getFirstSegmentOrd(lastNumber));
++
++    r.close();
++    iw.close();
++    dir.close();
++  }
++
++  public void testNRTOrdinalMap_merge() throws Exception {
++    Directory dir = newDirectory();
++    IndexWriterConfig cfg = new IndexWriterConfig(new MockAnalyzer(random()));
++    cfg.setMergePolicy(NoMergePolicy.INSTANCE);
++    IndexWriter iw = new IndexWriter(dir, cfg);
++
++    int numValues = TestUtil.nextInt(random(), 1, 99);
++    for (int i = 0; i < numValues; i++) {
++      Document d = new Document();
++      d.add(new SortedSetDocValuesField("field", new BytesRef(String.format(Locale.ROOT, "%10d", i))));
++      iw.addDocument(d);
++    }
++
++    DirectoryReader r = DirectoryReader.open(iw, true);
++    UpdateableOrdinalMap ordinalMap = sortedSetReOpen("key", null, "field", r, PackedInts.DEFAULT);
++    assertEquals(numValues, ordinalMap.getValueCount());
++    assertEquals(0, ordinalMap.getStats().getRebuilds());
++    assertEquals(0, ordinalMap.getStats().getVersion());
++    for (int i = 0; i < numValues; i++) {
++      assertEquals(i, ordinalMap.getGlobalOrds(0).get(i));
++      assertEquals(0, ordinalMap.getFirstSegmentNumber(i));
++    }
++
++    int numRounds = TestUtil.nextInt(random(), 1, 10);
++    for (int round = 0; round < numRounds; round++) {
++      for (int i = 0; i < numValues; i++) {
++        Document d = new Document();
++        d.add(new SortedSetDocValuesField("field", new BytesRef(String.format(Locale.ROOT, "%10d", i))));
++        iw.addDocument(d);
++      }
++
++      r.close();
++      r = DirectoryReader.open(iw, true);
++      ordinalMap = sortedSetReOpen("key", ordinalMap, "field", r, PackedInts.DEFAULT);
++      assertEquals(numValues, ordinalMap.getValueCount());
++      assertEquals(0, ordinalMap.getStats().getRebuilds());
++      assertEquals(round + 1, ordinalMap.getStats().getVersion());
++      for (int segment = 0; segment < round + 2; segment++) {
++        for (int i = 0; i < numValues; i++) {
++          assertEquals(i, ordinalMap.getGlobalOrds(0).get(i));
++          assertEquals(0, ordinalMap.getFirstSegmentNumber(i));
++        }
++      }
++    }
++
++    r.close();
++    iw.close();
++    iw = new IndexWriter(dir, new IndexWriterConfig(new MockAnalyzer(random())));
++    iw.forceMerge(1);
++    r = DirectoryReader.open(dir);
++    ordinalMap = sortedSetReOpen("key", ordinalMap, "field", r, PackedInts.DEFAULT);
++    assertEquals(numValues, ordinalMap.getValueCount());
++    assertEquals(0, ordinalMap.getStats().getVersion());
++    assertEquals(1, ordinalMap.getStats().getRebuilds());
++
++    r.close();
++    iw.close();
++    dir.close();
++  }
++
++
++  public static UpdateableOrdinalMap sortedSetReOpen(Object owner, UpdateableOrdinalMap previous, String field, DirectoryReader reader, float acceptableOverheadRatio) throws IOException {
++    SortedSetDocValues[] values = new SortedSetDocValues[reader.leaves().size()];
++    for (LeafReaderContext context : reader.leaves()) {
++      values[context.ord] = context.reader().getSortedSetDocValues(field);
++    }
++    return UpdateableOrdinalMap.reopen(owner, previous, reader.leaves(), values, acceptableOverheadRatio);
++  }
++}
+Index: lucene/core/src/java/org/apache/lucene/index/OrdinalMap.java
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/index/OrdinalMap.java	(revision )
++++ lucene/core/src/java/org/apache/lucene/index/OrdinalMap.java	(revision )
+@@ -0,0 +1,50 @@
++package org.apache.lucene.index;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.util.Accountable;
++import org.apache.lucene.util.LongValues;
++
++/**
++ */
++public interface OrdinalMap extends Accountable {
++
++  /**
++   * Given a segment number, return a {@link org.apache.lucene.util.LongValues} instance that maps
++   * segment ordinals to global ordinals.
++   */
++  LongValues getGlobalOrds(int segmentIndex);
++
++  /**
++   * Given global ordinal, returns the ordinal of the first segment which contains
++   * this ordinal (the corresponding to the segment return {@link #getFirstSegmentNumber}).
++   */
++  long getFirstSegmentOrd(long globalOrd);
++
++  /**
++   * Given a global ordinal, returns the index of the first
++   * segment that contains this term.
++   */
++  int getFirstSegmentNumber(long globalOrd);
++
++  /**
++   * Returns the total number of unique terms in global ord space.
++   */
++  long getValueCount();
++
++}
+Index: lucene/core/src/java/org/apache/lucene/index/MultiDocValues.java
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/index/MultiDocValues.java	(date 1432237819000)
++++ lucene/core/src/java/org/apache/lucene/index/MultiDocValues.java	(revision )
+@@ -375,7 +375,7 @@
+   // TODO: we could also have a utility method to merge Terms[] and use size() as a weight when we need it
+   // TODO: use more efficient packed ints structures?
+   // TODO: pull this out? it's pretty generic (maps between N ord()-enabled TermsEnums) 
+-  public static class OrdinalMap implements Accountable {
++  public static class OrdinalMap implements org.apache.lucene.index.OrdinalMap {
+ 
+     private static class SegmentMap implements Accountable {
+       private static final long BASE_RAM_BYTES_USED = RamUsageEstimator.shallowSizeOfInstance(SegmentMap.class);

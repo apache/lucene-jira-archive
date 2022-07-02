@@ -1,0 +1,3937 @@
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/FlattenGraphFilter.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/FlattenGraphFilter.java
+new file mode 100644
+index 0000000..7ede190
+--- /dev/null
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/FlattenGraphFilter.java
+@@ -0,0 +1,424 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.lucene.analysis.synonym;
++
++/**
++ * This filter "casts" token graphs down into a "flat" form,
++ * for indexing.   This is an inherently lossy process: nodes (positions)
++ * along side paths are forcefully merged.
++ *
++ * <p>In general this means the output graph will accept token sequences
++ * that the input graph did not accept, and will also fail to accept
++ * token sequences that the input graph did accept.
++ *
++ * <p>This is only necessary at indexing time because Lucene cannot yet index
++ * an arbitrary token graph.  At search time there are better options, e.g.
++ * the experimental <code>TermAutomatonQuery</code> in sandbox.
++ *
++ * @lucene.experimental
++ */
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++
++import org.apache.lucene.analysis.TokenFilter;
++import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
++import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
++import org.apache.lucene.analysis.tokenattributes.PositionLengthAttribute;
++import org.apache.lucene.util.AttributeSource;
++import org.apache.lucene.util.RollingBuffer;
++
++/**
++ * Converts an incoming graph token stream, such as one from
++ * {@link SynonymGraphFilter}, into a flat form so that
++ * all nodes form a single linear chain with no side paths.  Every
++ * path through the graph touches every node.
++ *
++ * <p>If the graph was not already flat to start, this
++ * is likely a lossy process, i.e. it will often cause the 
++ * graph to accept token sequences it should not, and to
++ * reject token sequences it should not.
++ *
++ * <p>However, when applying synonyms during indexing, this
++ * is necessary because Lucene already does not index a graph 
++ * and so the indexing process is already lossy
++ * (it ignores the {@link PositionLengthAttribute}).
++ *
++ * @lucene.experimental
++ */
++public final class FlattenGraphFilter extends TokenFilter {
++
++  /** Holds all tokens leaving a given input position. */
++  private final static class InputNode implements RollingBuffer.Resettable {
++    private final List<AttributeSource.State> tokens = new ArrayList<>();
++
++    /** Our input node, or -1 if we haven't been assigned yet */
++    int node = -1;
++
++    /** Maximum to input node for all tokens leaving here; we use this
++     *  to know when we can freeze. */
++    int maxToNode = -1;
++
++    /** Where we currently map to; this changes (can only
++     *  increase as we see more input tokens), until we are finished
++     *  with this position. */
++    int outputNode = -1;
++
++    /** Which token (index into {@link #tokens}) we will next output. */
++    int nextOut;
++
++    @Override
++    public void reset() {
++      tokens.clear();
++      node = -1;
++      outputNode = -1;
++      maxToNode = -1;
++      nextOut = 0;
++    }
++  }
++
++  /** Gathers up merged input positions into a single output position,
++   *  only for the current "frontier" of nodes we've seen but can't yet
++   *  output because they are not frozen. */
++  private final static class OutputNode implements RollingBuffer.Resettable {
++    private final List<Integer> inputNodes = new ArrayList<>();
++
++    /** Node ID for this output, or -1 if we haven't been assigned yet. */
++    int node = -1;
++
++    /** Which input node (index into {@link #inputNodes}) we will next output. */
++    int nextOut;
++    
++    /** Start offset of tokens leaving this node. */
++    int startOffset = -1;
++
++    /** End offset of tokens arriving to this node. */
++    int endOffset = -1;
++
++    @Override
++    public void reset() {
++      inputNodes.clear();
++      node = -1;
++      nextOut = 0;
++      startOffset = -1;
++      endOffset = -1;
++    }
++  }
++
++  private final RollingBuffer<InputNode> inputNodes = new RollingBuffer<InputNode>() {
++    @Override
++    protected InputNode newInstance() {
++      return new InputNode();
++    }
++  };
++
++  private final RollingBuffer<OutputNode> outputNodes = new RollingBuffer<OutputNode>() {
++    @Override
++    protected OutputNode newInstance() {
++      return new OutputNode();
++    }
++  };
++
++  private final PositionIncrementAttribute posIncAtt = addAttribute(PositionIncrementAttribute.class);
++  private final PositionLengthAttribute posLenAtt = addAttribute(PositionLengthAttribute.class);
++  private final OffsetAttribute offsetAtt = addAttribute(OffsetAttribute.class);
++
++  /** Which input node the last seen token leaves from */
++  private int inputFrom;
++
++  /** We are currently releasing tokens leaving from this output node */
++  private int outputFrom;
++
++  // for debugging:
++  //private int retOutputFrom;
++
++  private boolean done;
++
++  private int lastOutputFrom;
++
++  private int finalOffset;
++
++  private int finalPosInc;
++
++  private int maxLookaheadUsed;
++
++  private int lastStartOffset;
++
++  public FlattenGraphFilter(TokenStream in) {
++    super(in);
++  }
++
++  private boolean releaseBufferedToken() {
++
++    // We only need the while loop (retry) if we have a hole (an output node that has no tokens leaving):
++    while (outputFrom < outputNodes.getMaxPos()) {
++      OutputNode output = outputNodes.get(outputFrom);
++      if (output.inputNodes.isEmpty()) {
++        // No tokens arrived to this node, which happens for the first node
++        // after a hole:
++        //System.out.println("    skip empty outputFrom=" + outputFrom);
++        outputFrom++;
++        continue;
++      }
++
++      int maxToNode = -1;
++      for(int inputNodeID : output.inputNodes) {
++        InputNode inputNode = inputNodes.get(inputNodeID);
++        assert inputNode.outputNode == outputFrom;
++        maxToNode = Math.max(maxToNode, inputNode.maxToNode);
++      }
++      //System.out.println("  release maxToNode=" + maxToNode + " vs inputFrom=" + inputFrom);
++
++      // TODO: we could shrink the frontier here somewhat if we
++      // always output posLen=1 as part of our "sausagizing":
++      if (maxToNode <= inputFrom || done) {
++        //System.out.println("  output node merged these inputs: " + output.inputNodes);
++        // These tokens are now frozen
++        assert output.nextOut < output.inputNodes.size(): "output.nextOut=" + output.nextOut + " vs output.inputNodes.size()=" + output.inputNodes.size();
++        InputNode inputNode = inputNodes.get(output.inputNodes.get(output.nextOut));
++        if (done && inputNode.tokens.size() == 0 && outputFrom >= outputNodes.getMaxPos()) {
++          return false;
++        }
++        if (inputNode.tokens.size() == 0) {
++          assert inputNode.nextOut == 0;
++          assert output.nextOut == 0;
++          // Hole dest nodes should never be merged since 1) we always
++          // assign them to a new output position, and 2) since they never
++          // have arriving tokens they cannot be pushed:
++          assert output.inputNodes.size() == 1: output.inputNodes.size();
++          outputFrom++;
++          inputNodes.freeBefore(output.inputNodes.get(0));
++          outputNodes.freeBefore(outputFrom);
++          continue;
++        }
++
++        assert inputNode.nextOut < inputNode.tokens.size();
++
++        restoreState(inputNode.tokens.get(inputNode.nextOut));
++
++        // Correct posInc
++        assert outputFrom >= lastOutputFrom;
++        posIncAtt.setPositionIncrement(outputFrom - lastOutputFrom);
++        int toInputNodeID = inputNode.node + posLenAtt.getPositionLength();
++        InputNode toInputNode = inputNodes.get(toInputNodeID);
++
++        // Correct posLen
++        assert toInputNode.outputNode > outputFrom;
++        posLenAtt.setPositionLength(toInputNode.outputNode - outputFrom);
++        lastOutputFrom = outputFrom;
++        inputNode.nextOut++;
++        //System.out.println("  ret " + this);
++
++        OutputNode outputEndNode = outputNodes.get(toInputNode.outputNode);
++
++        // Correct offsets
++
++        // This is a bit messy; we must do this so offset don't go backwards,
++        // which would otherwise happen if the replacement has more tokens
++        // than the input:
++        int startOffset = Math.max(lastStartOffset, output.startOffset);
++        offsetAtt.setOffset(startOffset, outputEndNode.endOffset);
++        lastStartOffset = startOffset;
++
++        if (inputNode.nextOut == inputNode.tokens.size()) {
++          output.nextOut++;
++          if (output.nextOut == output.inputNodes.size()) {
++            outputFrom++;
++            inputNodes.freeBefore(output.inputNodes.get(0));
++            outputNodes.freeBefore(outputFrom);
++          }
++        }
++
++        return true;
++      } else {
++        return false;
++      }
++    }
++
++    //System.out.println("    break false");
++    return false;
++  }
++
++  @Override
++  public boolean incrementToken() throws IOException {
++    //System.out.println("\nF.increment inputFrom=" + inputFrom + " outputFrom=" + outputFrom);
++
++    while (true) {
++      if (releaseBufferedToken()) {
++        //retOutputFrom += posIncAtt.getPositionIncrement();
++        //System.out.println("    return buffered: " + termAtt + " " + retOutputFrom + "-" + (retOutputFrom + posLenAtt.getPositionLength()));
++        //printStates();
++        return true;
++      } else if (done) {
++        //System.out.println("    done, return false");
++        return false;
++      }
++
++      if (input.incrementToken()) {
++        // Input node this token leaves from:
++        inputFrom += posIncAtt.getPositionIncrement();
++
++        int startOffset = offsetAtt.startOffset();
++        int endOffset = offsetAtt.endOffset();
++
++        // Input node this token goes to:
++        int inputTo = inputFrom + posLenAtt.getPositionLength();
++        //System.out.println("  input.inc " + termAtt + ": " + inputFrom + "-" + inputTo);
++
++        InputNode src = inputNodes.get(inputFrom);
++        if (src.node == -1) {
++          // This means the "from" node of this token was never seen as a "to" node,
++          // which should only happen if we just crossed a hole.  This is a challenging
++          // case for us because we normally rely on the full dependencies expressed
++          // by the arcs to assign outgoing node IDs.  It would be better if tokens
++          // were never dropped but instead just marked deleted with a new
++          // TermDeletedAttribute (boolean valued) ... but until that future, we have
++          // a hack here to forcefully jump the output node ID:
++          assert src.outputNode == -1;
++          src.node = inputFrom;
++
++          src.outputNode = outputNodes.getMaxPos() + 1;
++          //System.out.println("    hole: force to outputNode=" + src.outputNode);
++          OutputNode outSrc = outputNodes.get(src.outputNode);
++
++          // Not assigned yet:
++          assert outSrc.node == -1;
++          outSrc.node = src.outputNode;
++          outSrc.inputNodes.add(inputFrom);
++          outSrc.startOffset = startOffset;
++        } else {
++          OutputNode outSrc = outputNodes.get(src.outputNode);
++          if (outSrc.startOffset == -1 || startOffset > outSrc.startOffset) {
++            // "shrink wrap" the offsets so the original tokens (with most
++            // restrictive offsets) win:
++            outSrc.startOffset = Math.max(startOffset, outSrc.startOffset);
++          }
++        }
++
++        // Buffer this token:
++        src.tokens.add(captureState());
++        src.maxToNode = Math.max(src.maxToNode, inputTo);
++        maxLookaheadUsed = Math.max(maxLookaheadUsed, inputNodes.getBufferSize());
++
++        InputNode dest = inputNodes.get(inputTo);
++        if (dest.node == -1) {
++          // Common case: first time a token is arriving to this input position:
++          dest.node = inputTo;
++        }
++
++        // Always number output nodes sequentially:
++        int outputEndNode = src.outputNode + 1;
++
++        if (outputEndNode > dest.outputNode) {
++          if (dest.outputNode != -1) {
++            boolean removed = outputNodes.get(dest.outputNode).inputNodes.remove(Integer.valueOf(inputTo));
++            assert removed;
++          }
++          //System.out.println("    increase output node: " + dest.outputNode + " vs " + outputEndNode);
++          outputNodes.get(outputEndNode).inputNodes.add(inputTo);
++          dest.outputNode = outputEndNode;
++
++          // Since all we ever do is merge incoming nodes together, and then renumber
++          // the merged nodes sequentially, we should only ever assign smaller node
++          // numbers:
++          assert outputEndNode <= inputTo: "outputEndNode=" + outputEndNode + " vs inputTo=" + inputTo;
++        }
++
++        OutputNode outDest = outputNodes.get(dest.outputNode);
++        // "shrink wrap" the offsets so the original tokens (with most
++        // restrictive offsets) win:
++        if (outDest.endOffset == -1 || endOffset < outDest.endOffset) {
++          outDest.endOffset = endOffset;
++        }
++
++      } else {
++        //System.out.println("  got false from input");
++        input.end();
++        finalPosInc = posIncAtt.getPositionIncrement();
++        finalOffset = offsetAtt.endOffset();
++        done = true;
++        // Don't return false here: we need to force release any buffered tokens now
++      }
++    }
++  }
++
++  // Only for debugging:
++  /*
++  private void printStates() {
++    System.out.println("states:");
++    for(int i=outputFrom;i<outputNodes.getMaxPos();i++) {
++      OutputNode outputNode = outputNodes.get(i);
++      System.out.println("  output " + i + ": inputs " + outputNode.inputNodes);
++      for(int inputNodeID : outputNode.inputNodes) {
++        InputNode inputNode = inputNodes.get(inputNodeID);
++        assert inputNode.outputNode == i;
++      }
++    }
++  }
++  */
++
++  @Override
++  public void end() throws IOException {
++    if (done == false) {
++      super.end();
++    } else {
++      // NOTE, shady: don't call super.end, because we did already from incrementToken
++    }
++
++   clearAttributes();
++    if (done) {
++      // On exc, done is false, and we will not have set these:
++      posIncAtt.setPositionIncrement(finalPosInc);
++      offsetAtt.setOffset(finalOffset, finalOffset);
++    } else {
++      super.end();
++    }
++  }
++  
++  @Override
++  public void reset() throws IOException {
++    //System.out.println("F: reset");
++    super.reset();
++    inputFrom = -1;
++    inputNodes.reset();
++    InputNode in = inputNodes.get(0);
++    in.node = 0;
++    in.outputNode = 0;
++
++    outputNodes.reset();
++    OutputNode out = outputNodes.get(0);
++    out.node = 0;
++    out.inputNodes.add(0);
++    out.startOffset = 0;
++    outputFrom = 0;
++    //retOutputFrom = -1;
++    lastOutputFrom = -1;
++    done = false;
++    finalPosInc = -1;
++    finalOffset = -1;
++    lastStartOffset = 0;
++    maxLookaheadUsed = 0;
++  }
++
++  // for testing
++  int getMaxLookaheadUsed() {
++    return maxLookaheadUsed;
++  }
++}
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/FlattenGraphFilterFactory.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/FlattenGraphFilterFactory.java
+new file mode 100644
+index 0000000..a6cba97
+--- /dev/null
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/FlattenGraphFilterFactory.java
+@@ -0,0 +1,44 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.lucene.analysis.synonym;
++
++import java.util.Map;
++
++import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.analysis.util.TokenFilterFactory;
++
++/** 
++ * Factory for {@link FlattenGraphFilter}. 
++ *
++ * @lucene.experimental
++ */
++public class FlattenGraphFilterFactory extends TokenFilterFactory {
++
++  /** Creates a new FlattenGraphFilterFactory */
++  public FlattenGraphFilterFactory(Map<String,String> args) {
++    super(args);
++    if (!args.isEmpty()) {
++      throw new IllegalArgumentException("Unknown parameters: " + args);
++    }
++  }
++  
++  @Override
++  public TokenStream create(TokenStream input) {
++    return new FlattenGraphFilter(input);
++  }
++}
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymFilter.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymFilter.java
+index 6a72920..29f6e1c 100644
+--- a/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymFilter.java
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymFilter.java
+@@ -81,6 +81,9 @@ import org.apache.lucene.util.fst.FST;
+  * used for parsing.  Subsequent tokens simply pass through
+  * and are not parsed.  A future improvement would be to
+  * allow these tokens to also be matched.</p>
++ *
++ * @deprecated Use {@link SynonymGraphFilter} instead, but be sure to also
++ * use {@link FlattenGraphFilter} at index time (not at search time) as well.
+  */ 
+ 
+ // TODO: maybe we should resolve token -> wordID then run
+@@ -105,6 +108,7 @@ import org.apache.lucene.util.fst.FST;
+ //
+ // Another possible solution is described at http://www.cis.uni-muenchen.de/people/Schulz/Pub/dictle5.ps
+ 
++@Deprecated
+ public final class SynonymFilter extends TokenFilter {
+ 
+   public static final String TYPE_SYNONYM = "SYNONYM";
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymFilterFactory.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymFilterFactory.java
+index 8bab9a7..df10e9b 100644
+--- a/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymFilterFactory.java
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymFilterFactory.java
+@@ -72,7 +72,11 @@ import org.apache.lucene.analysis.util.TokenizerFactory;
+  *   <li><code>{@link Analyzer} analyzer</code> - an analyzer used for each raw synonym</li>
+  * </ul>
+  * @see SolrSynonymParser SolrSynonymParser: default format
++ *
++ * @deprecated Use {@link SynonymGraphFilterFactory} instead, but be sure to also
++ * use {@link FlattenGraphFilterFactory} at index time (not at search time) as well.
+  */
++@Deprecated
+ public class SynonymFilterFactory extends TokenFilterFactory implements ResourceLoaderAware {
+   private final boolean ignoreCase;
+   private final String tokenizerFactory;
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymGraphFilter.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymGraphFilter.java
+new file mode 100644
+index 0000000..c64e219
+--- /dev/null
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymGraphFilter.java
+@@ -0,0 +1,585 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.lucene.analysis.synonym;
++
++import org.apache.lucene.analysis.TokenFilter;
++import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
++import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
++import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
++import org.apache.lucene.analysis.tokenattributes.PositionLengthAttribute;
++import org.apache.lucene.analysis.tokenattributes.TypeAttribute;
++import org.apache.lucene.store.ByteArrayDataInput;
++import org.apache.lucene.util.AttributeSource;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.CharsRefBuilder;
++import org.apache.lucene.util.RollingBuffer;
++import org.apache.lucene.util.fst.FST;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.LinkedList;
++import java.util.List;
++
++// TODO: maybe we should resolve token -> wordID then run
++// FST on wordIDs, for better perf?
++ 
++// TODO: a more efficient approach would be Aho/Corasick's
++// algorithm
++// http://en.wikipedia.org/wiki/Aho%E2%80%93Corasick_string_matching_algorithm
++// It improves over the current approach here
++// because it does not fully re-start matching at every
++// token.  For example if one pattern is "a b c x"
++// and another is "b c d" and the input is "a b c d", on
++// trying to parse "a b c x" but failing when you got to x,
++// rather than starting over again your really should
++// immediately recognize that "b c d" matches at the next
++// input.  I suspect this won't matter that much in
++// practice, but it's possible on some set of synonyms it
++// will.  We'd have to modify Aho/Corasick to enforce our
++// conflict resolving (eg greedy matching) because that algo
++// finds all matches.  This really amounts to adding a .*
++// closure to the FST and then determinizing it.
++//
++// Another possible solution is described at http://www.cis.uni-muenchen.de/people/Schulz/Pub/dictle5.ps
++
++/** Applies single- or multi-token synonyms from a {@link SynonymMap}
++ *  to an incoming {@link TokenStream}, producing a fully correct graph
++ *  output.  This is a replacement for {@link SynonymFilter}, which produces
++ *  incorrect graphs for multi-token synonyms.
++ *
++ *  <p>However, if you use this during indexing, you must follow it with
++ *  {@link FlattenGraphFilter} to squash tokens on top of one another
++ *  like {@link SynonymFilter}, because the indexer can't directly
++ *  consume a graph.  To get fully correct positional queries you should
++ *  instead apply synonyms using this {@code TokenFilter} at query time
++ *  and translate the resulting graph to a {@code TermAutomatonQuery}
++ *  e.g. using {@code TokenStreamToTermAutomatonQuery}.
++ *
++ *  <p><b>NOTE</b>: this cannot consume an incoming graph; results will
++ *  be undefined.
++ *
++ *  @lucene.experimental */
++
++public final class SynonymGraphFilter extends TokenFilter {
++
++  public static final String TYPE_SYNONYM = "SYNONYM";
++
++  private final CharTermAttribute termAtt = addAttribute(CharTermAttribute.class);
++  private final PositionIncrementAttribute posIncrAtt = addAttribute(PositionIncrementAttribute.class);
++  private final PositionLengthAttribute posLenAtt = addAttribute(PositionLengthAttribute.class);
++  private final TypeAttribute typeAtt = addAttribute(TypeAttribute.class);
++  private final OffsetAttribute offsetAtt = addAttribute(OffsetAttribute.class);
++
++  private final SynonymMap synonyms;
++  private final boolean ignoreCase;
++
++  private final FST<BytesRef> fst;
++
++  private final FST.BytesReader fstReader;
++  private final FST.Arc<BytesRef> scratchArc;
++  private final ByteArrayDataInput bytesReader = new ByteArrayDataInput();
++  private final BytesRef scratchBytes = new BytesRef();
++  private final CharsRefBuilder scratchChars = new CharsRefBuilder();
++  private final LinkedList<BufferedOutputToken> outputBuffer = new LinkedList<>();
++
++  private int nextNodeOut;
++  private int lastNodeOut;
++  private int maxLookaheadUsed;
++
++  // For testing:
++  private int captureCount;
++
++  private boolean liveToken;
++
++  // Start/end offset of the current match:
++  private int matchStartOffset;
++  private int matchEndOffset;
++
++  // True once the input TokenStream is exhausted:
++  private boolean finished;
++
++  private int lookaheadNextRead;
++  private int lookaheadNextWrite;
++
++  private RollingBuffer<BufferedInputToken> lookahead = new RollingBuffer<BufferedInputToken>() {
++    @Override
++    protected BufferedInputToken newInstance() {
++      return new BufferedInputToken();
++    }
++  };
++
++  static class BufferedInputToken implements RollingBuffer.Resettable {
++    final CharsRefBuilder term = new CharsRefBuilder();
++    AttributeSource.State state;
++    int startOffset = -1;
++    int endOffset = -1;
++
++    @Override
++    public void reset() {
++      state = null;
++      term.clear();
++
++      // Intentionally invalid to ferret out bugs:
++      startOffset = -1;
++      endOffset = -1;
++    }
++  }
++
++  static class BufferedOutputToken {
++    final String term;
++
++    // Non-null if this was an incoming token:
++    final State state;
++
++    final int startNode;
++    final int endNode;
++
++    public BufferedOutputToken(State state, String term, int startNode, int endNode) {
++      this.state = state;
++      this.term = term;
++      this.startNode = startNode;
++      this.endNode = endNode;
++    }
++  }
++
++  public SynonymGraphFilter(TokenStream input, SynonymMap synonyms, boolean ignoreCase) {
++    super(input);
++    this.synonyms = synonyms;
++    this.fst = synonyms.fst;
++    if (fst == null) {
++      throw new IllegalArgumentException("fst must be non-null");
++    }
++    this.fstReader = fst.getBytesReader();
++    scratchArc = new FST.Arc<>();
++    this.ignoreCase = ignoreCase;
++  }
++
++  @Override
++  public boolean incrementToken() throws IOException {
++    //System.out.println("\nS: incrToken lastNodeOut=" + lastNodeOut + " nextNodeOut=" + nextNodeOut);
++
++    assert lastNodeOut <= nextNodeOut;
++      
++    if (outputBuffer.isEmpty() == false) {
++      // We still have pending outputs from a prior synonym match:
++      releaseBufferedToken();
++      //System.out.println("  syn: ret buffered=" + this);
++      assert liveToken == false;
++      return true;
++    }
++
++    // Try to parse a new synonym match at the current token:
++
++    if (parse()) {
++      // A new match was found:
++      releaseBufferedToken();
++      //System.out.println("  syn: after parse, ret buffered=" + this);
++      assert liveToken == false;
++      return true;
++    }
++
++    if (lookaheadNextRead == lookaheadNextWrite) {
++
++      // Fast path: parse pulled one token, but it didn't match
++      // the start for any synonym, so we now return it "live" w/o having
++      // cloned all of its atts:
++      if (finished) {
++        //System.out.println("  syn: ret END");
++        return false;
++      }
++
++      assert liveToken;
++      liveToken = false;
++
++      // NOTE: no need to change posInc since it's relative, i.e. whatever
++      // node our output is upto will just increase by the incoming posInc.
++      // We also don't need to change posLen, but only because we cannot
++      // consume a graph, so the incoming token can never span a future
++      // synonym match.
++
++    } else {
++      // We still have buffered lookahead tokens from a previous
++      // parse attempt that required lookahead; just replay them now:
++      //System.out.println("  restore buffer");
++      assert lookaheadNextRead < lookaheadNextWrite: "read=" + lookaheadNextRead + " write=" + lookaheadNextWrite;
++      BufferedInputToken token = lookahead.get(lookaheadNextRead);
++      lookaheadNextRead++;
++
++      restoreState(token.state);
++
++      lookahead.freeBefore(lookaheadNextRead);
++
++      //System.out.println("  after restore offset=" + offsetAtt.startOffset() + "-" + offsetAtt.endOffset());
++      assert liveToken == false;
++    }
++
++    lastNodeOut += posIncrAtt.getPositionIncrement();
++    nextNodeOut = lastNodeOut + posLenAtt.getPositionLength();
++
++    //System.out.println("  syn: ret lookahead=" + this);
++
++    return true;
++  }
++
++  private void releaseBufferedToken() throws IOException {
++    //System.out.println("  releaseBufferedToken");
++
++    BufferedOutputToken token = outputBuffer.pollFirst();
++
++    if (token.state != null) {
++      // This is an original input token (keepOrig=true case):
++      //System.out.println("    hasState");
++      restoreState(token.state);
++      //System.out.println("    startOffset=" + offsetAtt.startOffset() + " endOffset=" + offsetAtt.endOffset());
++    } else {
++      clearAttributes();
++      //System.out.println("    no state");
++      termAtt.append(token.term);
++
++      // We better have a match already:
++      assert matchStartOffset != -1;
++
++      offsetAtt.setOffset(matchStartOffset, matchEndOffset);
++      //System.out.println("    startOffset=" + matchStartOffset + " endOffset=" + matchEndOffset);
++      typeAtt.setType(TYPE_SYNONYM);
++    }
++
++    //System.out.println("    lastNodeOut=" + lastNodeOut);
++    //System.out.println("    term=" + termAtt);
++
++    posIncrAtt.setPositionIncrement(token.startNode - lastNodeOut);
++    lastNodeOut = token.startNode;
++    posLenAtt.setPositionLength(token.endNode - token.startNode);
++  }
++
++  /** Scans the next input token(s) to see if a synonym matches.  Returns true
++   *  if a match was found. */
++  private boolean parse() throws IOException {
++    // System.out.println(Thread.currentThread().getName() + ": S: parse: " + System.identityHashCode(this));
++
++    // Holds the longest match we've seen so far:
++    BytesRef matchOutput = null;
++    int matchInputLength = 0;
++
++    BytesRef pendingOutput = fst.outputs.getNoOutput();
++    fst.getFirstArc(scratchArc);
++
++    assert scratchArc.output == fst.outputs.getNoOutput();
++
++    // How many tokens in the current match
++    int matchLength = 0;
++    boolean doFinalCapture = false;
++
++    int lookaheadUpto = lookaheadNextRead;
++    matchStartOffset = -1;
++
++    byToken:
++    while (true) {
++      //System.out.println("  cycle lookaheadUpto=" + lookaheadUpto + " maxPos=" + lookahead.getMaxPos());
++      
++      // Pull next token's chars:
++      final char[] buffer;
++      final int bufferLen;
++      final int inputEndOffset;
++
++      if (lookaheadUpto <= lookahead.getMaxPos()) {
++        // Still in our lookahead buffer
++        BufferedInputToken token = lookahead.get(lookaheadUpto);
++        lookaheadUpto++;
++        buffer = token.term.chars();
++        bufferLen = token.term.length();
++        inputEndOffset = token.endOffset;
++        //System.out.println("    use buffer now max=" + lookahead.getMaxPos());
++        if (matchStartOffset == -1) {
++          matchStartOffset = token.startOffset;
++        }
++      } else {
++
++        // We used up our lookahead buffer of input tokens
++        // -- pull next real input token:
++
++        assert finished || liveToken == false;
++
++        if (finished) {
++          //System.out.println("    break: finished");
++          break;
++        } else if (input.incrementToken()) {
++          //System.out.println("    input.incrToken");
++          liveToken = true;
++          buffer = termAtt.buffer();
++          bufferLen = termAtt.length();
++          if (matchStartOffset == -1) {
++            matchStartOffset = offsetAtt.startOffset();
++          }
++          inputEndOffset = offsetAtt.endOffset();
++
++          lookaheadUpto++;
++        } else {
++          // No more input tokens
++          finished = true;
++          //System.out.println("    break: now set finished");
++          break;
++        }
++      }
++
++      matchLength++;
++      //System.out.println("    cycle term=" + new String(buffer, 0, bufferLen));
++
++      // Run each char in this token through the FST:
++      int bufUpto = 0;
++      while (bufUpto < bufferLen) {
++        final int codePoint = Character.codePointAt(buffer, bufUpto, bufferLen);
++        if (fst.findTargetArc(ignoreCase ? Character.toLowerCase(codePoint) : codePoint, scratchArc, scratchArc, fstReader) == null) {
++          break byToken;
++        }
++
++        // Accum the output
++        pendingOutput = fst.outputs.add(pendingOutput, scratchArc.output);
++        bufUpto += Character.charCount(codePoint);
++      }
++
++      assert bufUpto == bufferLen;
++
++      // OK, entire token matched; now see if this is a final
++      // state in the FST (a match):
++      if (scratchArc.isFinal()) {
++        matchOutput = fst.outputs.add(pendingOutput, scratchArc.nextFinalOutput);
++        matchInputLength = matchLength;
++        matchEndOffset = inputEndOffset;
++        //System.out.println("    ** match");
++      }
++
++      // See if the FST can continue matching (ie, needs to
++      // see the next input token):
++      if (fst.findTargetArc(SynonymMap.WORD_SEPARATOR, scratchArc, scratchArc, fstReader) == null) {
++        // No further rules can match here; we're done
++        // searching for matching rules starting at the
++        // current input position.
++        break;
++      } else {
++        // More matching is possible -- accum the output (if
++        // any) of the WORD_SEP arc:
++        pendingOutput = fst.outputs.add(pendingOutput, scratchArc.output);
++        doFinalCapture = true;
++        if (liveToken) {
++          capture();
++        }
++      }
++    }
++
++    if (doFinalCapture && liveToken && finished == false) {
++      // Must capture the final token if we captured any prior tokens:
++      capture();
++    }
++
++    if (matchOutput != null) {
++
++      if (liveToken) {
++        // Single input token synonym; we must buffer it now:
++        capture();
++      }
++
++      // There is a match!
++      bufferOutputTokens(matchOutput, matchInputLength);
++      lookaheadNextRead += matchInputLength;
++      //System.out.println("  precmatch; set lookaheadNextRead=" + lookaheadNextRead + " now max=" + lookahead.getMaxPos());
++      lookahead.freeBefore(lookaheadNextRead);
++      //System.out.println("  match; set lookaheadNextRead=" + lookaheadNextRead + " now max=" + lookahead.getMaxPos());
++      return true;
++    } else {
++      //System.out.println("  no match; lookaheadNextRead=" + lookaheadNextRead);
++      return false;
++    }
++
++    //System.out.println("  parse done inputSkipCount=" + inputSkipCount + " nextRead=" + nextRead + " nextWrite=" + nextWrite);
++  }
++
++  /** Expands the output graph into the necessary tokens, adding
++   *  synonyms as side paths parallel to the input tokens, and
++   *  buffers them in the output token buffer. */
++  private void bufferOutputTokens(BytesRef bytes, int matchInputLength) {
++    bytesReader.reset(bytes.bytes, bytes.offset, bytes.length);
++
++    final int code = bytesReader.readVInt();
++    final boolean keepOrig = (code & 0x1) == 0;
++    //System.out.println("  buffer: keepOrig=" + keepOrig + " matchInputLength=" + matchInputLength);
++
++    // How many nodes along all paths; we need this to assign the
++    // node ID for the final end node where all paths merge back:
++    int totalPathNodes;
++    if (keepOrig) {
++      assert matchInputLength > 0;
++      totalPathNodes = matchInputLength - 1;
++    } else {
++      totalPathNodes = 0;
++    }
++
++    // How many synonyms we will insert over this match:
++    final int count = code >>> 1;
++
++    // TODO: we could encode this instead into the FST:
++
++    // 1st pass: count how many new nodes we need
++    List<List<String>> paths = new ArrayList<>();
++    for(int outputIDX=0;outputIDX<count;outputIDX++) {
++      int wordID = bytesReader.readVInt();
++      synonyms.words.get(wordID, scratchBytes);
++      scratchChars.copyUTF8Bytes(scratchBytes);
++      int lastStart = 0;
++
++      List<String> path = new ArrayList<>();
++      paths.add(path);
++      int chEnd = scratchChars.length();
++      for(int chUpto=0; chUpto<=chEnd; chUpto++) {
++        if (chUpto == chEnd || scratchChars.charAt(chUpto) == SynonymMap.WORD_SEPARATOR) {
++          path.add(new String(scratchChars.chars(), lastStart, chUpto - lastStart));
++          lastStart = 1 + chUpto;
++        }
++      }
++
++      assert path.size() > 0;
++      totalPathNodes += path.size() - 1;
++    }
++    //System.out.println("  totalPathNodes=" + totalPathNodes);
++
++    // 2nd pass: buffer tokens for the graph fragment
++
++    // NOTE: totalPathNodes will be 0 in the case where the matched
++    // input is a single token and all outputs are also a single token
++
++    // We "spawn" a side-path for each of the outputs for this matched
++    // synonym, all ending back at this end node:
++
++    int startNode = nextNodeOut;
++
++    int endNode = startNode + totalPathNodes + 1;
++    //System.out.println("  " + paths.size() + " new side-paths");
++
++    // First, fanout all tokens departing start node for these new side paths:
++    int newNodeCount = 0;
++    for(List<String> path : paths) {
++      int pathEndNode;
++      //System.out.println("    path size=" + path.size());
++      if (path.size() == 1) {
++        // Single token output, so there are no intermediate nodes:
++        pathEndNode = endNode;
++      } else {
++        pathEndNode = nextNodeOut + newNodeCount + 1;
++        newNodeCount += path.size() - 1;
++      }
++      outputBuffer.add(new BufferedOutputToken(null, path.get(0), startNode, pathEndNode));
++    }
++
++    // We must do the original tokens last, else the offsets "go backwards":
++    if (keepOrig) {
++      BufferedInputToken token = lookahead.get(lookaheadNextRead);
++      int inputEndNode;
++      if (matchInputLength == 1) {
++        // Single token matched input, so there are no intermediate nodes:
++        inputEndNode = endNode;
++      } else {
++        inputEndNode = nextNodeOut + newNodeCount + 1;
++      }
++
++      //System.out.println("    keepOrig first token: " + token.term);
++
++      outputBuffer.add(new BufferedOutputToken(token.state, token.term.toString(), startNode, inputEndNode));
++    }
++
++    nextNodeOut = endNode;
++
++    // Do full side-path for each syn output:
++    for(int pathID=0;pathID<paths.size();pathID++) {
++      List<String> path = paths.get(pathID);
++      if (path.size() > 1) {
++        int lastNode = outputBuffer.get(pathID).endNode;
++        for(int i=1;i<path.size()-1;i++) {
++          outputBuffer.add(new BufferedOutputToken(null, path.get(i), lastNode, lastNode+1));
++          lastNode++;
++        }
++        outputBuffer.add(new BufferedOutputToken(null, path.get(path.size()-1), lastNode, endNode));
++      }
++    }
++
++    if (keepOrig && matchInputLength > 1) {
++      // Do full "side path" with the original tokens:
++      int lastNode = outputBuffer.get(paths.size()).endNode;
++      for(int i=1;i<matchInputLength-1;i++) {
++        BufferedInputToken token = lookahead.get(lookaheadNextRead + i);
++        outputBuffer.add(new BufferedOutputToken(token.state, token.term.toString(), lastNode, lastNode+1));
++        lastNode++;
++      }
++      BufferedInputToken token = lookahead.get(lookaheadNextRead + matchInputLength - 1);
++      outputBuffer.add(new BufferedOutputToken(token.state, token.term.toString(), lastNode, endNode));
++    }
++
++    /*
++    System.out.println("  after buffer: " + outputBuffer.size() + " tokens:");
++    for(BufferedOutputToken token : outputBuffer) {
++      System.out.println("    tok: " + token.term + " startNode=" + token.startNode + " endNode=" + token.endNode);
++    }
++    */
++  }
++
++  /** Buffers the current input token into lookahead buffer. */
++  private void capture() {
++    assert liveToken;
++    liveToken = false;
++    BufferedInputToken token = lookahead.get(lookaheadNextWrite);
++    lookaheadNextWrite++;
++
++    token.state = captureState();
++    token.startOffset = offsetAtt.startOffset();
++    token.endOffset = offsetAtt.endOffset();
++    assert token.term.length() == 0;
++    token.term.append(termAtt);
++
++    captureCount++;
++    maxLookaheadUsed = Math.max(maxLookaheadUsed, lookahead.getBufferSize());
++    //System.out.println("  maxLookaheadUsed=" + maxLookaheadUsed);
++  }
++
++  @Override
++  public void reset() throws IOException {
++    super.reset();
++    lookahead.reset();
++    lookaheadNextWrite = 0;
++    lookaheadNextRead = 0;
++    captureCount = 0;
++    lastNodeOut = -1;
++    nextNodeOut = 0;
++    matchStartOffset = -1;
++    matchEndOffset = -1;
++    finished = false;
++    liveToken = false;
++    outputBuffer.clear();
++    maxLookaheadUsed = 0;
++    //System.out.println("S: reset");
++  }
++
++  // for testing
++  int getCaptureCount() {
++    return captureCount;
++  }
++
++  // for testing
++  int getMaxLookaheadUsed() {
++    return maxLookaheadUsed;
++  }
++}
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymGraphFilterFactory.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymGraphFilterFactory.java
+new file mode 100644
+index 0000000..91e06e4
+--- /dev/null
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymGraphFilterFactory.java
+@@ -0,0 +1,204 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.lucene.analysis.synonym;
++
++import java.io.IOException;
++import java.io.InputStreamReader;
++import java.nio.charset.CharsetDecoder;
++import java.nio.charset.CodingErrorAction;
++import java.nio.charset.StandardCharsets;
++import java.text.ParseException;
++import java.util.HashMap;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Map;
++
++import org.apache.lucene.analysis.Analyzer;
++import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.analysis.Tokenizer;
++import org.apache.lucene.analysis.core.LowerCaseFilter;
++import org.apache.lucene.analysis.core.WhitespaceTokenizer;
++import org.apache.lucene.analysis.util.ResourceLoader;
++import org.apache.lucene.analysis.util.ResourceLoaderAware;
++import org.apache.lucene.analysis.util.TokenFilterFactory;
++import org.apache.lucene.analysis.util.TokenizerFactory;
++
++/**
++ * Factory for {@link SynonymGraphFilter}.
++ * <pre class="prettyprint">
++ * &lt;fieldType name="text_synonym" class="solr.TextField" positionIncrementGap="100"&gt;
++ *   &lt;analyzer&gt;
++ *     &lt;tokenizer class="solr.WhitespaceTokenizerFactory"/&gt;
++ *     &lt;filter class="solr.SynonymGraphFilterFactory" synonyms="synonyms.txt" 
++ *             format="solr" ignoreCase="false" expand="true" 
++ *             tokenizerFactory="solr.WhitespaceTokenizerFactory"
++ *             [optional tokenizer factory parameters]/&gt;
++ *   &lt;/analyzer&gt;
++ * &lt;/fieldType&gt;</pre>
++ * 
++ * <p>
++ * An optional param name prefix of "tokenizerFactory." may be used for any 
++ * init params that the SynonymGraphFilterFactory needs to pass to the specified 
++ * TokenizerFactory.  If the TokenizerFactory expects an init parameters with 
++ * the same name as an init param used by the SynonymGraphFilterFactory, the prefix 
++ * is mandatory.
++ * </p>
++ * 
++ * <p>
++ * The optional {@code format} parameter controls how the synonyms will be parsed:
++ * It supports the short names of {@code solr} for {@link SolrSynonymParser} 
++ * and {@code wordnet} for and {@link WordnetSynonymParser}, or your own 
++ * {@code SynonymMap.Parser} class name. The default is {@code solr}.
++ * A custom {@link SynonymMap.Parser} is expected to have a constructor taking:
++ * <ul>
++ *   <li><code>boolean dedup</code> - true if duplicates should be ignored, false otherwise</li>
++ *   <li><code>boolean expand</code> - true if conflation groups should be expanded, false if they are one-directional</li>
++ *   <li><code>{@link Analyzer} analyzer</code> - an analyzer used for each raw synonym</li>
++ * </ul>
++ * @see SolrSynonymParser SolrSynonymParser: default format
++ *
++ * @lucene.experimental
++ */
++public class SynonymGraphFilterFactory extends TokenFilterFactory implements ResourceLoaderAware {
++  private final boolean ignoreCase;
++  private final String tokenizerFactory;
++  private final String synonyms;
++  private final String format;
++  private final boolean expand;
++  private final String analyzerName;
++  private final Map<String, String> tokArgs = new HashMap<>();
++
++  private SynonymMap map;
++  
++  public SynonymGraphFilterFactory(Map<String,String> args) {
++    super(args);
++    ignoreCase = getBoolean(args, "ignoreCase", false);
++    synonyms = require(args, "synonyms");
++    format = get(args, "format");
++    expand = getBoolean(args, "expand", true);
++
++    analyzerName = get(args, "analyzer");
++    tokenizerFactory = get(args, "tokenizerFactory");
++    if (analyzerName != null && tokenizerFactory != null) {
++      throw new IllegalArgumentException("Analyzer and TokenizerFactory can't be specified both: " +
++                                         analyzerName + " and " + tokenizerFactory);
++    }
++
++    if (tokenizerFactory != null) {
++      tokArgs.put("luceneMatchVersion", getLuceneMatchVersion().toString());
++      for (Iterator<String> itr = args.keySet().iterator(); itr.hasNext();) {
++        String key = itr.next();
++        tokArgs.put(key.replaceAll("^tokenizerFactory\\.",""), args.get(key));
++        itr.remove();
++      }
++    }
++    if (!args.isEmpty()) {
++      throw new IllegalArgumentException("Unknown parameters: " + args);
++    }
++  }
++  
++  @Override
++  public TokenStream create(TokenStream input) {
++    // if the fst is null, it means there's actually no synonyms... just return the original stream
++    // as there is nothing to do here.
++    return map.fst == null ? input : new SynonymGraphFilter(input, map, ignoreCase);
++  }
++
++  @Override
++  public void inform(ResourceLoader loader) throws IOException {
++    final TokenizerFactory factory = tokenizerFactory == null ? null : loadTokenizerFactory(loader, tokenizerFactory);
++    Analyzer analyzer;
++    
++    if (analyzerName != null) {
++      analyzer = loadAnalyzer(loader, analyzerName);
++    } else {
++      analyzer = new Analyzer() {
++        @Override
++        protected TokenStreamComponents createComponents(String fieldName) {
++          Tokenizer tokenizer = factory == null ? new WhitespaceTokenizer() : factory.create();
++          TokenStream stream = ignoreCase ? new LowerCaseFilter(tokenizer) : tokenizer;
++          return new TokenStreamComponents(tokenizer, stream);
++        }
++      };
++    }
++
++    try (Analyzer a = analyzer) {
++      String formatClass = format;
++      if (format == null || format.equals("solr")) {
++        formatClass = SolrSynonymParser.class.getName();
++      } else if (format.equals("wordnet")) {
++        formatClass = WordnetSynonymParser.class.getName();
++      }
++      // TODO: expose dedup as a parameter?
++      map = loadSynonyms(loader, formatClass, true, a);
++    } catch (ParseException e) {
++      throw new IOException("Error parsing synonyms file:", e);
++    }
++  }
++
++  /**
++   * Load synonyms with the given {@link SynonymMap.Parser} class.
++   */
++  protected SynonymMap loadSynonyms(ResourceLoader loader, String cname, boolean dedup, Analyzer analyzer) throws IOException, ParseException {
++    CharsetDecoder decoder = StandardCharsets.UTF_8.newDecoder()
++        .onMalformedInput(CodingErrorAction.REPORT)
++        .onUnmappableCharacter(CodingErrorAction.REPORT);
++
++    SynonymMap.Parser parser;
++    Class<? extends SynonymMap.Parser> clazz = loader.findClass(cname, SynonymMap.Parser.class);
++    try {
++      parser = clazz.getConstructor(boolean.class, boolean.class, Analyzer.class).newInstance(dedup, expand, analyzer);
++    } catch (Exception e) {
++      throw new RuntimeException(e);
++    }
++
++    List<String> files = splitFileNames(synonyms);
++    for (String file : files) {
++      decoder.reset();
++      parser.parse(new InputStreamReader(loader.openResource(file), decoder));
++    }
++    return parser.build();
++  }
++  
++  // (there are no tests for this functionality)
++  private TokenizerFactory loadTokenizerFactory(ResourceLoader loader, String cname) throws IOException {
++    Class<? extends TokenizerFactory> clazz = loader.findClass(cname, TokenizerFactory.class);
++    try {
++      TokenizerFactory tokFactory = clazz.getConstructor(Map.class).newInstance(tokArgs);
++      if (tokFactory instanceof ResourceLoaderAware) {
++        ((ResourceLoaderAware) tokFactory).inform(loader);
++      }
++      return tokFactory;
++    } catch (Exception e) {
++      throw new RuntimeException(e);
++    }
++  }
++
++  private Analyzer loadAnalyzer(ResourceLoader loader, String cname) throws IOException {
++    Class<? extends Analyzer> clazz = loader.findClass(cname, Analyzer.class);
++    try {
++      Analyzer analyzer = clazz.getConstructor().newInstance();
++      if (analyzer instanceof ResourceLoaderAware) {
++        ((ResourceLoaderAware) analyzer).inform(loader);
++      }
++      return analyzer;
++    } catch (Exception e) {
++      throw new RuntimeException(e);
++    }
++  }
++}
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymMap.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymMap.java
+index fc8703f..7371e23 100644
+--- a/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymMap.java
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymMap.java
+@@ -74,6 +74,11 @@ public class SynonymMap {
+     private int maxHorizontalContext;
+     private final boolean dedup;
+ 
++    /** Default constructor, passes {@code dedup=true}. */
++    public Builder() {
++      this(true);
++    }
++
+     /** If dedup is true then identical rules (same input,
+      *  same output) will be added only once. */
+     public Builder(boolean dedup) {
+@@ -109,8 +114,6 @@ public class SynonymMap {
+       reuse.setLength(upto);
+       return reuse.get();
+     }
+-    
+-
+ 
+     /** only used for asserting! */
+     private boolean hasHoles(CharsRef chars) {
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/util/CharTokenizer.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/util/CharTokenizer.java
+index 9100345..13289be 100644
+--- a/lucene/analysis/common/src/java/org/apache/lucene/analysis/util/CharTokenizer.java
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/util/CharTokenizer.java
+@@ -256,10 +256,12 @@ public abstract class CharTokenizer extends Tokenizer {
+         }
+         end += charCount;
+         length += Character.toChars(normalize(c), buffer, length); // buffer it, normalized
+-        if (length >= MAX_WORD_LEN) // buffer overflow! make sure to check for >= surrogate pair could break == test
++        if (length >= MAX_WORD_LEN) { // buffer overflow! make sure to check for >= surrogate pair could break == test
+           break;
+-      } else if (length > 0)             // at non-Letter w/ chars
++        }
++      } else if (length > 0) {           // at non-Letter w/ chars
+         break;                           // return 'em
++      }
+     }
+ 
+     termAtt.setLength(length);
+diff --git a/lucene/analysis/common/src/resources/META-INF/services/org.apache.lucene.analysis.util.TokenFilterFactory b/lucene/analysis/common/src/resources/META-INF/services/org.apache.lucene.analysis.util.TokenFilterFactory
+index 70120c5..73986d7 100644
+--- a/lucene/analysis/common/src/resources/META-INF/services/org.apache.lucene.analysis.util.TokenFilterFactory
++++ b/lucene/analysis/common/src/resources/META-INF/services/org.apache.lucene.analysis.util.TokenFilterFactory
+@@ -101,5 +101,7 @@ org.apache.lucene.analysis.standard.ClassicFilterFactory
+ org.apache.lucene.analysis.standard.StandardFilterFactory
+ org.apache.lucene.analysis.sv.SwedishLightStemFilterFactory
+ org.apache.lucene.analysis.synonym.SynonymFilterFactory
++org.apache.lucene.analysis.synonym.SynonymGraphFilterFactory
++org.apache.lucene.analysis.synonym.FlattenGraphFilterFactory
+ org.apache.lucene.analysis.tr.TurkishLowerCaseFilterFactory
+ org.apache.lucene.analysis.util.ElisionFilterFactory
+diff --git a/lucene/analysis/common/src/test/org/apache/lucene/analysis/miscellaneous/TestWordDelimiterFilter.java b/lucene/analysis/common/src/test/org/apache/lucene/analysis/miscellaneous/TestWordDelimiterFilter.java
+index a22d9c9..580b17e 100644
+--- a/lucene/analysis/common/src/test/org/apache/lucene/analysis/miscellaneous/TestWordDelimiterFilter.java
++++ b/lucene/analysis/common/src/test/org/apache/lucene/analysis/miscellaneous/TestWordDelimiterFilter.java
+@@ -224,18 +224,27 @@ public class TestWordDelimiterFilter extends BaseTokenStreamTestCase {
+     assertAnalyzesTo(a, "LUCENE / SOLR", new String[] { "LUCENE", "SOLR" },
+         new int[] { 0, 9 },
+         new int[] { 6, 13 },
+-        new int[] { 1, 1 });
++        null,
++        new int[] { 1, 1 },
++        null,
++        false);
+     
+     /* only in this case, posInc of 2 ?! */
+     assertAnalyzesTo(a, "LUCENE / solR", new String[] { "LUCENE", "sol", "solR", "R" },
+         new int[] { 0, 9, 9, 12 },
+         new int[] { 6, 12, 13, 13 },
+-        new int[] { 1, 1, 0, 1 });
++        null,                     
++        new int[] { 1, 1, 0, 1 },
++        null,
++        false);
+     
+     assertAnalyzesTo(a, "LUCENE / NUTCH SOLR", new String[] { "LUCENE", "NUTCH", "SOLR" },
+         new int[] { 0, 9, 15 },
+         new int[] { 6, 14, 19 },
+-        new int[] { 1, 1, 1 });
++        null,
++        new int[] { 1, 1, 1 },
++        null,
++        false);
+     
+     /* analyzer that will consume tokens with large position increments */
+     Analyzer a2 = new Analyzer() {
+@@ -252,24 +261,36 @@ public class TestWordDelimiterFilter extends BaseTokenStreamTestCase {
+     assertAnalyzesTo(a2, "LUCENE largegap SOLR", new String[] { "LUCENE", "largegap", "SOLR" },
+         new int[] { 0, 7, 16 },
+         new int[] { 6, 15, 20 },
+-        new int[] { 1, 10, 1 });
++        null,
++        new int[] { 1, 10, 1 },
++        null,
++        false);
+     
+     /* the "/" had a position increment of 10, where did it go?!?!! */
+     assertAnalyzesTo(a2, "LUCENE / SOLR", new String[] { "LUCENE", "SOLR" },
+         new int[] { 0, 9 },
+         new int[] { 6, 13 },
+-        new int[] { 1, 11 });
++        null,
++        new int[] { 1, 11 },
++        null,
++        false);
+     
+     /* in this case, the increment of 10 from the "/" is carried over */
+     assertAnalyzesTo(a2, "LUCENE / solR", new String[] { "LUCENE", "sol", "solR", "R" },
+         new int[] { 0, 9, 9, 12 },
+         new int[] { 6, 12, 13, 13 },
+-        new int[] { 1, 11, 0, 1 });
++        null,
++        new int[] { 1, 11, 0, 1 },
++        null,
++        false);
+     
+     assertAnalyzesTo(a2, "LUCENE / NUTCH SOLR", new String[] { "LUCENE", "NUTCH", "SOLR" },
+         new int[] { 0, 9, 15 },
+         new int[] { 6, 14, 19 },
+-        new int[] { 1, 11, 1 });
++        null,
++        new int[] { 1, 11, 1 },
++        null,
++        false);
+ 
+     Analyzer a3 = new Analyzer() {
+       @Override
+@@ -284,14 +305,21 @@ public class TestWordDelimiterFilter extends BaseTokenStreamTestCase {
+         new String[] { "lucene", "lucenesolr", "solr" },
+         new int[] { 0, 0, 7 },
+         new int[] { 6, 11, 11 },
+-        new int[] { 1, 0, 1 });
++        null,
++        new int[] { 1, 0, 1 },
++        null,
++        false);
+ 
+     /* the stopword should add a gap here */
+     assertAnalyzesTo(a3, "the lucene.solr", 
+         new String[] { "lucene", "lucenesolr", "solr" }, 
+         new int[] { 4, 4, 11 }, 
+         new int[] { 10, 15, 15 },
+-        new int[] { 2, 0, 1 });
++        null,
++        new int[] { 2, 0, 1 },
++        null,
++        false);
++
+     IOUtils.close(a, a2, a3);
+   }
+   
+diff --git a/lucene/analysis/common/src/test/org/apache/lucene/analysis/synonym/TestFlattenGraphFilter.java b/lucene/analysis/common/src/test/org/apache/lucene/analysis/synonym/TestFlattenGraphFilter.java
+new file mode 100644
+index 0000000..d61fa96
+--- /dev/null
++++ b/lucene/analysis/common/src/test/org/apache/lucene/analysis/synonym/TestFlattenGraphFilter.java
+@@ -0,0 +1,284 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.lucene.analysis.synonym;
++
++import org.apache.lucene.analysis.Analyzer;
++import org.apache.lucene.analysis.BaseTokenStreamTestCase;
++import org.apache.lucene.analysis.CannedTokenStream;
++import org.apache.lucene.analysis.MockTokenizer;
++import org.apache.lucene.analysis.Token;
++import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.analysis.Tokenizer;
++
++public class TestFlattenGraphFilter extends BaseTokenStreamTestCase {
++  
++  private static Token token(String term, int posInc, int posLength, int startOffset, int endOffset) {
++    final Token t = new Token(term, startOffset, endOffset);
++    t.setPositionIncrement(posInc);
++    t.setPositionLength(posLength);
++    return t;
++  }
++
++  public void testSimpleMock() throws Exception {
++    Analyzer a = new Analyzer() {
++        @Override
++        protected TokenStreamComponents createComponents(String fieldName) {
++          Tokenizer tokenizer = new MockTokenizer(MockTokenizer.SIMPLE, true);
++          TokenStream ts = new FlattenGraphFilter(tokenizer);
++          return new TokenStreamComponents(tokenizer, ts);
++        }
++      };
++
++    assertAnalyzesTo(a, "wtf happened",
++                     new String[] {"wtf", "happened"},
++                     new int[]    {    0,          4},
++                     new int[]    {    3,         12},
++                     null,
++                     new int[]    {    1,          1},
++                     new int[]    {    1,          1},
++                     true);
++  }
++
++  // Make sure graph is unchanged if it's already flat
++  public void testAlreadyFlatten() throws Exception {
++    TokenStream in = new CannedTokenStream(0, 12, new Token[] {
++        token("wtf", 1, 1, 0, 3),
++        token("what", 0, 1, 0, 3),
++        token("wow", 0, 1, 0, 3),
++        token("the", 1, 1, 0, 3),
++        token("that's", 0, 1, 0, 3),
++        token("fudge", 1, 1, 0, 3),
++        token("funny", 0, 1, 0, 3),
++        token("happened", 1, 1, 4, 12)
++      });
++
++    TokenStream out = new FlattenGraphFilter(in);
++
++    // ... but on output, it's flattened to wtf/what/wow that's/the fudge/funny happened:
++    assertTokenStreamContents(out,
++                              new String[] {"wtf", "what", "wow", "the", "that's", "fudge", "funny", "happened"},
++                              new int[] {0, 0, 0, 0, 0, 0, 0, 4},
++                              new int[] {3, 3, 3, 3, 3, 3, 3, 12},
++                              new int[] {1, 0, 0, 1, 0, 1, 0, 1},
++                              new int[] {1, 1, 1, 1, 1, 1, 1, 1},
++                              12);
++  }
++
++  public void testWTF1() throws Exception {
++
++    // "wow that's funny" and "what the fudge" are separate side paths, in parallel with "wtf", on input:
++    TokenStream in = new CannedTokenStream(0, 12, new Token[] {
++        token("wtf", 1, 5, 0, 3),
++        token("what", 0, 1, 0, 3),
++        token("wow", 0, 3, 0, 3),
++        token("the", 1, 1, 0, 3),
++        token("fudge", 1, 3, 0, 3),
++        token("that's", 1, 1, 0, 3),
++        token("funny", 1, 1, 0, 3),
++        token("happened", 1, 1, 4, 12)
++      });
++
++
++    TokenStream out = new FlattenGraphFilter(in);
++
++    // ... but on output, it's flattened to wtf/what/wow that's/the fudge/funny happened:
++    assertTokenStreamContents(out,
++                              new String[] {"wtf", "what", "wow", "the", "that's", "fudge", "funny", "happened"},
++                              new int[] {0, 0, 0, 0, 0, 0, 0, 4},
++                              new int[] {3, 3, 3, 3, 3, 3, 3, 12},
++                              new int[] {1, 0, 0, 1, 0, 1, 0, 1},
++                              new int[] {3, 1, 1, 1, 1, 1, 1, 1},
++                              12);
++    
++  }
++
++  /** Same as testWTF1 except the "wtf" token comes out later */
++  public void testWTF2() throws Exception {
++
++    // "wow that's funny" and "what the fudge" are separate side paths, in parallel with "wtf", on input:
++    TokenStream in = new CannedTokenStream(0, 12, new Token[] {
++        token("what", 1, 1, 0, 3),
++        token("wow", 0, 3, 0, 3),
++        token("wtf", 0, 5, 0, 3),
++        token("the", 1, 1, 0, 3),
++        token("fudge", 1, 3, 0, 3),
++        token("that's", 1, 1, 0, 3),
++        token("funny", 1, 1, 0, 3),
++        token("happened", 1, 1, 4, 12)
++      });
++
++
++    TokenStream out = new FlattenGraphFilter(in);
++
++    // ... but on output, it's flattened to wtf/what/wow that's/the fudge/funny happened:
++    assertTokenStreamContents(out,
++                              new String[] {"what", "wow", "wtf", "the", "that's", "fudge", "funny", "happened"},
++                              new int[] {0, 0, 0, 0, 0, 0, 0, 4},
++                              new int[] {3, 3, 3, 3, 3, 3, 3, 12},
++                              new int[] {1, 0, 0, 1, 0, 1, 0, 1},
++                              new int[] {1, 1, 3, 1, 1, 1, 1, 1},
++                              12);
++    
++  }
++
++  public void testNonGreedySynonyms() throws Exception {
++    // This is just "hypothetical" for Lucene today, because SynFilter is
++    // greedy: when two syn rules match on overlapping tokens, only one
++    // (greedily) wins.  This test pretends all syn matches could match:
++
++    TokenStream in = new CannedTokenStream(0, 20, new Token[] {
++        token("wizard", 1, 1, 0, 6),
++        token("wizard_of_oz", 0, 3, 0, 12),
++        token("of", 1, 1, 7, 9),
++        token("oz", 1, 1, 10, 12),
++        token("oz_screams", 0, 2, 10, 20),
++        token("screams", 1, 1, 13, 20),
++      });
++
++
++    TokenStream out = new FlattenGraphFilter(in);
++
++    // ... but on output, it's flattened to wtf/what/wow that's/the fudge/funny happened:
++    assertTokenStreamContents(out,
++                              new String[] {"wizard", "wizard_of_oz", "of", "oz", "oz_screams", "screams"},
++                              new int[] {0, 0, 7, 10, 10, 13},
++                              new int[] {6, 12, 9, 12, 20, 20},
++                              new int[] {1, 0, 1, 1, 0, 1},
++                              new int[] {1, 3, 1, 1, 2, 1},
++                              20);
++    
++  }
++
++  public void testNonGraph() throws Exception {
++    TokenStream in = new CannedTokenStream(0, 22, new Token[] {
++        token("hello", 1, 1, 0, 5),
++        token("pseudo", 1, 1, 6, 12),
++        token("world", 1, 1, 13, 18),
++        token("fun", 1, 1, 19, 22),
++      });
++
++
++    TokenStream out = new FlattenGraphFilter(in);
++
++    // ... but on output, it's flattened to wtf/what/wow that's/the fudge/funny happened:
++    assertTokenStreamContents(out,
++                              new String[] {"hello", "pseudo", "world", "fun"},
++                              new int[] {0, 6, 13, 19},
++                              new int[] {5, 12, 18, 22},
++                              new int[] {1, 1, 1, 1},
++                              new int[] {1, 1, 1, 1},
++                              22);
++  }
++
++  public void testSimpleHole() throws Exception {
++    TokenStream in = new CannedTokenStream(0, 13, new Token[] {
++        token("hello", 1, 1, 0, 5),
++        token("hole", 2, 1, 6, 10),
++        token("fun", 1, 1, 11, 13),
++      });
++
++
++    TokenStream out = new FlattenGraphFilter(in);
++
++    // ... but on output, it's flattened to wtf/what/wow that's/the fudge/funny happened:
++    assertTokenStreamContents(out,
++                              new String[] {"hello", "hole", "fun"},
++                              new int[] {0, 6, 11},
++                              new int[] {5, 10, 13},
++                              new int[] {1, 2, 1},
++                              new int[] {1, 1, 1},
++                              13);
++  }
++
++  public void testHoleUnderSyn() throws Exception {
++    // Tests a StopFilter after SynFilter where a stopword in a syn is removed
++    //
++    //   wizard of oz -> woz syn, but then "of" becomes a hole
++
++    TokenStream in = new CannedTokenStream(0, 12, new Token[] {
++        token("wizard", 1, 1, 0, 6),
++        token("woz", 0, 3, 0, 12),
++        token("oz", 2, 1, 10, 12),
++      });
++
++
++    TokenStream out = new FlattenGraphFilter(in);
++
++    assertTokenStreamContents(out,
++                              new String[] {"wizard", "woz", "oz"},
++                              new int[] {0, 0, 10},
++                              new int[] {6, 12, 12},
++                              new int[] {1, 0, 2},
++                              new int[] {1, 3, 1},
++                              12);
++  }
++
++  public void testStrangelyNumberedNodes() throws Exception {
++
++    // Uses only nodes 0, 2, 3, i.e. 1 is just never used (it is not a hole!!)
++    TokenStream in = new CannedTokenStream(0, 27, new Token[] {
++        token("dog", 1, 3, 0, 5),
++        token("puppy", 0, 3, 0, 5),
++        token("flies", 3, 1, 6, 11),
++      });
++
++    TokenStream out = new FlattenGraphFilter(in);
++
++    assertTokenStreamContents(out,
++                              new String[] {"dog", "puppy", "flies"},
++                              new int[] {0, 0, 6},
++                              new int[] {5, 5, 11},
++                              new int[] {1, 0, 1},
++                              new int[] {1, 1, 1},
++                              27);
++  }
++
++  public void testTwoLongParallelPaths() throws Exception {
++
++    // "a a a a a a" in parallel with "b b b b b b"
++    TokenStream in = new CannedTokenStream(0, 11, new Token[] {
++        token("a", 1, 1, 0, 1),
++        token("b", 0, 2, 0, 1),
++        token("a", 1, 2, 2, 3),
++        token("b", 1, 2, 2, 3),
++        token("a", 1, 2, 4, 5),
++        token("b", 1, 2, 4, 5),
++        token("a", 1, 2, 6, 7),
++        token("b", 1, 2, 6, 7),
++        token("a", 1, 2, 8, 9),
++        token("b", 1, 2, 8, 9),
++        token("a", 1, 2, 10, 11),
++        token("b", 1, 2, 10, 11),
++      });
++
++
++    TokenStream out = new FlattenGraphFilter(in);
++    
++    // ... becomes flattened to a single path with overlapping a/b token between each node:
++    assertTokenStreamContents(out,
++                              new String[] {"a", "b", "a", "b", "a", "b", "a", "b", "a", "b", "a", "b"},
++                              new int[] {0, 0, 2, 2, 4, 4, 6, 6, 8, 8, 10, 10},
++                              new int[] {1, 1, 3, 3, 5, 5, 7, 7, 9, 9, 11, 11},
++                              new int[] {1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0},
++                              new int[] {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
++                              11);
++    
++  }
++
++  // NOTE: TestSynonymGraphFilter's testRandomSyns also tests FlattenGraphFilter
++}
+diff --git a/lucene/analysis/common/src/test/org/apache/lucene/analysis/synonym/TestSynonymGraphFilter.java b/lucene/analysis/common/src/test/org/apache/lucene/analysis/synonym/TestSynonymGraphFilter.java
+new file mode 100644
+index 0000000..edf2d2a
+--- /dev/null
++++ b/lucene/analysis/common/src/test/org/apache/lucene/analysis/synonym/TestSynonymGraphFilter.java
+@@ -0,0 +1,1956 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.lucene.analysis.synonym;
++
++import org.apache.lucene.analysis.Analyzer;
++import org.apache.lucene.analysis.BaseTokenStreamTestCase;
++import org.apache.lucene.analysis.MockAnalyzer;
++import org.apache.lucene.analysis.MockGraphTokenFilter;
++import org.apache.lucene.analysis.MockTokenizer;
++import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.analysis.TokenStreamToAutomaton;
++import org.apache.lucene.analysis.Tokenizer;
++import org.apache.lucene.analysis.tokenattributes.*;
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.Field;
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.RandomIndexWriter;
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.PhraseQuery;
++import org.apache.lucene.store.ByteArrayDataInput;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.BytesRefBuilder;
++import org.apache.lucene.util.CharsRef;
++import org.apache.lucene.util.CharsRefBuilder;
++import org.apache.lucene.util.IOUtils;
++import org.apache.lucene.util.IntsRef;
++import org.apache.lucene.util.IntsRefBuilder;
++import org.apache.lucene.util.TestUtil;
++import org.apache.lucene.util.automaton.Automaton;
++import org.apache.lucene.util.automaton.AutomatonTestUtil;
++import org.apache.lucene.util.automaton.Operations;
++import org.apache.lucene.util.automaton.TooComplexToDeterminizeException;
++import org.apache.lucene.util.automaton.Transition;
++import org.apache.lucene.util.fst.Util;
++
++import java.io.IOException;
++import java.io.StringReader;
++import java.text.ParseException;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++
++public class TestSynonymGraphFilter extends BaseTokenStreamTestCase {
++
++  /** Set as a side effect by {@link #getAnalyzer} and {@link #getFlattenAnalyzer}. */
++  private SynonymGraphFilter synFilter;
++  private FlattenGraphFilter flattenFilter;
++
++  public void testBasicKeepOrigOneOutput() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder();
++    add(b, "a b", "x", true);
++
++    Analyzer a = getAnalyzer(b, true);
++    assertAnalyzesTo(a,
++                     "c a b",
++                     new String[] {"c", "x", "a", "b"},
++                     new int[]    { 0,   2,   2,   4},
++                     new int[]    { 1,   5,   3,   5},
++                     new String[] {"word", "SYNONYM", "word", "word"},
++                     new int[]    { 1,   1,   0,   1},
++                     new int[]    { 1,   2,   1,   1});
++    a.close();
++  }
++
++  public void testMixedKeepOrig() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder();
++    add(b, "a b", "x", true);
++    add(b, "e f", "y", false);
++
++    Analyzer a = getAnalyzer(b, true);
++    assertAnalyzesTo(a,
++                     "c a b c e f g",
++                     new String[] {"c", "x", "a", "b", "c", "y", "g"},
++                     new int[]    { 0,   2,   2,   4,   6,   8,   12},
++                     new int[]    { 1,   5,   3,   5,   7,   11,  13},
++                     new String[] {"word", "SYNONYM", "word", "word", "word", "SYNONYM", "word"},
++                     new int[]    { 1,   1,   0,   1,   1,   1,   1},
++                     new int[]    { 1,   2,   1,   1,   1,   1,   1});
++    a.close();
++  }
++
++  public void testNoParseAfterBuffer() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder();
++    add(b, "b a", "x", true);
++
++    Analyzer a = getAnalyzer(b, true);
++    assertAnalyzesTo(a,
++                     "b b b",
++                     new String[] {"b", "b", "b"},
++                     new int[]    { 0,   2,   4},
++                     new int[]    { 1,   3,   5},
++                     new String[] {"word", "word", "word"},
++                     new int[]    { 1,   1,   1},
++                     new int[]    { 1,   1,   1});
++    a.close();
++  }
++
++  public void testOneInputMultipleOutputKeepOrig() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder();
++    add(b, "a b", "x", true);
++    add(b, "a b", "y", true);
++
++    Analyzer a = getAnalyzer(b, true);
++    assertAnalyzesTo(a,
++                     "c a b c",
++                     new String[] {"c", "x", "y",  "a", "b", "c"},
++                     new int[]    { 0,   2,   2,   2,   4,   6},
++                     new int[]    { 1,   5,   5,   3,   5,   7},
++                     new String[] {"word", "SYNONYM", "SYNONYM", "word", "word", "word"},
++                     new int[]    { 1,   1,   0,   0,   1,   1,   1,   1},
++                     new int[]    { 1,   2,   2,   1,   1,   1,   1,   1});
++    a.close();
++  }
++
++  /**
++   * Verify type of token and positionLength after analyzer.
++   */
++  public void testPositionLengthAndTypeSimple() throws Exception {
++    String testFile =
++        "spider man, spiderman";
++
++    Analyzer analyzer = solrSynsToAnalyzer(testFile);
++
++    assertAnalyzesToPositions(analyzer, "spider man",
++        new String[]{"spiderman", "spider", "man"},
++        new String[]{"SYNONYM", "word", "word"},
++        new int[]{1, 0, 1},
++        new int[]{2, 1, 1});
++  }
++
++  /**
++   * parse a syn file with some escaped syntax chars
++   */
++  public void testEscapedStuff() throws Exception {
++    String testFile =
++        "a\\=>a => b\\=>b\n" +
++            "a\\,a => b\\,b";
++    Analyzer analyzer = solrSynsToAnalyzer(testFile);
++
++    assertAnalyzesTo(analyzer, "ball",
++        new String[]{"ball"},
++        new int[]{1});
++
++    assertAnalyzesTo(analyzer, "a=>a",
++        new String[]{"b=>b"},
++        new int[]{1});
++
++    assertAnalyzesTo(analyzer, "a,a",
++                     new String[]{"b,b"},
++                     new int[]{1});
++    analyzer.close();
++  }
++
++  /**
++   * parse a syn file with bad syntax
++   */
++  public void testInvalidAnalyzesToNothingOutput() throws Exception {
++    String testFile = "a => 1";
++    Analyzer analyzer = new MockAnalyzer(random(), MockTokenizer.SIMPLE, false);
++    SolrSynonymParser parser = new SolrSynonymParser(true, true, analyzer);
++    try {
++      parser.parse(new StringReader(testFile));
++      fail("didn't get expected exception");
++    } catch (ParseException expected) {
++      // expected exc
++    }
++    analyzer.close();
++  }
++
++  /**
++   * parse a syn file with bad syntax
++   */
++  public void testInvalidDoubleMap() throws Exception {
++    String testFile = "a => b => c";
++    Analyzer analyzer = new MockAnalyzer(random());
++    SolrSynonymParser parser = new SolrSynonymParser(true, true, analyzer);
++    try {
++      parser.parse(new StringReader(testFile));
++      fail("didn't get expected exception");
++    } catch (ParseException expected) {
++     // expected exc
++    }
++    analyzer.close();
++  }
++
++  /**
++   * Tests some simple examples from the solr wiki
++   */
++  public void testSimple() throws Exception {
++    String testFile =
++        "i-pod, ipod, ipoooood\n" +
++            "foo => foo bar\n" +
++            "foo => baz\n" +
++            "this test, that testing";
++
++    Analyzer analyzer = solrSynsToAnalyzer(testFile);
++
++    assertAnalyzesTo(analyzer, "ball",
++        new String[]{"ball"},
++        new int[]{1});
++
++    assertAnalyzesTo(analyzer, "i-pod",
++                     new String[]{"ipod", "ipoooood", "i-pod"},
++                     new int[]{1, 0, 0});
++
++    assertAnalyzesTo(analyzer, "foo",
++        new String[]{"foo", "baz", "bar"},
++        new int[]{1, 0, 1});
++
++    assertAnalyzesTo(analyzer, "this test",
++        new String[]{"that", "this", "testing", "test"},
++        new int[]{1, 0, 1, 0});
++    analyzer.close();
++  }
++
++  public void testBufferLength() throws Exception {
++    String testFile =
++        "c => 8 2 5 6 7\n" +
++            "f c e d f, 1\n" +
++            "c g a f d, 6 5 5\n" +
++            "e c => 4\n" +
++            "g => 5\n" +
++            "a g b f e => 5 0 7 7\n" +
++            "b => 1";
++    Analyzer analyzer = solrSynsToAnalyzer(testFile);
++
++    String doc = "b c g a f b d";
++    String[] expected = new String[]{"1", "8", "2", "5", "6", "7", "5", "a", "f", "1", "d"};
++    assertAnalyzesTo(analyzer, doc, expected);
++  }
++
++  private Analyzer solrSynsToAnalyzer(String syns) throws IOException, ParseException {
++    Analyzer analyzer = new MockAnalyzer(random());
++    SolrSynonymParser parser = new SolrSynonymParser(true, true, analyzer);
++    parser.parse(new StringReader(syns));
++    analyzer.close();
++    return getFlattenAnalyzer(parser, true);
++  }
++
++  public void testMoreThanOneLookAhead() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder();
++    add(b, "a b c d", "x", true);
++
++    Analyzer a = getAnalyzer(b, true);
++    assertAnalyzesTo(a,
++                     "a b c e",
++                     new String[] {"a", "b", "c", "e"},
++                     new int[]    { 0,   2,   4,   6},
++                     new int[]    { 1,   3,   5,   7},
++                     new String[] {"word", "word", "word", "word"},
++                     new int[]    { 1,   1,   1,   1},
++                     new int[]    { 1,   1,   1,   1});
++    a.close();
++  }
++
++  public void testLookaheadAfterParse() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder();
++    add(b, "b b", "x", true);
++    add(b, "b", "y", true);
++
++    Analyzer a = getAnalyzer(b, true);
++
++    assertAnalyzesTo(a, "b a b b",
++                     new String[] {"y", "b", "a", "x", "b", "b"},
++                     new int[]    {0,    0,   2,   4,   4,   6},  
++                     new int[]    {1,    1,   3,   7,   5,   7},  
++                     null,
++                     new int[]    {1,    0,   1,   1,   0,   1},  
++                     new int[]    {1,    1,   1,   2,   1,   1},
++                     true);
++  }
++
++  public void testLookaheadSecondParse() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder();
++    add(b, "b b b", "x", true);
++    add(b, "b", "y", true);
++
++    Analyzer a = getAnalyzer(b, true);
++
++    assertAnalyzesTo(a, "b b",
++                     new String[] {"y", "b", "y", "b"},
++                     new int[]    { 0,   0,   2,   2},  
++                     new int[]    { 1,   1,   3,   3},  
++                     null,
++                     new int[]    { 1,    0,   1,   0},  
++                     new int[]    { 1,    1,   1,   1},
++                     true);
++  }
++
++  public void testOneInputMultipleOutputNoKeepOrig() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder();
++    add(b, "a b", "x", false);
++    add(b, "a b", "y", false);
++
++    Analyzer a = getAnalyzer(b, true);
++    assertAnalyzesTo(a,
++                     "c a b c",
++                     new String[] {"c", "x", "y", "c"},
++                     new int[]    { 0,   2,   2,   6},
++                     new int[]    { 1,   5,   5,   7},
++                     new String[] {"word", "SYNONYM", "SYNONYM", "word"},
++                     new int[]    { 1,   1,   0,   1},
++                     new int[]    { 1,   1,   1,   1});
++    a.close();
++  }
++
++  public void testOneInputMultipleOutputMixedKeepOrig() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder();
++    add(b, "a b", "x", true);
++    add(b, "a b", "y", false);
++
++    Analyzer a = getAnalyzer(b, true);
++    assertAnalyzesTo(a,
++                     "c a b c",
++                     new String[] {"c", "x", "y",  "a", "b", "c"},
++                     new int[]    { 0,   2,   2,   2,   4,   6},
++                     new int[]    { 1,   5,   5,   3,   5,   7},
++                     new String[] {"word", "SYNONYM", "SYNONYM", "word", "word", "word"},
++                     new int[]    { 1,   1,   0,   0,   1,   1,   1,   1},
++                     new int[]    { 1,   2,   2,   1,   1,   1,   1,   1});
++    a.close();
++  }
++
++  public void testSynAtEnd() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder();
++    add(b, "a b", "x", true);
++
++    Analyzer a = getAnalyzer(b, true);
++    assertAnalyzesTo(a,
++                     "c d e a b",
++                     new String[] {"c", "d", "e", "x", "a", "b"},
++                     new int[]    { 0,   2,   4,   6,   6,   8},
++                     new int[]    { 1,   3,   5,   9,   7,   9},
++                     new String[] {"word", "word", "word", "SYNONYM", "word", "word"},
++                     new int[]    { 1,   1,   1,   1,   0,   1},
++                     new int[]    { 1,   1,   1,   2,   1,   1});
++    a.close();
++  }
++
++  public void testTwoSynsInARow() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder();
++    add(b, "a", "x", false);
++
++    Analyzer a = getAnalyzer(b, true);
++    assertAnalyzesTo(a,
++                     "c a a b",
++                     new String[] {"c", "x", "x", "b"},
++                     new int[]    { 0,   2,   4,   6},
++                     new int[]    { 1,   3,   5,   7},
++                     new String[] {"word", "SYNONYM", "SYNONYM", "word"},
++                     new int[]    { 1,   1,   1,   1},
++                     new int[]    { 1,   1,   1,   1});
++    a.close();
++  }
++
++  public void testBasicKeepOrigTwoOutputs() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder();
++    add(b, "a b", "x y", true);
++    add(b, "a b", "m n o", true);
++
++    Analyzer a = getAnalyzer(b, true);
++    assertAnalyzesTo(a,
++                     "c a b d",
++                     new String[] {"c", "x", "m", "a", "y", "n", "o", "b", "d"},
++                     new int[]    { 0,   2,   2,   2,   2,   2,   2,   4,   6},
++                     new int[]    { 1,   5,   5,   3,   5,   5,   5,   5,   7},
++                     new String[] {"word", "SYNONYM", "SYNONYM", "word", "SYNONYM", "SYNONYM", "SYNONYM", "word", "word"},
++                     new int[]    { 1,   1,   0,   0,   1,   1,   1,   1,   1},
++                     new int[]    { 1,   1,   2,   4,   4,   1,   2,   1,   1});
++    a.close();
++  }
++
++  public void testNoCaptureIfNoMatch() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder();
++    add(b, "a b", "x y", true);
++
++    Analyzer a = getAnalyzer(b, true);
++
++    assertAnalyzesTo(a,
++                     "c d d",
++                     new String[] {"c", "d", "d"},
++                     new int[]    { 0,   2,   4},
++                     new int[]    { 1,   3,   5},
++                     new String[] {"word", "word", "word"},
++                     new int[]    { 1,   1,   1},
++                     new int[]    { 1,   1,   1});
++    assertEquals(0, synFilter.getCaptureCount());
++    a.close();
++  }
++
++  public void testBasicNotKeepOrigOneOutput() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder();
++    add(b, "a b", "x", false);
++
++    Analyzer a = getAnalyzer(b, true);
++    assertAnalyzesTo(a,
++                     "c a b",
++                     new String[] {"c", "x"},
++                     new int[] {0, 2},
++                     new int[] {1, 5},
++                     new String[] {"word", "SYNONYM"},
++                     new int[] {1, 1},
++                     new int[] {1, 1});
++    a.close();
++  }
++
++  public void testBasicNoKeepOrigTwoOutputs() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder();
++    add(b, "a b", "x y", false);
++    add(b, "a b", "m n o", false);
++
++    Analyzer a = getAnalyzer(b, true);
++    assertAnalyzesTo(a,
++                     "c a b d",
++                     new String[] {"c", "x", "m", "y", "n", "o", "d"},
++                     new int[]    { 0,   2,   2,   2,   2,   2,   6},
++                     new int[]    { 1,   5,   5,   5,   5,   5,   7},
++                     new String[] {"word", "SYNONYM", "SYNONYM", "SYNONYM", "SYNONYM", "SYNONYM", "word"},
++                     new int[]    { 1,   1,   0,   1,   1,   1,   1},
++                     new int[]    { 1,   1,   2,   3,   1,   1,   1});
++    a.close();
++  }
++
++  public void testIgnoreCase() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder();
++    add(b, "a b", "x y", false);
++    add(b, "a b", "m n o", false);
++    
++    Analyzer a = getAnalyzer(b, true);
++    assertAnalyzesTo(a,
++                     "c A B D",
++                     new String[] {"c", "x", "m", "y", "n", "o", "D"},
++                     new int[]    { 0,   2,   2,   2,   2,   2,   6},
++                     new int[]    { 1,   5,   5,   5,   5,   5,   7},
++                     new String[] {"word", "SYNONYM", "SYNONYM", "SYNONYM", "SYNONYM", "SYNONYM", "word"},
++                     new int[]    { 1,   1,   0,   1,   1,   1,   1},
++                     new int[]    { 1,   1,   2,   3,   1,   1,   1});
++    a.close();
++  }
++
++  public void testDoNotIgnoreCase() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder();
++    add(b, "a b", "x y", false);
++    add(b, "a b", "m n o", false);
++    
++    Analyzer a = getAnalyzer(b, false);
++    assertAnalyzesTo(a,
++                     "c A B D",
++                     new String[] {"c", "A", "B", "D"},
++                     new int[]    { 0,   2,   4,   6},
++                     new int[]    { 1,   3,   5,   7},
++                     new String[] {"word", "word", "word", "word"},
++                     new int[]    { 1,   1,   1,   1},
++                     new int[]    { 1,   1,   1,   1});
++    a.close();
++  }
++
++  public void testBufferedFinish1() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder();
++    add(b, "a b c", "m n o", false);
++
++    Analyzer a = getAnalyzer(b, true);
++    assertAnalyzesTo(a,
++                     "c a b",
++                     new String[] {"c", "a", "b"},
++                     new int[]    { 0,   2,   4},
++                     new int[]    { 1,   3,   5},
++                     new String[] {"word", "word", "word"},
++                     new int[]    { 1,   1,   1},
++                     new int[]    { 1,   1,   1});
++    a.close();
++  }
++
++  public void testBufferedFinish2() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder();
++    add(b, "a b", "m n o", false);
++    add(b, "d e", "m n o", false);
++
++    Analyzer a = getAnalyzer(b, true);
++    assertAnalyzesTo(a,
++                     "c a d",
++                     new String[] {"c", "a", "d"},
++                     new int[]    { 0,   2,   4},
++                     new int[]    { 1,   3,   5},
++                     new String[] {"word", "word", "word"},
++                     new int[]    { 1,   1,   1},
++                     new int[]    { 1,   1,   1});
++    a.close();
++  }
++
++  public void testCanReuse() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder();
++    add(b, "a b", "x", true);
++    Analyzer a = getAnalyzer(b, true);
++    for(int i=0;i<10;i++) {
++      assertAnalyzesTo(a,
++                       "c a b",
++                       new String[] {"c", "x", "a", "b"},
++                       new int[]    { 0,   2,   2,   4},
++                       new int[]    { 1,   5,   3,   5},
++                       new String[] {"word", "SYNONYM", "word", "word"},
++                       new int[]    { 1,   1,   0,   1},
++                       new int[]    { 1,   2,   1,   1});
++    }
++    a.close();
++  }
++
++  /** Multiple input tokens map to a single output token */
++  public void testManyToOne() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder();
++    add(b, "a b c", "z", true);
++
++    Analyzer a = getAnalyzer(b, true);
++    assertAnalyzesTo(a,
++                     "a b c d",
++                     new String[] {"z", "a", "b", "c", "d"},
++                     new int[]    { 0,   0,   2,   4,   6},
++                     new int[]    { 5,   1,   3,   5,   7},
++                     new String[] {"SYNONYM", "word", "word", "word", "word"},
++                     new int[]    { 1,   0,   1,   1,   1},
++                     new int[]    { 3,   1,   1,   1,   1});
++    a.close();
++  }
++  
++  public void testBufferAfterMatch() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder();
++    add(b, "a b c d", "x", true);
++    add(b, "a b", "y", false);
++
++    // The 'c' token has to be buffered because SynGraphFilter
++    // needs to know whether a b c d -> x matches:
++    Analyzer a = getAnalyzer(b, true);
++    assertAnalyzesTo(a,
++                     "f a b c e",
++                     new String[] {"f", "y", "c", "e"},
++                     new int[]    { 0,   2,   6,   8},
++                     new int[]    { 1,   5,   7,   9},
++                     new String[] {"word", "SYNONYM", "word", "word"},
++                     new int[]    { 1,   1,   1,   1},
++                     new int[]    { 1,   1,   1,   1});
++    a.close();
++  }
++
++  public void testZeroSyns() throws Exception {
++    Tokenizer tokenizer = new MockTokenizer();
++    tokenizer.setReader(new StringReader("aa bb"));
++    try {
++      new SynonymGraphFilter(tokenizer, new SynonymMap.Builder(true).build(), true);
++      fail("did not hit expected exception");
++    } catch (IllegalArgumentException iae) {
++      // expected
++      assertEquals("fst must be non-null", iae.getMessage());
++    }
++  }
++
++  public void testOutputHangsOffEnd() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder(true);
++    final boolean keepOrig = false;
++    // b hangs off the end (no input token under it):
++    add(b, "a", "a b", keepOrig);
++    Analyzer a = getFlattenAnalyzer(b, true);
++    assertAnalyzesTo(a, "a",
++                     new String[] {"a", "b"},
++                     new int[]    { 0,   0},  
++                     new int[]    { 1,   1},
++                     null,
++                     new int[]    { 1,   1},
++                     new int[]    { 1,   1},
++                     true);
++    a.close();
++  }
++
++  public void testDedup() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder(true);
++    final boolean keepOrig = false;
++    add(b, "a b", "ab", keepOrig);
++    add(b, "a b", "ab", keepOrig);
++    add(b, "a b", "ab", keepOrig);
++    Analyzer a = getFlattenAnalyzer(b, true);
++
++    assertAnalyzesTo(a, "a b",
++        new String[]{"ab"},
++        new int[]{1});
++    a.close();
++  }
++
++  public void testNoDedup() throws Exception {
++    // dedup is false:
++    SynonymMap.Builder b = new SynonymMap.Builder(false);
++    final boolean keepOrig = false;
++    add(b, "a b", "ab", keepOrig);
++    add(b, "a b", "ab", keepOrig);
++    add(b, "a b", "ab", keepOrig);
++    Analyzer a = getFlattenAnalyzer(b, true);
++
++    assertAnalyzesTo(a, "a b",
++        new String[]{"ab", "ab", "ab"},
++        new int[]{1, 0, 0});
++    a.close();
++  }
++
++  public void testMatching() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder(true);
++    final boolean keepOrig = false;
++    add(b, "a b", "ab", keepOrig);
++    add(b, "a c", "ac", keepOrig);
++    add(b, "a", "aa", keepOrig);
++    add(b, "b", "bb", keepOrig);
++    add(b, "z x c v", "zxcv", keepOrig);
++    add(b, "x c", "xc", keepOrig);
++
++    Analyzer a = getFlattenAnalyzer(b, true);
++
++    checkOneTerm(a, "$", "$");
++    checkOneTerm(a, "a", "aa");
++    checkOneTerm(a, "b", "bb");
++
++    assertAnalyzesTo(a, "a $",
++        new String[]{"aa", "$"},
++        new int[]{1, 1});
++
++    assertAnalyzesTo(a, "$ a",
++        new String[]{"$", "aa"},
++        new int[]{1, 1});
++
++    assertAnalyzesTo(a, "a a",
++        new String[]{"aa", "aa"},
++        new int[]{1, 1});
++
++    assertAnalyzesTo(a, "z x c v",
++        new String[]{"zxcv"},
++        new int[]{1});
++
++    assertAnalyzesTo(a, "z x c $",
++        new String[]{"z", "xc", "$"},
++        new int[]{1, 1, 1});
++    a.close();
++  }
++
++  public void testBasic1() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder(true);
++    add(b, "a", "foo", true);
++    add(b, "a b", "bar fee", true);
++    add(b, "b c", "dog collar", true);
++    add(b, "c d", "dog harness holder extras", true);
++    add(b, "m c e", "dog barks loudly", false);
++    add(b, "i j k", "feep", true);
++
++    add(b, "e f", "foo bar", false);
++    add(b, "e f", "baz bee", false);
++
++    add(b, "z", "boo", false);
++    add(b, "y", "bee", true);
++    Analyzer a = getFlattenAnalyzer(b, true);
++
++    assertAnalyzesTo(a, "a b c",
++                     new String[] {"bar", "a", "fee", "b", "c"},
++                     new int[] {1, 0, 1, 0, 1});
++
++    assertAnalyzesTo(a, "x a b c d",
++                     new String[] {"x", "bar", "a", "fee", "b", "dog", "c", "harness", "d", "holder", "extras"},
++                     new int[] {1, 1, 0, 1, 0, 1, 0, 1, 0, 1, 1});
++
++    assertAnalyzesTo(a, "a b a",
++                     new String[] {"bar", "a", "fee", "b", "foo", "a"},
++                     new int[] {1, 0, 1, 0, 1, 0});
++
++    // outputs no longer add to one another:
++    assertAnalyzesTo(a, "c d c d",
++                     new String[] {"dog", "c", "harness", "d", "holder", "extras", "dog", "c", "harness", "d", "holder", "extras"},
++                     new int[] {1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 1, 1});
++
++    // two outputs for same input
++    assertAnalyzesTo(a, "e f",
++                     new String[] {"foo", "baz", "bar", "bee"},
++                     new int[] {1, 0, 1, 0});
++
++    // verify multi-word / single-output offsets:
++    assertAnalyzesTo(a, "g i j k g",
++                     new String[] {"g", "feep", "i", "j", "k", "g"},
++                     new int[] {1, 1, 0, 1, 1, 1});
++
++    // mixed keepOrig true/false:
++    assertAnalyzesTo(a, "a m c e x",
++                     new String[] {"foo", "a", "dog", "barks", "loudly", "x"},
++                     new int[] {1, 0, 1, 1, 1, 1});
++    assertAnalyzesTo(a, "c d m c e x",
++                     new String[] {"dog", "c", "harness", "d", "holder", "extras", "dog", "barks", "loudly","x"},
++                     new int[] {1, 0, 1, 0, 1, 1, 1, 1, 1, 1});
++    assertTrue(synFilter.getCaptureCount() > 0);
++
++    // no captureStates when no syns matched
++    assertAnalyzesTo(a, "p q r s t",
++                     new String[] {"p", "q", "r", "s", "t"},
++                     new int[] {1, 1, 1, 1, 1});
++    assertEquals(0, synFilter.getCaptureCount());
++
++    // captureStates are necessary for the single-token syn case:
++    assertAnalyzesTo(a, "p q z y t",
++                     new String[] {"p", "q", "boo", "bee", "y", "t"},
++                     new int[] {1, 1, 1, 1, 0, 1});
++    assertTrue(synFilter.getCaptureCount() > 0);
++  }
++
++  public void testBasic2() throws Exception {
++    boolean keepOrig = true;
++    do {
++      keepOrig = !keepOrig;
++
++      SynonymMap.Builder b = new SynonymMap.Builder(true);
++      add(b,"aaa", "aaaa1 aaaa2 aaaa3", keepOrig);
++      add(b, "bbb", "bbbb1 bbbb2", keepOrig);
++      Analyzer a = getFlattenAnalyzer(b, true);
++
++      if (keepOrig) {
++        assertAnalyzesTo(a, "xyzzy bbb pot of gold",
++                         new String[] {"xyzzy", "bbbb1", "bbb", "bbbb2", "pot", "of", "gold"},
++                         new int[] {1, 1, 0, 1, 1, 1, 1});
++        assertAnalyzesTo(a, "xyzzy aaa pot of gold",
++                         new String[] {"xyzzy", "aaaa1", "aaa", "aaaa2", "aaaa2", "pot", "of", "gold"},
++                         new int[] {1, 1, 0, 1, 1, 1, 1, 1});
++      } else {
++        assertAnalyzesTo(a, "xyzzy bbb pot of gold",
++                         new String[] {"xyzzy", "bbbb1", "bbbb2", "pot", "of", "gold"},
++                         new int[] {1, 1, 1, 1, 1, 1});
++        assertAnalyzesTo(a, "xyzzy aaa pot of gold",
++                         new String[] {"xyzzy", "aaaa1", "aaaa2", "aaaa3", "pot", "of", "gold"},
++                         new int[] {1, 1, 1, 1, 1, 1, 1});
++      }
++    } while (keepOrig);
++  }
++
++  /** If we expand synonyms during indexing, it's a bit better than
++   *  SynonymFilter is today, but still necessarily has false
++   *  positive and negative PhraseQuery matches because we do not  
++   *  index posLength, so we lose information. */
++  public void testFlattenedGraph() throws Exception {
++
++    SynonymMap.Builder b = new SynonymMap.Builder();
++    add(b, "wtf", "what the fudge", true);
++
++    Analyzer a = getFlattenAnalyzer(b, true);
++
++    assertAnalyzesTo(a, "wtf happened",
++                     new String[] {"what", "wtf", "the", "fudge", "happened"},
++                     new int[]    {    0,     0,      0,     0,       4},  
++                     new int[]    {    3,     3,      3,     3,       12},
++                     null,
++                     new int[]    {    1,     0,      1,     1,       1},
++                     new int[]    {    1,     3,      1,     1,       1},
++                     true);
++
++    Directory dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir, a);
++    Document doc = new Document();
++    doc.add(newTextField("field", "wtf happened", Field.Store.NO));
++    w.addDocument(doc);
++    IndexReader r = w.getReader();
++    w.close();
++
++    IndexSearcher s = newSearcher(r);
++
++    // Good (this should not match, and doesn't):
++    assertEquals(0, s.count(new PhraseQuery("field", "what", "happened")));
++
++    // Bad (this should match, but doesn't):
++    assertEquals(0, s.count(new PhraseQuery("field", "wtf", "happened")));
++
++    // Good (this should match, and does):
++    assertEquals(1, s.count(new PhraseQuery("field", "what", "the", "fudge", "happened")));
++
++    // Bad (this should not match, but does):
++    assertEquals(1, s.count(new PhraseQuery("field", "wtf", "the")));
++
++    IOUtils.close(r, dir);
++  }
++
++  // Needs TermAutomatonQuery, which is in sandbox still:
++  /*
++  public void testAccurateGraphQuery1() throws Exception {
++    Directory dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++    Document doc = new Document();
++    doc.add(newTextField("field", "wtf happened", Field.Store.NO));
++    w.addDocument(doc);
++    IndexReader r = w.getReader();
++    w.close();
++
++    IndexSearcher s = newSearcher(r);
++
++    SynonymMap.Builder b = new SynonymMap.Builder();
++    add(b, "what the fudge", "wtf", true);
++
++    SynonymMap map = b.build();
++
++    TokenStreamToTermAutomatonQuery ts2q = new TokenStreamToTermAutomatonQuery();
++
++    TokenStream in = new CannedTokenStream(0, 23, new Token[] {
++        token("what", 1, 1, 0, 4),
++        token("the", 1, 1, 5, 8),
++        token("fudge", 1, 1, 9, 14),
++        token("happened", 1, 1, 15, 23),
++      });
++
++    assertEquals(1, s.count(ts2q.toQuery("field", new SynonymGraphFilter(in, map, true))));
++
++    in = new CannedTokenStream(0, 12, new Token[] {
++        token("wtf", 1, 1, 0, 3),
++        token("happened", 1, 1, 4, 12),
++      });
++
++    assertEquals(1, s.count(ts2q.toQuery("field", new SynonymGraphFilter(in, map, true))));
++
++    // "what happened" should NOT match:
++    in = new CannedTokenStream(0, 13, new Token[] {
++        token("what", 1, 1, 0, 4),
++        token("happened", 1, 1, 5, 13),
++      });
++    assertEquals(0, s.count(ts2q.toQuery("field", new SynonymGraphFilter(in, map, true))));
++
++    IOUtils.close(r, dir);
++  }
++  */
++
++  /** If we expand synonyms at search time, the results are correct. */
++  // Needs TermAutomatonQuery, which is in sandbox still:
++  /*
++  public void testAccurateGraphQuery2() throws Exception {
++    Directory dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++    Document doc = new Document();
++    doc.add(newTextField("field", "say wtf happened", Field.Store.NO));
++    w.addDocument(doc);
++    IndexReader r = w.getReader();
++    w.close();
++
++    IndexSearcher s = newSearcher(r);
++
++    SynonymMap.Builder b = new SynonymMap.Builder();
++    add(b, "what the fudge", "wtf", true);
++
++    SynonymMap map = b.build();
++
++    TokenStream in = new CannedTokenStream(0, 26, new Token[] {
++        token("say", 1, 1, 0, 3),
++        token("what", 1, 1, 3, 7),
++        token("the", 1, 1, 8, 11),
++        token("fudge", 1, 1, 12, 17),
++        token("happened", 1, 1, 18, 26),
++      });
++
++    TokenStreamToTermAutomatonQuery ts2q = new TokenStreamToTermAutomatonQuery();
++
++    assertEquals(1, s.count(ts2q.toQuery("field", new SynonymGraphFilter(in, map, true))));
++
++    // "what happened" should NOT match:
++    in = new CannedTokenStream(0, 13, new Token[] {
++        token("what", 1, 1, 0, 4),
++        token("happened", 1, 1, 5, 13),
++      });
++    assertEquals(0, s.count(ts2q.toQuery("field", new SynonymGraphFilter(in, map, true))));
++
++    IOUtils.close(r, dir);
++  }
++  */
++
++  // Needs TermAutomatonQuery, which is in sandbox still:
++  /*
++  public void testAccurateGraphQuery3() throws Exception {
++    Directory dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++    Document doc = new Document();
++    doc.add(newTextField("field", "say what the fudge happened", Field.Store.NO));
++    w.addDocument(doc);
++    IndexReader r = w.getReader();
++    w.close();
++
++    IndexSearcher s = newSearcher(r);
++
++    SynonymMap.Builder b = new SynonymMap.Builder();
++    add(b, "wtf", "what the fudge", true);
++
++    SynonymMap map = b.build();
++
++    TokenStream in = new CannedTokenStream(0, 15, new Token[] {
++        token("say", 1, 1, 0, 3),
++        token("wtf", 1, 1, 3, 6),
++        token("happened", 1, 1, 7, 15),
++      });
++
++    TokenStreamToTermAutomatonQuery ts2q = new TokenStreamToTermAutomatonQuery();
++
++    assertEquals(1, s.count(ts2q.toQuery("field", new SynonymGraphFilter(in, map, true))));
++
++    // "what happened" should NOT match:
++    in = new CannedTokenStream(0, 13, new Token[] {
++        token("what", 1, 1, 0, 4),
++        token("happened", 1, 1, 5, 13),
++      });
++    assertEquals(0, s.count(ts2q.toQuery("field", new SynonymGraphFilter(in, map, true))));
++
++    IOUtils.close(r, dir);
++  }
++
++  private static Token token(String term, int posInc, int posLength, int startOffset, int endOffset) {
++    final Token t = new Token(term, startOffset, endOffset);
++    t.setPositionIncrement(posInc);
++    t.setPositionLength(posLength);
++    return t;
++  }
++  */
++
++  private String randomNonEmptyString() {
++    while(true) {
++      String s = TestUtil.randomUnicodeString(random()).trim();
++      //String s = TestUtil.randomSimpleString(random()).trim();
++      if (s.length() != 0 && s.indexOf('\u0000') == -1) {
++        return s;
++      }
++    }
++  }
++
++  // Adds MockGraphTokenFilter after SynFilter:
++  public void testRandomGraphAfter() throws Exception {
++    final int numIters = atLeast(3);
++    for (int i = 0; i < numIters; i++) {
++      SynonymMap.Builder b = new SynonymMap.Builder(random().nextBoolean());
++      final int numEntries = atLeast(10);
++      for (int j = 0; j < numEntries; j++) {
++        add(b, randomNonEmptyString(), randomNonEmptyString(), random().nextBoolean());
++      }
++      final SynonymMap map = b.build();
++      final boolean ignoreCase = random().nextBoolean();
++      final boolean doFlatten = random().nextBoolean();
++      
++      final Analyzer analyzer = new Analyzer() {
++        @Override
++        protected TokenStreamComponents createComponents(String fieldName) {
++          Tokenizer tokenizer = new MockTokenizer(MockTokenizer.SIMPLE, true);
++          TokenStream syns = new SynonymGraphFilter(tokenizer, map, ignoreCase);
++          TokenStream graph = new MockGraphTokenFilter(random(), syns);
++          if (doFlatten) {
++            graph = new FlattenGraphFilter(graph);
++          }
++          return new TokenStreamComponents(tokenizer, graph);
++        }
++      };
++
++      checkRandomData(random(), analyzer, 100);
++      analyzer.close();
++    }
++  }
++
++  public void testEmptyStringInput() throws IOException {
++    final int numIters = atLeast(10);
++    for (int i = 0; i < numIters; i++) {
++      SynonymMap.Builder b = new SynonymMap.Builder(random().nextBoolean());
++      final int numEntries = atLeast(10);
++      for (int j = 0; j < numEntries; j++) {
++        add(b, randomNonEmptyString(), randomNonEmptyString(), random().nextBoolean());
++      }
++      final boolean ignoreCase = random().nextBoolean();
++
++      Analyzer analyzer = getAnalyzer(b, ignoreCase);
++
++      checkAnalysisConsistency(random(), analyzer, random().nextBoolean(), "");
++      analyzer.close();
++    }
++  }
++
++  /** simple random test, doesn't verify correctness.
++   *  does verify it doesnt throw exceptions, or that the stream doesn't misbehave
++   */
++  public void testRandom2() throws Exception {
++    final int numIters = atLeast(3);
++    for (int i = 0; i < numIters; i++) {
++      SynonymMap.Builder b = new SynonymMap.Builder(random().nextBoolean());
++      final int numEntries = atLeast(10);
++      for (int j = 0; j < numEntries; j++) {
++        add(b, randomNonEmptyString(), randomNonEmptyString(), random().nextBoolean());
++      }
++      final boolean ignoreCase = random().nextBoolean();
++      final boolean doFlatten = random().nextBoolean();
++
++      Analyzer analyzer;
++      if (doFlatten) {
++        analyzer = getFlattenAnalyzer(b, ignoreCase);
++      } else {
++        analyzer = getAnalyzer(b, ignoreCase);
++      }
++
++      checkRandomData(random(), analyzer, 100);
++      analyzer.close();
++    }
++  }
++
++  /** simple random test like testRandom2, but for larger docs
++   */
++  public void testRandomHuge() throws Exception {
++    final int numIters = atLeast(3);
++    for (int i = 0; i < numIters; i++) {
++      SynonymMap.Builder b = new SynonymMap.Builder(random().nextBoolean());
++      final int numEntries = atLeast(10);
++      if (VERBOSE) {
++        System.out.println("TEST: iter=" + i + " numEntries=" + numEntries);
++      }
++      for (int j = 0; j < numEntries; j++) {
++        add(b, randomNonEmptyString(), randomNonEmptyString(), random().nextBoolean());
++      }
++      final boolean ignoreCase = random().nextBoolean();
++      final boolean doFlatten = random().nextBoolean();
++      
++      Analyzer analyzer;
++      if (doFlatten) {
++        analyzer = getFlattenAnalyzer(b, ignoreCase);
++      } else {
++        analyzer = getAnalyzer(b, ignoreCase);
++      }
++
++      checkRandomData(random(), analyzer, 100, 1024);
++      analyzer.close();
++    }
++  }
++
++  public void testEmptyTerm() throws IOException {
++    final int numIters = atLeast(10);
++    for (int i = 0; i < numIters; i++) {
++      SynonymMap.Builder b = new SynonymMap.Builder(random().nextBoolean());
++      final int numEntries = atLeast(10);
++      for (int j = 0; j < numEntries; j++) {
++        add(b, randomNonEmptyString(), randomNonEmptyString(), random().nextBoolean());
++      }
++      final boolean ignoreCase = random().nextBoolean();
++      
++      final Analyzer analyzer = getAnalyzer(b, ignoreCase);
++
++      checkAnalysisConsistency(random(), analyzer, random().nextBoolean(), "");
++      analyzer.close();
++    }
++  }
++
++  // LUCENE-3375
++  public void testVanishingTermsNoFlatten() throws Exception {
++    String testFile = 
++      "aaa => aaaa1 aaaa2 aaaa3\n" + 
++      "bbb => bbbb1 bbbb2\n";
++    Analyzer analyzer = solrSynsToAnalyzer(testFile);
++
++    assertAnalyzesTo(analyzer, "xyzzy bbb pot of gold",
++                     new String[] { "xyzzy", "bbbb1", "bbbb2", "pot", "of", "gold" });
++    
++    // xyzzy aaa pot of gold -> xyzzy aaaa1 aaaa2 aaaa3 gold
++    assertAnalyzesTo(analyzer, "xyzzy aaa pot of gold",
++                     new String[] { "xyzzy", "aaaa1", "aaaa2", "aaaa3", "pot", "of", "gold" });
++    analyzer.close();
++  }
++
++  // LUCENE-3375
++  public void testVanishingTermsWithFlatten() throws Exception {
++    String testFile = 
++      "aaa => aaaa1 aaaa2 aaaa3\n" + 
++      "bbb => bbbb1 bbbb2\n";
++      
++    Analyzer analyzer = solrSynsToAnalyzer(testFile);
++    
++    assertAnalyzesTo(analyzer, "xyzzy bbb pot of gold",
++                     new String[] { "xyzzy", "bbbb1", "bbbb2", "pot", "of", "gold" });
++    
++    // xyzzy aaa pot of gold -> xyzzy aaaa1 aaaa2 aaaa3 gold
++    assertAnalyzesTo(analyzer, "xyzzy aaa pot of gold",
++                     new String[] { "xyzzy", "aaaa1", "aaaa2", "aaaa3", "pot", "of", "gold" });
++    analyzer.close();
++  }
++
++  public void testBuilderDedup() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder(true);
++    final boolean keepOrig = false;
++    add(b, "a b", "ab", keepOrig);
++    add(b, "a b", "ab", keepOrig);
++    add(b, "a b", "ab", keepOrig);
++    Analyzer a = getAnalyzer(b, true);
++
++    assertAnalyzesTo(a, "a b",
++        new String[] { "ab" },
++        new int[] { 1 });
++    a.close();
++  }
++
++  public void testBuilderNoDedup() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder(false);
++    final boolean keepOrig = false;
++    add(b, "a b", "ab", keepOrig);
++    add(b, "a b", "ab", keepOrig);
++    add(b, "a b", "ab", keepOrig);
++    Analyzer a = getAnalyzer(b, true);
++
++    assertAnalyzesTo(a, "a b",
++        new String[] { "ab", "ab", "ab" },
++        new int[] { 1, 0, 0 });
++    a.close();
++  }
++
++  public void testRecursion1() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder(true);
++    final boolean keepOrig = false;
++    add(b, "zoo", "zoo", keepOrig);
++    Analyzer a = getAnalyzer(b, true);
++    
++    assertAnalyzesTo(a, "zoo zoo $ zoo",
++        new String[] { "zoo", "zoo", "$", "zoo" },
++        new int[] { 1, 1, 1, 1 });
++    a.close();
++  }
++
++  public void testRecursion2() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder(true);
++    final boolean keepOrig = false;
++    add(b, "zoo", "zoo", keepOrig);
++    add(b, "zoo", "zoo zoo", keepOrig);
++    Analyzer a = getAnalyzer(b, true);
++
++    // verify("zoo zoo $ zoo", "zoo/zoo zoo/zoo/zoo $/zoo zoo/zoo zoo");
++    assertAnalyzesTo(a, "zoo zoo $ zoo",
++                     new String[] { "zoo", "zoo", "zoo", "zoo", "zoo", "zoo", "$", "zoo", "zoo", "zoo" },
++        new int[] { 1, 0, 1, 1, 0, 1, 1, 1, 0, 1 });
++    a.close();
++  }
++
++  public void testRecursion3() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder(true);
++    final boolean keepOrig = true;
++    add(b, "zoo zoo", "zoo", keepOrig);
++    Analyzer a = getFlattenAnalyzer(b, true);
++
++    assertAnalyzesTo(a, "zoo zoo $ zoo",
++       new String[]{"zoo", "zoo", "zoo", "$", "zoo"},
++        new int[]{1, 0, 1, 1, 1});
++    a.close();
++  }
++
++  public void testRecursion4() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder(true);
++    final boolean keepOrig = true;
++    add(b, "zoo zoo", "zoo", keepOrig);
++    add(b, "zoo", "zoo zoo", keepOrig);
++    Analyzer a = getFlattenAnalyzer(b, true);
++    assertAnalyzesTo(a, "zoo zoo $ zoo",
++        new String[]{"zoo", "zoo", "zoo", "$", "zoo", "zoo", "zoo"},
++       new int[]{1, 0, 1, 1, 1, 0, 1});
++    a.close();
++  }
++
++  public void testKeepOrig() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder(true);
++    final boolean keepOrig = true;
++    add(b, "a b", "ab", keepOrig);
++    add(b, "a c", "ac", keepOrig);
++    add(b, "a", "aa", keepOrig);
++    add(b, "b", "bb", keepOrig);
++    add(b, "z x c v", "zxcv", keepOrig);
++    add(b, "x c", "xc", keepOrig);
++    Analyzer a = getAnalyzer(b, true);
++    
++    assertAnalyzesTo(a, "$", 
++        new String[] { "$" },
++        new int[] { 1 });
++    assertAnalyzesTo(a, "a", 
++        new String[] { "aa", "a" },
++        new int[] { 1, 0 });
++    assertAnalyzesTo(a, "a", 
++        new String[] { "aa", "a" },
++        new int[] { 1, 0 });
++    assertAnalyzesTo(a, "$ a", 
++        new String[] { "$", "aa", "a" },
++        new int[] { 1, 1, 0 });
++    assertAnalyzesTo(a, "a $", 
++        new String[] { "aa", "a", "$" },
++        new int[] { 1, 0, 1 });
++    assertAnalyzesTo(a, "$ a !", 
++        new String[] { "$", "aa", "a", "!" },
++        new int[] { 1, 1, 0, 1 });
++    assertAnalyzesTo(a, "a a", 
++        new String[] { "aa", "a", "aa", "a" },
++        new int[] { 1, 0, 1, 0 });
++    assertAnalyzesTo(a, "b", 
++        new String[] { "bb", "b" },
++        new int[] { 1, 0 });
++    assertAnalyzesTo(a, "z x c v",
++        new String[] { "zxcv", "z", "x", "c", "v" },
++        new int[] { 1, 0, 1, 1, 1 });
++    assertAnalyzesTo(a, "z x c $",
++        new String[] { "z", "xc", "x", "c", "$" },
++        new int[] { 1, 1, 0, 1, 1 });
++    a.close();
++  }
++
++  /**
++   * verify type of token and positionLengths on synonyms of different word counts, with non preserving, explicit rules.
++   */
++  public void testNonPreservingMultiwordSynonyms() throws Exception {
++    String testFile =
++      "aaa => two words\n" +
++      "bbb => one two, very many multiple words\n" +
++      "ee ff, gg, h i j k, h i => one\n" +
++      "cc dd => usa,united states,u s a,united states of america";
++
++    Analyzer analyzer = solrSynsToAnalyzer(testFile);
++
++    assertAnalyzesTo(analyzer, "aaa",
++        new String[]{"two", "words"},
++        new int[]{0, 0},
++        new int[]{3, 3},
++        new String[]{"SYNONYM", "SYNONYM"},
++        new int[]{1, 1},
++        new int[]{1, 1});
++
++    assertAnalyzesToPositions(analyzer, "amazing aaa",
++        new String[]{"amazing", "two", "words"},
++        new String[]{"word", "SYNONYM", "SYNONYM"},
++        new int[]{1, 1, 1},
++        new int[]{1, 1, 1});
++
++    assertAnalyzesTo(analyzer, "p bbb s",
++        new String[]{"p", "one", "very", "two", "many", "multiple", "words", "s"},
++        new int[]{0, 2, 2, 2, 2, 2, 2, 6},
++        new int[]{1, 5, 5, 5, 5, 5, 5, 7},
++        new String[]{"word", "SYNONYM", "SYNONYM", "SYNONYM", "SYNONYM", "SYNONYM", "SYNONYM", "word"},
++        new int[]{1, 1, 0, 1, 0, 1, 1, 1},
++        new int[]{1, 1, 1, 3, 1, 1, 1, 1});
++
++    assertAnalyzesTo(analyzer, "p ee ff s",
++        new String[]{"p", "one", "s"},
++        new int[]{0, 2, 8},
++        new int[]{1, 7, 9},
++        new String[]{"word", "SYNONYM", "word"},
++        new int[]{1, 1, 1},
++        new int[]{1, 1, 1});
++
++    assertAnalyzesTo(analyzer, "p h i j s",
++        new String[]{"p", "one", "j", "s"},
++        new int[]{0, 2, 6, 8},
++        new int[]{1, 5, 7, 9},
++        new String[]{"word", "SYNONYM", "word", "word"},
++        new int[]{1, 1, 1, 1},
++        new int[]{1, 1, 1, 1});
++
++    analyzer.close();
++  }
++
++  private Analyzer getAnalyzer(SynonymMap.Builder b, final boolean ignoreCase) throws IOException {
++    final SynonymMap map = b.build();
++    return new Analyzer() {
++        @Override
++        protected TokenStreamComponents createComponents(String fieldName) {
++          Tokenizer tokenizer = new MockTokenizer(MockTokenizer.WHITESPACE, false);
++          // Make a local variable so testRandomHuge doesn't share it across threads!
++          SynonymGraphFilter synFilter = new SynonymGraphFilter(tokenizer, map, ignoreCase);
++          TestSynonymGraphFilter.this.flattenFilter = null;
++          TestSynonymGraphFilter.this.synFilter = synFilter;
++          return new TokenStreamComponents(tokenizer, synFilter);
++        }
++      };
++  }
++
++  /** Appends FlattenGraphFilter too */
++  private Analyzer getFlattenAnalyzer(SynonymMap.Builder b, boolean ignoreCase) throws IOException {
++    final SynonymMap map = b.build();
++    return new Analyzer() {
++        @Override
++        protected TokenStreamComponents createComponents(String fieldName) {
++          Tokenizer tokenizer = new MockTokenizer(MockTokenizer.WHITESPACE, true);
++          // Make a local variable so testRandomHuge doesn't share it across threads!
++          SynonymGraphFilter synFilter = new SynonymGraphFilter(tokenizer, map, ignoreCase);
++          FlattenGraphFilter flattenFilter = new FlattenGraphFilter(synFilter);
++          TestSynonymGraphFilter.this.synFilter = synFilter;
++          TestSynonymGraphFilter.this.flattenFilter = flattenFilter;
++          return new TokenStreamComponents(tokenizer, flattenFilter);
++        }
++      };
++  }
++
++  private void add(SynonymMap.Builder b, String input, String output, boolean keepOrig) {
++    if (VERBOSE) {
++      //System.out.println("  add input=" + input + " output=" + output + " keepOrig=" + keepOrig);
++    }
++    CharsRefBuilder inputCharsRef = new CharsRefBuilder();
++    SynonymMap.Builder.join(input.split(" +"), inputCharsRef);
++
++    CharsRefBuilder outputCharsRef = new CharsRefBuilder();
++    SynonymMap.Builder.join(output.split(" +"), outputCharsRef);
++
++    b.add(inputCharsRef.get(), outputCharsRef.get(), keepOrig);
++  }
++
++  private char[] randomBinaryChars(int minLen, int maxLen, double bias, char base) {
++    int len = TestUtil.nextInt(random(), minLen, maxLen);
++    char[] chars = new char[len];
++    for(int i=0;i<len;i++) {
++      char ch;
++      if (random().nextDouble() < bias) {
++        ch = base;
++      } else {
++        ch = (char) (base+1);
++      }
++      chars[i] = ch;
++    }
++
++    return chars;
++  }
++
++  private static String toTokenString(char[] chars) {
++    StringBuilder b = new StringBuilder();
++    for(char c : chars) {
++      if (b.length() > 0) {
++        b.append(' ');
++      }
++      b.append(c);
++    }
++    return b.toString();
++  }
++
++  private static class OneSyn {
++    char[] in;
++    char[] out;
++    boolean keepOrig;
++
++    @Override
++    public String toString() {
++      return toTokenString(in) + " --> " + toTokenString(out) + " (keepOrig=" + keepOrig + ")";
++    }
++  }
++
++  public void testRandomSyns() throws Exception {
++    int synCount = atLeast(10);
++    double bias = random().nextDouble();
++    boolean dedup = random().nextBoolean();
++
++    boolean flatten = random().nextBoolean();
++
++    SynonymMap.Builder b = new SynonymMap.Builder(dedup);
++    List<OneSyn> syns = new ArrayList<>();
++    // Makes random syns from random a / b tokens, mapping to random x / y tokens
++    if (VERBOSE) {
++      System.out.println("TEST: make " + synCount + " syns");
++      System.out.println("  bias for a over b=" + bias);
++      System.out.println("  dedup=" + dedup);
++      System.out.println("  flatten=" + flatten);
++    }
++
++    int maxSynLength = 0;
++
++    for(int i=0;i<synCount;i++) {
++      OneSyn syn = new OneSyn();
++      syn.in = randomBinaryChars(1, 5, bias, 'a');
++      syn.out = randomBinaryChars(1, 5, 0.5, 'x');
++      syn.keepOrig = random().nextBoolean();
++      syns.add(syn);
++
++      maxSynLength = Math.max(maxSynLength, syn.in.length);
++
++      if (VERBOSE) {
++        System.out.println("  " + syn);
++      }
++      add(b, toTokenString(syn.in), toTokenString(syn.out), syn.keepOrig);
++    }
++
++    // Compute max allowed lookahead for flatten filter:
++    int maxFlattenLookahead = 0;
++    if (flatten) {
++      for(int i=0;i<synCount;i++) {
++        OneSyn syn1 = syns.get(i);
++        int count = syn1.out.length;
++        boolean keepOrig = syn1.keepOrig;
++        for(int j=0;j<synCount;j++) {
++          OneSyn syn2 = syns.get(i);
++          keepOrig |= syn2.keepOrig;
++          if (syn1.in.equals(syn2.in)) {
++            count += syn2.out.length;
++          }
++        }
++
++        if (keepOrig) {
++          count += syn1.in.length;
++        }
++
++        maxFlattenLookahead = Math.max(maxFlattenLookahead, count);
++      }
++    }
++
++    // Only used w/ VERBOSE:
++    Analyzer aNoFlattened;
++    if (VERBOSE) {
++      aNoFlattened = getAnalyzer(b, true);
++    } else {
++      aNoFlattened = null;
++    }
++
++    Analyzer a;
++    if (flatten) {
++      a = getFlattenAnalyzer(b, true);
++    } else {
++      a = getAnalyzer(b, true);
++    }
++
++    int iters = atLeast(20);
++    for(int iter=0;iter<iters;iter++) {
++
++      String doc = toTokenString(randomBinaryChars(50, 100, bias, 'a'));
++      //String doc = toTokenString(randomBinaryChars(10, 50, bias, 'a'));
++
++      if (VERBOSE) {
++        System.out.println("TEST: iter="+  iter + " doc=" + doc);
++      }
++      Automaton expected = slowSynFilter(doc, syns, flatten);
++      if (VERBOSE) {
++        System.out.println("  expected:\n" + expected.toDot());
++        if (flatten) {
++          Automaton unflattened = toAutomaton(aNoFlattened.tokenStream("field", new StringReader(doc)));
++          System.out.println("  actual unflattened:\n" + unflattened.toDot());
++        }
++      }
++      Automaton actual = toAutomaton(a.tokenStream("field", new StringReader(doc)));
++      if (VERBOSE) {
++        System.out.println("  actual:\n" + actual.toDot());
++      }
++
++      assertTrue("maxLookaheadUsed=" + synFilter.getMaxLookaheadUsed() + " maxSynLength=" + maxSynLength,
++                 synFilter.getMaxLookaheadUsed() <= maxSynLength);
++      if (flatten) {
++        assertTrue("flatten maxLookaheadUsed=" + flattenFilter.getMaxLookaheadUsed() + " maxFlattenLookahead=" + maxFlattenLookahead,
++                   flattenFilter.getMaxLookaheadUsed() <= maxFlattenLookahead);
++      }
++
++      checkAnalysisConsistency(random(), a, random().nextBoolean(), doc);
++      // We can easily have a non-deterministic automaton at this point, e.g. if
++      // more than one syn matched at given point, or if the syn mapped to an
++      // output token that also happens to be in the input:
++      try {
++        actual = Operations.determinize(actual, 50000);
++      } catch (TooComplexToDeterminizeException tctde) {
++        // Unfortunately the syns can easily create difficult-to-determinize graphs:
++        assertTrue(approxEquals(actual, expected));
++        continue;
++      }
++
++      try {
++        expected = Operations.determinize(expected, 50000);
++      } catch (TooComplexToDeterminizeException tctde) {
++        // Unfortunately the syns can easily create difficult-to-determinize graphs:
++        assertTrue(approxEquals(actual, expected));
++        continue;
++      }
++
++      assertTrue(approxEquals(actual, expected));
++      assertTrue(Operations.sameLanguage(actual, expected));
++    }
++
++    a.close();
++  }
++
++  /** Only used when true equality is too costly to check! */
++  private boolean approxEquals(Automaton actual, Automaton expected) {
++    // Don't collapse these into one line else the thread stack won't say which direction failed!:
++    boolean b1 = approxSubsetOf(actual, expected);
++    boolean b2 = approxSubsetOf(expected, actual);
++    return b1 && b2;
++  }
++
++  private boolean approxSubsetOf(Automaton a1, Automaton a2) {
++    AutomatonTestUtil.RandomAcceptedStrings ras = new AutomatonTestUtil.RandomAcceptedStrings(a1);
++    for(int i=0;i<2000;i++) {
++      int[] ints = ras.getRandomAcceptedString(random());
++      IntsRef path = new IntsRef(ints, 0, ints.length);
++      if (accepts(a2, path) == false) {
++        throw new RuntimeException("a2 does not accept " + path);
++      }
++    }
++
++    // Presumed true
++    return true;
++  }
++
++  /** Like {@link Operations#run} except the incoming automaton is allowed to be non-deterministic. */
++  private static boolean accepts(Automaton a, IntsRef path) {
++    Set<Integer> states = new HashSet<>();
++    states.add(0);
++    Transition t = new Transition();
++    for(int i=0;i<path.length;i++) {
++      int digit = path.ints[path.offset+i];
++      Set<Integer> nextStates = new HashSet<>();
++      for(int state : states) {
++        int count = a.initTransition(state, t);
++        for(int j=0;j<count;j++) {
++          a.getNextTransition(t);
++          if (digit >= t.min && digit <= t.max) {
++            nextStates.add(t.dest);
++          }
++        }
++      }
++      states = nextStates;
++      if (states.isEmpty()) {
++        return false;
++      }
++    }
++
++    for(int state : states) {
++      if (a.isAccept(state)) {
++        return true;
++      }
++    }
++
++    return false;
++  }
++
++  /** Stupid, slow brute-force, yet hopefully bug-free, synonym filter. */
++  private Automaton slowSynFilter(String doc, List<OneSyn> syns, boolean flatten) {
++    String[] tokens = doc.split(" +");
++    if (VERBOSE) {
++      System.out.println("  doc has " + tokens.length + " tokens");
++    }
++    int i=0;
++    Automaton.Builder a = new Automaton.Builder();
++    int lastState = a.createState();
++    while (i<tokens.length) {
++      // Consider all possible syn matches starting at this point:
++      assert tokens[i].length() == 1;
++      if (VERBOSE) {
++        System.out.println("    i=" + i);
++      }
++
++      List<OneSyn> matches = new ArrayList<>();
++      for(OneSyn syn : syns) {
++        if (i + syn.in.length <= tokens.length) {
++          boolean match = true;
++          for(int j=0;j<syn.in.length;j++) {
++            if (tokens[i+j].charAt(0) != syn.in[j]) {
++              match = false;
++              break;
++            }
++          }
++
++          if (match) {
++            if (matches.isEmpty() == false) {
++              if (syn.in.length < matches.get(0).in.length) {
++                // Greedy matching: we already found longer syns matching here
++                continue;
++              } else if (syn.in.length > matches.get(0).in.length) {
++                // Greedy matching: all previous matches were shorter, so we drop them
++                matches.clear();
++              } else {
++                // Keep the current matches: we allow multiple synonyms matching the same input string
++              }
++            }
++
++            matches.add(syn);
++          }
++        }
++      }
++
++      int nextState = a.createState();
++
++      if (matches.isEmpty() == false) {
++        // We have match(es) starting at this token
++        if (VERBOSE) {
++          System.out.println("  matches @ i=" + i + ": " + matches);
++        }
++        // We keepOrig if any of the matches said to:
++        boolean keepOrig = false;
++        for(OneSyn syn : matches) {
++          keepOrig |= syn.keepOrig;
++        }
++
++        List<Integer> flatStates;
++        if (flatten) {
++          flatStates = new ArrayList<>();
++        } else {
++          flatStates = null;
++        }
++
++        if (keepOrig) {
++          // Add path for the original tokens
++          addSidePath(a, lastState, nextState, matches.get(0).in, flatStates);
++        }
++
++        for(OneSyn syn : matches) {
++          addSidePath(a, lastState, nextState, syn.out, flatStates);
++        }
++
++        i += matches.get(0).in.length;
++      } else {
++        a.addTransition(lastState, nextState, tokens[i].charAt(0));
++        i++;
++      }
++
++      lastState = nextState;
++    }
++
++    a.setAccept(lastState, true);
++
++    return topoSort(a.finish());
++  }
++
++  /** Just creates a side path from startState to endState with the provided tokens. */
++  private static void addSidePath(Automaton.Builder a, int startState, int endState, char[] tokens, List<Integer> flatStates) {
++    int lastState = startState;
++    for(int i=0;i<tokens.length;i++) {
++      int nextState;
++      if (i == tokens.length-1) {
++        nextState = endState;
++      } else if (flatStates == null || i >= flatStates.size()) {
++        nextState = a.createState();
++        if (flatStates != null) {
++          assert i == flatStates.size();
++          flatStates.add(nextState);
++        }
++      } else {
++        nextState = flatStates.get(i);
++      }
++      a.addTransition(lastState, nextState, tokens[i]);
++
++      lastState = nextState;
++    }
++  }
++
++  private Automaton toAutomaton(TokenStream ts) throws IOException {
++    PositionIncrementAttribute posIncAtt = ts.addAttribute(PositionIncrementAttribute.class);
++    PositionLengthAttribute posLenAtt = ts.addAttribute(PositionLengthAttribute.class);
++    CharTermAttribute termAtt = ts.addAttribute(CharTermAttribute.class);
++    ts.reset();
++    Automaton a = new Automaton();
++    int srcNode = -1;
++    int destNode = -1;
++    int state = a.createState();
++    while (ts.incrementToken()) {
++      assert termAtt.length() == 1;
++      char c = termAtt.charAt(0);
++      int posInc = posIncAtt.getPositionIncrement();
++      if (posInc != 0) {
++        srcNode += posInc;
++        while (state < srcNode) {
++          state = a.createState();
++        }
++      }
++      destNode = srcNode + posLenAtt.getPositionLength();
++      while (state < destNode) {
++        state = a.createState();
++      }
++      a.addTransition(srcNode, destNode, c);
++    }
++    ts.end();
++    ts.close();
++    a.finishState();
++    a.setAccept(destNode, true);
++    return a;
++  }
++
++  /*
++  private String toDot(TokenStream ts) throws IOException {
++    PositionIncrementAttribute posIncAtt = ts.addAttribute(PositionIncrementAttribute.class);
++    PositionLengthAttribute posLenAtt = ts.addAttribute(PositionLengthAttribute.class);
++    CharTermAttribute termAtt = ts.addAttribute(CharTermAttribute.class);
++    TypeAttribute typeAtt = ts.addAttribute(TypeAttribute.class);
++    ts.reset();
++    int srcNode = -1;
++    int destNode = -1;
++
++    StringBuilder b = new StringBuilder();
++    b.append("digraph Automaton {\n");
++    b.append("  rankdir = LR\n");
++    b.append("  node [width=0.2, height=0.2, fontsize=8]\n");
++    b.append("  initial [shape=plaintext,label=\"\"]\n");
++    b.append("  initial -> 0\n");
++
++    while (ts.incrementToken()) {
++      int posInc = posIncAtt.getPositionIncrement();
++      if (posInc != 0) {
++        srcNode += posInc;
++        b.append("  ");
++        b.append(srcNode);
++        b.append(" [shape=circle,label=\"" + srcNode + "\"]\n");
++      }
++      destNode = srcNode + posLenAtt.getPositionLength();
++      b.append("  ");
++      b.append(srcNode);
++      b.append(" -> ");
++      b.append(destNode);
++      b.append(" [label=\"");
++      b.append(termAtt);
++      b.append("\"");
++      if (typeAtt.type().equals("word") == false) {
++        b.append(" color=red");
++      }
++      b.append("]\n");
++    }
++    ts.end();
++    ts.close();
++
++    b.append('}');
++    return b.toString();
++  }
++  */
++
++  /** Renumbers nodes according to their topo sort */
++  private Automaton topoSort(Automaton in) {
++    int[] newToOld = Operations.topoSortStates(in);
++    int[] oldToNew = new int[newToOld.length];
++
++    Automaton.Builder a = new Automaton.Builder();
++    //System.out.println("remap:");
++    for(int i=0;i<newToOld.length;i++) {
++      a.createState();
++      oldToNew[newToOld[i]] = i;
++      //System.out.println("  " + newToOld[i] + " -> " + i);
++      if (in.isAccept(newToOld[i])) {
++        a.setAccept(i, true);
++        //System.out.println("    **");
++      }
++    }
++
++    Transition t = new Transition();
++    for(int i=0;i<newToOld.length;i++) {
++      int count = in.initTransition(newToOld[i], t);
++      for(int j=0;j<count;j++) {
++        in.getNextTransition(t);
++        a.addTransition(i, oldToNew[t.dest], t.min, t.max);
++      }
++    }
++
++    return a.finish();
++  }
++
++  /**
++   * verify type of token and positionLengths on synonyms of different word counts.
++   */
++  public void testPositionLengthAndType() throws Exception {
++    String testFile =
++        "spider man, spiderman\n" +
++        "usa,united states,u s a,united states of america";
++    Analyzer analyzer = new MockAnalyzer(random());
++    SolrSynonymParser parser = new SolrSynonymParser(true, true, analyzer);
++
++    parser.parse(new StringReader(testFile));
++    analyzer.close();
++
++    SynonymMap map = parser.build();
++    analyzer = getFlattenAnalyzer(parser, true);
++
++    BytesRef value = Util.get(map.fst, Util.toUTF32(new CharsRef("usa"), new IntsRefBuilder()));
++    ByteArrayDataInput bytesReader = new ByteArrayDataInput(value.bytes, value.offset, value.length);
++    final int code = bytesReader.readVInt();
++    final int count = code >>> 1;
++
++    final int[] synonymsIdxs = new int[count];
++    for (int i = 0; i < count; i++) {
++      synonymsIdxs[i] = bytesReader.readVInt();
++    }
++
++    BytesRef scratchBytes = new BytesRef();
++    map.words.get(synonymsIdxs[2], scratchBytes);
++
++    int synonymLength = 1;
++    for (int i = scratchBytes.offset; i < scratchBytes.offset + scratchBytes.length; i++) {
++      if (scratchBytes.bytes[i] == SynonymMap.WORD_SEPARATOR) {
++        synonymLength++;
++      }
++    }
++
++    assertEquals(count, 3);
++    assertEquals(synonymLength, 4);
++
++    assertAnalyzesTo(analyzer, "spider man",
++                     new String[]{"spiderman", "spider", "man"},
++                     new int[]{0, 0, 7},
++                     new int[]{10, 6, 10},
++                     new String[]{"SYNONYM", "word", "word"},
++                     new int[]{1, 0, 1},
++                     new int[]{2, 1, 1});
++
++    assertAnalyzesToPositions(analyzer, "amazing spider man",
++                              new String[]{"amazing", "spiderman", "spider", "man"},
++                              new String[]{"word", "SYNONYM", "word", "word"},
++                              new int[]{1, 1, 0, 1},
++                              new int[]{1, 2, 1, 1});
++
++    // System.out.println(toDot(getAnalyzer(parser, true).tokenStream("field", new StringReader("the usa is wealthy"))));
++
++    assertAnalyzesTo(analyzer, "the united states of america is wealthy",
++                     new String[]{"the", "usa", "united", "u", "united", "states", "s", "states", "a", "of", "america", "is", "wealthy"},
++                     new int[]      {0,     4,        4,   4,        4,       11,  11,       11,   18,  18,        21,   29,        32},
++                     new int[]      {3,    28,       10,  10,       10,       28,  17,       17,   28,  20,        28,   31,        39},
++                     new String[]{"word", "SYNONYM", "SYNONYM", "SYNONYM", "word", "SYNONYM", "SYNONYM", "word", "SYNONYM", "word", "word", "word", "word"},
++                     new int[]      {1,     1,        0,   0,        0,        1,   0,        0,    1,   0,         1,    1,         1},
++                     new int[]      {1,     4,        1,   1,        1,        3,   1,        1,    2,   1,         1,    1,         1});
++
++    assertAnalyzesToPositions(analyzer, "spiderman",
++                              new String[]{"spider", "spiderman", "man"},
++                              new String[]{"SYNONYM", "word", "SYNONYM"},
++                              new int[]{1, 0, 1},
++                              new int[]{1, 2, 1});
++
++    assertAnalyzesTo(analyzer, "spiderman enemies",
++                     new String[]{"spider", "spiderman", "man", "enemies"},
++                     new int[]{0, 0, 0, 10},
++                     new int[]{9, 9, 9, 17},
++                     new String[]{"SYNONYM", "word", "SYNONYM", "word"},
++                     new int[]{1, 0, 1, 1},
++                     new int[]{1, 2, 1, 1});
++
++    assertAnalyzesTo(analyzer, "the usa is wealthy",
++                     new String[]{"the", "united", "u", "united", "usa", "states", "s", "states", "a", "of", "america", "is", "wealthy"},
++                     new int[]      {0,        4,   4,        4,     4,        4,   4,        4,   4,    4,         4,    8,        11},
++                     new int[]      {3,        7,   7,        7,     7,        7,   7,        7,   7,    7,         7,   10,        18},
++                     new String[]{"word", "SYNONYM", "SYNONYM", "SYNONYM", "word", "SYNONYM", "SYNONYM", "SYNONYM", "SYNONYM", "SYNONYM", "SYNONYM", "word", "word"},
++                     new int[]      {1,        1,   0,        0,     0,        1,   0,        0,   1,    0,         1,    1,         1},
++                     new int[]      {1,        1,   1,        1,     4,        3,   1,        1,   2,    1,         1,    1,         1});
++    
++    assertAllStrings(analyzer, "the usa is wealthy", new String[] {
++        "the usa is wealthy",
++        "the united states is wealthy",
++        "the u s a is wealthy",
++        "the united states of america is wealthy",
++        // Wrong. Here only due to "sausagization" of the multi word synonyms.
++        "the u states is wealthy",
++        "the u states a is wealthy",
++        "the u s of america is wealthy",
++        "the u states of america is wealthy",
++        "the united s a is wealthy",
++        "the united states a is wealthy",
++        "the united s of america is wealthy"});
++
++    assertAnalyzesTo(analyzer, "the united states is wealthy",
++                     new String[]{"the", "usa", "u", "united", "united", "s", "states", "states", "a", "of", "america", "is", "wealthy"},
++                     new int[]      {0,     4,   4,        4,        4,  11,       11,       11,  11,   11,        11,   18,        21},
++                     new int[]      {3,    17,  10,       10,       10,  17,       17,       17,  17,   17,        17,   20,        28},
++                     new String[]{"word", "SYNONYM", "SYNONYM", "SYNONYM", "word", "SYNONYM", "SYNONYM", "word", "SYNONYM", "SYNONYM", "SYNONYM", "word", "word"},
++                     new int[]      {1,     1,   0,        0,        0,   1,        0,        0,   1,    0,         1,    1,         1},
++                     new int[]      {1,     4,   1,        1,        1,   1,        1,        3,   2,    1,         1,    1,         1},
++                     false);
++
++    assertAnalyzesTo(analyzer, "the united states of balance",
++                     new String[]{"the", "usa", "u", "united", "united", "s", "states", "states", "a", "of", "america", "of", "balance"},
++                     new int[]      {0,     4,   4,        4,        4,  11,       11,       11,  11,   11,        11,   18,        21},
++                     new int[]      {3,    17,  10,       10,       10,  17,       17,       17,  17,   17,        17,   20,        28},
++                     new String[]{"word", "SYNONYM", "SYNONYM", "SYNONYM", "word", "SYNONYM", "SYNONYM", "word", "SYNONYM", "SYNONYM", "SYNONYM", "word", "word"},
++                     new int[]      {1,     1,   0,        0,        0,   1,        0,        0,   1,    0,         1,    1,         1},
++                     new int[]      {1,     4,   1,        1,        1,   1,        1,        3,   2,    1,         1,    1,         1});
++
++    analyzer.close();
++  }
++
++  public void testMultiwordOffsets() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder(true);
++    final boolean keepOrig = true;
++    add(b, "national hockey league", "nhl", keepOrig);
++    Analyzer a = getFlattenAnalyzer(b, true);
++
++    assertAnalyzesTo(a, "national hockey league",
++        new String[]{"nhl", "national", "hockey", "league"},
++        new int[]{0, 0, 9, 16},
++        new int[]{22, 8, 15, 22},
++        new int[]{1, 0, 1, 1});
++    a.close();
++  }
++
++  public void testIncludeOrig() throws Exception {
++    SynonymMap.Builder b = new SynonymMap.Builder(true);
++    final boolean keepOrig = true;
++    add(b, "a b", "ab", keepOrig);
++    add(b, "a c", "ac", keepOrig);
++    add(b, "a", "aa", keepOrig);
++    add(b, "b", "bb", keepOrig);
++    add(b, "z x c v", "zxcv", keepOrig);
++    add(b, "x c", "xc", keepOrig);
++
++    Analyzer a = getFlattenAnalyzer(b, true);
++
++    assertAnalyzesTo(a, "$",
++        new String[]{"$"},
++        new int[]{1});
++    assertAnalyzesTo(a, "a",
++        new String[]{"aa", "a"},
++        new int[]{1, 0});
++    assertAnalyzesTo(a, "a",
++        new String[]{"aa", "a"},
++        new int[]{1, 0});
++    assertAnalyzesTo(a, "$ a",
++        new String[]{"$", "aa", "a"},
++        new int[]{1, 1, 0});
++    assertAnalyzesTo(a, "a $",
++        new String[]{"aa", "a", "$"},
++        new int[]{1, 0, 1});
++    assertAnalyzesTo(a, "$ a !",
++        new String[]{"$", "aa", "a", "!"},
++        new int[]{1, 1, 0, 1});
++    assertAnalyzesTo(a, "a a",
++        new String[]{"aa", "a", "aa", "a"},
++        new int[]{1, 0, 1, 0});
++    assertAnalyzesTo(a, "b",
++        new String[]{"bb", "b"},
++        new int[]{1, 0});
++    assertAnalyzesTo(a, "z x c v",
++        new String[]{"zxcv", "z", "x", "c", "v"},
++        new int[]{1, 0, 1, 1, 1});
++    assertAnalyzesTo(a, "z x c $",
++        new String[]{"z", "xc", "x", "c", "$"},
++        new int[]{1, 1, 0, 1, 1});
++    a.close();
++  }
++
++  /**
++   * Helper method to validate all strings that can be generated from a token stream.
++   * Uses {@link TokenStreamToAutomaton} to create an automaton. Asserts the finite strings of the automaton are all
++   * and only the given valid strings.
++   * @param analyzer analyzer containing the SynonymFilter under test.
++   * @param text text to be analyzed.
++   * @param expectedStrings all expected finite strings.
++   */
++  public void assertAllStrings(Analyzer analyzer, String text, String[] expectedStrings) throws IOException {
++    TokenStream tokenStream = analyzer.tokenStream("dummy", text);
++    try {
++      Automaton automaton = new TokenStreamToAutomaton().toAutomaton(tokenStream);
++      Set<IntsRef> finiteStrings = AutomatonTestUtil.getFiniteStringsRecursive(automaton, -1);
++
++      assertEquals("Invalid resulting strings count. Expected " + expectedStrings.length + " was " + finiteStrings.size(),
++          expectedStrings.length, finiteStrings.size());
++
++      Set<String> expectedStringsSet = new HashSet<>(Arrays.asList(expectedStrings));
++
++      BytesRefBuilder scratchBytesRefBuilder = new BytesRefBuilder();
++      for (IntsRef ir: finiteStrings) {
++        String s = Util.toBytesRef(ir, scratchBytesRefBuilder).utf8ToString().replace((char) TokenStreamToAutomaton.POS_SEP, ' ');
++        assertTrue("Unexpected string found: " + s, expectedStringsSet.contains(s));
++      }
++    } finally {
++      tokenStream.close();
++    }
++  }
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/util/automaton/Automaton.java b/lucene/core/src/java/org/apache/lucene/util/automaton/Automaton.java
+index 0dd449c..e4a5bd9 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/automaton/Automaton.java
++++ b/lucene/core/src/java/org/apache/lucene/util/automaton/Automaton.java
+@@ -579,14 +579,15 @@ public class Automaton implements Accountable {
+   /** Returns the dot (graphviz) representation of this automaton.
+    *  This is extremely useful for visualizing the automaton. */
+   public String toDot() {
+-    // TODO: breadth first search so we can see get layered output...
++    // TODO: breadth first search so we can get layered output...
+ 
+     StringBuilder b = new StringBuilder();
+     b.append("digraph Automaton {\n");
+     b.append("  rankdir = LR\n");
++    b.append("  node [width=0.2, height=0.2, fontsize=8]\n");
+     final int numStates = getNumStates();
+     if (numStates > 0) {
+-      b.append("  initial [shape=plaintext,label=\"0\"]\n");
++      b.append("  initial [shape=plaintext,label=\"\"]\n");
+       b.append("  initial -> 0\n");
+     }
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/util/automaton/Operations.java b/lucene/core/src/java/org/apache/lucene/util/automaton/Operations.java
+index eedb533..718a908 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/automaton/Operations.java
++++ b/lucene/core/src/java/org/apache/lucene/util/automaton/Operations.java
+@@ -370,10 +370,8 @@ final public class Operations {
+   }
+ 
+   /** Returns true if these two automata accept exactly the
+-   *  same language.  This is a costly computation!  Note
+-   *  also that a1 and a2 will be determinized as a side
+-   *  effect.  Both automata must be determinized and have
+-   *  no dead states! */
++   *  same language.  This is a costly computation!  Both automata
++   *  must be determinized and have no dead states! */
+   public static boolean sameLanguage(Automaton a1, Automaton a2) {
+     if (a1 == a2) {
+       return true;
+diff --git a/lucene/core/src/java/org/apache/lucene/util/automaton/StatePair.java b/lucene/core/src/java/org/apache/lucene/util/automaton/StatePair.java
+index 4ce81ab..7be9339 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/automaton/StatePair.java
++++ b/lucene/core/src/java/org/apache/lucene/util/automaton/StatePair.java
+@@ -79,7 +79,9 @@ public class StatePair {
+    */
+   @Override
+   public int hashCode() {
+-    return s1 ^ s2;
++    // Don't use s1 ^ s2 since it's vulnerable to the case where s1 == s2 always --> hashCode = 0, e.g. if you call Operations.sameLanguage, 
++    // passing the same automaton against itself:
++    return s1 * 31 + s2;
+   }
+ 
+   @Override
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/analysis/BaseTokenStreamTestCase.java b/lucene/test-framework/src/java/org/apache/lucene/analysis/BaseTokenStreamTestCase.java
+index 5fd2fef..924756e 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/analysis/BaseTokenStreamTestCase.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/analysis/BaseTokenStreamTestCase.java
+@@ -185,22 +185,22 @@ public abstract class BaseTokenStreamTestCase extends LuceneTestCase {
+       
+       assertEquals("term "+i, output[i], termAtt.toString());
+       if (startOffsets != null) {
+-        assertEquals("startOffset "+i, startOffsets[i], offsetAtt.startOffset());
++        assertEquals("startOffset " + i + " term=" + termAtt, startOffsets[i], offsetAtt.startOffset());
+       }
+       if (endOffsets != null) {
+-        assertEquals("endOffset "+i, endOffsets[i], offsetAtt.endOffset());
++        assertEquals("endOffset " + i + " term=" + termAtt, endOffsets[i], offsetAtt.endOffset());
+       }
+       if (types != null) {
+-        assertEquals("type "+i, types[i], typeAtt.type());
++        assertEquals("type " + i + " term=" + termAtt, types[i], typeAtt.type());
+       }
+       if (posIncrements != null) {
+-        assertEquals("posIncrement "+i, posIncrements[i], posIncrAtt.getPositionIncrement());
++        assertEquals("posIncrement " + i + " term=" + termAtt, posIncrements[i], posIncrAtt.getPositionIncrement());
+       }
+       if (posLengths != null) {
+-        assertEquals("posLength "+i, posLengths[i], posLengthAtt.getPositionLength());
++        assertEquals("posLength " + i + " term=" + termAtt, posLengths[i], posLengthAtt.getPositionLength());
+       }
+       if (keywordAtts != null) {
+-        assertEquals("keywordAtt " + i, keywordAtts[i], keywordAtt.isKeyword());
++        assertEquals("keywordAtt " + i + " term=" + termAtt, keywordAtts[i], keywordAtt.isKeyword());
+       }
+       
+       // we can enforce some basic things about a few attributes even if the caller doesn't check:
+@@ -208,13 +208,13 @@ public abstract class BaseTokenStreamTestCase extends LuceneTestCase {
+         final int startOffset = offsetAtt.startOffset();
+         final int endOffset = offsetAtt.endOffset();
+         if (finalOffset != null) {
+-          assertTrue("startOffset must be <= finalOffset", startOffset <= finalOffset.intValue());
+-          assertTrue("endOffset must be <= finalOffset: got endOffset=" + endOffset + " vs finalOffset=" + finalOffset.intValue(),
++          assertTrue("startOffset (= " + startOffset + ") must be <= finalOffset (= " + finalOffset + ") term=" + termAtt, startOffset <= finalOffset.intValue());
++          assertTrue("endOffset must be <= finalOffset: got endOffset=" + endOffset + " vs finalOffset=" + finalOffset.intValue() + " term=" + termAtt,
+                      endOffset <= finalOffset.intValue());
+         }
+ 
+         if (offsetsAreCorrect) {
+-          assertTrue("offsets must not go backwards startOffset=" + startOffset + " is < lastStartOffset=" + lastStartOffset, offsetAtt.startOffset() >= lastStartOffset);
++          assertTrue("offsets must not go backwards startOffset=" + startOffset + " is < lastStartOffset=" + lastStartOffset + " term=" + termAtt, offsetAtt.startOffset() >= lastStartOffset);
+           lastStartOffset = offsetAtt.startOffset();
+         }
+ 
+@@ -236,7 +236,7 @@ public abstract class BaseTokenStreamTestCase extends LuceneTestCase {
+             // We've seen a token leaving from this position
+             // before; verify the startOffset is the same:
+             //System.out.println("  + vs " + pos + " -> " + startOffset);
+-            assertEquals("pos=" + pos + " posLen=" + posLength + " token=" + termAtt, posToStartOffset.get(pos).intValue(), startOffset);
++            assertEquals(i + " inconsistent startOffset: pos=" + pos + " posLen=" + posLength + " token=" + termAtt, posToStartOffset.get(pos).intValue(), startOffset);
+           }
+ 
+           final int endPos = pos + posLength;
+@@ -249,7 +249,7 @@ public abstract class BaseTokenStreamTestCase extends LuceneTestCase {
+             // We've seen a token arriving to this position
+             // before; verify the endOffset is the same:
+             //System.out.println("  + ve " + endPos + " -> " + endOffset);
+-            assertEquals("pos=" + pos + " posLen=" + posLength + " token=" + termAtt, posToEndOffset.get(endPos).intValue(), endOffset);
++            assertEquals("inconsistent endOffset " + i + " pos=" + pos + " posLen=" + posLength + " token=" + termAtt, posToEndOffset.get(endPos).intValue(), endOffset);
+           }
+         }
+       }
+@@ -351,16 +351,19 @@ public abstract class BaseTokenStreamTestCase extends LuceneTestCase {
+   
+   public static void assertAnalyzesTo(Analyzer a, String input, String[] output, int startOffsets[], int endOffsets[], String types[], int posIncrements[]) throws IOException {
+     checkResetException(a, input);
++    checkAnalysisConsistency(random(), a, true, input);
+     assertTokenStreamContents(a.tokenStream("dummy", input), output, startOffsets, endOffsets, types, posIncrements, null, input.length());
+   }
+   
+   public static void assertAnalyzesTo(Analyzer a, String input, String[] output, int startOffsets[], int endOffsets[], String types[], int posIncrements[], int posLengths[]) throws IOException {
+     checkResetException(a, input);
++    checkAnalysisConsistency(random(), a, true, input);
+     assertTokenStreamContents(a.tokenStream("dummy", input), output, startOffsets, endOffsets, types, posIncrements, posLengths, input.length());
+   }
+ 
+   public static void assertAnalyzesTo(Analyzer a, String input, String[] output, int startOffsets[], int endOffsets[], String types[], int posIncrements[], int posLengths[], boolean offsetsAreCorrect) throws IOException {
+     checkResetException(a, input);
++    checkAnalysisConsistency(random(), a, true, input, offsetsAreCorrect);
+     assertTokenStreamContents(a.tokenStream("dummy", input), output, startOffsets, endOffsets, types, posIncrements, posLengths, input.length(), offsetsAreCorrect);
+   }
+   
+@@ -379,6 +382,10 @@ public abstract class BaseTokenStreamTestCase extends LuceneTestCase {
+   public static void assertAnalyzesToPositions(Analyzer a, String input, String[] output, int[] posIncrements, int[] posLengths) throws IOException {
+     assertAnalyzesTo(a, input, output, null, null, null, posIncrements, posLengths);
+   }
++
++  public static void assertAnalyzesToPositions(Analyzer a, String input, String[] output, String[] types, int[] posIncrements, int[] posLengths) throws IOException {
++    assertAnalyzesTo(a, input, output, null, null, types, posIncrements, posLengths);
++  }
+   
+   public static void assertAnalyzesTo(Analyzer a, String input, String[] output, int startOffsets[], int endOffsets[]) throws IOException {
+     assertAnalyzesTo(a, input, output, startOffsets, endOffsets, null, null, null);
+@@ -599,7 +606,7 @@ public abstract class BaseTokenStreamTestCase extends LuceneTestCase {
+     try {
+       for (int i = 0; i < iterations; i++) {
+         String text;
+-        
++
+         if (random.nextInt(10) == 7) {
+           // real data from linedocs
+           text = docs.nextDoc().get("body");
+@@ -623,7 +630,7 @@ public abstract class BaseTokenStreamTestCase extends LuceneTestCase {
+           // synthetic
+           text = TestUtil.randomAnalysisString(random, maxWordLength, simple);
+         }
+-        
++
+         try {
+           checkAnalysisConsistency(random, a, useCharFilter, text, offsetsAreCorrect, currentField);
+           if (iw != null) {
+@@ -769,7 +776,7 @@ public abstract class BaseTokenStreamTestCase extends LuceneTestCase {
+           } catch (IllegalStateException ise) {
+             // Catch & ignore MockTokenizer's
+             // anger...
+-            if ("end() called before incrementToken() returned false!".equals(ise.getMessage())) {
++            if (ise.getMessage().contains("end() called in wrong state=")) {
+               // OK
+             } else {
+               throw ise;
+@@ -794,7 +801,7 @@ public abstract class BaseTokenStreamTestCase extends LuceneTestCase {
+           } catch (IllegalStateException ise) {
+             // Catch & ignore MockTokenizer's
+             // anger...
+-            if ("end() called before incrementToken() returned false!".equals(ise.getMessage())) {
++            if (ise.getMessage().contains("end() called in wrong state=")) {
+               // OK
+             } else {
+               throw ise;
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/analysis/MockTokenizer.java b/lucene/test-framework/src/java/org/apache/lucene/analysis/MockTokenizer.java
+index 6256721..76b71c1 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/analysis/MockTokenizer.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/analysis/MockTokenizer.java
+@@ -103,6 +103,7 @@ public class MockTokenizer extends Tokenizer {
+   public MockTokenizer(CharacterRunAutomaton runAutomaton, boolean lowerCase) {
+     this(runAutomaton, lowerCase, DEFAULT_MAX_TOKEN_LENGTH);
+   }
++
+   /** Calls {@link #MockTokenizer(CharacterRunAutomaton, boolean) MockTokenizer(Reader, WHITESPACE, true)} */
+   public MockTokenizer() {
+     this(WHITESPACE, true);
+@@ -316,7 +317,7 @@ public class MockTokenizer extends Tokenizer {
+       // some tokenizers, such as limiting tokenizers, call end() before incrementToken() returns false.
+       // these tests should disable this check (in general you should consume the entire stream)
+       if (streamState != State.INCREMENT_FALSE) {
+-        fail("end() called before incrementToken() returned false!");
++        fail("end() called in wrong state=" + streamState + "!");
+       }
+     } finally {
+       streamState = State.END;

@@ -1,0 +1,172 @@
+Index: src/java/org/apache/lucene/index/FieldsReader.java
+===================================================================
+--- src/java/org/apache/lucene/index/FieldsReader.java	(revision 591357)
++++ src/java/org/apache/lucene/index/FieldsReader.java	(working copy)
+@@ -186,6 +186,27 @@
+     return doc;
+   }
+ 
++  final int length(int docID) throws IOException {
++    indexStream.seek((docID + docStoreOffset) * 8L);
++    final long pos1 = indexStream.readLong();
++    // nocommit: do this w/o exception -- check file length
++    long pos2;
++    try {
++      pos2 = indexStream.readLong();
++    } catch (IOException e) {
++      pos2 = fieldsStream.length();
++    }
++    return (int) (pos2 - pos1);
++  }
++
++  final void doc(int docID, byte[] buffer, int size) throws CorruptIndexException, IOException {
++    indexStream.seek((docID + docStoreOffset) * 8L);
++    final long pos = indexStream.readLong();
++    //final long size = length(docID);
++    fieldsStream.seek(pos);
++    fieldsStream.readBytes(buffer, 0, size);
++  }
++
+   /**
+    * Skip the field.  We still have to read some of the information about the field, but can skip past the actual content.
+    * This will have the most payoff on large fields.
+Index: src/java/org/apache/lucene/index/FieldsWriter.java
+===================================================================
+--- src/java/org/apache/lucene/index/FieldsWriter.java	(revision 591357)
++++ src/java/org/apache/lucene/index/FieldsWriter.java	(working copy)
+@@ -127,6 +127,12 @@
+       }
+     }
+ 
++    // Bulk write of full entry for a document
++    final void addDocument(byte[] buffer, int size) throws IOException {
++      indexStream.writeLong(fieldsStream.getFilePointer());
++      fieldsStream.writeBytes(buffer, size);
++    }
++
+     final void addDocument(Document doc) throws IOException {
+         indexStream.writeLong(fieldsStream.getFilePointer());
+ 
+Index: src/java/org/apache/lucene/index/SegmentMerger.java
+===================================================================
+--- src/java/org/apache/lucene/index/SegmentMerger.java	(revision 591357)
++++ src/java/org/apache/lucene/index/SegmentMerger.java	(working copy)
+@@ -210,24 +210,50 @@
+       fieldInfos = new FieldInfos();		  // merge field names
+     }
+ 
+-    int docCount = 0;
+     for (int i = 0; i < readers.size(); i++) {
+       IndexReader reader = (IndexReader) readers.elementAt(i);
+-      addIndexed(reader, fieldInfos, reader.getFieldNames(IndexReader.FieldOption.TERMVECTOR_WITH_POSITION_OFFSET), true, true, true, false);
+-      addIndexed(reader, fieldInfos, reader.getFieldNames(IndexReader.FieldOption.TERMVECTOR_WITH_POSITION), true, true, false, false);
+-      addIndexed(reader, fieldInfos, reader.getFieldNames(IndexReader.FieldOption.TERMVECTOR_WITH_OFFSET), true, false, true, false);
+-      addIndexed(reader, fieldInfos, reader.getFieldNames(IndexReader.FieldOption.TERMVECTOR), true, false, false, false);
+-      addIndexed(reader, fieldInfos, reader.getFieldNames(IndexReader.FieldOption.STORES_PAYLOADS), false, false, false, true);
+-      addIndexed(reader, fieldInfos, reader.getFieldNames(IndexReader.FieldOption.INDEXED), false, false, false, false);
+-      fieldInfos.add(reader.getFieldNames(IndexReader.FieldOption.UNINDEXED), false);
++      if (reader instanceof SegmentReader) {
++        SegmentReader sreader = (SegmentReader) reader;
++        for (int j = 0; j < sreader.getFieldInfos().size(); j++) {
++          FieldInfo fi = sreader.getFieldInfos().fieldInfo(j);
++          fieldInfos.add(fi.name, fi.isIndexed, fi.storeTermVector, fi.storePositionWithTermVector, fi.storeOffsetWithTermVector, !reader.hasNorms(fi.name));
++        }
++      } else {
++        addIndexed(reader, fieldInfos, reader.getFieldNames(IndexReader.FieldOption.TERMVECTOR_WITH_POSITION_OFFSET), true, true, true, false);
++        addIndexed(reader, fieldInfos, reader.getFieldNames(IndexReader.FieldOption.TERMVECTOR_WITH_POSITION), true, true, false, false);
++        addIndexed(reader, fieldInfos, reader.getFieldNames(IndexReader.FieldOption.TERMVECTOR_WITH_OFFSET), true, false, true, false);
++        addIndexed(reader, fieldInfos, reader.getFieldNames(IndexReader.FieldOption.TERMVECTOR), true, false, false, false);
++        addIndexed(reader, fieldInfos, reader.getFieldNames(IndexReader.FieldOption.STORES_PAYLOADS), false, false, false, true);
++        addIndexed(reader, fieldInfos, reader.getFieldNames(IndexReader.FieldOption.INDEXED), false, false, false, false);
++        fieldInfos.add(reader.getFieldNames(IndexReader.FieldOption.UNINDEXED), false);
++      }
+     }
++
+     fieldInfos.write(directory, segment + ".fnm");
+ 
++    int docCount = 0;
++
+     if (mergeDocStores) {
+ 
+-      FieldsWriter fieldsWriter = // merge field values
+-        new FieldsWriter(directory, segment, fieldInfos);
+-    
++      SegmentReader[] sreaders = new SegmentReader[readers.size()];
++      for (int i = 0; i < readers.size(); i++) {
++        IndexReader reader = (IndexReader) readers.elementAt(i);
++        boolean same = reader.getFieldNames(IndexReader.FieldOption.ALL).size() == fieldInfos.size() && reader instanceof SegmentReader;
++        if (same) {
++          SegmentReader sreader = (SegmentReader) reader;
++          for (int j = 0; same && j < fieldInfos.size(); j++) {
++            same = fieldInfos.fieldName(j).equals(sreader.getFieldInfos().fieldName(j));
++          }
++          if(same)
++            sreaders[i] = sreader;
++        }
++      }
++	
++      byte[] buffer = new byte[1024];
++
++      // merge field values
++      FieldsWriter fieldsWriter = new FieldsWriter(directory, segment, fieldInfos);
++
+       // for merging we don't want to compress/uncompress the data, so to tell the FieldsReader that we're
+       // in  merge mode, we use this FieldSelector
+       FieldSelector fieldSelectorMerge = new FieldSelector() {
+@@ -239,17 +265,27 @@
+       try {
+         for (int i = 0; i < readers.size(); i++) {
+           IndexReader reader = (IndexReader) readers.elementAt(i);
++          SegmentReader sreader = sreaders[i];
+           int maxDoc = reader.maxDoc();
+           for (int j = 0; j < maxDoc; j++)
+-            if (!reader.isDeleted(j)) {               // skip deleted docs
+-              fieldsWriter.addDocument(reader.document(j, fieldSelectorMerge));
++            if (!reader.isDeleted(j)) { // skip deleted docs
++              if (sreader != null) {
++                int len = sreader.getFieldsReader().length(j);
++                if (len > buffer.length) {
++                  buffer = new byte[len * 2];
++                }
++                //System.out.println("direct copy " + len);
++                sreader.getFieldsReader().doc(j, buffer, len);
++                fieldsWriter.addDocument(buffer, len);
++              } else {
++                fieldsWriter.addDocument(reader.document(j, fieldSelectorMerge));
++              }
+               docCount++;
+             }
+         }
+       } finally {
+         fieldsWriter.close();
+       }
+-
+     } else
+       // If we are skipping the doc stores, that means there
+       // are no deletions in any of these segments, so we
+Index: src/java/org/apache/lucene/index/SegmentReader.java
+===================================================================
+--- src/java/org/apache/lucene/index/SegmentReader.java	(revision 591357)
++++ src/java/org/apache/lucene/index/SegmentReader.java	(working copy)
+@@ -314,6 +314,10 @@
+     undeleteAll = false;
+   }
+ 
++  FieldsReader getFieldsReader() {
++    return fieldsReader;
++  }
++
+   protected void doClose() throws IOException {
+     if (fieldsReader != null) {
+       fieldsReader.close();
+@@ -388,6 +392,10 @@
+     return tis.terms(t);
+   }
+ 
++  FieldInfos getFieldInfos() {
++    return fieldInfos;
++  }
++
+   /**
+    * @throws CorruptIndexException if the index is corrupt
+    * @throws IOException if there is a low-level IO error

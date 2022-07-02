@@ -1,0 +1,4449 @@
+
+
+Index: lucene/CHANGES.txt
+--- lucene/CHANGES.txt	2011-06-09 13:54:57.466549801 -0400
++++ lucene/CHANGES.txt	2011-07-13 15:57:50.465101736 -0400
+@@ -239,6 +239,11 @@
+ * LUCENE-3146: IndexReader.setNorm throws IllegalStateException if the field
+   does not store norms. (Shai Erera, Mike McCandless)
+   
++* LUCENE-3309: Stored fields no longer record whether they were
++  tokenized or not.  In general you should not rely on stored fields
++  to record any "metadata" from indexing (tokenized, omitNorms,
++  IndexOptions, boost, etc.)  (Mike McCandless)
++  
+ API Changes
+ 
+ * LUCENE-2302, LUCENE-1458, LUCENE-2111, LUCENE-2514: Terms are no longer
+
+
+Index: lucene/contrib/CHANGES.txt
+--- lucene/contrib/CHANGES.txt	2011-06-09 13:54:47.592426929 -0400
++++ lucene/contrib/CHANGES.txt	2011-07-13 15:56:36.287101917 -0400
+@@ -5,6 +5,14 @@
+ 
+ ======================= Trunk (not yet released) =======================
+   
++Changes in Runtime Behavior
++
++ * LUCENE-3309: Fast vector highlighter now inserts the
++   MultiValuedSeparator for NOT_ANALYZED fields (in addition to
++   ANALYZED fields).  To ensure your offsets are correct you should
++   provide an analyzer that returns 1 from the offsetGap method.
++   (Mike McCandless)
++
+ Build
+ 
+  * LUCENE-2845: Moved contrib/benchmark to modules.
+
+
+Index: lucene/contrib/highlighter/src/java/org/apache/lucene/search/vectorhighlight/BaseFragmentsBuilder.java
+--- lucene/contrib/highlighter/src/java/org/apache/lucene/search/vectorhighlight/BaseFragmentsBuilder.java	2011-06-09 13:54:47.584445441 -0400
++++ lucene/contrib/highlighter/src/java/org/apache/lucene/search/vectorhighlight/BaseFragmentsBuilder.java	2011-07-14 04:49:50.383091004 -0400
+@@ -21,15 +21,16 @@
+ import java.util.ArrayList;
+ import java.util.List;
+ 
+-import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.Field;
+-import org.apache.lucene.document.MapFieldSelector;
++import org.apache.lucene.index.FieldInfo;
+ import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.StoredFieldVisitor;
+ import org.apache.lucene.search.highlight.DefaultEncoder;
+ import org.apache.lucene.search.highlight.Encoder;
+-import org.apache.lucene.search.vectorhighlight.FieldFragList.WeightedFragInfo;
+ import org.apache.lucene.search.vectorhighlight.FieldFragList.WeightedFragInfo.SubInfo;
++import org.apache.lucene.search.vectorhighlight.FieldFragList.WeightedFragInfo;
+ import org.apache.lucene.search.vectorhighlight.FieldPhraseList.WeightedPhraseInfo.Toffs;
++import org.apache.lucene.store.IndexInput;
+ 
+ public abstract class BaseFragmentsBuilder implements FragmentsBuilder {
+ 
+@@ -107,10 +108,24 @@
+     return fragments.toArray( new String[fragments.size()] );
+   }
+   
+-  protected Field[] getFields( IndexReader reader, int docId, String fieldName) throws IOException {
++  protected Field[] getFields( IndexReader reader, int docId, final String fieldName) throws IOException {
+     // according to javadoc, doc.getFields(fieldName) cannot be used with lazy loaded field???
+-    Document doc = reader.document( docId, new MapFieldSelector(fieldName) );
+-    return doc.getFields( fieldName ); // according to Document class javadoc, this never returns null
++    final List<Field> fields = new ArrayList<Field>();
++    reader.document(docId, new StoredFieldVisitor() {
++        @Override
++        public boolean stringField(FieldInfo fieldInfo, IndexInput in, int numUTF8Bytes) throws IOException {
++          if (fieldInfo.name.equals(fieldName)) {
++            final byte[] b = new byte[numUTF8Bytes];
++            in.readBytes(b, 0, b.length);
++            Field.TermVector termVector = Field.TermVector.toTermVector(fieldInfo.storeTermVector, fieldInfo.storeOffsetWithTermVector, fieldInfo.storePositionWithTermVector);
++            fields.add(new Field(fieldInfo.name, false, new String(b, "UTF-8"), Field.Store.YES, Field.Index.ANALYZED, termVector));
++          } else {
++            in.seek(in.getFilePointer() + numUTF8Bytes);
++          }
++          return false;
++        }
++      });
++    return fields.toArray(new Field[fields.size()]);
+   }
+ 
+   protected String makeFragment( StringBuilder buffer, int[] index, Field[] values, WeightedFragInfo fragInfo,
+@@ -142,7 +157,6 @@
+       int startOffset, int endOffset ){
+     while( buffer.length() < endOffset && index[0] < values.length ){
+       buffer.append( values[index[0]].stringValue() );
+-      if( values[index[0]].isTokenized() )
+         buffer.append( multiValuedSeparator );
+       index[0]++;
+     }
+
+
+Index: lucene/contrib/highlighter/src/test/org/apache/lucene/search/vectorhighlight/AbstractTestCase.java
+--- lucene/contrib/highlighter/src/test/org/apache/lucene/search/vectorhighlight/AbstractTestCase.java	2011-07-11 15:04:05.741080719 -0400
++++ lucene/contrib/highlighter/src/test/org/apache/lucene/search/vectorhighlight/AbstractTestCase.java	2011-07-13 15:37:01.575101924 -0400
+@@ -34,9 +34,10 @@
+ import org.apache.lucene.document2.TextField;
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.IndexWriter;
++import org.apache.lucene.index.IndexWriterConfig.OpenMode;
+ import org.apache.lucene.index.IndexWriterConfig;
++import org.apache.lucene.index.IndexableField;
+ import org.apache.lucene.index.Term;
+-import org.apache.lucene.index.IndexWriterConfig.OpenMode;
+ import org.apache.lucene.queryParser.QueryParser;
+ import org.apache.lucene.search.DisjunctionMaxQuery;
+ import org.apache.lucene.search.PhraseQuery;
+@@ -88,7 +89,26 @@
+     super.setUp();
+     analyzerW = new MockAnalyzer(random, MockTokenizer.WHITESPACE, false);
+     analyzerB = new BigramAnalyzer();
+-    analyzerK = new MockAnalyzer(random, MockTokenizer.KEYWORD, false);
++    final Analyzer k = new MockAnalyzer(random, MockTokenizer.KEYWORD, false);
++    analyzerK = new Analyzer() {
++      @Override
++      public TokenStream tokenStream(String fieldName, Reader reader) {
++        return k.tokenStream(fieldName, reader);
++      }
++
++      @Override
++      public TokenStream reusableTokenStream(String fieldName, Reader reader) throws IOException {
++        return k.reusableTokenStream(fieldName, reader);
++      }
++
++      @Override
++      public int getOffsetGap(IndexableField field) {
++        // Because we add single-char separator for all
++        // (even not-tokenized) fields:
++        return 1;
++      }
++    };
++
+     paW = new QueryParser(TEST_VERSION_CURRENT,  F, analyzerW );
+     paB = new QueryParser(TEST_VERSION_CURRENT,  F, analyzerB );
+     dir = newDirectory();
+
+
+Index: lucene/contrib/highlighter/src/test/org/apache/lucene/search/vectorhighlight/SimpleFragmentsBuilderTest.java
+--- lucene/contrib/highlighter/src/test/org/apache/lucene/search/vectorhighlight/SimpleFragmentsBuilderTest.java	2011-07-11 15:04:05.742206420 -0400
++++ lucene/contrib/highlighter/src/test/org/apache/lucene/search/vectorhighlight/SimpleFragmentsBuilderTest.java	2011-07-13 15:37:23.887277622 -0400
+@@ -152,9 +152,8 @@
+     SimpleFragListBuilder sflb = new SimpleFragListBuilder();
+     FieldFragList ffl = sflb.createFieldFragList( fpl, 100 );
+     SimpleFragmentsBuilder sfb = new SimpleFragmentsBuilder();
+-    // '/' separator doesn't effect the snippet because of NOT_ANALYZED field
+     sfb.setMultiValuedSeparator( '/' );
+-    assertEquals( "abc<b>defg</b>hijkl", sfb.createFragment( reader, 0, F, ffl ) );
++    assertEquals( "abc/<b>defg</b>/hijkl/", sfb.createFragment( reader, 0, F, ffl ) );
+   }
+   
+   public void testMVSeparator() throws Exception {
+
+
+Index: lucene/contrib/instantiated/src/java/org/apache/lucene/store/instantiated/InstantiatedIndexReader.java
+--- lucene/contrib/instantiated/src/java/org/apache/lucene/store/instantiated/InstantiatedIndexReader.java	2011-07-04 18:24:24.166098684 -0400
++++ lucene/contrib/instantiated/src/java/org/apache/lucene/store/instantiated/InstantiatedIndexReader.java	2011-07-14 05:02:45.452101897 -0400
+@@ -30,7 +30,6 @@
+ import java.util.Comparator;
+ 
+ import org.apache.lucene.document.Document;
+-import org.apache.lucene.document.FieldSelector;
+ import org.apache.lucene.index.*;
+ import org.apache.lucene.index.IndexReader.ReaderContext;
+ import org.apache.lucene.store.Directory;
+@@ -252,42 +251,6 @@
+   }
+ 
+   /**
+-   * Return the {@link org.apache.lucene.document.Document} at the <code>n</code><sup>th</sup>
+-   * position.
+-     <p>
+-   * <b>Warning!</b>
+-   * The resulting document is the actual stored document instance
+-   * and not a deserialized clone as retuned by an IndexReader
+-   * over a {@link org.apache.lucene.store.Directory}.
+-   * I.e., if you need to touch the document, clone it first!
+-   * <p>
+-   * This can also be seen as a feature for live changes of stored values,
+-   * but be careful! Adding a field with an name unknown to the index
+-   * or to a field with previously no stored values will make
+-   * {@link org.apache.lucene.store.instantiated.InstantiatedIndexReader#getFieldNames(org.apache.lucene.index.IndexReader.FieldOption)}
+-   * out of sync, causing problems for instance when merging the
+-   * instantiated index to another index.
+-     <p>
+-   * This implementation ignores the field selector! All stored fields are always returned!
+-   * <p>
+-   *
+-   * @param n document number
+-   * @param fieldSelector ignored
+-   * @return The stored fields of the {@link org.apache.lucene.document.Document} at the nth position
+-   * @throws CorruptIndexException if the index is corrupt
+-   * @throws IOException if there is a low-level IO error
+-   * 
+-   * @see org.apache.lucene.document.Fieldable
+-   * @see org.apache.lucene.document.FieldSelector
+-   * @see org.apache.lucene.document.SetBasedFieldSelector
+-   * @see org.apache.lucene.document.LoadFirstFieldSelector
+-   */
+-  @Override
+-  public Document document(int n, FieldSelector fieldSelector) throws CorruptIndexException, IOException {
+-    return document(n);
+-  }
+-
+-  /**
+    * Returns the stored fields of the <code>n</code><sup>th</sup>
+    * <code>Document</code> in this index.
+    * <p>
+@@ -313,6 +276,11 @@
+     return getIndex().getDocumentsByNumber()[n].getDocument();
+   }
+ 
++  @Override
++  public void document(int docID, StoredFieldVisitor visitor) throws IOException {
++    throw new UnsupportedOperationException();
++  }
++
+   /**
+    * never ever touch these values. it is the true values, unless norms have
+    * been touched.
+
+
+Index: lucene/contrib/memory/src/java/org/apache/lucene/index/memory/MemoryIndex.java
+--- lucene/contrib/memory/src/java/org/apache/lucene/index/memory/MemoryIndex.java	2011-06-09 13:54:46.722609228 -0400
++++ lucene/contrib/memory/src/java/org/apache/lucene/index/memory/MemoryIndex.java	2011-07-14 04:49:20.622348153 -0400
+@@ -35,23 +35,23 @@
+ import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
+ import org.apache.lucene.analysis.tokenattributes.TermToBytesRefAttribute;
+ import org.apache.lucene.document.Document;
+-import org.apache.lucene.document.FieldSelector;
+-import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.DocsAndPositionsEnum;
++import org.apache.lucene.index.DocsEnum;
++import org.apache.lucene.index.FieldInvertState;
+ import org.apache.lucene.index.Fields;
++import org.apache.lucene.index.FieldsEnum;
+ import org.apache.lucene.index.IndexReader.AtomicReaderContext;
++import org.apache.lucene.index.IndexReader.ReaderContext;
++import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.OrdTermState;
+-import org.apache.lucene.index.TermState;
+-import org.apache.lucene.index.Terms;
+-import org.apache.lucene.index.TermsEnum;
+-import org.apache.lucene.index.FieldsEnum;
+-import org.apache.lucene.index.DocsEnum;
+-import org.apache.lucene.index.DocsAndPositionsEnum;
++import org.apache.lucene.index.StoredFieldVisitor;
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.index.TermFreqVector;
+ import org.apache.lucene.index.TermPositionVector;
++import org.apache.lucene.index.TermState;
+ import org.apache.lucene.index.TermVectorMapper;
+-import org.apache.lucene.index.FieldInvertState;
+-import org.apache.lucene.index.IndexReader.ReaderContext;
++import org.apache.lucene.index.Terms;
++import org.apache.lucene.index.TermsEnum;
+ import org.apache.lucene.search.Collector;
+ import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.Query;
+@@ -60,8 +60,8 @@
+ import org.apache.lucene.search.SimilarityProvider;
+ import org.apache.lucene.store.RAMDirectory; // for javadocs
+ import org.apache.lucene.util.ArrayUtil;
+-import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.Bits;
++import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.Constants; // for javadocs
+ 
+ /**
+@@ -1225,16 +1225,9 @@
+     }
+   
+     @Override
+-    public Document document(int n) {
+-      if (DEBUG) System.err.println("MemoryIndexReader.document");
+-      return new Document(); // there are no stored fields
+-    }
+-
+-    //When we convert to JDK 1.5 make this Set<String>
+-    @Override
+-    public Document document(int n, FieldSelector fieldSelector) throws IOException {
++    public void document(int docID, StoredFieldVisitor visitor) {
+       if (DEBUG) System.err.println("MemoryIndexReader.document");
+-      return new Document(); // there are no stored fields
++      // no-op: there are no stored fields
+     }
+ 
+     @Override
+
+
+Index: lucene/contrib/misc/src/java/org/apache/lucene/document/FieldSelector.java
+--- lucene/contrib/misc/src/java/org/apache/lucene/document/FieldSelector.java	1969-12-31 19:00:00.000000000 -0500
++++ lucene/contrib/misc/src/java/org/apache/lucene/document/FieldSelector.java	2011-07-14 05:09:34.066528822 -0400
+@@ -0,0 +1,33 @@
++package org.apache.lucene.document;
++
++/**
++ * Copyright 2004 The Apache Software Foundation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * Similar to a {@link java.io.FileFilter}, the FieldSelector allows one to make decisions about
++ * what Fields get loaded on a {@link Document} by {@link FieldSelectorVisitor}
++ *
++ **/
++public interface FieldSelector {
++
++  /**
++   * 
++   * @param fieldName the field to accept or reject
++   * @return an instance of {@link FieldSelectorResult}
++   * if the {@link Field} named <code>fieldName</code> should be loaded.
++   */
++  FieldSelectorResult accept(String fieldName);
++}
+
+
+Index: lucene/contrib/misc/src/java/org/apache/lucene/document/FieldSelectorResult.java
+--- lucene/contrib/misc/src/java/org/apache/lucene/document/FieldSelectorResult.java	1969-12-31 19:00:00.000000000 -0500
++++ lucene/contrib/misc/src/java/org/apache/lucene/document/FieldSelectorResult.java	2011-07-13 16:28:48.504372532 -0400
+@@ -0,0 +1,76 @@
++package org.apache.lucene.document;
++
++/**
++ * Copyright 2004 The Apache Software Foundation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ *  Provides information about what should be done with this Field 
++ *
++ **/
++public enum FieldSelectorResult {
++
++    /**
++     * Load this {@link Field} every time the {@link Document} is loaded, reading in the data as it is encountered.
++     *  {@link Document#getField(String)} and {@link Document#getFieldable(String)} should not return null.
++     *<p/>
++     * {@link Document#add(Fieldable)} should be called by the Reader.
++     */
++  LOAD,
++
++    /**
++     * Lazily load this {@link Field}.  This means the {@link Field} is valid, but it may not actually contain its data until
++     * invoked.  {@link Document#getField(String)} SHOULD NOT BE USED.  {@link Document#getFieldable(String)} is safe to use and should
++     * return a valid instance of a {@link Fieldable}.
++     *<p/>
++     * {@link Document#add(Fieldable)} should be called by the Reader.
++     */
++  LAZY_LOAD,
++
++    /**
++     * Do not load the {@link Field}.  {@link Document#getField(String)} and {@link Document#getFieldable(String)} should return null.
++     * {@link Document#add(Fieldable)} is not called.
++     * <p/>
++     * {@link Document#add(Fieldable)} should not be called by the Reader.
++     */
++  NO_LOAD,
++
++    /**
++     * Load this field as in the {@link #LOAD} case, but immediately return from {@link Field} loading for the {@link Document}.  Thus, the
++     * Document may not have its complete set of Fields.  {@link Document#getField(String)} and {@link Document#getFieldable(String)} should
++     * both be valid for this {@link Field}
++     * <p/>
++     * {@link Document#add(Fieldable)} should be called by the Reader.
++     */
++  LOAD_AND_BREAK,
++
++    /** Expert:  Load the size of this {@link Field} rather than its value.
++     * Size is measured as number of bytes required to store the field == bytes for a binary or any compressed value, and 2*chars for a String value.
++     * The size is stored as a binary value, represented as an int in a byte[], with the higher order byte first in [0]
++     */
++  SIZE,
++
++    /** Expert: Like {@link #SIZE} but immediately break from the field loading loop, i.e., stop loading further fields, after the size is loaded */         
++  SIZE_AND_BREAK,
++
++  /**
++     * Lazily load this {@link Field}, but do not cache the result.  This means the {@link Field} is valid, but it may not actually contain its data until
++     * invoked.  {@link Document#getField(String)} SHOULD NOT BE USED.  {@link Document#getFieldable(String)} is safe to use and should
++     * return a valid instance of a {@link Fieldable}.
++     *<p/>
++     * {@link Document#add(Fieldable)} should be called by the Reader.
++     */
++  LATENT
++}
+
+
+Index: lucene/contrib/misc/src/java/org/apache/lucene/document/FieldSelectorVisitor.java
+--- lucene/contrib/misc/src/java/org/apache/lucene/document/FieldSelectorVisitor.java	1969-12-31 19:00:00.000000000 -0500
++++ lucene/contrib/misc/src/java/org/apache/lucene/document/FieldSelectorVisitor.java	2011-07-14 04:59:38.248446461 -0400
+@@ -0,0 +1,315 @@
++package org.apache.lucene.document;
++
++/**
++ * Copyright 2004 The Apache Software Foundation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.io.Reader;
++
++import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.index.FieldInfo;
++import org.apache.lucene.index.FieldReaderException;
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.StoredFieldVisitor;
++import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.util.BytesRef;
++
++/** Create this, passing a legacy {@link FieldSelector} to it, then
++ *  pass this class to {@link IndexReader#document(int,
++ *  StoredFieldVisitor)}, then call {@link #getDocument} to
++ *  retrieve the loaded document.
++
++ *  <p><b>NOTE</b>:  If you use Lazy fields, you should not
++ *  access the returned document after the reader has been
++ *  closed!
++ */
++
++public class FieldSelectorVisitor extends StoredFieldVisitor {
++
++  private final FieldSelector selector;
++  private final Document doc;
++
++  public FieldSelectorVisitor(FieldSelector selector) {
++    this.selector = selector;
++    doc = new Document();
++  }
++
++  public Document getDocument() {
++    return doc;
++  }
++
++  @Override
++  public boolean binaryField(FieldInfo fieldInfo, IndexInput in, int numBytes) throws IOException {
++    final FieldSelectorResult accept = selector.accept(fieldInfo.name);
++    switch (accept) {
++    case LOAD:
++    case LOAD_AND_BREAK:
++      final byte[] b = new byte[numBytes];
++      in.readBytes(b, 0, b.length);
++      doc.add(new Field(fieldInfo.name, b));
++      return accept != FieldSelectorResult.LOAD;
++    case LAZY_LOAD:
++    case LATENT:
++      addFieldLazy(in, fieldInfo, true, accept == FieldSelectorResult.LAZY_LOAD, numBytes);
++      return false;
++    case SIZE:
++    case SIZE_AND_BREAK:
++      in.seek(in.getFilePointer() + numBytes);
++      addFieldSize(fieldInfo, numBytes);
++      return accept != FieldSelectorResult.SIZE;
++    default:
++      // skip
++      in.seek(in.getFilePointer() + numBytes);
++      return false;
++    }
++  }
++
++  @Override
++  public boolean stringField(FieldInfo fieldInfo, IndexInput in, int numUTF8Bytes) throws IOException {
++    final FieldSelectorResult accept = selector.accept(fieldInfo.name);
++    switch (accept) {
++    case LOAD:
++    case LOAD_AND_BREAK:
++      final byte[] b = new byte[numUTF8Bytes];
++      in.readBytes(b, 0, b.length);
++      Field.TermVector termVector = Field.TermVector.toTermVector(fieldInfo.storeTermVector, fieldInfo.storeOffsetWithTermVector, fieldInfo.storePositionWithTermVector);
++      doc.add(new Field(fieldInfo.name, false, new String(b, "UTF-8"), Field.Store.YES, Field.Index.ANALYZED, termVector));
++      return accept != FieldSelectorResult.LOAD;
++    case LAZY_LOAD:
++    case LATENT:
++      addFieldLazy(in, fieldInfo, false, accept == FieldSelectorResult.LAZY_LOAD, numUTF8Bytes);
++      return false;
++    case SIZE:
++    case SIZE_AND_BREAK:
++      in.seek(in.getFilePointer() + numUTF8Bytes);
++      addFieldSize(fieldInfo, 2*numUTF8Bytes);
++      return accept != FieldSelectorResult.SIZE;
++    default:
++      // skip
++      in.seek(in.getFilePointer() + numUTF8Bytes);
++      return false;
++    }
++  }
++
++  @Override
++  public boolean intField(FieldInfo fieldInfo, int value) throws IOException {
++    return addNumericField(fieldInfo, new NumericField(fieldInfo.name, Field.Store.YES, fieldInfo.isIndexed).setIntValue(value));
++  }
++
++  @Override
++  public boolean longField(FieldInfo fieldInfo, long value) throws IOException {
++    return addNumericField(fieldInfo, new NumericField(fieldInfo.name, Field.Store.YES, fieldInfo.isIndexed).setLongValue(value));
++  }
++
++  @Override
++  public boolean floatField(FieldInfo fieldInfo, float value) throws IOException {
++    return addNumericField(fieldInfo, new NumericField(fieldInfo.name, Field.Store.YES, fieldInfo.isIndexed).setFloatValue(value));
++  }
++
++  @Override
++  public boolean doubleField(FieldInfo fieldInfo, double value) throws IOException {
++    return addNumericField(fieldInfo, new NumericField(fieldInfo.name, Field.Store.YES, fieldInfo.isIndexed).setDoubleValue(value));
++  }
++
++  private boolean addNumericField(FieldInfo fieldInfo, NumericField f) {
++    f.setOmitNorms(fieldInfo.omitNorms);
++    f.setOmitTermFreqAndPositions(fieldInfo.omitTermFreqAndPositions);
++    doc.add(f);
++    final FieldSelectorResult accept = selector.accept(fieldInfo.name);
++    switch (accept) {
++    case LOAD:
++      return false;
++    case LOAD_AND_BREAK:
++      return true;
++    case LAZY_LOAD:
++    case LATENT:
++      return false;
++    case SIZE:
++      return false;
++    case SIZE_AND_BREAK:
++      return true;
++    default:
++      return false;
++    }
++  }
++
++  private void addFieldLazy(IndexInput in, FieldInfo fi, boolean binary, boolean cacheResult, int numBytes) throws IOException {
++    final AbstractField f;
++    final long pointer = in.getFilePointer();
++    // Need to move the pointer ahead by toRead positions
++    in.seek(pointer+numBytes);
++    if (binary) {
++      f = new LazyField(in, fi.name, Field.Store.YES, numBytes, pointer, binary, cacheResult);
++    } else {
++      Field.TermVector termVector = Field.TermVector.toTermVector(fi.storeTermVector, fi.storeOffsetWithTermVector, fi.storePositionWithTermVector);
++      f = new LazyField(in, fi.name, Field.Store.YES, Field.Index.ANALYZED, termVector, numBytes, pointer, binary, cacheResult);
++    }
++    
++    f.setOmitNorms(fi.omitNorms);
++    f.setOmitTermFreqAndPositions(fi.omitTermFreqAndPositions);
++    doc.add(f);
++  }
++
++  // Add the size of field as a byte[] containing the 4 bytes of the integer byte size (high order byte first; char = 2 bytes)
++  // Read just the size -- caller must skip the field content to continue reading fields
++  // Return the size in bytes or chars, depending on field type
++  private void addFieldSize(FieldInfo fi, int numBytes) throws IOException {
++    byte[] sizebytes = new byte[4];
++    sizebytes[0] = (byte) (numBytes>>>24);
++    sizebytes[1] = (byte) (numBytes>>>16);
++    sizebytes[2] = (byte) (numBytes>>> 8);
++    sizebytes[3] = (byte)  numBytes      ;
++    doc.add(new Field(fi.name, sizebytes));
++  }
++
++  /**
++   * A Lazy field implementation that defers loading of fields until asked for, instead of when the Document is
++   * loaded.
++   */
++  private static class LazyField extends AbstractField {
++    private int toRead;
++    private long pointer;
++    private final boolean cacheResult;
++    private final IndexInput in;
++
++    public LazyField(IndexInput in, String name, Field.Store store, int toRead, long pointer, boolean isBinary, boolean cacheResult) {
++      super(name, store, Field.Index.NO, Field.TermVector.NO);
++      this.in = in;
++      this.toRead = toRead;
++      this.pointer = pointer;
++      this.isBinary = isBinary;
++      this.cacheResult = cacheResult;
++      if (isBinary)
++        binaryLength = toRead;
++      lazy = true;
++    }
++
++    public LazyField(IndexInput in, String name, Field.Store store, Field.Index index, Field.TermVector termVector, int toRead, long pointer, boolean isBinary, boolean cacheResult) {
++      super(name, store, index, termVector);
++      this.in = in;
++      this.toRead = toRead;
++      this.pointer = pointer;
++      this.isBinary = isBinary;
++      this.cacheResult = cacheResult;
++      if (isBinary)
++        binaryLength = toRead;
++      lazy = true;
++    }
++
++    public Number getNumericValue() {
++      return null;
++    }
++
++    public NumericField.DataType getDataType() {
++      return null;
++    }
++
++    private IndexInput localFieldsStream;
++
++    private IndexInput getFieldStream() {
++      if (localFieldsStream == null) {
++        localFieldsStream = (IndexInput) in.clone();
++      }
++      return localFieldsStream;
++    }
++
++    /** The value of the field as a Reader, or null.  If null, the String value,
++     * binary value, or TokenStream value is used.  Exactly one of stringValue(), 
++     * readerValue(), getBinaryValue(), and tokenStreamValue() must be set. */
++    public Reader readerValue() {
++      return null;
++    }
++
++    /** The value of the field as a TokenStream, or null.  If null, the Reader value,
++     * String value, or binary value is used. Exactly one of stringValue(), 
++     * readerValue(), getBinaryValue(), and tokenStreamValue() must be set. */
++    public TokenStream tokenStreamValue() {
++      return null;
++    }
++
++    /** The value of the field as a String, or null.  If null, the Reader value,
++     * binary value, or TokenStream value is used.  Exactly one of stringValue(), 
++     * readerValue(), getBinaryValue(), and tokenStreamValue() must be set. */
++    synchronized public String stringValue() {
++      if (isBinary)
++        return null;
++      else {
++        if (fieldsData == null) {
++          String result = null;
++          IndexInput localFieldsStream = getFieldStream();
++          try {
++            localFieldsStream.seek(pointer);
++            byte[] bytes = new byte[toRead];
++            localFieldsStream.readBytes(bytes, 0, toRead);
++            result = new String(bytes, "UTF-8");
++          } catch (IOException e) {
++            throw new FieldReaderException(e);
++          }
++          if (cacheResult == true){
++            fieldsData = result;
++          }
++          return result;
++        } else {
++          return (String) fieldsData;
++        }
++      }
++    }
++
++    synchronized private byte[] getBinaryValue(byte[] result) {
++      if (isBinary) {
++        if (fieldsData == null) {
++          // Allocate new buffer if result is null or too small
++          final byte[] b;
++          if (result == null || result.length < toRead)
++            b = new byte[toRead];
++          else
++            b = result;
++   
++          IndexInput localFieldsStream = getFieldStream();
++
++          // Throw this IOException since IndexReader.document does so anyway, so probably not that big of a change for people
++          // since they are already handling this exception when getting the document
++          try {
++            localFieldsStream.seek(pointer);
++            localFieldsStream.readBytes(b, 0, toRead);
++          } catch (IOException e) {
++            throw new FieldReaderException(e);
++          }
++
++          binaryOffset = 0;
++          binaryLength = toRead;
++          if (cacheResult == true){
++            fieldsData = b;
++          }
++          return b;
++        } else {
++          return (byte[]) fieldsData;
++        }
++      } else
++        return null;     
++    }
++
++    @Override
++    public BytesRef binaryValue(BytesRef reuse) {
++      final byte[] bytes = getBinaryValue(reuse != null ? reuse.bytes : null);
++      if (bytes != null) {
++        return new BytesRef(bytes, 0, bytes.length);
++      } else {
++        return null;
++      }
++    }
++  }
++}
+\ No newline at end of file
+
+
+Index: lucene/contrib/misc/src/java/org/apache/lucene/document/LoadFirstFieldSelector.java
+--- lucene/contrib/misc/src/java/org/apache/lucene/document/LoadFirstFieldSelector.java	1969-12-31 19:00:00.000000000 -0500
++++ lucene/contrib/misc/src/java/org/apache/lucene/document/LoadFirstFieldSelector.java	2011-07-13 16:29:19.783101685 -0400
+@@ -0,0 +1,29 @@
++package org.apache.lucene.document;
++/**
++ * Copyright 2004 The Apache Software Foundation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++
++/**
++ * Load the First field and break.
++ * <p/>
++ * See {@link FieldSelectorResult#LOAD_AND_BREAK}
++ */
++public class LoadFirstFieldSelector implements FieldSelector {
++
++  public FieldSelectorResult accept(String fieldName) {
++    return FieldSelectorResult.LOAD_AND_BREAK;
++  }
++}
+\ No newline at end of file
+
+
+Index: lucene/contrib/misc/src/java/org/apache/lucene/document/MapFieldSelector.java
+--- lucene/contrib/misc/src/java/org/apache/lucene/document/MapFieldSelector.java	1969-12-31 19:00:00.000000000 -0500
++++ lucene/contrib/misc/src/java/org/apache/lucene/document/MapFieldSelector.java	2011-07-13 16:29:19.784101805 -0400
+@@ -0,0 +1,67 @@
++package org.apache.lucene.document;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.util.Arrays;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++
++/**
++ * A {@link FieldSelector} based on a Map of field names to {@link FieldSelectorResult}s
++ *
++ */
++public class MapFieldSelector implements FieldSelector {
++    
++    Map<String,FieldSelectorResult> fieldSelections;
++    
++    /** Create a a MapFieldSelector
++     * @param fieldSelections maps from field names (String) to {@link FieldSelectorResult}s
++     */
++    public MapFieldSelector(Map<String,FieldSelectorResult> fieldSelections) {
++        this.fieldSelections = fieldSelections;
++    }
++    
++    /** Create a a MapFieldSelector
++     * @param fields fields to LOAD.  List of Strings.  All other fields are NO_LOAD.
++     */
++    public MapFieldSelector(List<String> fields) {
++        fieldSelections = new HashMap<String,FieldSelectorResult>(fields.size()*5/3);
++        for (final String field : fields)
++            fieldSelections.put(field, FieldSelectorResult.LOAD);
++    }
++    
++    /** Create a a MapFieldSelector
++     * @param fields fields to LOAD.  All other fields are NO_LOAD.
++     */
++    public MapFieldSelector(String... fields) {
++      this(Arrays.asList(fields));
++    }
++
++
++    
++    /** Load field according to its associated value in fieldSelections
++     * @param field a field name
++     * @return the fieldSelections value that field maps to or NO_LOAD if none.
++     */
++    public FieldSelectorResult accept(String field) {
++        FieldSelectorResult selection = fieldSelections.get(field);
++        return selection!=null ? selection : FieldSelectorResult.NO_LOAD;
++    }
++    
++}
+
+
+Index: lucene/contrib/misc/src/java/org/apache/lucene/document/SetBasedFieldSelector.java
+--- lucene/contrib/misc/src/java/org/apache/lucene/document/SetBasedFieldSelector.java	1969-12-31 19:00:00.000000000 -0500
++++ lucene/contrib/misc/src/java/org/apache/lucene/document/SetBasedFieldSelector.java	2011-07-13 16:29:19.786101806 -0400
+@@ -0,0 +1,58 @@
++package org.apache.lucene.document;
++
++import java.util.Set;
++/**
++ * Copyright 2004 The Apache Software Foundation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * Declare what fields to load normally and what fields to load lazily
++ *
++ **/
++public class SetBasedFieldSelector implements FieldSelector {
++  
++  private Set<String> fieldsToLoad;
++  private Set<String> lazyFieldsToLoad;
++  
++  /**
++   * Pass in the Set of {@link Field} names to load and the Set of {@link Field} names to load lazily.  If both are null, the
++   * Document will not have any {@link Field} on it.  
++   * @param fieldsToLoad A Set of {@link String} field names to load.  May be empty, but not null
++   * @param lazyFieldsToLoad A Set of {@link String} field names to load lazily.  May be empty, but not null  
++   */
++  public SetBasedFieldSelector(Set<String> fieldsToLoad, Set<String> lazyFieldsToLoad) {
++    this.fieldsToLoad = fieldsToLoad;
++    this.lazyFieldsToLoad = lazyFieldsToLoad;
++  }
++
++  /**
++   * Indicate whether to load the field with the given name or not. If the {@link Field#name()} is not in either of the 
++   * initializing Sets, then {@link org.apache.lucene.document.FieldSelectorResult#NO_LOAD} is returned.  If a Field name
++   * is in both <code>fieldsToLoad</code> and <code>lazyFieldsToLoad</code>, lazy has precedence.
++   * 
++   * @param fieldName The {@link Field} name to check
++   * @return The {@link FieldSelectorResult}
++   */
++  public FieldSelectorResult accept(String fieldName) {
++    FieldSelectorResult result = FieldSelectorResult.NO_LOAD;
++    if (fieldsToLoad.contains(fieldName) == true){
++      result = FieldSelectorResult.LOAD;
++    }
++    if (lazyFieldsToLoad.contains(fieldName) == true){
++      result = FieldSelectorResult.LAZY_LOAD;
++    }                                           
++    return result;
++  }
++}
+\ No newline at end of file
+
+
+Index: lucene/contrib/misc/src/test/org/apache/lucene/index/TestFieldsReader.java
+--- lucene/contrib/misc/src/test/org/apache/lucene/index/TestFieldsReader.java	1969-12-31 19:00:00.000000000 -0500
++++ lucene/contrib/misc/src/test/org/apache/lucene/index/TestFieldsReader.java	2011-07-13 19:32:34.428400410 -0400
+@@ -0,0 +1,350 @@
++package org.apache.lucene.index;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.File;
++import java.io.IOException;
++import java.util.*;
++
++import org.apache.lucene.analysis.MockAnalyzer;
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.Field;
++import org.apache.lucene.document.FieldSelector;
++import org.apache.lucene.document.FieldSelectorResult;
++import org.apache.lucene.document.FieldSelectorVisitor;
++import org.apache.lucene.document.Fieldable;
++import org.apache.lucene.document.LoadFirstFieldSelector;
++import org.apache.lucene.document.SetBasedFieldSelector;
++import org.apache.lucene.index.IndexWriterConfig.OpenMode;
++import org.apache.lucene.store.AlreadyClosedException;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util._TestUtil;
++import org.junit.AfterClass;
++import org.junit.BeforeClass;
++
++
++public class TestFieldsReader extends LuceneTestCase {
++  private static Directory dir;
++  private static org.apache.lucene.document2.Document testDoc = new org.apache.lucene.document2.Document();
++  private static FieldInfos fieldInfos = null;
++
++  @BeforeClass
++  public static void beforeClass() throws Exception {
++    fieldInfos = new FieldInfos();
++    DocHelper.setupDoc(testDoc);
++    _TestUtil.add(testDoc, fieldInfos);
++    dir = newDirectory();
++    IndexWriterConfig conf = newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random)).setMergePolicy(newLogMergePolicy());
++    ((LogMergePolicy) conf.getMergePolicy()).setUseCompoundFile(false);
++    IndexWriter writer = new IndexWriter(dir, conf);
++    writer.addDocument(testDoc);
++    writer.close();
++  }
++
++  @AfterClass
++  public static void afterClass() throws Exception {
++    dir.close();
++    dir = null;
++    fieldInfos = null;
++    testDoc = null;
++  }
++
++  private Document getDocument(IndexReader ir, int docID, FieldSelector selector) throws IOException {
++    final FieldSelectorVisitor visitor = new FieldSelectorVisitor(selector);
++    ir.document(docID, visitor);
++    return visitor.getDocument();
++  }
++
++  public void testLazyFields() throws Exception {
++    assertTrue(dir != null);
++    assertTrue(fieldInfos != null);
++    IndexReader reader = IndexReader.open(dir);
++    Set<String> loadFieldNames = new HashSet<String>();
++    loadFieldNames.add(DocHelper.TEXT_FIELD_1_KEY);
++    loadFieldNames.add(DocHelper.TEXT_FIELD_UTF1_KEY);
++    Set<String> lazyFieldNames = new HashSet<String>();
++    //new String[]{DocHelper.LARGE_LAZY_FIELD_KEY, DocHelper.LAZY_FIELD_KEY, DocHelper.LAZY_FIELD_BINARY_KEY};
++    lazyFieldNames.add(DocHelper.LARGE_LAZY_FIELD_KEY);
++    lazyFieldNames.add(DocHelper.LAZY_FIELD_KEY);
++    lazyFieldNames.add(DocHelper.LAZY_FIELD_BINARY_KEY);
++    lazyFieldNames.add(DocHelper.TEXT_FIELD_UTF2_KEY);
++    SetBasedFieldSelector fieldSelector = new SetBasedFieldSelector(loadFieldNames, lazyFieldNames);
++    Document doc = getDocument(reader, 0, fieldSelector);
++    assertTrue("doc is null and it shouldn't be", doc != null);
++    Fieldable field = doc.getFieldable(DocHelper.LAZY_FIELD_KEY);
++    assertTrue("field is null and it shouldn't be", field != null);
++    assertTrue("field is not lazy and it should be", field.isLazy());
++    String value = field.stringValue();
++    assertTrue("value is null and it shouldn't be", value != null);
++    assertTrue(value + " is not equal to " + DocHelper.LAZY_FIELD_TEXT, value.equals(DocHelper.LAZY_FIELD_TEXT) == true);
++    assertTrue("calling stringValue() twice should give same reference", field.stringValue() == field.stringValue());
++
++    field = doc.getFieldable(DocHelper.TEXT_FIELD_1_KEY);
++    assertTrue("field is null and it shouldn't be", field != null);
++    assertTrue("Field is lazy and it should not be", field.isLazy() == false);
++    field = doc.getFieldable(DocHelper.TEXT_FIELD_UTF1_KEY);
++    assertTrue("field is null and it shouldn't be", field != null);
++    assertTrue("Field is lazy and it should not be", field.isLazy() == false);
++    assertTrue(field.stringValue() + " is not equal to " + DocHelper.FIELD_UTF1_TEXT, field.stringValue().equals(DocHelper.FIELD_UTF1_TEXT) == true);
++
++    field = doc.getFieldable(DocHelper.TEXT_FIELD_UTF2_KEY);
++    assertTrue("field is null and it shouldn't be", field != null);
++    assertTrue("Field is lazy and it should not be", field.isLazy() == true);
++    assertTrue(field.stringValue() + " is not equal to " + DocHelper.FIELD_UTF2_TEXT, field.stringValue().equals(DocHelper.FIELD_UTF2_TEXT) == true);
++
++    field = doc.getFieldable(DocHelper.LAZY_FIELD_BINARY_KEY);
++    assertTrue("field is null and it shouldn't be", field != null);
++    assertTrue("stringValue isn't null for lazy binary field", field.stringValue() == null);
++
++    byte [] bytes = field.binaryValue(null).bytes;
++    assertTrue("bytes is null and it shouldn't be", bytes != null);
++    assertTrue("", DocHelper.LAZY_FIELD_BINARY_BYTES.length == bytes.length);
++    assertTrue("calling binaryValue() twice should give same reference", field.binaryValue(null).bytes == field.binaryValue(null).bytes);
++    for (int i = 0; i < bytes.length; i++) {
++      assertTrue("byte[" + i + "] is mismatched", bytes[i] == DocHelper.LAZY_FIELD_BINARY_BYTES[i]);
++
++    }
++    reader.close();
++  }
++
++  public void testLatentFields() throws Exception {
++    assertTrue(dir != null);
++    assertTrue(fieldInfos != null);
++    IndexReader reader = IndexReader.open(dir);
++    Set<String> loadFieldNames = new HashSet<String>();
++    loadFieldNames.add(DocHelper.TEXT_FIELD_1_KEY);
++    loadFieldNames.add(DocHelper.TEXT_FIELD_UTF1_KEY);
++    Set<String> lazyFieldNames = new HashSet<String>();
++    //new String[]{DocHelper.LARGE_LAZY_FIELD_KEY, DocHelper.LAZY_FIELD_KEY, DocHelper.LAZY_FIELD_BINARY_KEY};
++    lazyFieldNames.add(DocHelper.LARGE_LAZY_FIELD_KEY);
++    lazyFieldNames.add(DocHelper.LAZY_FIELD_KEY);
++    lazyFieldNames.add(DocHelper.LAZY_FIELD_BINARY_KEY);
++    lazyFieldNames.add(DocHelper.TEXT_FIELD_UTF2_KEY);
++
++    // Use LATENT instead of LAZY
++    SetBasedFieldSelector fieldSelector = new SetBasedFieldSelector(loadFieldNames, lazyFieldNames) {
++        @Override
++        public FieldSelectorResult accept(String fieldName) {
++          final FieldSelectorResult result = super.accept(fieldName);
++          if (result == FieldSelectorResult.LAZY_LOAD) {
++            return FieldSelectorResult.LATENT;
++          } else {
++            return result;
++          }
++        }
++      };
++
++    Document doc = getDocument(reader, 0, fieldSelector);
++    assertTrue("doc is null and it shouldn't be", doc != null);
++    Fieldable field = doc.getFieldable(DocHelper.LAZY_FIELD_KEY);
++    assertTrue("field is null and it shouldn't be", field != null);
++    assertTrue("field is not lazy and it should be", field.isLazy());
++    String value = field.stringValue();
++    assertTrue("value is null and it shouldn't be", value != null);
++    assertTrue(value + " is not equal to " + DocHelper.LAZY_FIELD_TEXT, value.equals(DocHelper.LAZY_FIELD_TEXT) == true);
++    assertTrue("calling stringValue() twice should give different references", field.stringValue() != field.stringValue());
++
++    field = doc.getFieldable(DocHelper.TEXT_FIELD_1_KEY);
++    assertTrue("field is null and it shouldn't be", field != null);
++    assertTrue("Field is lazy and it should not be", field.isLazy() == false);
++    assertTrue("calling stringValue() twice should give same reference", field.stringValue() == field.stringValue());
++
++    field = doc.getFieldable(DocHelper.TEXT_FIELD_UTF1_KEY);
++    assertTrue("field is null and it shouldn't be", field != null);
++    assertTrue("Field is lazy and it should not be", field.isLazy() == false);
++    assertTrue(field.stringValue() + " is not equal to " + DocHelper.FIELD_UTF1_TEXT, field.stringValue().equals(DocHelper.FIELD_UTF1_TEXT) == true);
++    assertTrue("calling stringValue() twice should give same reference", field.stringValue() == field.stringValue());
++
++    field = doc.getFieldable(DocHelper.TEXT_FIELD_UTF2_KEY);
++    assertTrue("field is null and it shouldn't be", field != null);
++    assertTrue("Field is lazy and it should not be", field.isLazy() == true);
++    assertTrue(field.stringValue() + " is not equal to " + DocHelper.FIELD_UTF2_TEXT, field.stringValue().equals(DocHelper.FIELD_UTF2_TEXT) == true);
++    assertTrue("calling stringValue() twice should give different references", field.stringValue() != field.stringValue());
++
++    field = doc.getFieldable(DocHelper.LAZY_FIELD_BINARY_KEY);
++    assertTrue("field is null and it shouldn't be", field != null);
++    assertTrue("stringValue isn't null for lazy binary field", field.stringValue() == null);
++    assertTrue("calling binaryValue() twice should give different references", field.binaryValue(null).bytes != field.binaryValue(null).bytes);
++
++    byte [] bytes = field.binaryValue(null).bytes;
++    assertTrue("bytes is null and it shouldn't be", bytes != null);
++    assertTrue("", DocHelper.LAZY_FIELD_BINARY_BYTES.length == bytes.length);
++    for (int i = 0; i < bytes.length; i++) {
++      assertTrue("byte[" + i + "] is mismatched", bytes[i] == DocHelper.LAZY_FIELD_BINARY_BYTES[i]);
++
++    }
++    reader.close();
++  }
++
++
++
++
++  public void testLazyFieldsAfterClose() throws Exception {
++    assertTrue(dir != null);
++    assertTrue(fieldInfos != null);
++    IndexReader reader = IndexReader.open(dir);
++    Set<String> loadFieldNames = new HashSet<String>();
++    loadFieldNames.add(DocHelper.TEXT_FIELD_1_KEY);
++    loadFieldNames.add(DocHelper.TEXT_FIELD_UTF1_KEY);
++    Set<String> lazyFieldNames = new HashSet<String>();
++    lazyFieldNames.add(DocHelper.LARGE_LAZY_FIELD_KEY);
++    lazyFieldNames.add(DocHelper.LAZY_FIELD_KEY);
++    lazyFieldNames.add(DocHelper.LAZY_FIELD_BINARY_KEY);
++    lazyFieldNames.add(DocHelper.TEXT_FIELD_UTF2_KEY);
++    SetBasedFieldSelector fieldSelector = new SetBasedFieldSelector(loadFieldNames, lazyFieldNames);
++    Document doc = getDocument(reader, 0, fieldSelector);
++    assertTrue("doc is null and it shouldn't be", doc != null);
++    Fieldable field = doc.getFieldable(DocHelper.LAZY_FIELD_KEY);
++    assertTrue("field is null and it shouldn't be", field != null);
++    assertTrue("field is not lazy and it should be", field.isLazy());
++    reader.close();
++    try {
++      field.stringValue();
++      fail("did not hit AlreadyClosedException as expected");
++    } catch (AlreadyClosedException e) {
++      // expected
++    }
++  }
++
++  public void testLoadFirst() throws Exception {
++    assertTrue(dir != null);
++    assertTrue(fieldInfos != null);
++    IndexReader reader = IndexReader.open(dir);
++    LoadFirstFieldSelector fieldSelector = new LoadFirstFieldSelector();
++    Document doc = getDocument(reader, 0, fieldSelector);
++    assertTrue("doc is null and it shouldn't be", doc != null);
++    int count = 0;
++    List<Fieldable> l = doc.getFields();
++    for (final Fieldable fieldable : l ) {
++      Field field = (Field) fieldable;
++
++      assertTrue("field is null and it shouldn't be", field != null);
++      String sv = field.stringValue();
++      assertTrue("sv is null and it shouldn't be", sv != null);
++      count++;
++    }
++    assertTrue(count + " does not equal: " + 1, count == 1);
++    reader.close();
++  }
++
++  /**
++   * Not really a test per se, but we should have some way of assessing whether this is worthwhile.
++   * <p/>
++   * Must test using a File based directory
++   *
++   * @throws Exception
++   */
++  public void testLazyPerformance() throws Exception {
++    String userName = System.getProperty("user.name");
++    File file = _TestUtil.getTempDir("lazyDir" + userName);
++    Directory tmpDir = newFSDirectory(file);
++    assertTrue(tmpDir != null);
++
++    IndexWriterConfig conf = newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random)).setOpenMode(OpenMode.CREATE).setMergePolicy(newLogMergePolicy());
++    ((LogMergePolicy) conf.getMergePolicy()).setUseCompoundFile(false);
++    IndexWriter writer = new IndexWriter(tmpDir, conf);
++    writer.addDocument(testDoc);
++    writer.close();
++
++    assertTrue(fieldInfos != null);
++    long lazyTime = 0;
++    long regularTime = 0;
++    int length = 10;
++    Set<String> lazyFieldNames = new HashSet<String>();
++    lazyFieldNames.add(DocHelper.LARGE_LAZY_FIELD_KEY);
++    SetBasedFieldSelector fieldSelector = new SetBasedFieldSelector(Collections. <String> emptySet(), lazyFieldNames);
++
++    for (int i = 0; i < length; i++) {
++      IndexReader reader = IndexReader.open(tmpDir);
++
++      Document doc;
++      doc = reader.document(0);//Load all of them
++      assertTrue("doc is null and it shouldn't be", doc != null);
++      Fieldable field = doc.getFieldable(DocHelper.LARGE_LAZY_FIELD_KEY);
++      assertTrue("field is null and it shouldn't be", field != null);
++      assertTrue("field is lazy", field.isLazy() == false);
++      String value;
++      long start;
++      long finish;
++      start = System.currentTimeMillis();
++      //On my machine this was always 0ms.
++      value = field.stringValue();
++      finish = System.currentTimeMillis();
++      assertTrue("value is null and it shouldn't be", value != null);
++      regularTime += (finish - start);
++      reader.close();
++      reader = null;
++      doc = null;
++      //Hmmm, are we still in cache???
++      System.gc();
++      reader = IndexReader.open(tmpDir);
++      doc = getDocument(reader, 0, fieldSelector);
++      field = doc.getFieldable(DocHelper.LARGE_LAZY_FIELD_KEY);
++      assertTrue("field is not lazy", field.isLazy() == true);
++      start = System.currentTimeMillis();
++      //On my machine this took around 50 - 70ms
++      value = field.stringValue();
++      finish = System.currentTimeMillis();
++      assertTrue("value is null and it shouldn't be", value != null);
++      lazyTime += (finish - start);
++      reader.close();
++
++    }
++    tmpDir.close();
++    if (VERBOSE) {
++      System.out.println("Average Non-lazy time (should be very close to zero): " + regularTime / length + " ms for " + length + " reads");
++      System.out.println("Average Lazy Time (should be greater than zero): " + lazyTime / length + " ms for " + length + " reads");
++    }
++  }
++  
++  public void testLoadSize() throws IOException {
++    IndexReader reader = IndexReader.open(dir);
++    Document doc;
++    
++    doc = getDocument(reader, 0, new FieldSelector(){
++      public FieldSelectorResult accept(String fieldName) {
++        if (fieldName.equals(DocHelper.TEXT_FIELD_1_KEY) ||
++            fieldName.equals(DocHelper.LAZY_FIELD_BINARY_KEY))
++          return FieldSelectorResult.SIZE;
++        else if (fieldName.equals(DocHelper.TEXT_FIELD_3_KEY))
++          return FieldSelectorResult.LOAD;
++        else
++          return FieldSelectorResult.NO_LOAD;
++      }
++    });
++    Fieldable f1 = doc.getFieldable(DocHelper.TEXT_FIELD_1_KEY);
++    Fieldable f3 = doc.getFieldable(DocHelper.TEXT_FIELD_3_KEY);
++    Fieldable fb = doc.getFieldable(DocHelper.LAZY_FIELD_BINARY_KEY);
++    assertTrue(f1.isBinary());
++    assertTrue(!f3.isBinary());
++    assertTrue(fb.isBinary());
++    assertSizeEquals(2*DocHelper.FIELD_1_TEXT.length(), f1.binaryValue(null).bytes);
++    assertEquals(DocHelper.FIELD_3_TEXT, f3.stringValue());
++    assertSizeEquals(DocHelper.LAZY_FIELD_BINARY_BYTES.length, fb.binaryValue(null).bytes);
++    
++    reader.close();
++  }
++  
++  private void assertSizeEquals(int size, byte[] sizebytes) {
++    assertEquals((byte) (size>>>24), sizebytes[0]);
++    assertEquals((byte) (size>>>16), sizebytes[1]);
++    assertEquals((byte) (size>>> 8), sizebytes[2]);
++    assertEquals((byte)  size      , sizebytes[3]);
++  }
++}
+\ No newline at end of file
+
+
+Index: lucene/contrib/misc/src/test/org/apache/lucene/index/TestIndexReader.java
+--- lucene/contrib/misc/src/test/org/apache/lucene/index/TestIndexReader.java	1969-12-31 19:00:00.000000000 -0500
++++ lucene/contrib/misc/src/test/org/apache/lucene/index/TestIndexReader.java	2011-07-13 19:33:40.254101765 -0400
+@@ -0,0 +1,188 @@
++package org.apache.lucene.index;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++
++import java.io.IOException;
++import java.util.HashSet;
++import java.util.Set;
++
++import org.apache.lucene.analysis.MockAnalyzer;
++import org.apache.lucene.document.Fieldable;
++import org.apache.lucene.document.FieldSelector;
++import org.apache.lucene.document.FieldSelectorVisitor;
++import org.apache.lucene.document.SetBasedFieldSelector;
++import org.apache.lucene.document2.BinaryField;
++import org.apache.lucene.document2.Document;
++import org.apache.lucene.document2.FieldType;
++import org.apache.lucene.document2.TextField;
++import org.apache.lucene.index.IndexWriterConfig.OpenMode;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.LuceneTestCase;
++
++public class TestIndexReader extends LuceneTestCase {
++  private org.apache.lucene.document.Document getDocument(IndexReader ir, int docID, FieldSelector selector)  throws IOException {
++    final FieldSelectorVisitor visitor = new FieldSelectorVisitor(selector);
++    ir.document(docID, visitor);
++    return visitor.getDocument();
++  }
++
++  static void addDoc(IndexWriter writer, String value) throws IOException {
++    Document doc = new Document();
++    doc.add(newField("content", value, TextField.TYPE_UNSTORED));
++    writer.addDocument(doc);
++  }
++
++  static void addDocumentWithFields(IndexWriter writer) throws IOException {
++    Document doc = new Document();
++        
++    FieldType customType = new FieldType(TextField.TYPE_UNSTORED);
++    customType.setStored(true);
++    customType.setTokenized(false);
++
++    FieldType customType2 = new FieldType(TextField.TYPE_UNSTORED);
++    customType2.setStored(true);
++
++    FieldType customType3 = new FieldType();
++    customType3.setStored(true);
++    doc.add(newField("keyword", "test1", customType));
++    doc.add(newField("text", "test1", customType2));
++    doc.add(newField("unindexed", "test1", customType3));
++    doc.add(new TextField("unstored","test1"));
++    writer.addDocument(doc);
++  }
++
++
++  static void addDocumentWithDifferentFields(IndexWriter writer) throws IOException {
++    Document doc = new Document();
++      
++    FieldType customType = new FieldType(TextField.TYPE_UNSTORED);
++    customType.setStored(true);
++    customType.setTokenized(false);
++
++    FieldType customType2 = new FieldType(TextField.TYPE_UNSTORED);
++    customType2.setStored(true);
++
++    FieldType customType3 = new FieldType();
++    customType3.setStored(true);
++    doc.add(newField("keyword2", "test1", customType));
++    doc.add(newField("text2", "test1", customType2));
++    doc.add(newField("unindexed2", "test1", customType3));
++    doc.add(new TextField("unstored2","test1"));
++    writer.addDocument(doc);
++  }
++
++  static void addDocumentWithTermVectorFields(IndexWriter writer) throws IOException {
++    Document doc = new Document();
++    FieldType customType4 = new FieldType(TextField.TYPE_UNSTORED);
++    customType4.setStored(true);
++    FieldType customType5 = new FieldType(TextField.TYPE_UNSTORED);
++    customType5.setStored(true);
++    customType5.setStoreTermVectors(true);
++    FieldType customType6 = new FieldType(TextField.TYPE_UNSTORED);
++    customType6.setStored(true);
++    customType6.setStoreTermVectors(true);
++    customType6.setStoreTermVectorOffsets(true);
++    FieldType customType7 = new FieldType(TextField.TYPE_UNSTORED);
++    customType7.setStored(true);
++    customType7.setStoreTermVectors(true);
++    customType7.setStoreTermVectorPositions(true);
++    FieldType customType8 = new FieldType(TextField.TYPE_UNSTORED);
++    customType8.setStored(true);
++    customType8.setStoreTermVectors(true);
++    customType8.setStoreTermVectorOffsets(true);
++    customType8.setStoreTermVectorPositions(true);
++    doc.add(newField("tvnot","tvnot",customType4));
++    doc.add(newField("termvector","termvector",customType5));
++    doc.add(newField("tvoffset","tvoffset", customType6));
++    doc.add(newField("tvposition","tvposition", customType7));
++    doc.add(newField("tvpositionoffset","tvpositionoffset", customType8));
++        
++    writer.addDocument(doc);
++  }
++
++  public void testBinaryFields() throws IOException {
++    Directory dir = newDirectory();
++    byte[] bin = new byte[]{0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
++        
++    IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random)).setMergePolicy(newLogMergePolicy()));
++        
++    for (int i = 0; i < 10; i++) {
++      addDoc(writer, "document number " + (i + 1));
++      addDocumentWithFields(writer);
++      addDocumentWithDifferentFields(writer);
++      addDocumentWithTermVectorFields(writer);
++    }
++    writer.close();
++    writer = new IndexWriter(dir, newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random)).setOpenMode(OpenMode.APPEND).setMergePolicy(newLogMergePolicy()));
++    Document doc = new Document();
++    doc.add(new BinaryField("bin1", bin));
++    doc.add(new TextField("junk", "junk text"));
++    writer.addDocument(doc);
++    writer.close();
++    IndexReader reader = IndexReader.open(dir, false);
++    org.apache.lucene.document.Document doc2 = reader.document(reader.maxDoc() - 1);
++    org.apache.lucene.document.Field[] fields = doc2.getFields("bin1");
++    assertNotNull(fields);
++    assertEquals(1, fields.length);
++    org.apache.lucene.document.Field b1 = fields[0];
++    assertTrue(b1.isBinary());
++    BytesRef bytesRef = b1.binaryValue(null);
++    assertEquals(bin.length, bytesRef.length);
++    for (int i = 0; i < bin.length; i++) {
++      assertEquals(bin[i], bytesRef.bytes[i + bytesRef.offset]);
++    }
++    Set<String> lazyFields = new HashSet<String>();
++    lazyFields.add("bin1");
++    FieldSelector sel = new SetBasedFieldSelector(new HashSet<String>(), lazyFields);
++    doc2 = getDocument(reader, reader.maxDoc() - 1, sel);
++    Fieldable[] fieldables = doc2.getFieldables("bin1");
++    assertNotNull(fieldables);
++    assertEquals(1, fieldables.length);
++    Fieldable fb1 = fieldables[0];
++    assertTrue(fb1.isBinary());
++    bytesRef = fb1.binaryValue(null);
++    assertEquals(bin.length, bytesRef.bytes.length);
++    assertEquals(bin.length, bytesRef.length);
++    for (int i = 0; i < bin.length; i++) {
++      assertEquals(bin[i], bytesRef.bytes[i + bytesRef.offset]);
++    }
++    reader.close();
++    // force optimize
++
++
++    writer = new IndexWriter(dir, newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random)).setOpenMode(OpenMode.APPEND).setMergePolicy(newLogMergePolicy()));
++    writer.optimize();
++    writer.close();
++    reader = IndexReader.open(dir, false);
++    doc2 = reader.document(reader.maxDoc() - 1);
++    fields = doc2.getFields("bin1");
++    assertNotNull(fields);
++    assertEquals(1, fields.length);
++    b1 = fields[0];
++    assertTrue(b1.isBinary());
++    bytesRef = b1.binaryValue(null);
++    assertEquals(bin.length, bytesRef.length);
++    for (int i = 0; i < bin.length; i++) {
++      assertEquals(bin[i], bytesRef.bytes[i + bytesRef.offset]);
++    }
++    reader.close();
++    dir.close();
++  }
++}
+
+
+Index: lucene/contrib/misc/src/test/org/apache/lucene/index/TestLazyBug.java
+--- lucene/contrib/misc/src/test/org/apache/lucene/index/TestLazyBug.java	1969-12-31 19:00:00.000000000 -0500
++++ lucene/contrib/misc/src/test/org/apache/lucene/index/TestLazyBug.java	2011-07-13 18:12:29.018294750 -0400
+@@ -0,0 +1,146 @@
++package org.apache.lucene.index;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.util.Iterator;
++import java.util.List;
++import java.util.Set;
++
++import org.apache.lucene.analysis.MockAnalyzer;
++import org.apache.lucene.document.Fieldable;
++import org.apache.lucene.document.FieldSelector;
++import org.apache.lucene.document.FieldSelectorResult;
++import org.apache.lucene.document.FieldSelectorVisitor;
++import org.apache.lucene.document2.Document;
++import org.apache.lucene.document2.TextField;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.LuceneTestCase;
++import org.junit.AfterClass;
++import org.junit.BeforeClass;
++
++
++/**
++ * Test demonstrating EOF bug on the last field of the last doc
++ * if other docs have allready been accessed.
++ */
++public class TestLazyBug extends LuceneTestCase {
++
++  public static int NUM_DOCS = TEST_NIGHTLY ? 500 : 50;
++  public static int NUM_FIELDS = TEST_NIGHTLY ? 100 : 10;
++
++  private static String[] data = new String[] {
++    "now",
++    "is the time",
++    "for all good men",
++    "to come to the aid",
++    "of their country!",
++    "this string contains big chars:{\u0111 \u0222 \u0333 \u1111 \u2222 \u3333}",
++    "this string is a bigger string, mary had a little lamb, little lamb, little lamb!"
++  };
++
++  private static Set<String> dataset = asSet(data);
++
++  private static String MAGIC_FIELD = "f"+(NUM_FIELDS/3);
++  
++  private static Directory directory;
++  
++  @BeforeClass
++  public static void beforeClass() throws Exception {
++    directory = makeIndex();
++  }
++  
++  @AfterClass
++  public static void afterClass() throws Exception {
++    directory.close();
++    directory = null;
++  }
++
++  private static FieldSelector SELECTOR = new FieldSelector() {
++      public FieldSelectorResult accept(String f) {
++        if (f.equals(MAGIC_FIELD)) {
++          return FieldSelectorResult.LOAD;
++        }
++        return FieldSelectorResult.LAZY_LOAD;
++      }
++    };
++
++  private static Directory makeIndex() throws Exception {
++    Directory dir = newDirectory();
++    try {
++      IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig(
++                                                                     TEST_VERSION_CURRENT, new MockAnalyzer(random)).setMergePolicy(newLogMergePolicy()));
++      LogMergePolicy lmp = (LogMergePolicy) writer.getConfig().getMergePolicy();
++      lmp.setUseCompoundFile(false);
++      for (int d = 1; d <= NUM_DOCS; d++) {
++        Document doc = new Document();
++        for (int f = 1; f <= NUM_FIELDS; f++ ) {
++          doc.add(newField("f"+f,
++                            data[f % data.length]
++                            + '#' + data[random.nextInt(data.length)],
++                            TextField.TYPE_UNSTORED));
++        }
++        writer.addDocument(doc);
++      }
++      writer.close();
++    } catch (Exception e) {
++      throw new RuntimeException(e);
++    }
++    return dir;
++  }
++
++  public void doTest(int[] docs) throws Exception {
++    IndexReader reader = IndexReader.open(directory, true);
++    for (int i = 0; i < docs.length; i++) {
++      final FieldSelectorVisitor visitor = new FieldSelectorVisitor(SELECTOR);
++      reader.document(docs[i], visitor);
++      org.apache.lucene.document.Document d = visitor.getDocument();
++      d.get(MAGIC_FIELD);
++
++      List<Fieldable> fields = d.getFields();
++      for (Iterator<Fieldable> fi = fields.iterator(); fi.hasNext(); ) {
++        Fieldable f=null;
++        try {
++          f =  fi.next();
++          String fname = f.name();
++          String fval = f.stringValue();
++          assertNotNull(docs[i]+" FIELD: "+fname, fval);
++          String[] vals = fval.split("#");
++          if (!dataset.contains(vals[0]) || !dataset.contains(vals[1])) {
++            fail("FIELD:"+fname+",VAL:"+fval);
++          }
++        } catch (Exception e) {
++          throw new Exception(docs[i]+" WTF: "+f.name(), e);
++        }
++      }
++    }
++    reader.close();
++  }
++
++  public void testLazyWorks() throws Exception {
++    doTest(new int[] { NUM_DOCS-1 });
++  }
++
++  public void testLazyAlsoWorks() throws Exception {
++    doTest(new int[] { NUM_DOCS-1, NUM_DOCS/2 });
++  }
++
++  public void testLazyBroken() throws Exception {
++    doTest(new int[] { NUM_DOCS/2, NUM_DOCS-1 });
++  }
++
++}
+
+
+Index: lucene/contrib/misc/src/test/org/apache/lucene/index/TestParallelReader.java
+--- lucene/contrib/misc/src/test/org/apache/lucene/index/TestParallelReader.java	1969-12-31 19:00:00.000000000 -0500
++++ lucene/contrib/misc/src/test/org/apache/lucene/index/TestParallelReader.java	2011-07-13 19:32:09.884101629 -0400
+@@ -0,0 +1,156 @@
++package org.apache.lucene.index;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.Arrays;
++import java.util.Random;
++
++import org.apache.lucene.analysis.MockAnalyzer;
++import org.apache.lucene.document2.Document;
++import org.apache.lucene.document2.FieldType;
++import org.apache.lucene.document2.TextField;
++import org.apache.lucene.document.FieldSelector;
++import org.apache.lucene.document.FieldSelectorVisitor;
++import org.apache.lucene.document.MapFieldSelector;
++import org.apache.lucene.search.*;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.LuceneTestCase;
++
++public class TestParallelReader extends LuceneTestCase {
++
++  private IndexSearcher parallel;
++  private IndexSearcher single;
++  private Directory dir, dir1, dir2;
++  
++  @Override
++  public void setUp() throws Exception {
++    super.setUp();
++    single = single(random);
++    parallel = parallel(random);
++  }
++  
++  @Override
++  public void tearDown() throws Exception {
++    single.getIndexReader().close();
++    single.close();
++    parallel.getIndexReader().close();
++    parallel.close();
++    dir.close();
++    dir1.close();
++    dir2.close();
++    super.tearDown();
++  }
++
++  // Fields 1-4 indexed together:
++  private IndexSearcher single(Random random) throws IOException {
++    dir = newDirectory();
++    IndexWriter w = new IndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer(random)));
++    Document d1 = new Document();
++    FieldType customType = new FieldType(TextField.TYPE_UNSTORED);
++    customType.setStored(true);
++    d1.add(newField("f1", "v1", customType));
++    d1.add(newField("f2", "v1", customType));
++    d1.add(newField("f3", "v1", customType));
++    d1.add(newField("f4", "v1", customType));
++    w.addDocument(d1);
++    Document d2 = new Document();
++    d2.add(newField("f1", "v2", customType));
++    d2.add(newField("f2", "v2", customType));
++    d2.add(newField("f3", "v2", customType));
++    d2.add(newField("f4", "v2", customType));
++    w.addDocument(d2);
++    w.close();
++
++    return new IndexSearcher(dir, false);
++  }
++
++  // Fields 1 & 2 in one index, 3 & 4 in other, with ParallelReader:
++  private IndexSearcher parallel(Random random) throws IOException {
++    dir1 = getDir1(random);
++    dir2 = getDir2(random);
++    ParallelReader pr = new ParallelReader();
++    pr.add(IndexReader.open(dir1, false));
++    pr.add(IndexReader.open(dir2, false));
++    return newSearcher(pr);
++  }
++
++  private org.apache.lucene.document.Document getDocument(IndexReader ir, int docID, FieldSelector selector) throws IOException {
++    final FieldSelectorVisitor visitor = new FieldSelectorVisitor(selector);
++    ir.document(docID, visitor);
++    return visitor.getDocument();
++  }
++
++  public void testDocument() throws IOException {
++    Directory dir1 = getDir1(random);
++    Directory dir2 = getDir2(random);
++    ParallelReader pr = new ParallelReader();
++    pr.add(IndexReader.open(dir1, false));
++    pr.add(IndexReader.open(dir2, false));
++
++    org.apache.lucene.document.Document doc11 = getDocument(pr, 0, new MapFieldSelector("f1"));
++    org.apache.lucene.document.Document doc24 = getDocument(pr, 1, new MapFieldSelector(Arrays.asList("f4")));
++    org.apache.lucene.document.Document doc223 = getDocument(pr, 1, new MapFieldSelector("f2", "f3"));
++    
++    assertEquals(1, doc11.getFields().size());
++    assertEquals(1, doc24.getFields().size());
++    assertEquals(2, doc223.getFields().size());
++    
++    assertEquals("v1", doc11.get("f1"));
++    assertEquals("v2", doc24.get("f4"));
++    assertEquals("v2", doc223.get("f2"));
++    assertEquals("v2", doc223.get("f3"));
++    pr.close();
++    dir1.close();
++    dir2.close();
++  }
++
++  private Directory getDir1(Random random) throws IOException {
++    Directory dir1 = newDirectory();
++    IndexWriter w1 = new IndexWriter(dir1, newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer(random)));
++    Document d1 = new Document();
++    FieldType customType = new FieldType(TextField.TYPE_UNSTORED);
++    customType.setStored(true);
++    d1.add(newField("f1", "v1", customType));
++    d1.add(newField("f2", "v1", customType));
++    w1.addDocument(d1);
++    Document d2 = new Document();
++    d2.add(newField("f1", "v2", customType));
++    d2.add(newField("f2", "v2", customType));
++    w1.addDocument(d2);
++    w1.close();
++    return dir1;
++  }
++
++  private Directory getDir2(Random random) throws IOException {
++    Directory dir2 = newDirectory();
++    FieldType customType = new FieldType(TextField.TYPE_UNSTORED);
++    customType.setStored(true);
++    IndexWriter w2 = new IndexWriter(dir2, newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer(random)));
++    Document d3 = new Document();
++    d3.add(newField("f3", "v1", customType));
++    d3.add(newField("f4", "v1", customType));
++    w2.addDocument(d3);
++    Document d4 = new Document();
++    d4.add(newField("f3", "v2", customType));
++    d4.add(newField("f4", "v2", customType));
++    w2.addDocument(d4);
++    w2.close();
++    return dir2;
++  }
++}
+
+
+Index: lucene/contrib/misc/src/test/org/apache/lucene/search/TestThreadSafe.java
+--- lucene/contrib/misc/src/test/org/apache/lucene/search/TestThreadSafe.java	1969-12-31 19:00:00.000000000 -0500
++++ lucene/contrib/misc/src/test/org/apache/lucene/search/TestThreadSafe.java	2011-07-13 18:15:45.622133082 -0400
+@@ -0,0 +1,161 @@
++package org.apache.lucene.search;
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.IndexWriter;
++import org.apache.lucene.index.IndexWriterConfig;
++import org.apache.lucene.index.IndexWriterConfig.OpenMode;
++import org.apache.lucene.analysis.MockAnalyzer;
++import org.apache.lucene.document.Fieldable;
++import org.apache.lucene.document.FieldSelector;
++import org.apache.lucene.document.FieldSelectorVisitor;
++import org.apache.lucene.document2.*;
++
++import java.util.Random;
++import java.util.List;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.io.IOException;
++
++public class TestThreadSafe extends LuceneTestCase {
++  Directory dir1;
++
++  IndexReader ir1;
++
++  class Thr extends Thread {
++    final int iter;
++    final Random rand;
++    final AtomicBoolean failed;
++
++    // pass in random in case we want to make things reproducable
++    public Thr(int iter, Random rand, AtomicBoolean failed) {
++      this.iter = iter;
++      this.rand = rand;
++      this.failed = failed;
++    }
++
++    @Override
++      public void run() {
++      try {
++        for (int i=0; i<iter; i++) {
++          /*** future
++           // pick a random index reader... a shared one, or create your own
++           IndexReader ir;
++          ***/
++
++          switch(rand.nextInt(1)) {
++          case 0: loadDoc(ir1); break;
++          }
++
++        }
++      } catch (Throwable th) {
++        failed.set(true);
++        throw new RuntimeException(th);
++      }
++    }
++
++
++    private org.apache.lucene.document.Document getDocument(IndexReader ir, int docID, FieldSelector selector) throws IOException {
++      final FieldSelectorVisitor visitor = new FieldSelectorVisitor(selector);
++      ir.document(docID, visitor);
++      return visitor.getDocument();
++    }
++
++    void loadDoc(IndexReader ir) throws IOException {
++      // beware of deleted docs in the future
++      org.apache.lucene.document.Document doc = getDocument(ir, rand.nextInt(ir.maxDoc()),
++                                                            new org.apache.lucene.document.FieldSelector() {
++                                                              public org.apache.lucene.document.FieldSelectorResult accept(String fieldName) {
++                                                                switch(rand.nextInt(2)) {
++                                                                case 0: return org.apache.lucene.document.FieldSelectorResult.LAZY_LOAD;
++                                                                case 1: return org.apache.lucene.document.FieldSelectorResult.LOAD;
++                                                                  // TODO: add other options
++                                                                default: return org.apache.lucene.document.FieldSelectorResult.LOAD;
++                                                                }
++                                                              }
++                                                            }
++                                                            );
++
++      List<Fieldable> fields = doc.getFields();
++      for (final Fieldable f : fields ) {
++        validateField(f);
++      }
++
++    }
++
++  }
++
++
++  void validateField(Fieldable f) {
++    String val = f.stringValue();
++    if (!val.startsWith("^") || !val.endsWith("$")) {
++      throw new RuntimeException("Invalid field:" + f.toString() + " val=" +val);
++    }
++  }
++
++  String[] words = "now is the time for all good men to come to the aid of their country".split(" ");
++
++  void buildDir(Directory dir, int nDocs, int maxFields, int maxFieldLen) throws IOException {
++    IndexWriter iw = new IndexWriter(dir, new IndexWriterConfig(
++                                                                TEST_VERSION_CURRENT, new MockAnalyzer(random)).setOpenMode(OpenMode.CREATE).setMaxBufferedDocs(10));
++    for (int j=0; j<nDocs; j++) {
++      Document d = new Document();
++      int nFields = random.nextInt(maxFields);
++      for (int i=0; i<nFields; i++) {
++        int flen = random.nextInt(maxFieldLen);
++        StringBuilder sb = new StringBuilder("^ ");
++        while (sb.length() < flen) sb.append(' ').append(words[random.nextInt(words.length)]);
++        sb.append(" $");
++        d.add(newField("f"+i, sb.toString(), TextField.TYPE_STORED));
++      }
++      iw.addDocument(d);
++    }
++    iw.close();
++  }
++
++
++  void doTest(int iter, int nThreads) throws Exception {
++    Thr[] tarr = new Thr[nThreads];
++    AtomicBoolean failed = new AtomicBoolean();
++    for (int i=0; i<nThreads; i++) {
++      tarr[i] = new Thr(iter, new Random(random.nextLong()), failed);
++      tarr[i].start();
++    }
++    for (int i=0; i<nThreads; i++) {
++      tarr[i].join();
++    }
++    assertFalse(failed.get());
++  }
++
++  public void testLazyLoadThreadSafety() throws Exception{
++    dir1 = newDirectory();
++    // test w/ field sizes bigger than the buffer of an index input
++    buildDir(dir1, 15, 5, 2000);
++
++    // do many small tests so the thread locals go away inbetween
++    int num = atLeast(10);
++    for (int i = 0; i < num; i++) {
++      ir1 = IndexReader.open(dir1, false);
++      doTest(10,10);
++      ir1.close();
++    }
++    dir1.close();
++  }
++
++}
+
+
+Index: lucene/src/java/org/apache/lucene/document/FieldSelector.java
+--- lucene/src/java/org/apache/lucene/document/FieldSelector.java	2011-07-13 09:04:23.047101830 -0400
++++ lucene/src/java/org/apache/lucene/document/FieldSelector.java	1969-12-31 19:00:00.000000000 -0500
+@@ -1,33 +0,0 @@
+-package org.apache.lucene.document;
+-
+-/**
+- * Copyright 2004 The Apache Software Foundation
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-/**
+- * Similar to a {@link java.io.FileFilter}, the FieldSelector allows one to make decisions about
+- * what Fields get loaded on a {@link Document} by {@link org.apache.lucene.index.IndexReader#document(int,org.apache.lucene.document.FieldSelector)}
+- *
+- **/
+-public interface FieldSelector {
+-
+-  /**
+-   * 
+-   * @param fieldName the field to accept or reject
+-   * @return an instance of {@link FieldSelectorResult}
+-   * if the {@link Field} named <code>fieldName</code> should be loaded.
+-   */
+-  FieldSelectorResult accept(String fieldName);
+-}
+
+
+Index: lucene/src/java/org/apache/lucene/document/FieldSelectorResult.java
+--- lucene/src/java/org/apache/lucene/document/FieldSelectorResult.java	2011-06-09 13:54:55.178424661 -0400
++++ lucene/src/java/org/apache/lucene/document/FieldSelectorResult.java	1969-12-31 19:00:00.000000000 -0500
+@@ -1,76 +0,0 @@
+-package org.apache.lucene.document;
+-
+-/**
+- * Copyright 2004 The Apache Software Foundation
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-/**
+- *  Provides information about what should be done with this Field 
+- *
+- **/
+-public enum FieldSelectorResult {
+-
+-    /**
+-     * Load this {@link Field} every time the {@link Document} is loaded, reading in the data as it is encountered.
+-     *  {@link Document#getField(String)} and {@link Document#getFieldable(String)} should not return null.
+-     *<p/>
+-     * {@link Document#add(Fieldable)} should be called by the Reader.
+-     */
+-  LOAD,
+-
+-    /**
+-     * Lazily load this {@link Field}.  This means the {@link Field} is valid, but it may not actually contain its data until
+-     * invoked.  {@link Document#getField(String)} SHOULD NOT BE USED.  {@link Document#getFieldable(String)} is safe to use and should
+-     * return a valid instance of a {@link Fieldable}.
+-     *<p/>
+-     * {@link Document#add(Fieldable)} should be called by the Reader.
+-     */
+-  LAZY_LOAD,
+-
+-    /**
+-     * Do not load the {@link Field}.  {@link Document#getField(String)} and {@link Document#getFieldable(String)} should return null.
+-     * {@link Document#add(Fieldable)} is not called.
+-     * <p/>
+-     * {@link Document#add(Fieldable)} should not be called by the Reader.
+-     */
+-  NO_LOAD,
+-
+-    /**
+-     * Load this field as in the {@link #LOAD} case, but immediately return from {@link Field} loading for the {@link Document}.  Thus, the
+-     * Document may not have its complete set of Fields.  {@link Document#getField(String)} and {@link Document#getFieldable(String)} should
+-     * both be valid for this {@link Field}
+-     * <p/>
+-     * {@link Document#add(Fieldable)} should be called by the Reader.
+-     */
+-  LOAD_AND_BREAK,
+-
+-    /** Expert:  Load the size of this {@link Field} rather than its value.
+-     * Size is measured as number of bytes required to store the field == bytes for a binary or any compressed value, and 2*chars for a String value.
+-     * The size is stored as a binary value, represented as an int in a byte[], with the higher order byte first in [0]
+-     */
+-  SIZE,
+-
+-    /** Expert: Like {@link #SIZE} but immediately break from the field loading loop, i.e., stop loading further fields, after the size is loaded */         
+-  SIZE_AND_BREAK,
+-
+-  /**
+-     * Lazily load this {@link Field}, but do not cache the result.  This means the {@link Field} is valid, but it may not actually contain its data until
+-     * invoked.  {@link Document#getField(String)} SHOULD NOT BE USED.  {@link Document#getFieldable(String)} is safe to use and should
+-     * return a valid instance of a {@link Fieldable}.
+-     *<p/>
+-     * {@link Document#add(Fieldable)} should be called by the Reader.
+-     */
+-  LATENT
+-}
+
+
+Index: lucene/src/java/org/apache/lucene/document/LoadFirstFieldSelector.java
+--- lucene/src/java/org/apache/lucene/document/LoadFirstFieldSelector.java	2011-06-09 13:54:55.180424680 -0400
++++ lucene/src/java/org/apache/lucene/document/LoadFirstFieldSelector.java	1969-12-31 19:00:00.000000000 -0500
+@@ -1,29 +0,0 @@
+-package org.apache.lucene.document;
+-/**
+- * Copyright 2004 The Apache Software Foundation
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-
+-/**
+- * Load the First field and break.
+- * <p/>
+- * See {@link FieldSelectorResult#LOAD_AND_BREAK}
+- */
+-public class LoadFirstFieldSelector implements FieldSelector {
+-
+-  public FieldSelectorResult accept(String fieldName) {
+-    return FieldSelectorResult.LOAD_AND_BREAK;
+-  }
+-}
+\ No newline at end of file
+
+
+Index: lucene/src/java/org/apache/lucene/document/MapFieldSelector.java
+--- lucene/src/java/org/apache/lucene/document/MapFieldSelector.java	2011-06-09 13:54:55.178424661 -0400
++++ lucene/src/java/org/apache/lucene/document/MapFieldSelector.java	1969-12-31 19:00:00.000000000 -0500
+@@ -1,67 +0,0 @@
+-package org.apache.lucene.document;
+-
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-import java.util.Arrays;
+-import java.util.HashMap;
+-import java.util.List;
+-import java.util.Map;
+-
+-/**
+- * A {@link FieldSelector} based on a Map of field names to {@link FieldSelectorResult}s
+- *
+- */
+-public class MapFieldSelector implements FieldSelector {
+-    
+-    Map<String,FieldSelectorResult> fieldSelections;
+-    
+-    /** Create a a MapFieldSelector
+-     * @param fieldSelections maps from field names (String) to {@link FieldSelectorResult}s
+-     */
+-    public MapFieldSelector(Map<String,FieldSelectorResult> fieldSelections) {
+-        this.fieldSelections = fieldSelections;
+-    }
+-    
+-    /** Create a a MapFieldSelector
+-     * @param fields fields to LOAD.  List of Strings.  All other fields are NO_LOAD.
+-     */
+-    public MapFieldSelector(List<String> fields) {
+-        fieldSelections = new HashMap<String,FieldSelectorResult>(fields.size()*5/3);
+-        for (final String field : fields)
+-            fieldSelections.put(field, FieldSelectorResult.LOAD);
+-    }
+-    
+-    /** Create a a MapFieldSelector
+-     * @param fields fields to LOAD.  All other fields are NO_LOAD.
+-     */
+-    public MapFieldSelector(String... fields) {
+-      this(Arrays.asList(fields));
+-    }
+-
+-
+-    
+-    /** Load field according to its associated value in fieldSelections
+-     * @param field a field name
+-     * @return the fieldSelections value that field maps to or NO_LOAD if none.
+-     */
+-    public FieldSelectorResult accept(String field) {
+-        FieldSelectorResult selection = fieldSelections.get(field);
+-        return selection!=null ? selection : FieldSelectorResult.NO_LOAD;
+-    }
+-    
+-}
+
+
+Index: lucene/src/java/org/apache/lucene/document/SetBasedFieldSelector.java
+--- lucene/src/java/org/apache/lucene/document/SetBasedFieldSelector.java	2011-06-09 13:54:55.177424642 -0400
++++ lucene/src/java/org/apache/lucene/document/SetBasedFieldSelector.java	1969-12-31 19:00:00.000000000 -0500
+@@ -1,58 +0,0 @@
+-package org.apache.lucene.document;
+-
+-import java.util.Set;
+-/**
+- * Copyright 2004 The Apache Software Foundation
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-/**
+- * Declare what fields to load normally and what fields to load lazily
+- *
+- **/
+-public class SetBasedFieldSelector implements FieldSelector {
+-  
+-  private Set<String> fieldsToLoad;
+-  private Set<String> lazyFieldsToLoad;
+-  
+-  /**
+-   * Pass in the Set of {@link Field} names to load and the Set of {@link Field} names to load lazily.  If both are null, the
+-   * Document will not have any {@link Field} on it.  
+-   * @param fieldsToLoad A Set of {@link String} field names to load.  May be empty, but not null
+-   * @param lazyFieldsToLoad A Set of {@link String} field names to load lazily.  May be empty, but not null  
+-   */
+-  public SetBasedFieldSelector(Set<String> fieldsToLoad, Set<String> lazyFieldsToLoad) {
+-    this.fieldsToLoad = fieldsToLoad;
+-    this.lazyFieldsToLoad = lazyFieldsToLoad;
+-  }
+-
+-  /**
+-   * Indicate whether to load the field with the given name or not. If the {@link Field#name()} is not in either of the 
+-   * initializing Sets, then {@link org.apache.lucene.document.FieldSelectorResult#NO_LOAD} is returned.  If a Field name
+-   * is in both <code>fieldsToLoad</code> and <code>lazyFieldsToLoad</code>, lazy has precedence.
+-   * 
+-   * @param fieldName The {@link Field} name to check
+-   * @return The {@link FieldSelectorResult}
+-   */
+-  public FieldSelectorResult accept(String fieldName) {
+-    FieldSelectorResult result = FieldSelectorResult.NO_LOAD;
+-    if (fieldsToLoad.contains(fieldName) == true){
+-      result = FieldSelectorResult.LOAD;
+-    }
+-    if (lazyFieldsToLoad.contains(fieldName) == true){
+-      result = FieldSelectorResult.LAZY_LOAD;
+-    }                                           
+-    return result;
+-  }
+-}
+\ No newline at end of file
+
+
+Index: lucene/src/java/org/apache/lucene/document2/Document.java
+--- lucene/src/java/org/apache/lucene/document2/Document.java	2011-07-13 13:32:20.438081238 -0400
++++ lucene/src/java/org/apache/lucene/document2/Document.java	2011-07-14 05:09:58.523101651 -0400
+@@ -32,7 +32,7 @@
+  * should typically contain one or more stored fields which uniquely identify
+  * it.
+  *
+- * <p>Note that fields which are <i>not</i> {@link Fieldable#isStored() stored} are
++ * <p>Note that fields which are <i>not</i> {@link Fieldable#stored() stored} are
+  * <i>not</i> available in documents retrieved from the index, e.g. with {@link
+  * ScoreDoc#doc} or {@link IndexReader#document(int)}.
+  */
+
+
+Index: lucene/src/java/org/apache/lucene/document2/FieldSelector.java
+--- lucene/src/java/org/apache/lucene/document2/FieldSelector.java	2011-07-04 16:45:03.395101888 -0400
++++ lucene/src/java/org/apache/lucene/document2/FieldSelector.java	1969-12-31 19:00:00.000000000 -0500
+@@ -1,33 +0,0 @@
+-package org.apache.lucene.document2;
+-
+-/**
+- * Copyright 2004 The Apache Software Foundation
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-/**
+- * Similar to a {@link java.io.FileFilter}, the FieldSelector allows one to make decisions about
+- * what Fields get loaded on a {@link Document} by {@link org.apache.lucene.index.IndexReader#document(int,org.apache.lucene.document.FieldSelector)}
+- *
+- **/
+-public interface FieldSelector {
+-
+-  /**
+-   * 
+-   * @param fieldName the field to accept or reject
+-   * @return an instance of {@link FieldSelectorResult}
+-   * if the {@link Field} named <code>fieldName</code> should be loaded.
+-   */
+-  FieldSelectorResult accept(String fieldName);
+-}
+
+
+Index: lucene/src/java/org/apache/lucene/document2/FieldSelectorResult.java
+--- lucene/src/java/org/apache/lucene/document2/FieldSelectorResult.java	2011-07-04 16:45:03.395101888 -0400
++++ lucene/src/java/org/apache/lucene/document2/FieldSelectorResult.java	1969-12-31 19:00:00.000000000 -0500
+@@ -1,76 +0,0 @@
+-package org.apache.lucene.document2;
+-
+-/**
+- * Copyright 2004 The Apache Software Foundation
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-/**
+- *  Provides information about what should be done with this Field 
+- *
+- **/
+-public enum FieldSelectorResult {
+-
+-    /**
+-     * Load this {@link Field} every time the {@link Document} is loaded, reading in the data as it is encountered.
+-     *  {@link Document#getField(String)} and {@link Document#getFieldable(String)} should not return null.
+-     *<p/>
+-     * {@link Document#add(Fieldable)} should be called by the Reader.
+-     */
+-  LOAD,
+-
+-    /**
+-     * Lazily load this {@link Field}.  This means the {@link Field} is valid, but it may not actually contain its data until
+-     * invoked.  {@link Document#getField(String)} SHOULD NOT BE USED.  {@link Document#getFieldable(String)} is safe to use and should
+-     * return a valid instance of a {@link Fieldable}.
+-     *<p/>
+-     * {@link Document#add(Fieldable)} should be called by the Reader.
+-     */
+-  LAZY_LOAD,
+-
+-    /**
+-     * Do not load the {@link Field}.  {@link Document#getField(String)} and {@link Document#getFieldable(String)} should return null.
+-     * {@link Document#add(Fieldable)} is not called.
+-     * <p/>
+-     * {@link Document#add(Fieldable)} should not be called by the Reader.
+-     */
+-  NO_LOAD,
+-
+-    /**
+-     * Load this field as in the {@link #LOAD} case, but immediately return from {@link Field} loading for the {@link Document}.  Thus, the
+-     * Document may not have its complete set of Fields.  {@link Document#getField(String)} and {@link Document#getFieldable(String)} should
+-     * both be valid for this {@link Field}
+-     * <p/>
+-     * {@link Document#add(Fieldable)} should be called by the Reader.
+-     */
+-  LOAD_AND_BREAK,
+-
+-    /** Expert:  Load the size of this {@link Field} rather than its value.
+-     * Size is measured as number of bytes required to store the field == bytes for a binary or any compressed value, and 2*chars for a String value.
+-     * The size is stored as a binary value, represented as an int in a byte[], with the higher order byte first in [0]
+-     */
+-  SIZE,
+-
+-    /** Expert: Like {@link #SIZE} but immediately break from the field loading loop, i.e., stop loading further fields, after the size is loaded */         
+-  SIZE_AND_BREAK,
+-
+-  /**
+-     * Lazily load this {@link Field}, but do not cache the result.  This means the {@link Field} is valid, but it may not actually contain its data until
+-     * invoked.  {@link Document#getField(String)} SHOULD NOT BE USED.  {@link Document#getFieldable(String)} is safe to use and should
+-     * return a valid instance of a {@link Fieldable}.
+-     *<p/>
+-     * {@link Document#add(Fieldable)} should be called by the Reader.
+-     */
+-  LATENT
+-}
+
+
+Index: lucene/src/java/org/apache/lucene/document2/NumericField.java
+--- lucene/src/java/org/apache/lucene/document2/NumericField.java	2011-07-13 13:32:20.438081238 -0400
++++ lucene/src/java/org/apache/lucene/document2/NumericField.java	2011-07-14 05:10:59.468101798 -0400
+@@ -106,7 +106,7 @@
+  * consumes more disk space in the index but may result in faster range search
+  * performance. The default value, 4, was selected for a reasonable tradeoff of
+  * disk space consumption versus performance. You can use the expert constructor
+- * {@link #NumericField(String,int,Field.Store,boolean)} if you'd like to change
++ * {@link #NumericField(String,int,FieldType)} if you'd like to change
+  * the value. Note that you must also specify a congruent value when creating
+  * {@link NumericRangeQuery} or {@link NumericRangeFilter}. For low cardinality
+  * fields larger precision steps are good. If the cardinality is &lt; 100, it is
+
+
+Index: lucene/src/java/org/apache/lucene/index/DirectoryReader.java
+--- lucene/src/java/org/apache/lucene/index/DirectoryReader.java	2011-06-09 13:54:54.971424662 -0400
++++ lucene/src/java/org/apache/lucene/index/DirectoryReader.java	2011-07-14 04:47:15.828401126 -0400
+@@ -29,8 +29,6 @@
+ import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
+ 
+-import org.apache.lucene.document.Document;
+-import org.apache.lucene.document.FieldSelector;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.Lock;
+ import org.apache.lucene.store.LockObtainFailedException;
+@@ -557,12 +555,11 @@
+     return maxDoc;
+   }
+ 
+-  // inherit javadoc
+   @Override
+-  public Document document(int n, FieldSelector fieldSelector) throws CorruptIndexException, IOException {
++  public void document(int docID, StoredFieldVisitor visitor) throws CorruptIndexException, IOException {
+     ensureOpen();
+-    int i = readerIndex(n);                          // find segment num
+-    return subReaders[i].document(n - starts[i], fieldSelector);    // dispatch to segment reader
++    int i = readerIndex(docID);                          // find segment num
++    subReaders[i].document(docID - starts[i], visitor);    // dispatch to segment reader
+   }
+ 
+   @Override
+
+
+Index: lucene/src/java/org/apache/lucene/index/DocumentStoredFieldVisitor.java
+--- lucene/src/java/org/apache/lucene/index/DocumentStoredFieldVisitor.java	1969-12-31 19:00:00.000000000 -0500
++++ lucene/src/java/org/apache/lucene/index/DocumentStoredFieldVisitor.java	2011-07-14 05:57:35.863509164 -0400
+@@ -0,0 +1,119 @@
++package org.apache.lucene.index;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.Set;
++
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.Field;
++import org.apache.lucene.document.NumericField;
++import org.apache.lucene.store.IndexInput;
++
++/** A {@link StoredFieldVisitor} that creates a {@link
++ *  Document} containing all stored fields, or only specific
++ *  requested fields provided to {@link #DocumentStoredFieldVisitor(Set)}
++ *  This is used by {@link IndexReader#document(int)} to load a
++ *  document.
++ *
++ * @lucene.experimental */
++public class DocumentStoredFieldVisitor extends StoredFieldVisitor {
++  private final Document doc = new Document();
++  private final Set<String> fieldsToAdd;
++
++  /** Load only fields named in the provided <code>Set&lt;String&gt;</code>. */
++  public DocumentStoredFieldVisitor(Set<String> fieldsToAdd) {
++    this.fieldsToAdd = fieldsToAdd;
++  }
++
++  /** Load all stored fields. */
++  public DocumentStoredFieldVisitor() {
++    this.fieldsToAdd = null;
++  }
++
++  @Override
++  public boolean binaryField(FieldInfo fieldInfo, IndexInput in, int numBytes) throws IOException {
++    if (accept(fieldInfo)) {
++      final byte[] b = new byte[numBytes];
++      in.readBytes(b, 0, b.length);
++      doc.add(new Field(fieldInfo.name, b));
++    } else {
++      in.seek(in.getFilePointer() + numBytes);
++    }
++    return false;
++  }
++
++  @Override
++  public boolean stringField(FieldInfo fieldInfo, IndexInput in, int numUTF8Bytes) throws IOException {
++    if (accept(fieldInfo)) {
++      final byte[] b = new byte[numUTF8Bytes];
++      in.readBytes(b, 0, b.length);
++      doc.add(new Field(fieldInfo.name,
++                        false,
++                        new String(b, "UTF-8"),
++                        Field.Store.YES,
++                        Field.Index.ANALYZED,  // made up!
++                        Field.TermVector.toTermVector(fieldInfo.storeTermVector,
++                                                      fieldInfo.storeOffsetWithTermVector,
++                                                      fieldInfo.storePositionWithTermVector)));
++    } else {
++      in.seek(in.getFilePointer() + numUTF8Bytes);
++    }
++    return false;
++  }
++
++  @Override
++  public boolean intField(FieldInfo fieldInfo, int value) {
++    if (accept(fieldInfo)) {
++      doc.add(new NumericField(fieldInfo.name, Field.Store.YES, fieldInfo.isIndexed).setIntValue(value));
++    }
++    return false;
++  }
++
++  @Override
++  public boolean longField(FieldInfo fieldInfo, long value) {
++    if (accept(fieldInfo)) {
++      doc.add(new NumericField(fieldInfo.name, Field.Store.YES, fieldInfo.isIndexed).setLongValue(value));
++    }
++    return false;
++  }
++
++  @Override
++  public boolean floatField(FieldInfo fieldInfo, float value) {
++    if (accept(fieldInfo)) {
++      doc.add(new NumericField(fieldInfo.name, Field.Store.YES, fieldInfo.isIndexed).setFloatValue(value));
++    }
++    return false;
++  }
++
++  @Override
++  public boolean doubleField(FieldInfo fieldInfo, double value) {
++    if (accept(fieldInfo)) {
++      doc.add(new NumericField(fieldInfo.name, Field.Store.YES, fieldInfo.isIndexed).setDoubleValue(value));
++    }
++    return false;
++  }
++
++  private boolean accept(FieldInfo fieldInfo) {
++    return fieldsToAdd == null || fieldsToAdd.contains(fieldInfo.name);
++  }
++
++  public Document getDocument() {
++    return doc;
++  }
++}
+
+
+Index: lucene/src/java/org/apache/lucene/index/FieldInfo.java
+--- lucene/src/java/org/apache/lucene/index/FieldInfo.java	2011-06-09 13:54:54.976424624 -0400
++++ lucene/src/java/org/apache/lucene/index/FieldInfo.java	2011-07-13 17:33:43.862101902 -0400
+@@ -26,9 +26,9 @@
+   public boolean isIndexed;
+ 
+   // true if term vector for this field should be stored
+-  boolean storeTermVector;
+-  boolean storeOffsetWithTermVector;
+-  boolean storePositionWithTermVector;
++  public boolean storeTermVector;
++  public boolean storeOffsetWithTermVector;
++  public boolean storePositionWithTermVector;
+ 
+   public boolean omitNorms; // omit norms associated with indexed fields  
+   public boolean omitTermFreqAndPositions;
+
+
+Index: lucene/src/java/org/apache/lucene/index/FieldsReader.java
+--- lucene/src/java/org/apache/lucene/index/FieldsReader.java	2011-07-13 13:23:48.089371255 -0400
++++ lucene/src/java/org/apache/lucene/index/FieldsReader.java	2011-07-14 04:47:12.492336189 -0400
+@@ -20,19 +20,10 @@
+ import java.io.IOException;
+ import java.io.Reader;
+ 
+-import org.apache.lucene.analysis.TokenStream;
+-import org.apache.lucene.document.AbstractField;
+-import org.apache.lucene.document.Document;
+-import org.apache.lucene.document.Field;
+-import org.apache.lucene.document.FieldSelector;
+-import org.apache.lucene.document.FieldSelectorResult;
+-import org.apache.lucene.document.NumericField;
+ import org.apache.lucene.store.AlreadyClosedException;
+ import org.apache.lucene.store.BufferedIndexInput;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.IndexInput;
+-import org.apache.lucene.util.BytesRef;
+-import org.apache.lucene.util.CloseableThreadLocal;
+ 
+ /**
+  * Class responsible for access to stored document fields.
+@@ -64,7 +55,6 @@
+   // file.  This will be 0 if we have our own private file.
+   private int docStoreOffset;
+ 
+-  private CloseableThreadLocal<IndexInput> fieldsStreamTL = new CloseableThreadLocal<IndexInput>();
+   private boolean isOriginal = false;
+ 
+   /** Returns a cloned FieldsReader that shares open
+@@ -193,7 +183,6 @@
+       if (indexStream != null) {
+         indexStream.close();
+       }
+-      fieldsStreamTL.close();
+       closed = true;
+     }
+   }
+@@ -206,50 +195,52 @@
+     indexStream.seek(FORMAT_SIZE + (docID + docStoreOffset) * 8L);
+   }
+ 
+-  public final Document doc(int n, FieldSelector fieldSelector) throws CorruptIndexException, IOException {
++  public final void visitDocument(int n, StoredFieldVisitor visitor) throws CorruptIndexException, IOException {
+     seekIndex(n);
+-    long position = indexStream.readLong();
+-    fieldsStream.seek(position);
++    fieldsStream.seek(indexStream.readLong());
+ 
+-    Document doc = new Document();
+-    int numFields = fieldsStream.readVInt();
+-    out: for (int i = 0; i < numFields; i++) {
++    final int numFields = fieldsStream.readVInt();
++    for (int fieldIDX = 0; fieldIDX < numFields; fieldIDX++) {
+       int fieldNumber = fieldsStream.readVInt();
+-      FieldInfo fi = fieldInfos.fieldInfo(fieldNumber);
+-      FieldSelectorResult acceptField = fieldSelector == null ? FieldSelectorResult.LOAD : fieldSelector.accept(fi.name);
++      FieldInfo fieldInfo = fieldInfos.fieldInfo(fieldNumber);
+       
+       int bits = fieldsStream.readByte() & 0xFF;
+-      assert bits <= (FieldsWriter.FIELD_IS_NUMERIC_MASK | FieldsWriter.FIELD_IS_TOKENIZED | FieldsWriter.FIELD_IS_BINARY): "bits=" + Integer.toHexString(bits);
++      assert bits <= (FieldsWriter.FIELD_IS_NUMERIC_MASK | FieldsWriter.FIELD_IS_BINARY): "bits=" + Integer.toHexString(bits);
+ 
+-      boolean tokenize = (bits & FieldsWriter.FIELD_IS_TOKENIZED) != 0;
+-      boolean binary = (bits & FieldsWriter.FIELD_IS_BINARY) != 0;
++      final boolean binary = (bits & FieldsWriter.FIELD_IS_BINARY) != 0;
+       final int numeric = bits & FieldsWriter.FIELD_IS_NUMERIC_MASK;
+ 
+-      switch (acceptField) {
+-        case LOAD:
+-          addField(doc, fi, binary, tokenize, numeric);
++      final boolean doStop;
++      if (binary) {
++        final int numBytes = fieldsStream.readVInt();
++        doStop = visitor.binaryField(fieldInfo, fieldsStream, numBytes);
++      } else if (numeric != 0) {
++        switch(numeric) {
++        case FieldsWriter.FIELD_IS_NUMERIC_INT:
++          doStop = visitor.intField(fieldInfo, fieldsStream.readInt());
+           break;
+-        case LOAD_AND_BREAK:
+-          addField(doc, fi, binary, tokenize, numeric);
+-          break out; //Get out of this loop
+-        case LAZY_LOAD:
+-          addFieldLazy(doc, fi, binary, tokenize, true, numeric);
++        case FieldsWriter.FIELD_IS_NUMERIC_LONG:
++          doStop = visitor.longField(fieldInfo, fieldsStream.readLong());
+           break;
+-        case LATENT:
+-          addFieldLazy(doc, fi, binary, tokenize, false, numeric);
++        case FieldsWriter.FIELD_IS_NUMERIC_FLOAT:
++          doStop = visitor.floatField(fieldInfo, Float.intBitsToFloat(fieldsStream.readInt()));
+           break;
+-        case SIZE:
+-          skipFieldBytes(addFieldSize(doc, fi, binary, numeric));
++        case FieldsWriter.FIELD_IS_NUMERIC_DOUBLE:
++          doStop = visitor.doubleField(fieldInfo, Double.longBitsToDouble(fieldsStream.readLong()));
+           break;
+-        case SIZE_AND_BREAK:
+-          addFieldSize(doc, fi, binary, numeric);
+-          break out; //Get out of this loop
+         default:
+-          skipField(numeric);
++          throw new FieldReaderException("Invalid numeric type: " + Integer.toHexString(numeric));
+       }
++      } else {
++        // Text:
++        final int numUTF8Bytes = fieldsStream.readVInt();
++        doStop = visitor.stringField(fieldInfo, fieldsStream, numUTF8Bytes);
+     }
+ 
+-    return doc;
++      if (doStop) {
++        return;
++      }
++    }
+   }
+ 
+   /** Returns the length in bytes of each raw document in a
+@@ -277,272 +268,4 @@
+ 
+     return fieldsStream;
+   }
+-
+-  /**
+-   * Skip the field.  We still have to read some of the information about the field, but can skip past the actual content.
+-   * This will have the most payoff on large fields.
+-   */
+-  private void skipField(int numeric) throws IOException {
+-    final int numBytes;
+-    switch(numeric) {
+-      case 0:
+-        numBytes = fieldsStream.readVInt();
+-        break;
+-      case FieldsWriter.FIELD_IS_NUMERIC_INT:
+-      case FieldsWriter.FIELD_IS_NUMERIC_FLOAT:
+-        numBytes = 4;
+-        break;
+-      case FieldsWriter.FIELD_IS_NUMERIC_LONG:
+-      case FieldsWriter.FIELD_IS_NUMERIC_DOUBLE:
+-        numBytes = 8;
+-        break;
+-      default:
+-        throw new FieldReaderException("Invalid numeric type: " + Integer.toHexString(numeric));
+-    }
+-    
+-    skipFieldBytes(numBytes);
+-  }
+-  
+-  private void skipFieldBytes(int toRead) throws IOException {
+-    fieldsStream.seek(fieldsStream.getFilePointer() + toRead);
+-  }
+-
+-  private NumericField loadNumericField(FieldInfo fi, int numeric) throws IOException {
+-    assert numeric != 0;
+-    switch(numeric) {
+-      case FieldsWriter.FIELD_IS_NUMERIC_INT:
+-        return new NumericField(fi.name, Field.Store.YES, fi.isIndexed).setIntValue(fieldsStream.readInt());
+-      case FieldsWriter.FIELD_IS_NUMERIC_LONG:
+-        return new NumericField(fi.name, Field.Store.YES, fi.isIndexed).setLongValue(fieldsStream.readLong());
+-      case FieldsWriter.FIELD_IS_NUMERIC_FLOAT:
+-        return new NumericField(fi.name, Field.Store.YES, fi.isIndexed).setFloatValue(Float.intBitsToFloat(fieldsStream.readInt()));
+-      case FieldsWriter.FIELD_IS_NUMERIC_DOUBLE:
+-        return new NumericField(fi.name, Field.Store.YES, fi.isIndexed).setDoubleValue(Double.longBitsToDouble(fieldsStream.readLong()));
+-      default:
+-        throw new FieldReaderException("Invalid numeric type: " + Integer.toHexString(numeric));
+-    }
+-  }
+-
+-  private void addFieldLazy(Document doc, FieldInfo fi, boolean binary, boolean tokenize, boolean cacheResult, int numeric) throws IOException {
+-    final AbstractField f;
+-    if (binary) {
+-      int toRead = fieldsStream.readVInt();
+-      long pointer = fieldsStream.getFilePointer();
+-      f = new LazyField(fi.name, Field.Store.YES, toRead, pointer, binary, cacheResult);
+-      //Need to move the pointer ahead by toRead positions
+-      fieldsStream.seek(pointer + toRead);
+-    } else if (numeric != 0) {
+-      f = loadNumericField(fi, numeric);
+-    } else {
+-      Field.Store store = Field.Store.YES;
+-      Field.Index index = Field.Index.toIndex(fi.isIndexed, tokenize);
+-      Field.TermVector termVector = Field.TermVector.toTermVector(fi.storeTermVector, fi.storeOffsetWithTermVector, fi.storePositionWithTermVector);
+-
+-      int length = fieldsStream.readVInt();
+-      long pointer = fieldsStream.getFilePointer();
+-      //Skip ahead of where we are by the length of what is stored
+-      fieldsStream.seek(pointer+length);
+-      f = new LazyField(fi.name, store, index, termVector, length, pointer, binary, cacheResult);
+-    }
+-    
+-    f.setOmitNorms(fi.omitNorms);
+-    f.setOmitTermFreqAndPositions(fi.omitTermFreqAndPositions);
+-    doc.add(f);
+-  }
+-
+-  private void addField(Document doc, FieldInfo fi, boolean binary, boolean tokenize, int numeric) throws CorruptIndexException, IOException {
+-    final AbstractField f;
+-
+-    if (binary) {
+-      int toRead = fieldsStream.readVInt();
+-      final byte[] b = new byte[toRead];
+-      fieldsStream.readBytes(b, 0, b.length);
+-      f = new Field(fi.name, b);
+-    } else if (numeric != 0) {
+-      f = loadNumericField(fi, numeric);
+-    } else {
+-      Field.Index index = Field.Index.toIndex(fi.isIndexed, tokenize);
+-      Field.TermVector termVector = Field.TermVector.toTermVector(fi.storeTermVector, fi.storeOffsetWithTermVector, fi.storePositionWithTermVector);
+-      f = new Field(fi.name,     // name
+-        false,
+-        fieldsStream.readString(), // read value
+-        Field.Store.YES,
+-        index,
+-        termVector);
+-    }
+-    
+-    f.setOmitTermFreqAndPositions(fi.omitTermFreqAndPositions);
+-    f.setOmitNorms(fi.omitNorms);
+-    doc.add(f);
+-  }
+-  
+-  // Add the size of field as a byte[] containing the 4 bytes of the integer byte size (high order byte first; char = 2 bytes)
+-  // Read just the size -- caller must skip the field content to continue reading fields
+-  // Return the size in bytes or chars, depending on field type
+-  private int addFieldSize(Document doc, FieldInfo fi, boolean binary, int numeric) throws IOException {
+-    final int bytesize, size;
+-    switch(numeric) {
+-      case 0:
+-        size = fieldsStream.readVInt();
+-        bytesize = binary ? size : 2*size;
+-        break;
+-      case FieldsWriter.FIELD_IS_NUMERIC_INT:
+-      case FieldsWriter.FIELD_IS_NUMERIC_FLOAT:
+-        size = bytesize = 4;
+-        break;
+-      case FieldsWriter.FIELD_IS_NUMERIC_LONG:
+-      case FieldsWriter.FIELD_IS_NUMERIC_DOUBLE:
+-        size = bytesize = 8;
+-        break;
+-      default:
+-        throw new FieldReaderException("Invalid numeric type: " + Integer.toHexString(numeric));
+-    }
+-    byte[] sizebytes = new byte[4];
+-    sizebytes[0] = (byte) (bytesize>>>24);
+-    sizebytes[1] = (byte) (bytesize>>>16);
+-    sizebytes[2] = (byte) (bytesize>>> 8);
+-    sizebytes[3] = (byte)  bytesize      ;
+-    doc.add(new Field(fi.name, sizebytes));
+-    return size;
+-  }
+-
+-  /**
+-   * A Lazy field implementation that defers loading of fields until asked for, instead of when the Document is
+-   * loaded.
+-   */
+-  private class LazyField extends AbstractField {
+-    private int toRead;
+-    private long pointer;
+-    private final boolean cacheResult;
+-
+-    public LazyField(String name, Field.Store store, int toRead, long pointer, boolean isBinary, boolean cacheResult) {
+-      super(name, store, Field.Index.NO, Field.TermVector.NO);
+-      this.toRead = toRead;
+-      this.pointer = pointer;
+-      this.isBinary = isBinary;
+-      this.cacheResult = cacheResult;
+-      if (isBinary)
+-        binaryLength = toRead;
+-      lazy = true;
+-    }
+-
+-    public LazyField(String name, Field.Store store, Field.Index index, Field.TermVector termVector, int toRead, long pointer, boolean isBinary, boolean cacheResult) {
+-      super(name, store, index, termVector);
+-      this.toRead = toRead;
+-      this.pointer = pointer;
+-      this.isBinary = isBinary;
+-      this.cacheResult = cacheResult;
+-      if (isBinary)
+-        binaryLength = toRead;
+-      lazy = true;
+-    }
+-
+-    public Number getNumericValue() {
+-      return null;
+-    }
+-
+-    public NumericField.DataType getDataType() {
+-      return null;
+-    }
+-
+-    private IndexInput getFieldStream() {
+-      IndexInput localFieldsStream = fieldsStreamTL.get();
+-      if (localFieldsStream == null) {
+-        localFieldsStream = (IndexInput) cloneableFieldsStream.clone();
+-        fieldsStreamTL.set(localFieldsStream);
+-      }
+-      return localFieldsStream;
+-    }
+-
+-    /** The value of the field as a Reader, or null.  If null, the String value,
+-     * binary value, or TokenStream value is used.  Exactly one of stringValue(), 
+-     * readerValue(), getBinaryValue(), and tokenStreamValue() must be set. */
+-    public Reader readerValue() {
+-      ensureOpen();
+-      return null;
+-    }
+-
+-    /** The value of the field as a TokenStream, or null.  If null, the Reader value,
+-     * String value, or binary value is used. Exactly one of stringValue(), 
+-     * readerValue(), getBinaryValue(), and tokenStreamValue() must be set. */
+-    public TokenStream tokenStreamValue() {
+-      ensureOpen();
+-      return null;
+-    }
+-
+-    /** The value of the field as a String, or null.  If null, the Reader value,
+-     * binary value, or TokenStream value is used.  Exactly one of stringValue(), 
+-     * readerValue(), getBinaryValue(), and tokenStreamValue() must be set. */
+-    public String stringValue() {
+-      ensureOpen();
+-      if (isBinary)
+-        return null;
+-      else {
+-        if (fieldsData == null) {
+-          String result = null;
+-          IndexInput localFieldsStream = getFieldStream();
+-          try {
+-            localFieldsStream.seek(pointer);
+-            byte[] bytes = new byte[toRead];
+-            localFieldsStream.readBytes(bytes, 0, toRead);
+-            result = new String(bytes, "UTF-8");
+-          } catch (IOException e) {
+-            throw new FieldReaderException(e);
+-          }
+-          if (cacheResult == true){
+-            fieldsData = result;
+-          }
+-          return result;
+-        } else {
+-          return (String) fieldsData;
+-        }
+-      }
+-    }
+-
+-    private byte[] getBinaryValue(byte[] result) {
+-      ensureOpen();
+-
+-      if (isBinary) {
+-        if (fieldsData == null) {
+-          // Allocate new buffer if result is null or too small
+-          final byte[] b;
+-          if (result == null || result.length < toRead)
+-            b = new byte[toRead];
+-          else
+-            b = result;
+-   
+-          IndexInput localFieldsStream = getFieldStream();
+-
+-          // Throw this IOException since IndexReader.document does so anyway, so probably not that big of a change for people
+-          // since they are already handling this exception when getting the document
+-          try {
+-            localFieldsStream.seek(pointer);
+-            localFieldsStream.readBytes(b, 0, toRead);
+-          } catch (IOException e) {
+-            throw new FieldReaderException(e);
+-          }
+-
+-          binaryOffset = 0;
+-          binaryLength = toRead;
+-          if (cacheResult == true){
+-            fieldsData = b;
+-          }
+-          return b;
+-        } else {
+-          return (byte[]) fieldsData;
+-        }
+-      } else
+-        return null;     
+-    }
+-
+-    @Override
+-    public BytesRef binaryValue(BytesRef reuse) {
+-      final byte[] bytes = getBinaryValue(reuse != null ? reuse.bytes : null);
+-      if (bytes != null) {
+-        return new BytesRef(bytes, 0, bytes.length);
+-      } else {
+-        return null;
+-      }
+-    }
+-  }
+ }
+
+
+Index: lucene/src/java/org/apache/lucene/index/FieldsWriter.java
+--- lucene/src/java/org/apache/lucene/index/FieldsWriter.java	2011-06-09 14:39:53.403662681 -0400
++++ lucene/src/java/org/apache/lucene/index/FieldsWriter.java	2011-07-13 15:50:56.727243992 -0400
+@@ -25,7 +25,7 @@
+ import org.apache.lucene.util.IOUtils;
+ 
+ final class FieldsWriter {
+-  static final int FIELD_IS_TOKENIZED = 1 << 0;
++  // NOTE: bit 0 is free here!
+   static final int FIELD_IS_BINARY = 1 << 1;
+ 
+   // the old bit 1 << 2 was compressed, is now left out
+@@ -137,11 +137,6 @@
+   final void writeField(int fieldNumber, IndexableField field) throws IOException {
+     fieldsStream.writeVInt(fieldNumber);
+     int bits = 0;
+-    // nocommit -- when we decouple analysis we should stop
+-    // recording this:
+-    if (field.indexed() && field.tokenized()) {
+-      bits |= FIELD_IS_TOKENIZED;
+-    }
+     final BytesRef bytes;
+     final String string;
+     // nocommit -- maybe a field should serialize itself?
+
+
+Index: lucene/src/java/org/apache/lucene/index/FilterIndexReader.java
+--- lucene/src/java/org/apache/lucene/index/FilterIndexReader.java	2011-06-09 13:54:54.972424667 -0400
++++ lucene/src/java/org/apache/lucene/index/FilterIndexReader.java	2011-07-14 04:47:20.645101882 -0400
+@@ -18,7 +18,6 @@
+  */
+ 
+ import org.apache.lucene.document.Document;
+-import org.apache.lucene.document.FieldSelector;
+ import org.apache.lucene.index.IndexReader.ReaderContext;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.util.Bits;
+@@ -341,9 +340,9 @@
+   }
+ 
+   @Override
+-  public Document document(int n, FieldSelector fieldSelector) throws CorruptIndexException, IOException {
++  public void document(int docID, StoredFieldVisitor visitor) throws CorruptIndexException, IOException {
+     ensureOpen();
+-    return in.document(n, fieldSelector);
++    in.document(docID, visitor);
+   }
+ 
+   @Override
+
+
+Index: lucene/src/java/org/apache/lucene/index/IndexReader.java
+--- lucene/src/java/org/apache/lucene/index/IndexReader.java	2011-06-26 10:21:32.217205782 -0400
++++ lucene/src/java/org/apache/lucene/index/IndexReader.java	2011-07-14 05:18:24.832245927 -0400
+@@ -17,27 +17,28 @@
+  * limitations under the License.
+  */
+ 
++import java.io.Closeable;
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.util.Collection;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.atomic.AtomicInteger;
++
+ import org.apache.lucene.document.Document;
+-import org.apache.lucene.document.FieldSelector;
+-import org.apache.lucene.search.FieldCache; // javadocs
+-import org.apache.lucene.search.Similarity;
++import org.apache.lucene.document.Field;
++import org.apache.lucene.document.NumericField;
+ import org.apache.lucene.index.codecs.Codec;
+ import org.apache.lucene.index.codecs.CodecProvider;
++import org.apache.lucene.search.FieldCache; // javadocs
++import org.apache.lucene.search.Similarity;
+ import org.apache.lucene.store.*;
+ import org.apache.lucene.util.ArrayUtil;
+ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.ReaderUtil;         // for javadocs
+ 
+-import java.io.File;
+-import java.io.FileOutputStream;
+-import java.io.IOException;
+-import java.io.Closeable;
+-import java.util.Collection;
+-import java.util.List;
+-import java.util.Map;
+-import java.util.concurrent.atomic.AtomicInteger;
+-
+ /** IndexReader is an abstract class, providing an interface for accessing an
+  index.  Search of an index is done entirely through this abstract interface,
+  so that any subclass which implements it is searchable.
+@@ -949,9 +950,22 @@
+     return maxDoc() - numDocs();
+   }
+ 
++  /** Expert: visits the fields of a stored document, for
++   *  custom processing/loading of each field.  If you
++   *  simply want to load all fields, use {@link
++   *  #document(int)}.  If you want to load a subset, use
++   *  {@link DocumentStoredFieldVisitor}.  */
++  public abstract void document(int docID, StoredFieldVisitor visitor) throws CorruptIndexException, IOException;
++
++  // nocommit -- the new document(int docID) API should
++  // clearly advertise that only field types/values are
++  // preserved -- index time metadata like boost, omitNorm,
++  // IndexOptions, tokenized are not preserved
++
+   /**
+    * Returns the stored fields of the <code>n</code><sup>th</sup>
+-   * <code>Document</code> in this index.
++   * <code>Document</code> in this index.  This is just
++   * sugar for using {@link DocumentStoredFieldVisitor}.
+    * <p>
+    * <b>NOTE:</b> for performance reasons, this method does not check if the
+    * requested document is deleted, and therefore asking for a deleted document
+@@ -962,44 +976,13 @@
+    * @throws CorruptIndexException if the index is corrupt
+    * @throws IOException if there is a low-level IO error
+    */
+-  public Document document(int n) throws CorruptIndexException, IOException {
++  public Document document(int docID) throws CorruptIndexException, IOException {
+     ensureOpen();
+-    return document(n, null);
++    final DocumentStoredFieldVisitor visitor = new DocumentStoredFieldVisitor();
++    document(docID, visitor);
++    return visitor.getDocument();
+   }
+ 
+-  /**
+-   * Get the {@link org.apache.lucene.document.Document} at the <code>n</code>
+-   * <sup>th</sup> position. The {@link FieldSelector} may be used to determine
+-   * what {@link org.apache.lucene.document.Field}s to load and how they should
+-   * be loaded. <b>NOTE:</b> If this Reader (more specifically, the underlying
+-   * <code>FieldsReader</code>) is closed before the lazy
+-   * {@link org.apache.lucene.document.Field} is loaded an exception may be
+-   * thrown. If you want the value of a lazy
+-   * {@link org.apache.lucene.document.Field} to be available after closing you
+-   * must explicitly load it or fetch the Document again with a new loader.
+-   * <p>
+-   * <b>NOTE:</b> for performance reasons, this method does not check if the
+-   * requested document is deleted, and therefore asking for a deleted document
+-   * may yield unspecified results. Usually this is not required, however you
+-   * can test if the doc is deleted by checking the {@link
+-   * Bits} returned from {@link MultiFields#getDeletedDocs}.
+-   * 
+-   * @param n Get the document at the <code>n</code><sup>th</sup> position
+-   * @param fieldSelector The {@link FieldSelector} to use to determine what
+-   *        Fields should be loaded on the Document. May be null, in which case
+-   *        all Fields will be loaded.
+-   * @return The stored fields of the
+-   *         {@link org.apache.lucene.document.Document} at the nth position
+-   * @throws CorruptIndexException if the index is corrupt
+-   * @throws IOException if there is a low-level IO error
+-   * @see org.apache.lucene.document.Fieldable
+-   * @see org.apache.lucene.document.FieldSelector
+-   * @see org.apache.lucene.document.SetBasedFieldSelector
+-   * @see org.apache.lucene.document.LoadFirstFieldSelector
+-   */
+-  // TODO (1.5): When we convert to JDK 1.5 make this Set<String>
+-  public abstract Document document(int n, FieldSelector fieldSelector) throws CorruptIndexException, IOException;
+-  
+   /** Returns true if any documents have been deleted */
+   public abstract boolean hasDeletions();
+ 
+
+
+Index: lucene/src/java/org/apache/lucene/index/MultiReader.java
+--- lucene/src/java/org/apache/lucene/index/MultiReader.java	2011-06-09 13:54:54.970424659 -0400
++++ lucene/src/java/org/apache/lucene/index/MultiReader.java	2011-07-14 04:47:25.460428917 -0400
+@@ -22,8 +22,6 @@
+ import java.util.Map;
+ import java.util.concurrent.ConcurrentHashMap;
+ 
+-import org.apache.lucene.document.Document;
+-import org.apache.lucene.document.FieldSelector;
+ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.ReaderUtil;
+@@ -257,12 +255,11 @@
+     return maxDoc;
+   }
+ 
+-  // inherit javadoc
+   @Override
+-  public Document document(int n, FieldSelector fieldSelector) throws CorruptIndexException, IOException {
++  public void document(int docID, StoredFieldVisitor visitor) throws CorruptIndexException, IOException {
+     ensureOpen();
+-    int i = readerIndex(n);                          // find segment num
+-    return subReaders[i].document(n - starts[i], fieldSelector);    // dispatch to segment reader
++    int i = readerIndex(docID);                          // find segment num
++    subReaders[i].document(docID - starts[i], visitor);    // dispatch to segment reader
+   }
+ 
+   @Override
+
+
+Index: lucene/src/java/org/apache/lucene/index/ParallelReader.java
+--- lucene/src/java/org/apache/lucene/index/ParallelReader.java	2011-06-09 13:54:54.955424663 -0400
++++ lucene/src/java/org/apache/lucene/index/ParallelReader.java	2011-07-14 04:47:29.293101800 -0400
+@@ -17,10 +17,6 @@
+  * limitations under the License.
+  */
+ 
+-import org.apache.lucene.document.Document;
+-import org.apache.lucene.document.FieldSelector;
+-import org.apache.lucene.document.FieldSelectorResult;
+-import org.apache.lucene.document.Fieldable;
+ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.MapBackedSet;
+@@ -345,30 +341,12 @@
+     hasDeletions = false;
+   }
+ 
+-  // append fields from storedFieldReaders
+   @Override
+-  public Document document(int n, FieldSelector fieldSelector) throws CorruptIndexException, IOException {
++  public void document(int docID, StoredFieldVisitor visitor) throws CorruptIndexException, IOException {
+     ensureOpen();
+-    Document result = new Document();
+     for (final IndexReader reader: storedFieldReaders) {
+-
+-      boolean include = (fieldSelector==null);
+-      if (!include) {
+-        Collection<String> fields = readerToFields.get(reader);
+-        for (final String field : fields)
+-          if (fieldSelector.accept(field) != FieldSelectorResult.NO_LOAD) {
+-            include = true;
+-            break;
+-          }
+-      }
+-      if (include) {
+-        List<Fieldable> fields = reader.document(n, fieldSelector).getFields();
+-        for (Fieldable field : fields) {
+-          result.add(field);
+-        }
+-      }
++      reader.document(docID, visitor);
+     }
+-    return result;
+   }
+ 
+   // get all vectors
+
+
+Index: lucene/src/java/org/apache/lucene/index/SegmentMerger.java
+--- lucene/src/java/org/apache/lucene/index/SegmentMerger.java	2011-06-09 13:54:54.973424639 -0400
++++ lucene/src/java/org/apache/lucene/index/SegmentMerger.java	2011-07-13 15:52:30.553102155 -0400
+@@ -310,6 +310,10 @@
+           // skip deleted docs
+           continue;
+         }
++        // TODO: this could be more efficient using
++        // FieldVisitor instead of loading/writing entire
++        // doc; ie we just have to renumber the field number
++        // on the fly?
+         // NOTE: it's very important to first assign to doc then pass it to
+         // termVectorsWriter.addAllDocVectors; see LUCENE-1282
+         Document doc = reader.document(j);
+
+
+Index: lucene/src/java/org/apache/lucene/index/SegmentReader.java
+--- lucene/src/java/org/apache/lucene/index/SegmentReader.java	2011-06-09 13:54:54.957424587 -0400
++++ lucene/src/java/org/apache/lucene/index/SegmentReader.java	2011-07-14 04:46:35.580101883 -0400
+@@ -27,8 +27,6 @@
+ import java.util.Set;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+-import org.apache.lucene.document.Document;
+-import org.apache.lucene.document.FieldSelector;
+ import org.apache.lucene.store.BufferedIndexInput;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.IndexInput;
+@@ -457,10 +455,9 @@
+     return core.fieldInfos;
+   }
+ 
+-  @Override
+-  public Document document(int n, FieldSelector fieldSelector) throws CorruptIndexException, IOException {
++  public void document(int docID, StoredFieldVisitor visitor) throws CorruptIndexException, IOException {
+     ensureOpen();
+-    return getFieldsReader().doc(n, fieldSelector);
++    getFieldsReader().visitDocument(docID, visitor);
+   }
+ 
+   @Override
+
+
+Index: lucene/src/java/org/apache/lucene/index/StoredFieldVisitor.java
+--- lucene/src/java/org/apache/lucene/index/StoredFieldVisitor.java	1969-12-31 19:00:00.000000000 -0500
++++ lucene/src/java/org/apache/lucene/index/StoredFieldVisitor.java	2011-07-14 05:57:25.675124341 -0400
+@@ -0,0 +1,87 @@
++package org.apache.lucene.index;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++
++import org.apache.lucene.document.Document;       // javadocs
++import org.apache.lucene.store.IndexInput;
++
++/**
++ * Expert: provides a low-level means of accessing the stored field
++ * values in an index.  See {@link IndexReader#document(int,
++ * StoredFieldVisitor)}.
++ *
++ * See {@link DocumentStoredFieldVisitor}, which is a
++ * <code>StoredFieldVisitor</code> that builds the
++ * {@link Document} containing all stored fields.  This is
++ * used by {@link IndexReader#document(int)}.
++ *
++ * @lucene.experimental */
++
++public class StoredFieldVisitor {
++  /** Process a binary field.  Note that if you want to
++   *  skip the field you must seek the IndexInput
++   *  (e.g., call <code>in.seek(numUTF8Bytes + in.getFilePointer()</code>)
++   *
++   *  <p>Return true to stop loading fields. */
++  public boolean binaryField(FieldInfo fieldInfo, IndexInput in, int numBytes) throws IOException {
++    in.seek(in.getFilePointer() + numBytes);
++    return false;
++  }
++
++  /** Process a string field by reading numUTF8Bytes.
++   *  Note that if you want to skip the field you must
++   *  seek the IndexInput as if you had read numBytes by
++   *  (e.g., call <code>in.seek(numUTF8Bytes + in.getFilePointer()</code>)
++   *
++   *  <p>Return true to stop loading fields. */
++  public boolean stringField(FieldInfo fieldInfo, IndexInput in, int numUTF8Bytes) throws IOException {
++    in.seek(in.getFilePointer() + numUTF8Bytes);
++    return false;
++  }
++
++  /** Process a int numeric field.
++   *
++   *  <p>Return true to stop loading fields. */
++  public boolean intField(FieldInfo fieldInfo, int value) throws IOException {
++    return false;
++  }
++
++  /** Process a long numeric field.
++   *
++   *  <p>Return true to stop loading fields. */
++  public boolean longField(FieldInfo fieldInfo, long value) throws IOException {
++    return false;
++  }
++
++  /** Process a float numeric field.
++   *
++   *  <p>Return true to stop loading fields. */
++  public boolean floatField(FieldInfo fieldInfo, float value) throws IOException {
++    return false;
++  }
++
++  /** Process a double numeric field.
++   *
++   *  <p>Return true to stop loading fields. */
++  public boolean doubleField(FieldInfo fieldInfo, double value) throws IOException {
++    return false;
++  }
++}
++
+
+
+Index: lucene/src/java/org/apache/lucene/search/IndexSearcher.java
+--- lucene/src/java/org/apache/lucene/search/IndexSearcher.java	2011-06-09 13:54:54.679424607 -0400
++++ lucene/src/java/org/apache/lucene/search/IndexSearcher.java	2011-07-14 04:48:06.957205583 -0400
+@@ -30,11 +30,11 @@
+ import java.util.concurrent.locks.ReentrantLock;
+ 
+ import org.apache.lucene.document.Document;
+-import org.apache.lucene.document.FieldSelector;
+ import org.apache.lucene.index.CorruptIndexException;
+-import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.IndexReader.AtomicReaderContext;
+ import org.apache.lucene.index.IndexReader.ReaderContext;
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.StoredFieldVisitor;
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.search.Weight.ScorerContext;
+ import org.apache.lucene.store.Directory;
+@@ -238,14 +238,14 @@
+     }
+   }
+ 
+-  /* Sugar for .getIndexReader().document(docID) */
++  /* Sugar for <code>.getIndexReader().document(docID)</code> */
+   public Document doc(int docID) throws CorruptIndexException, IOException {
+     return reader.document(docID);
+   }
+   
+-  /* Sugar for .getIndexReader().document(docID, fieldSelector) */
+-  public Document doc(int docID, FieldSelector fieldSelector) throws CorruptIndexException, IOException {
+-    return reader.document(docID, fieldSelector);
++  /* Sugar for <code>.getIndexReader().document(docID, fieldVisitor)</code> */
++  public void doc(int docID, StoredFieldVisitor fieldVisitor) throws CorruptIndexException, IOException {
++    reader.document(docID, fieldVisitor);
+   }
+   
+   /** Expert: Set the SimilarityProvider implementation used by this Searcher.
+
+
+Index: lucene/src/test/org/apache/lucene/index/TestFieldsReader.java
+--- lucene/src/test/org/apache/lucene/index/TestFieldsReader.java	2011-07-13 14:02:21.655101981 -0400
++++ lucene/src/test/org/apache/lucene/index/TestFieldsReader.java	2011-07-13 19:40:10.711101373 -0400
+@@ -25,14 +25,9 @@
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.Field;
+ import org.apache.lucene.document.NumericField;
+-import org.apache.lucene.document.FieldSelector;
+-import org.apache.lucene.document.FieldSelectorResult;
+ import org.apache.lucene.document.Fieldable;
+-import org.apache.lucene.document.LoadFirstFieldSelector;
+-import org.apache.lucene.document.SetBasedFieldSelector;
+ import org.apache.lucene.index.IndexWriterConfig.OpenMode;
+ import org.apache.lucene.search.FieldCache;
+-import org.apache.lucene.store.AlreadyClosedException;
+ import org.apache.lucene.store.BufferedIndexInput;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.IndexInput;
+@@ -46,7 +41,6 @@
+   private static Directory dir;
+   private static org.apache.lucene.document2.Document testDoc = new org.apache.lucene.document2.Document();
+   private static FieldInfos fieldInfos = null;
+-  private final static String TEST_SEGMENT_NAME = "_0";
+ 
+   @BeforeClass
+   public static void beforeClass() throws Exception {
+@@ -72,9 +67,8 @@
+   public void test() throws IOException {
+     assertTrue(dir != null);
+     assertTrue(fieldInfos != null);
+-    FieldsReader reader = new FieldsReader(dir, TEST_SEGMENT_NAME, fieldInfos);
+-    assertTrue(reader.size() == 1);
+-    Document doc = reader.doc(0, null);
++    IndexReader reader = IndexReader.open(dir);
++    Document doc = reader.document(0);
+     assertTrue(doc != null);
+     assertTrue(doc.getField(DocHelper.TEXT_FIELD_1_KEY) != null);
+ 
+@@ -84,311 +78,22 @@
+ 
+     assertTrue(field.isStoreOffsetWithTermVector() == true);
+     assertTrue(field.isStorePositionWithTermVector() == true);
+-    assertTrue(field.getOmitNorms() == false);
+-    assertTrue(field.getOmitTermFreqAndPositions() == false);
+ 
+     field = doc.getField(DocHelper.TEXT_FIELD_3_KEY);
+     assertTrue(field != null);
+     assertTrue(field.isTermVectorStored() == false);
+     assertTrue(field.isStoreOffsetWithTermVector() == false);
+     assertTrue(field.isStorePositionWithTermVector() == false);
+-    assertTrue(field.getOmitNorms() == true);
+-    assertTrue(field.getOmitTermFreqAndPositions() == false);
+ 
+     field = doc.getField(DocHelper.NO_TF_KEY);
+     assertTrue(field != null);
+     assertTrue(field.isTermVectorStored() == false);
+     assertTrue(field.isStoreOffsetWithTermVector() == false);
+     assertTrue(field.isStorePositionWithTermVector() == false);
+-    assertTrue(field.getOmitNorms() == false);
+-    assertTrue(field.getOmitTermFreqAndPositions() == true);
+-    reader.close();
+-  }
+-
+-
+-  public void testLazyFields() throws Exception {
+-    assertTrue(dir != null);
+-    assertTrue(fieldInfos != null);
+-    FieldsReader reader = new FieldsReader(dir, TEST_SEGMENT_NAME, fieldInfos);
+-    assertTrue(reader.size() == 1);
+-    Set<String> loadFieldNames = new HashSet<String>();
+-    loadFieldNames.add(DocHelper.TEXT_FIELD_1_KEY);
+-    loadFieldNames.add(DocHelper.TEXT_FIELD_UTF1_KEY);
+-    Set<String> lazyFieldNames = new HashSet<String>();
+-    //new String[]{DocHelper.LARGE_LAZY_FIELD_KEY, DocHelper.LAZY_FIELD_KEY, DocHelper.LAZY_FIELD_BINARY_KEY};
+-    lazyFieldNames.add(DocHelper.LARGE_LAZY_FIELD_KEY);
+-    lazyFieldNames.add(DocHelper.LAZY_FIELD_KEY);
+-    lazyFieldNames.add(DocHelper.LAZY_FIELD_BINARY_KEY);
+-    lazyFieldNames.add(DocHelper.TEXT_FIELD_UTF2_KEY);
+-    SetBasedFieldSelector fieldSelector = new SetBasedFieldSelector(loadFieldNames, lazyFieldNames);
+-    Document doc = reader.doc(0, fieldSelector);
+-    assertTrue("doc is null and it shouldn't be", doc != null);
+-    Fieldable field = doc.getFieldable(DocHelper.LAZY_FIELD_KEY);
+-    assertTrue("field is null and it shouldn't be", field != null);
+-    assertTrue("field is not lazy and it should be", field.isLazy());
+-    String value = field.stringValue();
+-    assertTrue("value is null and it shouldn't be", value != null);
+-    assertTrue(value + " is not equal to " + DocHelper.LAZY_FIELD_TEXT, value.equals(DocHelper.LAZY_FIELD_TEXT) == true);
+-    assertTrue("calling stringValue() twice should give same reference", field.stringValue() == field.stringValue());
+-
+-    field = doc.getFieldable(DocHelper.TEXT_FIELD_1_KEY);
+-    assertTrue("field is null and it shouldn't be", field != null);
+-    assertTrue("Field is lazy and it should not be", field.isLazy() == false);
+-    field = doc.getFieldable(DocHelper.TEXT_FIELD_UTF1_KEY);
+-    assertTrue("field is null and it shouldn't be", field != null);
+-    assertTrue("Field is lazy and it should not be", field.isLazy() == false);
+-    assertTrue(field.stringValue() + " is not equal to " + DocHelper.FIELD_UTF1_TEXT, field.stringValue().equals(DocHelper.FIELD_UTF1_TEXT) == true);
+-
+-    field = doc.getFieldable(DocHelper.TEXT_FIELD_UTF2_KEY);
+-    assertTrue("field is null and it shouldn't be", field != null);
+-    assertTrue("Field is lazy and it should not be", field.isLazy() == true);
+-    assertTrue(field.stringValue() + " is not equal to " + DocHelper.FIELD_UTF2_TEXT, field.stringValue().equals(DocHelper.FIELD_UTF2_TEXT) == true);
+-
+-    field = doc.getFieldable(DocHelper.LAZY_FIELD_BINARY_KEY);
+-    assertTrue("field is null and it shouldn't be", field != null);
+-    assertTrue("stringValue isn't null for lazy binary field", field.stringValue() == null);
+-
+-    byte [] bytes = field.binaryValue(null).bytes;
+-    assertTrue("bytes is null and it shouldn't be", bytes != null);
+-    assertTrue("", DocHelper.LAZY_FIELD_BINARY_BYTES.length == bytes.length);
+-    assertTrue("calling binaryValue() twice should give same reference", field.binaryValue(null).bytes == field.binaryValue(null).bytes);
+-    for (int i = 0; i < bytes.length; i++) {
+-      assertTrue("byte[" + i + "] is mismatched", bytes[i] == DocHelper.LAZY_FIELD_BINARY_BYTES[i]);
+-
+-    }
+-    reader.close();
+-  }
+-
+-  public void testLatentFields() throws Exception {
+-    assertTrue(dir != null);
+-    assertTrue(fieldInfos != null);
+-    FieldsReader reader = new FieldsReader(dir, TEST_SEGMENT_NAME, fieldInfos);
+-    assertTrue(reader.size() == 1);
+-    Set<String> loadFieldNames = new HashSet<String>();
+-    loadFieldNames.add(DocHelper.TEXT_FIELD_1_KEY);
+-    loadFieldNames.add(DocHelper.TEXT_FIELD_UTF1_KEY);
+-    Set<String> lazyFieldNames = new HashSet<String>();
+-    //new String[]{DocHelper.LARGE_LAZY_FIELD_KEY, DocHelper.LAZY_FIELD_KEY, DocHelper.LAZY_FIELD_BINARY_KEY};
+-    lazyFieldNames.add(DocHelper.LARGE_LAZY_FIELD_KEY);
+-    lazyFieldNames.add(DocHelper.LAZY_FIELD_KEY);
+-    lazyFieldNames.add(DocHelper.LAZY_FIELD_BINARY_KEY);
+-    lazyFieldNames.add(DocHelper.TEXT_FIELD_UTF2_KEY);
+-
+-    // Use LATENT instead of LAZY
+-    SetBasedFieldSelector fieldSelector = new SetBasedFieldSelector(loadFieldNames, lazyFieldNames) {
+-        @Override
+-        public FieldSelectorResult accept(String fieldName) {
+-          final FieldSelectorResult result = super.accept(fieldName);
+-          if (result == FieldSelectorResult.LAZY_LOAD) {
+-            return FieldSelectorResult.LATENT;
+-          } else {
+-            return result;
+-          }
+-        }
+-      };
+-
+-    Document doc = reader.doc(0, fieldSelector);
+-    assertTrue("doc is null and it shouldn't be", doc != null);
+-    Fieldable field = doc.getFieldable(DocHelper.LAZY_FIELD_KEY);
+-    assertTrue("field is null and it shouldn't be", field != null);
+-    assertTrue("field is not lazy and it should be", field.isLazy());
+-    String value = field.stringValue();
+-    assertTrue("value is null and it shouldn't be", value != null);
+-    assertTrue(value + " is not equal to " + DocHelper.LAZY_FIELD_TEXT, value.equals(DocHelper.LAZY_FIELD_TEXT) == true);
+-    assertTrue("calling stringValue() twice should give different references", field.stringValue() != field.stringValue());
+-
+-    field = doc.getFieldable(DocHelper.TEXT_FIELD_1_KEY);
+-    assertTrue("field is null and it shouldn't be", field != null);
+-    assertTrue("Field is lazy and it should not be", field.isLazy() == false);
+-    assertTrue("calling stringValue() twice should give same reference", field.stringValue() == field.stringValue());
+-
+-    field = doc.getFieldable(DocHelper.TEXT_FIELD_UTF1_KEY);
+-    assertTrue("field is null and it shouldn't be", field != null);
+-    assertTrue("Field is lazy and it should not be", field.isLazy() == false);
+-    assertTrue(field.stringValue() + " is not equal to " + DocHelper.FIELD_UTF1_TEXT, field.stringValue().equals(DocHelper.FIELD_UTF1_TEXT) == true);
+-    assertTrue("calling stringValue() twice should give same reference", field.stringValue() == field.stringValue());
+-
+-    field = doc.getFieldable(DocHelper.TEXT_FIELD_UTF2_KEY);
+-    assertTrue("field is null and it shouldn't be", field != null);
+-    assertTrue("Field is lazy and it should not be", field.isLazy() == true);
+-    assertTrue(field.stringValue() + " is not equal to " + DocHelper.FIELD_UTF2_TEXT, field.stringValue().equals(DocHelper.FIELD_UTF2_TEXT) == true);
+-    assertTrue("calling stringValue() twice should give different references", field.stringValue() != field.stringValue());
+-
+-    field = doc.getFieldable(DocHelper.LAZY_FIELD_BINARY_KEY);
+-    assertTrue("field is null and it shouldn't be", field != null);
+-    assertTrue("stringValue isn't null for lazy binary field", field.stringValue() == null);
+-    assertTrue("calling binaryValue() twice should give different references", field.binaryValue(null).bytes != field.binaryValue(null).bytes);
+-
+-    byte [] bytes = field.binaryValue(null).bytes;
+-    assertTrue("bytes is null and it shouldn't be", bytes != null);
+-    assertTrue("", DocHelper.LAZY_FIELD_BINARY_BYTES.length == bytes.length);
+-    for (int i = 0; i < bytes.length; i++) {
+-      assertTrue("byte[" + i + "] is mismatched", bytes[i] == DocHelper.LAZY_FIELD_BINARY_BYTES[i]);
+-
+-    }
+     reader.close();
+   }
+ 
+ 
+-
+-
+-  public void testLazyFieldsAfterClose() throws Exception {
+-    assertTrue(dir != null);
+-    assertTrue(fieldInfos != null);
+-    FieldsReader reader = new FieldsReader(dir, TEST_SEGMENT_NAME, fieldInfos);
+-    assertTrue(reader.size() == 1);
+-    Set<String> loadFieldNames = new HashSet<String>();
+-    loadFieldNames.add(DocHelper.TEXT_FIELD_1_KEY);
+-    loadFieldNames.add(DocHelper.TEXT_FIELD_UTF1_KEY);
+-    Set<String> lazyFieldNames = new HashSet<String>();
+-    lazyFieldNames.add(DocHelper.LARGE_LAZY_FIELD_KEY);
+-    lazyFieldNames.add(DocHelper.LAZY_FIELD_KEY);
+-    lazyFieldNames.add(DocHelper.LAZY_FIELD_BINARY_KEY);
+-    lazyFieldNames.add(DocHelper.TEXT_FIELD_UTF2_KEY);
+-    SetBasedFieldSelector fieldSelector = new SetBasedFieldSelector(loadFieldNames, lazyFieldNames);
+-    Document doc = reader.doc(0, fieldSelector);
+-    assertTrue("doc is null and it shouldn't be", doc != null);
+-    Fieldable field = doc.getFieldable(DocHelper.LAZY_FIELD_KEY);
+-    assertTrue("field is null and it shouldn't be", field != null);
+-    assertTrue("field is not lazy and it should be", field.isLazy());
+-    reader.close();
+-    try {
+-      field.stringValue();
+-      fail("did not hit AlreadyClosedException as expected");
+-    } catch (AlreadyClosedException e) {
+-      // expected
+-    }
+-  }
+-
+-  public void testLoadFirst() throws Exception {
+-    assertTrue(dir != null);
+-    assertTrue(fieldInfos != null);
+-    FieldsReader reader = new FieldsReader(dir, TEST_SEGMENT_NAME, fieldInfos);
+-    assertTrue(reader.size() == 1);
+-    LoadFirstFieldSelector fieldSelector = new LoadFirstFieldSelector();
+-    Document doc = reader.doc(0, fieldSelector);
+-    assertTrue("doc is null and it shouldn't be", doc != null);
+-    int count = 0;
+-    List<Fieldable> l = doc.getFields();
+-    for (final Fieldable fieldable : l ) {
+-      Field field = (Field) fieldable;
+-
+-      assertTrue("field is null and it shouldn't be", field != null);
+-      String sv = field.stringValue();
+-      assertTrue("sv is null and it shouldn't be", sv != null);
+-      count++;
+-    }
+-    assertTrue(count + " does not equal: " + 1, count == 1);
+-    reader.close();
+-  }
+-
+-  /**
+-   * Not really a test per se, but we should have some way of assessing whether this is worthwhile.
+-   * <p/>
+-   * Must test using a File based directory
+-   *
+-   * @throws Exception
+-   */
+-  public void testLazyPerformance() throws Exception {
+-    String userName = System.getProperty("user.name");
+-    File file = _TestUtil.getTempDir("lazyDir" + userName);
+-    Directory tmpDir = newFSDirectory(file);
+-    assertTrue(tmpDir != null);
+-
+-    IndexWriterConfig conf = newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random)).setOpenMode(OpenMode.CREATE).setMergePolicy(newLogMergePolicy());
+-    ((LogMergePolicy) conf.getMergePolicy()).setUseCompoundFile(false);
+-    IndexWriter writer = new IndexWriter(tmpDir, conf);
+-    writer.addDocument(testDoc);
+-    writer.close();
+-
+-    assertTrue(fieldInfos != null);
+-    FieldsReader reader;
+-    long lazyTime = 0;
+-    long regularTime = 0;
+-    int length = 10;
+-    Set<String> lazyFieldNames = new HashSet<String>();
+-    lazyFieldNames.add(DocHelper.LARGE_LAZY_FIELD_KEY);
+-    SetBasedFieldSelector fieldSelector = new SetBasedFieldSelector(Collections. <String> emptySet(), lazyFieldNames);
+-
+-    for (int i = 0; i < length; i++) {
+-      reader = new FieldsReader(tmpDir, TEST_SEGMENT_NAME, fieldInfos);
+-      assertTrue(reader.size() == 1);
+-
+-      Document doc;
+-      doc = reader.doc(0, null);//Load all of them
+-      assertTrue("doc is null and it shouldn't be", doc != null);
+-      Fieldable field = doc.getFieldable(DocHelper.LARGE_LAZY_FIELD_KEY);
+-      assertTrue("field is null and it shouldn't be", field != null);
+-      assertTrue("field is lazy", field.isLazy() == false);
+-      String value;
+-      long start;
+-      long finish;
+-      start = System.currentTimeMillis();
+-      //On my machine this was always 0ms.
+-      value = field.stringValue();
+-      finish = System.currentTimeMillis();
+-      assertTrue("value is null and it shouldn't be", value != null);
+-      regularTime += (finish - start);
+-      reader.close();
+-      reader = null;
+-      doc = null;
+-      //Hmmm, are we still in cache???
+-      System.gc();
+-      reader = new FieldsReader(tmpDir, TEST_SEGMENT_NAME, fieldInfos);
+-      doc = reader.doc(0, fieldSelector);
+-      field = doc.getFieldable(DocHelper.LARGE_LAZY_FIELD_KEY);
+-      assertTrue("field is not lazy", field.isLazy() == true);
+-      start = System.currentTimeMillis();
+-      //On my machine this took around 50 - 70ms
+-      value = field.stringValue();
+-      finish = System.currentTimeMillis();
+-      assertTrue("value is null and it shouldn't be", value != null);
+-      lazyTime += (finish - start);
+-      reader.close();
+-
+-    }
+-    tmpDir.close();
+-    if (VERBOSE) {
+-      System.out.println("Average Non-lazy time (should be very close to zero): " + regularTime / length + " ms for " + length + " reads");
+-      System.out.println("Average Lazy Time (should be greater than zero): " + lazyTime / length + " ms for " + length + " reads");
+-    }
+-  }
+-  
+-  public void testLoadSize() throws IOException {
+-    FieldsReader reader = new FieldsReader(dir, TEST_SEGMENT_NAME, fieldInfos);
+-    Document doc;
+-    
+-    doc = reader.doc(0, new FieldSelector(){
+-      public FieldSelectorResult accept(String fieldName) {
+-        if (fieldName.equals(DocHelper.TEXT_FIELD_1_KEY) ||
+-            fieldName.equals(DocHelper.LAZY_FIELD_BINARY_KEY))
+-          return FieldSelectorResult.SIZE;
+-        else if (fieldName.equals(DocHelper.TEXT_FIELD_3_KEY))
+-          return FieldSelectorResult.LOAD;
+-        else
+-          return FieldSelectorResult.NO_LOAD;
+-      }
+-    });
+-    Fieldable f1 = doc.getFieldable(DocHelper.TEXT_FIELD_1_KEY);
+-    Fieldable f3 = doc.getFieldable(DocHelper.TEXT_FIELD_3_KEY);
+-    Fieldable fb = doc.getFieldable(DocHelper.LAZY_FIELD_BINARY_KEY);
+-    assertTrue(f1.isBinary());
+-    assertTrue(!f3.isBinary());
+-    assertTrue(fb.isBinary());
+-    assertSizeEquals(2*DocHelper.FIELD_1_TEXT.length(), f1.binaryValue(null).bytes);
+-    assertEquals(DocHelper.FIELD_3_TEXT, f3.stringValue());
+-    assertSizeEquals(DocHelper.LAZY_FIELD_BINARY_BYTES.length, fb.binaryValue(null).bytes);
+-    
+-    reader.close();
+-  }
+-  
+-  private void assertSizeEquals(int size, byte[] sizebytes) {
+-    assertEquals((byte) (size>>>24), sizebytes[0]);
+-    assertEquals((byte) (size>>>16), sizebytes[1]);
+-    assertEquals((byte) (size>>> 8), sizebytes[2]);
+-    assertEquals((byte)  size      , sizebytes[3]);
+-  }
+-
+   public static class FaultyFSDirectory extends Directory {
+ 
+     Directory fsDir;
+
+
+Index: lucene/src/test/org/apache/lucene/index/TestIndexReader.java
+--- lucene/src/test/org/apache/lucene/index/TestIndexReader.java	2011-07-11 15:04:05.826205925 -0400
++++ lucene/src/test/org/apache/lucene/index/TestIndexReader.java	2011-07-13 19:29:33.865101784 -0400
+@@ -37,9 +37,7 @@
+ import org.apache.lucene.document2.FieldType;
+ import org.apache.lucene.document2.StringField;
+ import org.apache.lucene.document2.TextField;
+-import org.apache.lucene.document.FieldSelector;
+ import org.apache.lucene.document.Fieldable;
+-import org.apache.lucene.document.SetBasedFieldSelector;
+ import org.apache.lucene.index.IndexReader.FieldOption;
+ import org.apache.lucene.index.codecs.CodecProvider;
+ import org.apache.lucene.index.IndexWriterConfig.OpenMode;
+@@ -47,15 +45,10 @@
+ import org.apache.lucene.search.DocIdSetIterator;
+ import org.apache.lucene.search.FieldCache;
+ import org.apache.lucene.search.Similarity;
+-import org.apache.lucene.search.IndexSearcher;
+-import org.apache.lucene.search.ScoreDoc;
+-import org.apache.lucene.search.TermQuery;
+ import org.apache.lucene.store.AlreadyClosedException;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.LockObtainFailedException;
+-import org.apache.lucene.store.MockDirectoryWrapper;
+ import org.apache.lucene.store.NoSuchDirectoryException;
+-import org.apache.lucene.store.RAMDirectory;
+ import org.apache.lucene.store.LockReleaseFailedException;
+ import org.apache.lucene.util.LuceneTestCase;
+ import org.apache.lucene.util._TestUtil;
+@@ -406,21 +399,6 @@
+         for (int i = 0; i < bin.length; i++) {
+           assertEquals(bin[i], bytesRef.bytes[i + bytesRef.offset]);
+         }
+-        Set<String> lazyFields = new HashSet<String>();
+-        lazyFields.add("bin1");
+-        FieldSelector sel = new SetBasedFieldSelector(new HashSet<String>(), lazyFields);
+-        doc2 = reader.document(reader.maxDoc() - 1, sel);
+-        Fieldable[] fieldables = doc2.getFieldables("bin1");
+-        assertNotNull(fieldables);
+-        assertEquals(1, fieldables.length);
+-        Fieldable fb1 = fieldables[0];
+-        assertTrue(fb1.isBinary());
+-        bytesRef = fb1.binaryValue(null);
+-        assertEquals(bin.length, bytesRef.bytes.length);
+-        assertEquals(bin.length, bytesRef.length);
+-        for (int i = 0; i < bin.length; i++) {
+-          assertEquals(bin[i], bytesRef.bytes[i + bytesRef.offset]);
+-        }
+         reader.close();
+         // force optimize
+ 
+
+
+Index: lucene/src/test/org/apache/lucene/index/TestLazyBug.java
+--- lucene/src/test/org/apache/lucene/index/TestLazyBug.java	2011-07-11 15:04:05.854206420 -0400
++++ lucene/src/test/org/apache/lucene/index/TestLazyBug.java	1969-12-31 19:00:00.000000000 -0500
+@@ -1,143 +0,0 @@
+-package org.apache.lucene.index;
+-
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-import java.util.Iterator;
+-import java.util.List;
+-import java.util.Set;
+-
+-import org.apache.lucene.analysis.MockAnalyzer;
+-import org.apache.lucene.document.FieldSelector;
+-import org.apache.lucene.document.FieldSelectorResult;
+-import org.apache.lucene.document.Fieldable;
+-import org.apache.lucene.document2.Document;
+-import org.apache.lucene.document2.TextField;
+-import org.apache.lucene.store.Directory;
+-import org.apache.lucene.util.LuceneTestCase;
+-import org.junit.AfterClass;
+-import org.junit.BeforeClass;
+-
+-
+-/**
+- * Test demonstrating EOF bug on the last field of the last doc
+- * if other docs have allready been accessed.
+- */
+-public class TestLazyBug extends LuceneTestCase {
+-
+-  public static int NUM_DOCS = TEST_NIGHTLY ? 500 : 50;
+-  public static int NUM_FIELDS = TEST_NIGHTLY ? 100 : 10;
+-
+-  private static String[] data = new String[] {
+-    "now",
+-    "is the time",
+-    "for all good men",
+-    "to come to the aid",
+-    "of their country!",
+-    "this string contains big chars:{\u0111 \u0222 \u0333 \u1111 \u2222 \u3333}",
+-    "this string is a bigger string, mary had a little lamb, little lamb, little lamb!"
+-  };
+-
+-  private static Set<String> dataset = asSet(data);
+-
+-  private static String MAGIC_FIELD = "f"+(NUM_FIELDS/3);
+-  
+-  private static Directory directory;
+-  
+-  @BeforeClass
+-  public static void beforeClass() throws Exception {
+-    directory = makeIndex();
+-  }
+-  
+-  @AfterClass
+-  public static void afterClass() throws Exception {
+-    directory.close();
+-    directory = null;
+-  }
+-
+-  private static FieldSelector SELECTOR = new FieldSelector() {
+-      public FieldSelectorResult accept(String f) {
+-        if (f.equals(MAGIC_FIELD)) {
+-          return FieldSelectorResult.LOAD;
+-        }
+-        return FieldSelectorResult.LAZY_LOAD;
+-      }
+-    };
+-
+-  private static Directory makeIndex() throws Exception {
+-    Directory dir = newDirectory();
+-    try {
+-      IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig(
+-                                                                     TEST_VERSION_CURRENT, new MockAnalyzer(random)).setMergePolicy(newLogMergePolicy()));
+-      LogMergePolicy lmp = (LogMergePolicy) writer.getConfig().getMergePolicy();
+-      lmp.setUseCompoundFile(false);
+-      for (int d = 1; d <= NUM_DOCS; d++) {
+-        Document doc = new Document();
+-        for (int f = 1; f <= NUM_FIELDS; f++ ) {
+-          doc.add(newField("f"+f,
+-                            data[f % data.length]
+-                            + '#' + data[random.nextInt(data.length)],
+-                            TextField.TYPE_UNSTORED));
+-        }
+-        writer.addDocument(doc);
+-      }
+-      writer.close();
+-    } catch (Exception e) {
+-      throw new RuntimeException(e);
+-    }
+-    return dir;
+-  }
+-
+-  public void doTest(int[] docs) throws Exception {
+-    IndexReader reader = IndexReader.open(directory, true);
+-    for (int i = 0; i < docs.length; i++) {
+-      org.apache.lucene.document.Document d = reader.document(docs[i], SELECTOR);
+-      d.get(MAGIC_FIELD);
+-
+-      List<Fieldable> fields = d.getFields();
+-      for (Iterator<Fieldable> fi = fields.iterator(); fi.hasNext(); ) {
+-        Fieldable f=null;
+-        try {
+-          f =  fi.next();
+-          String fname = f.name();
+-          String fval = f.stringValue();
+-          assertNotNull(docs[i]+" FIELD: "+fname, fval);
+-          String[] vals = fval.split("#");
+-          if (!dataset.contains(vals[0]) || !dataset.contains(vals[1])) {
+-            fail("FIELD:"+fname+",VAL:"+fval);
+-          }
+-        } catch (Exception e) {
+-          throw new Exception(docs[i]+" WTF: "+f.name(), e);
+-        }
+-      }
+-    }
+-    reader.close();
+-  }
+-
+-  public void testLazyWorks() throws Exception {
+-    doTest(new int[] { NUM_DOCS-1 });
+-  }
+-
+-  public void testLazyAlsoWorks() throws Exception {
+-    doTest(new int[] { NUM_DOCS-1, NUM_DOCS/2 });
+-  }
+-
+-  public void testLazyBroken() throws Exception {
+-    doTest(new int[] { NUM_DOCS/2, NUM_DOCS-1 });
+-  }
+-
+-}
+
+
+Index: lucene/src/test/org/apache/lucene/index/TestParallelReader.java
+--- lucene/src/test/org/apache/lucene/index/TestParallelReader.java	2011-07-11 15:04:05.865206716 -0400
++++ lucene/src/test/org/apache/lucene/index/TestParallelReader.java	2011-07-13 19:30:03.114101833 -0400
+@@ -18,16 +18,13 @@
+  */
+ 
+ import java.io.IOException;
+-import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.Random;
+ 
+ import org.apache.lucene.analysis.MockAnalyzer;
+ import org.apache.lucene.document2.Document;
+-import org.apache.lucene.document2.Field;
+ import org.apache.lucene.document2.FieldType;
+ import org.apache.lucene.document2.TextField;
+-import org.apache.lucene.document.MapFieldSelector;
+ import org.apache.lucene.search.BooleanClause.Occur;
+ import org.apache.lucene.search.*;
+ import org.apache.lucene.store.Directory;
+@@ -91,30 +88,6 @@
+     dir2.close();
+   }
+   
+-  public void testDocument() throws IOException {
+-    Directory dir1 = getDir1(random);
+-    Directory dir2 = getDir2(random);
+-    ParallelReader pr = new ParallelReader();
+-    pr.add(IndexReader.open(dir1, false));
+-    pr.add(IndexReader.open(dir2, false));
+-
+-    org.apache.lucene.document.Document doc11 = pr.document(0, new MapFieldSelector("f1"));
+-    org.apache.lucene.document.Document doc24 = pr.document(1, new MapFieldSelector(Arrays.asList("f4")));
+-    org.apache.lucene.document.Document doc223 = pr.document(1, new MapFieldSelector("f2", "f3"));
+-    
+-    assertEquals(1, doc11.getFields().size());
+-    assertEquals(1, doc24.getFields().size());
+-    assertEquals(2, doc223.getFields().size());
+-    
+-    assertEquals("v1", doc11.get("f1"));
+-    assertEquals("v2", doc24.get("f4"));
+-    assertEquals("v2", doc223.get("f2"));
+-    assertEquals("v2", doc223.get("f3"));
+-    pr.close();
+-    dir1.close();
+-    dir2.close();
+-  }
+-  
+   public void testIncompatibleIndexes() throws IOException {
+     // two documents:
+     Directory dir1 = getDir1(random);
+
+
+Index: lucene/src/test/org/apache/lucene/search/TestThreadSafe.java
+--- lucene/src/test/org/apache/lucene/search/TestThreadSafe.java	2011-07-11 15:04:05.982206423 -0400
++++ lucene/src/test/org/apache/lucene/search/TestThreadSafe.java	1969-12-31 19:00:00.000000000 -0500
+@@ -1,153 +0,0 @@
+-package org.apache.lucene.search;
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-import org.apache.lucene.util.LuceneTestCase;
+-import org.apache.lucene.store.Directory;
+-import org.apache.lucene.index.IndexReader;
+-import org.apache.lucene.index.IndexWriter;
+-import org.apache.lucene.index.IndexWriterConfig;
+-import org.apache.lucene.index.IndexWriterConfig.OpenMode;
+-import org.apache.lucene.analysis.MockAnalyzer;
+-import org.apache.lucene.document.Fieldable;
+-import org.apache.lucene.document2.*;
+-
+-import java.util.Random;
+-import java.util.List;
+-import java.util.concurrent.atomic.AtomicBoolean;
+-import java.io.IOException;
+-
+-public class TestThreadSafe extends LuceneTestCase {
+-  Directory dir1;
+-
+-  IndexReader ir1;
+-
+-  class Thr extends Thread {
+-    final int iter;
+-    final Random rand;
+-    final AtomicBoolean failed;
+-
+-    // pass in random in case we want to make things reproducable
+-    public Thr(int iter, Random rand, AtomicBoolean failed) {
+-      this.iter = iter;
+-      this.rand = rand;
+-      this.failed = failed;
+-    }
+-
+-    @Override
+-    public void run() {
+-      try {
+-        for (int i=0; i<iter; i++) {
+-          /*** future
+-           // pick a random index reader... a shared one, or create your own
+-           IndexReader ir;
+-           ***/
+-
+-          switch(rand.nextInt(1)) {
+-            case 0: loadDoc(ir1); break;
+-          }
+-
+-        }
+-      } catch (Throwable th) {
+-        failed.set(true);
+-        throw new RuntimeException(th);
+-      }
+-    }
+-
+-
+-    void loadDoc(IndexReader ir) throws IOException {
+-      // beware of deleted docs in the future
+-      org.apache.lucene.document.Document doc = ir.document(rand.nextInt(ir.maxDoc()),
+-                new org.apache.lucene.document.FieldSelector() {
+-                  public org.apache.lucene.document.FieldSelectorResult accept(String fieldName) {
+-                    switch(rand.nextInt(2)) {
+-                      case 0: return org.apache.lucene.document.FieldSelectorResult.LAZY_LOAD;
+-                      case 1: return org.apache.lucene.document.FieldSelectorResult.LOAD;
+-                      // TODO: add other options
+-                      default: return org.apache.lucene.document.FieldSelectorResult.LOAD;
+-                    }
+-                  }
+-                }
+-              );
+-
+-      List<Fieldable> fields = doc.getFields();
+-      for (final Fieldable f : fields ) {
+-        validateField(f);
+-      }
+-
+-    }
+-
+-  }
+-
+-
+-  void validateField(Fieldable f) {
+-    String val = f.stringValue();
+-    if (!val.startsWith("^") || !val.endsWith("$")) {
+-      throw new RuntimeException("Invalid field:" + f.toString() + " val=" +val);
+-    }
+-  }
+-
+-  String[] words = "now is the time for all good men to come to the aid of their country".split(" ");
+-
+-  void buildDir(Directory dir, int nDocs, int maxFields, int maxFieldLen) throws IOException {
+-    IndexWriter iw = new IndexWriter(dir, new IndexWriterConfig(
+-        TEST_VERSION_CURRENT, new MockAnalyzer(random)).setOpenMode(OpenMode.CREATE).setMaxBufferedDocs(10));
+-    for (int j=0; j<nDocs; j++) {
+-      Document d = new Document();
+-      int nFields = random.nextInt(maxFields);
+-      for (int i=0; i<nFields; i++) {
+-        int flen = random.nextInt(maxFieldLen);
+-        StringBuilder sb = new StringBuilder("^ ");
+-        while (sb.length() < flen) sb.append(' ').append(words[random.nextInt(words.length)]);
+-        sb.append(" $");
+-        d.add(newField("f"+i, sb.toString(), TextField.TYPE_STORED));
+-      }
+-      iw.addDocument(d);
+-    }
+-    iw.close();
+-  }
+-
+-
+-  void doTest(int iter, int nThreads) throws Exception {
+-    Thr[] tarr = new Thr[nThreads];
+-    AtomicBoolean failed = new AtomicBoolean();
+-    for (int i=0; i<nThreads; i++) {
+-      tarr[i] = new Thr(iter, new Random(random.nextLong()), failed);
+-      tarr[i].start();
+-    }
+-    for (int i=0; i<nThreads; i++) {
+-      tarr[i].join();
+-    }
+-    assertFalse(failed.get());
+-  }
+-
+-  public void testLazyLoadThreadSafety() throws Exception{
+-    dir1 = newDirectory();
+-    // test w/ field sizes bigger than the buffer of an index input
+-    buildDir(dir1, 15, 5, 2000);
+-
+-    // do many small tests so the thread locals go away inbetween
+-    int num = atLeast(10);
+-    for (int i = 0; i < num; i++) {
+-      ir1 = IndexReader.open(dir1, false);
+-      doTest(10,10);
+-      ir1.close();
+-    }
+-    dir1.close();
+-  }
+-
+-}
+
+
+Index: modules/benchmark/src/java/org/apache/lucene/benchmark/byTask/tasks/SearchTravRetLoadFieldSelectorTask.java
+--- modules/benchmark/src/java/org/apache/lucene/benchmark/byTask/tasks/SearchTravRetLoadFieldSelectorTask.java	2011-06-09 13:54:45.980424600 -0400
++++ modules/benchmark/src/java/org/apache/lucene/benchmark/byTask/tasks/SearchTravRetLoadFieldSelectorTask.java	2011-07-14 04:58:41.456184610 -0400
+@@ -16,20 +16,23 @@
+  */
+ 
+ 
++import java.io.IOException;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.StringTokenizer;
++
+ import org.apache.lucene.benchmark.byTask.PerfRunData;
+-import org.apache.lucene.document.FieldSelector;
+-import org.apache.lucene.document.SetBasedFieldSelector;
+ import org.apache.lucene.document.Document;
++import org.apache.lucene.document.Field;
++import org.apache.lucene.document.NumericField;
++import org.apache.lucene.index.DocumentStoredFieldVisitor;
++import org.apache.lucene.index.FieldInfo;
+ import org.apache.lucene.index.IndexReader;
+-
+-import java.util.StringTokenizer;
+-import java.util.Set;
+-import java.util.HashSet;
+-import java.util.Collections;
+-import java.io.IOException;
++import org.apache.lucene.store.IndexInput;
+ 
+ /**
+- * Search and Traverse and Retrieve docs task using a SetBasedFieldSelector.
++ * Search and Traverse and Retrieve docs task using a
++ * FieldVisitor loading only the requested fields.
+  *
+  * <p>Note: This task reuses the reader if it is already open.
+  * Otherwise a reader is opened at start and closed at the end.
+@@ -41,7 +44,8 @@
+  */
+ public class SearchTravRetLoadFieldSelectorTask extends SearchTravTask {
+ 
+-  protected FieldSelector fieldSelector;
++  protected Set<String> fieldsToLoad;
++
+   public SearchTravRetLoadFieldSelectorTask(PerfRunData runData) {
+     super(runData);
+     
+@@ -55,18 +59,23 @@
+ 
+   @Override
+   protected Document retrieveDoc(IndexReader ir, int id) throws IOException {
+-    return ir.document(id, fieldSelector);
++    if (fieldsToLoad == null) {
++      return ir.document(id);
++    } else {
++      DocumentStoredFieldVisitor visitor = new DocumentStoredFieldVisitor(fieldsToLoad);
++      ir.document(id, visitor);
++      return visitor.getDocument();
++    }
+   }
+ 
+   @Override
+   public void setParams(String params) {
+     this.params = params; // cannot just call super.setParams(), b/c it's params differ.
+-    Set<String> fieldsToLoad = new HashSet<String>();
++    fieldsToLoad = new HashSet<String>();
+     for (StringTokenizer tokenizer = new StringTokenizer(params, ","); tokenizer.hasMoreTokens();) {
+       String s = tokenizer.nextToken();
+       fieldsToLoad.add(s);
+     }
+-    fieldSelector = new SetBasedFieldSelector(fieldsToLoad, Collections.<String> emptySet());
+   }
+ 
+ 
+
+
+Index: modules/benchmark/src/java/org/apache/lucene/benchmark/quality/utils/DocNameExtractor.java
+--- modules/benchmark/src/java/org/apache/lucene/benchmark/quality/utils/DocNameExtractor.java	2011-06-09 13:54:45.877424660 -0400
++++ modules/benchmark/src/java/org/apache/lucene/benchmark/quality/utils/DocNameExtractor.java	2011-07-14 04:58:44.736101881 -0400
+@@ -17,18 +17,21 @@
+ package org.apache.lucene.benchmark.quality.utils;
+ 
+ import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
+ 
+-import org.apache.lucene.document.FieldSelector;
+-import org.apache.lucene.document.FieldSelectorResult;
++import org.apache.lucene.index.FieldInfo;
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.StoredFieldVisitor;
+ import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.store.IndexInput;
+ 
+ /**
+  * Utility: extract doc names from an index
+  */
+ public class DocNameExtractor {
+ 
+-  private FieldSelector fldSel;
+-  private String docNameField;
++  private final String docNameField;
+   
+   /**
+    * Constructor for DocNameExtractor.
+@@ -36,13 +39,6 @@
+    */
+   public DocNameExtractor (final String docNameField) {
+     this.docNameField = docNameField;
+-    fldSel = new FieldSelector() {
+-      public FieldSelectorResult accept(String fieldName) {
+-        return fieldName.equals(docNameField) ? 
+-            FieldSelectorResult.LOAD_AND_BREAK :
+-              FieldSelectorResult.NO_LOAD;
+-      }
+-    };
+   }
+   
+   /**
+@@ -53,7 +49,25 @@
+    * @throws IOException if cannot extract the doc name from the index.
+    */
+   public String docName(IndexSearcher searcher, int docid) throws IOException {
+-    return searcher.doc(docid,fldSel).get(docNameField);
++    final List<String> name = new ArrayList<String>();
++    searcher.getIndexReader().document(docid, new StoredFieldVisitor() {
++        @Override
++        public boolean stringField(FieldInfo fieldInfo, IndexInput in, int numUTF8Bytes) throws IOException {
++          if (fieldInfo.name.equals(docNameField) && name.size() == 0) {
++            final byte[] b = new byte[numUTF8Bytes];
++            in.readBytes(b, 0, b.length);
++            name.add(new String(b, "UTF-8"));
++          } else {
++            in.seek(in.getFilePointer() + numUTF8Bytes);
++          }
++          return false;
++        }
++      });
++    if (name.size() != 0) {
++      return name.get(0);
++    } else {
++      return null;
++    }
+   }
+   
+ }
+
+
+Index: solr/src/java/org/apache/solr/handler/component/TermVectorComponent.java
+--- solr/src/java/org/apache/solr/handler/component/TermVectorComponent.java	2011-06-09 13:54:29.489424637 -0400
++++ solr/src/java/org/apache/solr/handler/component/TermVectorComponent.java	2011-07-14 05:00:41.217369572 -0400
+@@ -1,15 +1,23 @@
+ package org.apache.solr.handler.component;
+ 
+-import org.apache.lucene.document.Document;
+-import org.apache.lucene.document.Fieldable;
+-import org.apache.lucene.document.SetBasedFieldSelector;
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.HashMap;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Map;
++
++import org.apache.lucene.index.FieldInfo;
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.MultiFields;
++import org.apache.lucene.index.StoredFieldVisitor;
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.index.TermVectorMapper;
+ import org.apache.lucene.index.TermVectorOffsetInfo;
+ import org.apache.lucene.index.Terms;
+ import org.apache.lucene.index.TermsEnum;
++import org.apache.lucene.store.IndexInput;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.solr.common.SolrException;
+ import org.apache.solr.common.params.CommonParams;
+@@ -27,15 +35,6 @@
+ import org.apache.solr.util.SolrPluginUtils;
+ import org.apache.solr.util.plugin.SolrCoreAware;
+ 
+-import java.io.IOException;
+-import java.util.ArrayList;
+-import java.util.Collection;
+-import java.util.Collections;
+-import java.util.HashMap;
+-import java.util.Iterator;
+-import java.util.List;
+-import java.util.Map;
+-
+ /**
+  * Licensed to the Apache Software Foundation (ASF) under one or more
+  * contributor license agreements.  See the NOTICE file distributed with
+@@ -196,8 +195,43 @@
+     if (keyField != null) {
+       uniqFieldName = keyField.getName();
+     }
+-    //Only load the id field to get the uniqueKey of that field
+-    SetBasedFieldSelector fieldSelector = new SetBasedFieldSelector(Collections.singleton(uniqFieldName), Collections.<String>emptySet());
++    //Only load the id field to get the uniqueKey of that
++    //field
++
++    final String finalUniqFieldName = uniqFieldName;
++
++    final List<String> uniqValues = new ArrayList<String>();
++    final StoredFieldVisitor getUniqValue = new StoredFieldVisitor() {
++      @Override 
++      public boolean stringField(FieldInfo fieldInfo, IndexInput in, int numUTF8Bytes) throws IOException {
++        System.out.println("visit fi=" + fieldInfo.name + " vs " + finalUniqFieldName);
++        if (fieldInfo.name.equals(finalUniqFieldName)) {
++          final byte[] b = new byte[numUTF8Bytes];
++          in.readBytes(b, 0, b.length);
++          uniqValues.add(new String(b, "UTF-8"));
++        } else {
++          in.seek(in.getFilePointer() + numUTF8Bytes);
++        }
++        return false;
++      }
++
++      @Override 
++      public boolean intField(FieldInfo fieldInfo, int value) throws IOException {
++        if (fieldInfo.name.equals(finalUniqFieldName)) {
++          uniqValues.add(Integer.toString(value));
++        }
++        return false;
++      }
++
++      @Override 
++      public boolean longField(FieldInfo fieldInfo, long value) throws IOException {
++        if (fieldInfo.name.equals(finalUniqFieldName)) {
++          uniqValues.add(Long.toString(value));
++        }
++        return false;
++      }
++    };
++
+     TVMapper mapper = new TVMapper(reader);
+     mapper.fieldOptions = allFields; //this will only stay set if fieldOptions.isEmpty() (in other words, only if the user didn't set any fields)
+     while (iter.hasNext()) {
+@@ -207,13 +241,13 @@
+       termVectors.add("doc-" + docId, docNL);
+ 
+       if (keyField != null) {
+-        Document document = reader.document(docId, fieldSelector);
+-        Fieldable uniqId = document.getFieldable(uniqFieldName);
++        System.out.println("r=" + reader + " docID=" + docId);
++        reader.document(docId, getUniqValue);
+         String uniqVal = null;
+-        if (uniqId != null) {
+-          uniqVal = keyField.getType().storedToReadable(uniqId);          
+-        }
+-        if (uniqVal != null) {
++        System.out.println("  got " + uniqValues);
++        if (uniqValues.size() != 0) {
++          uniqVal = uniqValues.get(0);
++          uniqValues.clear();
+           docNL.add("uniqueKey", uniqVal);
+           termVectors.add("uniqueKeyFieldName", uniqFieldName);
+         }
+
+
+Index: solr/src/java/org/apache/solr/search/SolrIndexSearcher.java
+--- solr/src/java/org/apache/solr/search/SolrIndexSearcher.java	2011-06-09 13:54:29.363424611 -0400
++++ solr/src/java/org/apache/solr/search/SolrIndexSearcher.java	2011-07-14 05:01:26.250236068 -0400
+@@ -20,6 +20,7 @@
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.FieldSelector;
+ import org.apache.lucene.document.FieldSelectorResult;
++import org.apache.lucene.document.FieldSelectorVisitor;
+ import org.apache.lucene.index.*;
+ import org.apache.lucene.index.IndexReader.AtomicReaderContext;
+ import org.apache.lucene.search.*;
+@@ -406,13 +407,13 @@
+     return doc(i, (Set<String>)null);
+   }
+ 
+-  /** Retrieve a {@link Document} using a {@link org.apache.lucene.document.FieldSelector}
++  /** Visit a document's fields using a {@link StoredFieldVisitor}
+    * This method does not currently use the Solr document cache.
+    * 
+-   * @see IndexReader#document(int, FieldSelector) */
++   * @see IndexReader#document(int, StoredFieldVisitor) */
+   @Override
+-  public Document doc(int n, FieldSelector fieldSelector) throws IOException {
+-    return getIndexReader().document(n, fieldSelector);
++  public void doc(int n, StoredFieldVisitor visitor) throws IOException {
++    getIndexReader().document(n, visitor);
+   }
+ 
+   /**
+@@ -433,8 +434,9 @@
+     if(!enableLazyFieldLoading || fields == null) {
+       d = getIndexReader().document(i);
+     } else {
+-      d = getIndexReader().document(i, 
+-             new SetNonLazyFieldSelector(fields));
++      final FieldSelectorVisitor visitor = new FieldSelectorVisitor(new SetNonLazyFieldSelector(fields));
++      getIndexReader().document(i, visitor);
++      d = visitor.getDocument();
+     }
+ 
+     if (documentCache != null) {

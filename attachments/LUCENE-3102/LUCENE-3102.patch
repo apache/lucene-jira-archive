@@ -1,0 +1,178 @@
+Index: lucene/contrib/grouping/src/test/org/apache/lucene/search/grouping/TestGrouping.java
+===================================================================
+--- lucene/contrib/grouping/src/test/org/apache/lucene/search/grouping/TestGrouping.java	(revision 1124216)
++++ lucene/contrib/grouping/src/test/org/apache/lucene/search/grouping/TestGrouping.java	(working copy)
+@@ -435,37 +435,64 @@
+           System.out.println("TEST: groupSort=" + groupSort + " docSort=" + docSort + " searchTerm=" + searchTerm + " topNGroups=" + topNGroups + " groupOffset=" + groupOffset + " docOffset=" + docOffset + " doCache=" + doCache + " docsPerGroup=" + docsPerGroup + " doAllGroups=" + doAllGroups);
+         }
+ 
+-        final AllGroupsCollector groupCountCollector;
++        final AllGroupsCollector allGroupsCollector;
+         if (doAllGroups) {
+-          groupCountCollector = new AllGroupsCollector("group");
++          allGroupsCollector = new AllGroupsCollector("group");
+         } else {
+-          groupCountCollector = null;
++          allGroupsCollector = null;
+         }
+ 
+         final FirstPassGroupingCollector c1 = new FirstPassGroupingCollector("group", groupSort, groupOffset+topNGroups);
+         final CachingCollector cCache;
+         final Collector c;
++
++        final boolean useWrappingCollector = random.nextBoolean();
++
+         if (doCache) {
+           final double maxCacheMB = random.nextDouble();
+           if (VERBOSE) {
+             System.out.println("TEST: maxCacheMB=" + maxCacheMB);
+           }
+ 
+-          if (doAllGroups) {
+-            cCache = CachingCollector.create(c1, true, maxCacheMB);
+-            c = MultiCollector.wrap(cCache, groupCountCollector);
++          if (useWrappingCollector) {
++            if (doAllGroups) {
++              cCache = CachingCollector.create(c1, true, maxCacheMB);              
++              c = MultiCollector.wrap(cCache, allGroupsCollector);
++            } else {
++              c = cCache = CachingCollector.create(c1, true, maxCacheMB);              
++            }
+           } else {
+-            c = cCache = CachingCollector.create(c1, true, maxCacheMB);
++            // Collect only into cache, then replay multiple times:
++            c = cCache = CachingCollector.create(false, true, maxCacheMB);
+           }
+-        } else if (doAllGroups) {
+-          c = MultiCollector.wrap(c1, groupCountCollector);
+-          cCache = null;
+         } else {
+-          c = c1;
+           cCache = null;
++          if (doAllGroups) {
++            c = MultiCollector.wrap(c1, allGroupsCollector);
++          } else {
++            c = c1;
++          }
+         }
++
+         s.search(new TermQuery(new Term("content", searchTerm)), c);
+ 
++        if (doCache && !useWrappingCollector) {
++          if (cCache.isCached()) {
++            // Replay for first-pass grouping
++            cCache.replay(c1);
++            if (doAllGroups) {
++              // Replay for all groups:
++              cCache.replay(allGroupsCollector);
++            }
++          } else {
++            // Replay by re-running search:
++            s.search(new TermQuery(new Term("content", searchTerm)), c1);
++            if (doAllGroups) {
++              s.search(new TermQuery(new Term("content", searchTerm)), allGroupsCollector);
++            }
++          }
++        }
++
+         final Collection<SearchGroup> topGroups = c1.getTopGroups(groupOffset, fillFields);
+         final TopGroups groupsResult;
+ 
+@@ -497,7 +524,7 @@
+         
+           if (doAllGroups) {
+             TopGroups tempTopGroups = c2.getTopGroups(docOffset);
+-            groupsResult = new TopGroups(tempTopGroups, groupCountCollector.getGroupCount());
++            groupsResult = new TopGroups(tempTopGroups, allGroupsCollector.getGroupCount());
+           } else {
+             groupsResult = c2.getTopGroups(docOffset);
+           }
+Index: lucene/CHANGES.txt
+===================================================================
+--- lucene/CHANGES.txt	(revision 1124216)
++++ lucene/CHANGES.txt	(working copy)
+@@ -50,7 +50,7 @@
+   PathHierarchyTokenizer (Olivier Favre via ryan)
+ 
+ * LUCENE-1421, LUCENE-3102: added CachingCollector which allow you to cache 
+-  document IDs and scores encountered during the search, and "reply" them to 
++  document IDs and scores encountered during the search, and "replay" them to 
+   another Collector. (Mike McCandless, Shai Erera)
+   
+ API Changes
+Index: lucene/src/test/org/apache/lucene/search/TestCachingCollector.java
+===================================================================
+--- lucene/src/test/org/apache/lucene/search/TestCachingCollector.java	(revision 1124216)
++++ lucene/src/test/org/apache/lucene/search/TestCachingCollector.java	(working copy)
+@@ -171,5 +171,18 @@
+       assertFalse(cc.isCached());
+     }
+   }
++
++  public void testNoWrappedCollector() throws Exception {
++    for (boolean cacheScores : new boolean[] { false, true }) {
++      // create w/ null wrapped collector, and test that the methods work
++      CachingCollector cc = CachingCollector.create(true, cacheScores, 50 * ONE_BYTE);
++      cc.setNextReader(null, 0);
++      cc.setScorer(new MockScorer());
++      cc.collect(0);
++      
++      assertTrue(cc.isCached());
++      cc.replay(new NoOpCollector(true));
++    }
++  }
+   
+ }
+Index: lucene/src/java/org/apache/lucene/search/CachingCollector.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/search/CachingCollector.java	(revision 1124230)
++++ lucene/src/java/org/apache/lucene/search/CachingCollector.java	(working copy)
+@@ -310,6 +310,48 @@
+   protected int base;
+   protected int lastDocBase;
+ 
++  /**
++   * Creates a {@link CachingCollector} which does not wrap another collector.
++   * The cached documents and scores can later be {@link #replay(Collector)
++   * replayed}.
++   * 
++   * @param acceptDocsOutOfOrder
++   *          whether documents are allowed to be collected out-of-order
++   */
++  public static CachingCollector create(final boolean acceptDocsOutOfOrder, boolean cacheScores, double maxRAMMB) {
++    Collector other = new Collector() {
++      @Override
++      public boolean acceptsDocsOutOfOrder() {
++        return acceptDocsOutOfOrder;
++      }
++      
++      @Override
++      public void setScorer(Scorer scorer) throws IOException {}
++
++      @Override
++      public void collect(int doc) throws IOException {}
++
++      @Override
++      public void setNextReader(IndexReader reader, int docBase) throws IOException {}
++
++    };
++    return create(other, cacheScores, maxRAMMB);
++  }
++
++  /**
++   * Create a new {@link CachingCollector} that wraps the given collector and
++   * caches documents and scores up to the specified RAM threshold.
++   * 
++   * @param other
++   *          the Collector to wrap and delegate calls to.
++   * @param cacheScores
++   *          whether to cache scores in addition to document IDs. Note that
++   *          this increases the RAM consumed per doc
++   * @param maxRAMMB
++   *          the maximum RAM in MB to consume for caching the documents and
++   *          scores. If the collector exceeds the threshold, no documents and
++   *          scores are cached.
++   */
+   public static CachingCollector create(Collector other, boolean cacheScores, double maxRAMMB) {
+     return cacheScores ? new ScoreCachingCollector(other, maxRAMMB) : new NoScoreCachingCollector(other, maxRAMMB);
+   }

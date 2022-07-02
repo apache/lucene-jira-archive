@@ -1,0 +1,1550 @@
+Index: src/java/org/apache/lucene/util/pfor/PFor.java
+===================================================================
+--- src/java/org/apache/lucene/util/pfor/PFor.java	(revision 0)
++++ src/java/org/apache/lucene/util/pfor/PFor.java	(revision 0)
+@@ -0,0 +1,561 @@
++package org.apache.lucene.util.pfor;
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.nio.IntBuffer;
++import java.util.Arrays;
++   
++/** Patched Frame of Reference PFOR compression/decompression.
++ * <p>
++ * As defined in:<br>
++ * Super-Scalar RAM-CPU Cache Compression<br>
++ * Marcin Zukowski, Sándor Héman, Niels Nes, Peter Boncz, 2006.<br>
++ * with extensions from:<br>
++ * Performance of Compressed Inverted List Caching in Search Engines<br>
++ * Jiangong Zhang, Xiaohui Long, Torsten Suel, 2008.<br>
++ * <p>
++ * This class does not provide delta coding because the lucene index
++ * structures already have that.
++ * <p>
++ * The implementation uses 0 as lower bound for the frame,
++ * so small positive integers will be most effectively compressed.
++ * <p>
++ * Some optimized code is used for decompression,
++ * see class ForDecompress and its subclasses.
++ * <br>Good decompression performance will depend on the performance
++ * of java.nio.IntBuffer indexed get() methods.
++ * Use of the -server option helps performance for the Sun 1.6 jvm under Linux.
++ * <p>
++ * To be done:
++ * <ul>
++ * <li>Try and move start point of first exception to natural boundary:
++ * short at even byte position, int at quadruple. This may speed up
++ * exception decoding and avoid overlaps between buffered ints for exceptions.
++ * Optimize exception decoding code.
++ * <li>
++ * Optimize compression code.
++ * <li>
++ * Check whether IntBuffer.get() is faster than IntBuffer.get(index).
++ * <li>
++ * Check javadoc generation and generated javadocs. Add javadoc code references.
++ * </ul>
++ */
++public class PFor {
++  /** Number of frame bits. 2**numFrameBits - 1 is the maximum non exception value */
++  private int numFrameBits;
++  
++  /** Index on input and in compressed array of first exception, -1 when no exceptions */
++  private int firstExceptionIndex;
++  
++  /** Size of input, use -1 as long as no input available. */
++  private int inputSize = -1;
++  
++  /** Constant header tag to allow other compression methods, use value 001 for PFor */
++  private int compressionMethod;
++  private final int PFOR_COMPRESSION = 1;
++  
++  /** How to encode PFor exceptions: 0: byte, 1: short, 2:int, 3: long */
++  private int exceptionCode = -1;
++  
++  /** Total number of exception values */
++  private int numExceptions;
++  
++  /** int buffer for compressed data */
++  private IntBuffer intBuffer;
++  
++  /** index in int buffer for header */
++  private final int HEADER_INDEX = 0;
++
++  /** Start index in int buffer of array integers each compressed to numFrameBits. */
++  private final int COMPRESSED_INDEX = HEADER_INDEX + 1;
++  private final int HEADER_BYTES = 4 * COMPRESSED_INDEX;
++
++  /** Create a PFor compressor/decompressor. */
++  protected PFor() {
++  }
++  
++  /** Buffer to hold the compressed PFor data.<br>
++   *  When the buffer is not large enough, ArrayIndexOutOfBoundExceptions will occur
++   *  during compression/decompression.<br>
++   *  Without a valid buffer, compress() will only determine the number of bytes needed in the buffer,
++   *  see compress().<br>
++   *  Without a valid buffer, decompress() will throw a NullPointerException.<br>
++   *  For optimal speed when the IntBuffer is a view on a ByteBuffer,
++   *  the IntBuffer should have a byte offset of a  multiple of 4 bytes, possibly 0. <br>
++   *  An IntBuffer is used here because an int has 32 bits, which is always larger
++   *  than the number of frame bits, and 32 bits can efficiently accessed in the buffer
++   *  on all current processors.
++   */
++  public void setBuffer(IntBuffer intBuffer) {
++    this.intBuffer = intBuffer;
++  }
++
++  /** Compress a given int[] into the buffer.
++   * <br>
++   * When setBuffer() was not done, no actual compression is done.
++   * Regardless of the use of setBuffer(), bufferByteSize() will return
++   * a valid value after calling compress().
++   * <p>
++   * When a buffer is available, the following is done.
++   * A header is stored into the buffer, encoding a.o. numFrameBits and inputSize.
++   * All ints < 2**numFrameBits are stored sequentially in compressed form
++   * in the buffer.
++   * All other ints are stored in the buffer as exceptions after the compressed sequential ints,
++   * using 1, 2 or 4 bytes per exception, starting at the first byte after the compressed
++   * sequential ints.
++   * <br>
++   * The index of the first exception is encoded in the header in the buffer,
++   * all later exceptions have the offset to the next exception as their value,
++   * the last one offset to just after the available input size.
++   * After the first exception, when the next exception index does not fit in
++   * numFrameBits bits, an exception after 2**numFrameBits inputs is forced and inserted.
++   * <br>
++   * Exception values are stored in the order of the exceptions.
++   * The number of bytes used for an exception is also encoded in the header.
++   * This depends on the maximum exception value and does not vary between the exceptions.
++   */
++  public void compress(int[] input, int inputOffset, int inputSize, int numFrameBits) {
++    assert numFrameBits >= 1;
++    assert numFrameBits <= 31; // Practical max value reported as 24 by Zukowski 2006
++    this.numFrameBits = numFrameBits;
++    this.inputSize = inputSize;
++    numExceptions = 0;
++    int maxException = -1;
++    firstExceptionIndex = -1;
++    int lastExceptionIndex = -1;
++    int i;
++    int[] exceptionValues = new int[inputSize];
++    int maxNonExceptionValue = (1 << numFrameBits) - 1;
++    int maxChain = 254; // maximum value of firstExceptionIndex in header
++    // CHECKME: maxChain 1 off because of initial value of lastExceptionIndex and force exception test below?
++    for (i = 0; i < inputSize; i++) {
++      int v = input[i + inputOffset];
++  // System.out.println("compress input " + v);
++      // FIXME: split this loop to avoid if statement in loop.
++      // use predication for this: (someBool ? 1 : 0), and hope that the jit optimizes this.
++      if ( ((v <= maxNonExceptionValue) // no value exception
++           && (i < (lastExceptionIndex + maxChain)))) { // no forced exception
++        encodeCompressedValue(i, v); // normal encoding
++      } else { // exception
++        exceptionValues[numExceptions] = v;
++    //System.out.println("compress exception at index " + i + " value " + v);
++        numExceptions++;
++        if (firstExceptionIndex == -1) {
++          firstExceptionIndex = i;
++          assert firstExceptionIndex <= 254; // maximum value of firstExceptionIndex in header
++          maxException = v;
++          maxChain = maxNonExceptionValue + 1; // fewer bits available for exception chain value. 
++        } else if (v > maxException) {
++          maxException = v;
++        }
++        // encode the previous exception pointer
++        if (lastExceptionIndex >= 0) {
++      //System.out.println("compress chaining exception from lastExceptionIndex " + lastExceptionIndex
++      //                    + " to relative " + (i - lastExceptionIndex - 1));
++          encodeCompressedValue(lastExceptionIndex, i - lastExceptionIndex - 1);
++        }
++        lastExceptionIndex = i;
++      }
++    }
++    if (lastExceptionIndex >= 0) {
++  //System.out.println("compress chaining final exception from lastExceptionIndex " + lastExceptionIndex
++  //                    + " to relative " + (i - lastExceptionIndex - 1));
++      encodeCompressedValue(lastExceptionIndex, i - lastExceptionIndex - 1); // end the exception chain.
++    }
++    int bitsInArray = numFrameBits * input.length;
++    int bytesInArray = (bitsInArray + 7) / 8;
++    if (maxException < (1 << 8)) { // exceptions as byte
++      exceptionCode = 0;
++    } else if (maxException < (1 << 16)) { // exceptions as 2 bytes
++      exceptionCode = 1;
++    } else /* if (maxException < (1L << 32)) */ { // exceptions as 4 bytes
++      exceptionCode = 2;
++    }
++    encodeHeader(inputSize, firstExceptionIndex);
++    encodeExceptionValues(exceptionValues);
++  }
++
++  /** As compress(), but use the result of getNumFrameBits() as the number of frame bits. */
++  public void compress(int[] input, int inputOffset, int inputSize) {
++    compress(input, inputOffset, inputSize,
++             getNumFrameBits(input, inputOffset, inputSize));
++  }
++
++  protected int compressedArrayByteSize() { // override to constant for fixed numFrameBits and inputSize.
++    int compressedArrayBits = inputSize * numFrameBits;
++    return (compressedArrayBits + 7) / 8;
++  }
++
++  /** Return the number bytes used for a single exception */
++  private int exceptionByteSize() {
++    assert exceptionCode >= 0;
++    assert exceptionCode <= 2;
++    return exceptionCode == 0 ? 1
++          : exceptionCode == 1 ? 2
++          : 4;
++  }
++
++  /** Return the number of bytes used in intBuffer.
++   *  Only valid after compress() or decompress().
++   */
++  public int bufferByteSize() {
++    return HEADER_BYTES
++           + compressedArrayByteSize()
++           + exceptionByteSize() * numExceptions; // numExceptions only valid after compress() or decompress()
++  }
++  
++  private void encodeExceptionValues(int[] exceptionValues) {
++    int excByteOffset = compressedArrayByteSize();
++//System.out.println("encodeExceptionValues exceptionCode " + exceptionCode);
++    for (int i = 0; i < numExceptions; i++) {
++  //System.out.println("exception " + exceptionValues[i]);
++      encodeCompressedValueBase(excByteOffset++, exceptionValues[i] & 255, 8); // will use one int in buffer.
++      if (exceptionCode >= 1) { // double byte
++        encodeCompressedValueBase(excByteOffset++, (exceptionValues[i] >>> 8) & 255, 8); // id.
++        if (exceptionCode == 2) { // quadruple byte
++          encodeCompressedValueBase(excByteOffset++, (exceptionValues[i] >>> 16) & 255, 8); // id.
++          encodeCompressedValueBase(excByteOffset++, (exceptionValues[i] >>> 24) & 255, 8); // id.
++        }
++      }
++    }
++  }
++
++  protected void encodeCompressedValue(int compressedPos, int value) {
++    encodeCompressedValueBase(compressedPos, value, numFrameBits);
++  }
++
++  private int decodeCompressedValue(int compressedPos) {
++    return decodeCompressedValueBase(compressedPos, numFrameBits);
++  }
++
++  /** Encode a value into the compressed array of numFrameBit bit values by setting the corresponding bits.
++   * Since numFrameBits is always smaller than the number of bits in an int,
++   * at most two ints in the buffer will be affected.
++   * Has no effect when intBuffer == null.
++   */
++  protected void encodeCompressedValueBase(int compressedPos, int value, int numBits) {
++    assert numBits >= 0;
++    assert numBits <= 31;
++    final int maxValue = (int) ((1L << numBits) - 1);
++    assert value >= 0;
++    assert value <= maxValue;
++    if (intBuffer == null) {
++      return;
++    }
++    int compressedBitPos = numBits * compressedPos;
++    int intIndex = COMPRESSED_INDEX + (compressedBitPos >> 5);
++    int firstBitPosition = compressedBitPos & 31;
++    assert (intBuffer.get(intIndex) & (maxValue << firstBitPosition)) == 0; // no bits set yet.
++    intBuffer.put(intIndex, intBuffer.get(intIndex) | (value << firstBitPosition));
++    if ((firstBitPosition + numBits) > 32) { // value does not fit in first int
++      intIndex++;
++      assert (intBuffer.get(intIndex) & (maxValue >>> (32 - firstBitPosition))) == 0; // no bits set yet.
++      intBuffer.put(intIndex, intBuffer.get(intIndex) | (value >>> (32 - firstBitPosition)));
++    }
++  }
++
++  /** Decode a value from the compressed array of b bit values by retrieving the corresponding bits.
++   * Since numFrameBits is always smaller than the number of bits in an int,
++   * at most two ints in the buffer will be used.
++   */
++  private int decodeCompressedValueBase(int compressedPos, int numBits) {
++    assert numBits >= 0;
++    assert numBits <= 31;
++//System.out.print("decodeCompressedValueBase compressedPos " + compressedPos);
++//System.out.println(" base " + base);
++    int compressedBitPos = numBits * compressedPos;
++    int intIndex = COMPRESSED_INDEX + (compressedBitPos >> 5);
++    int firstBitPosition = compressedBitPos & 31;
++//System.out.print("intIndex " + intIndex);
++//System.out.println(" firstBitPosition " + firstBitPosition);
++    int value = intBuffer.get(intIndex) >>> firstBitPosition;
++    if ((firstBitPosition + numBits) > 32) { // value does not fit in first int
++      intIndex++;
++      value |= (intBuffer.get(intIndex) << (32 - firstBitPosition));
++    }
++    final int maxValue = (int) ((1L << numBits) - 1);
++    return value & maxValue;
++  }
++
++  /** The 4 byte header (32 bits) contains:
++   * - 2 bits for the exception size: 0b00: byte, 0b01: short, 0b10: int, 0b11: long (unused).
++   * - 3 bits for the compression method: 0b001 for PFor
++   * - 5 bits for numFrameBits
++   * - 8 bits for the input size: (128 == 2 ** 7, so 7 bits for input size - 1 would fit)
++   * - 8 bits for the index of the first exception + 1
++   * - 6 bits unused (could be used for the total number of exceptions, but this is redundant).
++   */
++  private void encodeHeader(int inputSize, int firstExceptionIndex) {
++    assert exceptionCode >= 0;
++    assert exceptionCode <= 2; // 3 for long, but unused for now.
++    assert numFrameBits >= 1;
++    assert numFrameBits <= 31;
++    assert inputSize >= 1;
++    assert inputSize <= 128;
++    assert firstExceptionIndex >= -1;
++    assert firstExceptionIndex < inputSize;
++    if (intBuffer != null) {
++      intBuffer.put(HEADER_INDEX,
++              ((firstExceptionIndex+1) << 24)
++            | (inputSize << 16)
++            | (numFrameBits << 8) // (b-1) might use one bit less.
++            | (PFOR_COMPRESSION << 5) | exceptionCode);
++    }
++//System.out.print("encodeHeader firstExceptionIndex " + firstExceptionIndex);
++//System.out.print(" inputSize " + inputSize);
++//System.out.print(" numFrameBits " + numFrameBits);
++//System.out.println(" exceptionCode " + exceptionCode);
++  }
++
++
++  private void decodeHeader() {
++    if (inputSize != -1) {
++      return;
++    }
++    int header = intBuffer.get(HEADER_INDEX);
++    firstExceptionIndex = ((header >>> 24) & 255) - 1; 
++    inputSize = (header >>> 16) & 255;
++    numFrameBits = (header >>> 8) & 31;
++    compressionMethod = (header >>> 5) & 7;
++    assert compressionMethod == PFOR_COMPRESSION;
++    exceptionCode = header & 31;
++    assert exceptionCode <= 2;
++//System.out.print("decodeHeader firstExceptionIndex " + firstExceptionIndex);
++//System.out.print(" inputSize " + inputSize);
++//System.out.print(" numFrameBits " + numFrameBits);
++//System.out.println(" exceptionCode " + exceptionCode);
++  }
++
++  /** Decompress from the buffer into output from a given offset. */
++  public void decompress(int[] output, int outputOffset) {
++    decodeHeader();
++    decodeCompressedInts(output, outputOffset);
++    decodeExceptions(output, outputOffset);
++  }
++  
++  /** Return the size of the integer array that is compressed in the buffer. */
++  public int getIntSize() {
++    decodeHeader();
++    return inputSize;
++  }
++  
++  /** For performance, delegate/subclass this to classes with fixed numFrameBits. */
++  protected void decodeCompressedInts(int[] output, int outputOffset) {
++    switch (numFrameBits) {
++    case 1:
++      For1Decompress.decodeCompressedInts(intBuffer, COMPRESSED_INDEX, inputSize, output, outputOffset);
++      break;
++    case 2:
++      For2Decompress.decodeCompressedInts(intBuffer, COMPRESSED_INDEX, inputSize, output, outputOffset);
++      break;
++    case 3:
++      For3Decompress.decodeCompressedInts(intBuffer, COMPRESSED_INDEX, inputSize, output, outputOffset);
++      break;
++    case 4:
++      For4Decompress.decodeCompressedInts(intBuffer, COMPRESSED_INDEX, inputSize, output, outputOffset);
++      break;
++    case 5:
++      For5Decompress.decodeCompressedInts(intBuffer, COMPRESSED_INDEX, inputSize, output, outputOffset);
++      break;
++    case 6:
++      For6Decompress.decodeCompressedInts(intBuffer, COMPRESSED_INDEX, inputSize, output, outputOffset);
++      break;
++    default:
++      ForDecompress.decodeAnyFrame(intBuffer, COMPRESSED_INDEX, inputSize, numFrameBits, output, outputOffset);
++//      for (int i = 0; i < inputSize; i++) {
++//        output[i + outputOffset] = decodeCompressedValue(i);
++//      }
++    }
++  }
++
++  /** Patch and return index of next exception */
++  static int patch(int[] output, int outputOffset, int excIndex, int excValue) {
++    int nextExceptionIndex = output[excIndex] + excIndex + 1; // chain offset
++    output[excIndex + outputOffset] = excValue; // patch
++    assert nextExceptionIndex > excIndex;
++    return nextExceptionIndex;
++  }
++  
++  /** Decode the exception values while going through the exception chain.
++   * <br>For performance, delegate/subclass this to classes with fixed exceptionCode.
++   * <br> Also, decoding exceptions is preferably done from an int border instead of
++   * from a random byte directly after the compressed array. This will allow faster
++   * decoding of exceptions, at the cost of at most 3 bytes.
++   * <br>When ((numFrameBits * inputSize) % 32) == 0, this cost will always be
++   * zero bytes so specialize for these cases.
++   */
++  protected void decodeExceptions(int[] output, int outputOffset) {
++    numExceptions = 0;
++    if (firstExceptionIndex == -1) {
++      return;
++    }
++    int excIndex = firstExceptionIndex;
++    int excByteOffset = compressedArrayByteSize(); // constant for given numFrameBits and numFrameBits.
++    int excValue;
++    do {
++      excValue = decodeCompressedValueBase(excByteOffset++, 8); // will use one int in buffer.
++      if (exceptionCode >= 1) { // double byte
++        excValue |= (decodeCompressedValueBase(excByteOffset++, 8) << 8);
++        if (exceptionCode == 2) { // quadruple byte
++          excValue |= (decodeCompressedValueBase(excByteOffset++, 8) << 16);
++          excValue |= (decodeCompressedValueBase(excByteOffset++, 8) << 24);
++        }
++      }
++      excIndex = patch(output, outputOffset, excIndex, excValue);
++      numExceptions++;
++    } while (excIndex < inputSize);
++  }
++
++  /** Determine the number of frame bits to be used for compression
++   * of a given input array.
++   * This is done by taking a copy of the input, sorting it and using this
++   * to determine the compressed size for each possible numbits in a single pass,
++   * ignoring forced exceptions.
++   * This is basically the method described by Zukowski, but simplified because
++   * the frame of reference is assumed to have 0 as lowerbound.
++   * Finally an estimation of the number of forced exceptions is reduced to
++   * less than 1 in 32 input numbers by increasing the number of frame bits.
++   */
++  public static int getNumFrameBits(int[] input, int inputOffset, int inputSize) {
++    if ((inputOffset + inputSize) > input.length) {
++      throw new IllegalArgumentException( "(inputOffSet " + inputOffset
++                                          + " + inputSize " + inputSize
++                                          + ") > input.length " + input.length);
++    }
++    int copy[] = Arrays.copyOfRange(input, inputOffset, inputOffset + inputSize);
++    assert copy.length == inputSize;
++    Arrays.sort(copy);
++    int maxValue = copy[copy.length-1];
++    if (maxValue <= 1) {
++      return 1;
++    }
++    int bytesPerException = (maxValue < (1 << 8)) ? 1 : (maxValue < (1 << 16)) ? 2 : 4;
++    int numFrameBits = 1;
++    int bytesForArray = (copy.length * numFrameBits  + 7) / 8;
++    // initially assume all input is an exception.
++    int totalBytes = bytesForArray + copy.length * bytesPerException; // excluding the header.
++    int bestBytes = totalBytes;
++    int bestNumFrameBits = numFrameBits;
++    int bestNumExceptions = copy.length;
++//System.out.println("getNumFrameBits copy.length " + copy.length);
++    for (int i = 0; i < copy.length; i++) {
++      totalBytes -= bytesPerException;
++  //System.out.println("getNumFrameBits i " + i
++  //  + " copy[i] " + copy[i]
++  //  + " totalBytes " + totalBytes);
++      while (copy[i] >= (1 << numFrameBits)) {
++        if (numFrameBits == 30) { // no point to increase further.
++          return bestNumFrameBits;
++        }
++        ++numFrameBits;
++        while (bytesForArray * 8 < copy.length * numFrameBits) {
++          bytesForArray++;
++          totalBytes++;
++        }
++    //System.out.println("getNumFrameBits numFrameBits " + numFrameBits
++    //                    + " (1 << numFrameBits) " + (1 << numFrameBits)
++    //                    + " totalBytes " + totalBytes);
++      }
++      if (totalBytes <= bestBytes) { // <= : prefer fewer exceptions for decompression speed.
++        bestBytes = totalBytes;
++        bestNumFrameBits = numFrameBits;
++        bestNumExceptions = (copy.length - i - 1);
++    //System.out.println("getNumFrameBits bestNumFrameBits " + bestNumFrameBits
++    //                    + " bestBytes " + bestBytes
++    //                    + " exceptions " + (copy.length - i - 1));
++      }
++    }
++    if (bestNumExceptions == 0) { // no need to bother about forced exceptions.
++      return bestNumFrameBits;
++    }
++    int minNumExceptions = (copy.length >> bestNumFrameBits);
++    int allowedNumExceptions = bestNumExceptions + (copy.length >> 5); // 1 in 32 is allowed to be forced.
++    if (allowedNumExceptions < minNumExceptions) {
++      // Estimation of number of too many forced exceptions positive.
++      bestNumFrameBits++; // reduce forced exceptions and perhaps reduce actual exceptions
++      // minNumExceptions >>= 1; // use this when changing last if to while.
++  // System.out.println("getNumFrameBits increased bestNumFrameBits to " + bestNumFrameBits);
++    }
++    return bestNumFrameBits;
++  }
++}
++
++/* PFor exception decompression.
++ * FIXME: move the classes below into separate java files in the same package.
++ */
++
++/** Specialisation of PIntForDecompress for single byte exceptions. */
++class P1IntForDecompress {
++  static int decodeExceptions(
++        IntBuffer intBuffer,
++        int inputSize,
++        int firstExceptionIndex,
++        int excIntOffset,
++        int[] output,
++        int outputOffset) {
++    int numExceptions = 0;
++    if (firstExceptionIndex != -1) {
++      int excIndex = firstExceptionIndex; // in compressed array, and output.
++      // int excIntOffset = exceptionIntOffSet();
++      do {
++        int excIntValue = intBuffer.get(excIntOffset);
++        excIndex = PFor.patch(output, outputOffset, excIndex, excIntValue & 255);
++        numExceptions++;
++        if (excIndex >= inputSize) break;
++        excIndex = PFor.patch(output, outputOffset, excIndex, (excIntValue >> 8) & 255);
++        numExceptions++;
++        if (excIndex >= inputSize) break;
++        excIndex = PFor.patch(output, outputOffset, excIndex, (excIntValue >> 16) & 255);
++        numExceptions++;
++        if (excIndex >= inputSize) break;
++        excIndex = PFor.patch(output, outputOffset, excIndex, (excIntValue >> 24) & 255);
++        numExceptions++;
++        if (excIndex >= inputSize) break;
++        excIntOffset++;
++      } while (true);
++    }
++    return numExceptions;
++  }
++}
++
++/** Specialisation of PIntForDecompress for two byte exceptions. */
++class P2IntForDecompress {
++  static int decodeExceptions(
++        IntBuffer intBuffer,
++        int inputSize,
++        int firstExceptionIndex,
++        int excIntOffset,
++        int[] output,
++        int outputOffset) {
++    int numExceptions = 0;
++    if (firstExceptionIndex != -1) {
++      int excIndex = firstExceptionIndex; // in compressed array, and output.
++      final int twoByteMask = (1<<16) - 1;
++      do {
++        int excIntValue = intBuffer.get(excIntOffset);
++        excIndex = PFor.patch(output, outputOffset, excIndex, excIntValue & twoByteMask);
++        numExceptions++;
++        if (excIndex >= inputSize) break;
++        excIndex = PFor.patch(output, outputOffset, excIndex, (excIntValue >> 16) & twoByteMask);
++        numExceptions++;
++        if (excIndex >= inputSize) break;
++        excIntOffset++;
++      } while (true);
++    }
++    return numExceptions;
++  }
++}
+
+Property changes on: src/java/org/apache/lucene/util/pfor/PFor.java
+___________________________________________________________________
+Name: svn:special
+   + *
+
+Index: src/java/org/apache/lucene/util/pfor/ForDecompress.java
+===================================================================
+--- src/java/org/apache/lucene/util/pfor/ForDecompress.java	(revision 0)
++++ src/java/org/apache/lucene/util/pfor/ForDecompress.java	(revision 0)
+@@ -0,0 +1,56 @@
++package org.apache.lucene.util.pfor;
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.nio.IntBuffer;
++
++/** PFor frame decompression for any number of frame bits. */
++class ForDecompress {
++
++  static void decodeAnyFrame(
++        IntBuffer intBuffer, int bufIndex, int inputSize, int numFrameBits,
++        int[] output, int outputOffset) {
++
++    assert numFrameBits >= 0;
++    assert numFrameBits <= 30 : numFrameBits; // CHECKME: <= 31 ok here?
++    final int mask = (1<<numFrameBits) - 1;
++
++    int intValue1 = intBuffer.get(bufIndex);
++    output[outputOffset] = intValue1 & mask;
++    if (--inputSize == 0) return;
++    int bitPos = numFrameBits;
++
++    do {
++      do {
++        output[++outputOffset] = (intValue1 >>> bitPos) & mask;
++        if (--inputSize == 0) return;
++        bitPos += numFrameBits;
++      } while (bitPos <= (32 - numFrameBits));
++      
++      int intValue2 = intBuffer.get(++bufIndex);
++      output[++outputOffset] = ( (bitPos == 32)
++                                  ? intValue2
++                                  : ((intValue1 >>> bitPos) | (intValue2 << (32 - bitPos)))
++                               ) & mask;
++        
++      if (--inputSize == 0) return;
++      
++      intValue1 = intValue2;
++      bitPos += numFrameBits - 32;
++    } while (true);
++  }
++}
+Index: src/java/org/apache/lucene/util/pfor/For1Decompress.java
+===================================================================
+--- src/java/org/apache/lucene/util/pfor/For1Decompress.java	(revision 0)
++++ src/java/org/apache/lucene/util/pfor/For1Decompress.java	(revision 0)
+@@ -0,0 +1,111 @@
++package org.apache.lucene.util.pfor;
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.nio.IntBuffer;
++
++/** PFor frame decompression specialized for 1 frame bit. */
++class For1Decompress extends ForDecompress {
++  static final int numFrameBits = 1;
++  static final int mask = (1<<numFrameBits) - 1;
++
++  static void decodeCompressedInts(
++        IntBuffer intBuffer, int bufIndex, int inputSize,
++        int[] output, int outputOffset) {
++
++    while (inputSize >= 32) {
++      int intValue = intBuffer.get(bufIndex++);
++      output[0 + outputOffset] = intValue & mask;
++      output[1 + outputOffset] = (intValue >>> 1) & mask;
++      output[2 + outputOffset] = (intValue >>> 2) & mask;
++      output[3 + outputOffset] = (intValue >>> 3) & mask;
++      output[4 + outputOffset] = (intValue >>> 4) & mask;
++      output[5 + outputOffset] = (intValue >>> 5) & mask;
++      output[6 + outputOffset] = (intValue >>> 6) & mask;
++      output[7 + outputOffset] = (intValue >>> 7) & mask;
++      output[8 + outputOffset] = (intValue >>> 8) & mask;
++      output[9 + outputOffset] = (intValue >>> 9) & mask;
++      output[10 + outputOffset] = (intValue >>> 10) & mask;
++      output[11 + outputOffset] = (intValue >>> 11) & mask;
++      output[12 + outputOffset] = (intValue >>> 12) & mask;
++      output[13 + outputOffset] = (intValue >>> 13) & mask;
++      output[14 + outputOffset] = (intValue >>> 14) & mask;
++      output[15 + outputOffset] = (intValue >>> 15) & mask;
++      output[16 + outputOffset] = (intValue >>> 16) & mask;
++      output[17 + outputOffset] = (intValue >>> 17) & mask;
++      output[18 + outputOffset] = (intValue >>> 18) & mask;
++      output[19 + outputOffset] = (intValue >>> 19) & mask;
++      output[20 + outputOffset] = (intValue >>> 20) & mask;
++      output[21 + outputOffset] = (intValue >>> 21) & mask;
++      output[22 + outputOffset] = (intValue >>> 22) & mask;
++      output[23 + outputOffset] = (intValue >>> 23) & mask;
++      output[24 + outputOffset] = (intValue >>> 24) & mask;
++      output[25 + outputOffset] = (intValue >>> 25) & mask;
++      output[26 + outputOffset] = (intValue >>> 26) & mask;
++      output[27 + outputOffset] = (intValue >>> 27) & mask;
++      output[28 + outputOffset] = (intValue >>> 28) & mask;
++      output[29 + outputOffset] = (intValue >>> 29) & mask;
++      output[30 + outputOffset] = (intValue >>> 30) & mask;
++      output[31 + outputOffset] = intValue >>> 31;
++      inputSize -= 32;
++      outputOffset += 32;
++    }
++    if (inputSize > 0) {
++      int intValue = intBuffer.get(bufIndex);
++      if (inputSize >= 16) {
++        for (int i = 0; i < 16; i++) {
++          output[i + outputOffset] = (intValue >>> i) & mask;
++        }
++        output[0 + outputOffset] = (intValue >>> 0) & mask;
++        output[1 + outputOffset] = (intValue >>> 1) & mask;
++        output[2 + outputOffset] = (intValue >>> 2) & mask;
++        output[3 + outputOffset] = (intValue >>> 3) & mask;
++        output[4 + outputOffset] = (intValue >>> 4) & mask;
++        output[5 + outputOffset] = (intValue >>> 5) & mask;
++        output[6 + outputOffset] = (intValue >>> 6) & mask;
++        output[7 + outputOffset] = (intValue >>> 7) & mask;
++        output[8 + outputOffset] = (intValue >>> 8) & mask;
++        output[9 + outputOffset] = (intValue >>> 9) & mask;
++        output[10 + outputOffset] = (intValue >>> 10) & mask;
++        output[11 + outputOffset] = (intValue >>> 11) & mask;
++        output[12 + outputOffset] = (intValue >>> 12) & mask;
++        output[13 + outputOffset] = (intValue >>> 13) & mask;
++        output[14 + outputOffset] = (intValue >>> 14) & mask;
++        output[15 + outputOffset] = (intValue >>> 15) & mask;
++        inputSize -= 16;
++        outputOffset += 16;
++        intValue >>>= 16;
++      }
++      if (inputSize >= 8) {
++        output[0 + outputOffset] = (intValue >>> 0) & mask;
++        output[1 + outputOffset] = (intValue >>> 1) & mask;
++        output[2 + outputOffset] = (intValue >>> 2) & mask;
++        output[3 + outputOffset] = (intValue >>> 3) & mask;
++        output[4 + outputOffset] = (intValue >>> 4) & mask;
++        output[5 + outputOffset] = (intValue >>> 5) & mask;
++        output[6 + outputOffset] = (intValue >>> 6) & mask;
++        output[7 + outputOffset] = (intValue >>> 7) & mask;
++        inputSize -= 8;
++        outputOffset += 8;
++        intValue >>>= 8;
++      }
++      for (int i = 0; i < inputSize; i++) {
++        output[i + outputOffset] = (intValue >>> i) & mask;
++      }
++    }
++  }
++}
+
+Property changes on: src/java/org/apache/lucene/util/pfor/For1Decompress.java
+___________________________________________________________________
+Name: svn:special
+   + *
+
+Index: src/java/org/apache/lucene/util/pfor/For2Decompress.java
+===================================================================
+--- src/java/org/apache/lucene/util/pfor/For2Decompress.java	(revision 0)
++++ src/java/org/apache/lucene/util/pfor/For2Decompress.java	(revision 0)
+@@ -0,0 +1,70 @@
++package org.apache.lucene.util.pfor;
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.nio.IntBuffer;
++
++/** PFor frame decompression specialized for 2 bit frame. */
++class For2Decompress {
++  static final int numFrameBits = 2;
++  static final int mask = (1<<numFrameBits) - 1;
++
++  static void decodeCompressedInts(
++        IntBuffer intBuffer, int bufIndex, int inputSize,
++        int[] output, int outputOffset) {
++    while (inputSize >= 16) {
++      int intValue = intBuffer.get(bufIndex++);
++      output[0 + outputOffset] = intValue & mask;
++      output[1 + outputOffset] = (intValue >>> 2) & mask;
++      output[2 + outputOffset] = (intValue >>> 4) & mask;
++      output[3 + outputOffset] = (intValue >>> 6) & mask;
++      output[4 + outputOffset] = (intValue >>> 8) & mask;
++      output[5 + outputOffset] = (intValue >>> 10) & mask;
++      output[6 + outputOffset] = (intValue >>> 12) & mask;
++      output[7 + outputOffset] = (intValue >>> 14) & mask;
++      output[8 + outputOffset] = (intValue >>> 16) & mask;
++      output[9 + outputOffset] = (intValue >>> 18) & mask;
++      output[10 + outputOffset] = (intValue >>> 20) & mask;
++      output[11 + outputOffset] = (intValue >>> 22) & mask;
++      output[12 + outputOffset] = (intValue >>> 24) & mask;
++      output[13 + outputOffset] = (intValue >>> 26) & mask;
++      output[14 + outputOffset] = (intValue >>> 28) & mask;
++      output[15 + outputOffset] = intValue >>> 30;
++      inputSize -= 16;
++      outputOffset += 16;
++    }
++    if (inputSize > 0) {
++      int intValue = intBuffer.get(bufIndex);
++      if (inputSize >= 8) {
++        output[0 + outputOffset] = (intValue >>> 0) & mask;
++        output[1 + outputOffset] = (intValue >>> 2) & mask;
++        output[2 + outputOffset] = (intValue >>> 4) & mask;
++        output[3 + outputOffset] = (intValue >>> 6) & mask;
++        output[4 + outputOffset] = (intValue >>> 8) & mask;
++        output[5 + outputOffset] = (intValue >>> 10) & mask;
++        output[6 + outputOffset] = (intValue >>> 12) & mask;
++        output[7 + outputOffset] = (intValue >>> 14) & mask;
++        inputSize -= 8;
++        outputOffset += 8;
++        intValue >>>= 16;
++      }
++      for (int i = 0; i < inputSize; i++) {
++        output[i + outputOffset] = (intValue >>> (i << 1)) & mask;
++      }
++    }
++  }
++}
+Index: src/java/org/apache/lucene/util/pfor/For3Decompress.java
+===================================================================
+--- src/java/org/apache/lucene/util/pfor/For3Decompress.java	(revision 0)
++++ src/java/org/apache/lucene/util/pfor/For3Decompress.java	(revision 0)
+@@ -0,0 +1,74 @@
++package org.apache.lucene.util.pfor;
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.nio.IntBuffer;
++
++/** PFor frame decompression specialized for 3 frame bits. */
++class For3Decompress extends ForDecompress {
++  static final int numFrameBits = 3;
++  static final int mask = (1<<numFrameBits) - 1;
++
++  static void decodeCompressedInts(
++        IntBuffer intBuffer, int bufIndex, int inputSize,
++        int[] output, int outputOffset) {
++
++    while (inputSize >= 32) {
++      int intValue1 = intBuffer.get(bufIndex);
++      int intValue2 = intBuffer.get(bufIndex + 1);
++      int intValue3 = intBuffer.get(bufIndex + 2);
++      output[0 + outputOffset] = intValue1 & mask;
++      output[1 + outputOffset] = (intValue1 >>> 3) & mask;
++      output[2 + outputOffset] = (intValue1 >>> 6) & mask;
++      output[3 + outputOffset] = (intValue1 >>> 9) & mask;
++      output[4 + outputOffset] = (intValue1 >>> 12) & mask;
++      output[5 + outputOffset] = (intValue1 >>> 15) & mask;
++      output[6 + outputOffset] = (intValue1 >>> 18) & mask;
++      output[7 + outputOffset] = (intValue1 >>> 21) & mask;
++      output[8 + outputOffset] = (intValue1 >>> 24) & mask;
++      output[9 + outputOffset] = (intValue1 >>> 27) & mask;
++      output[10 + outputOffset] = ((intValue1 >>> 30) | (intValue2 << 2)) & mask;
++      output[11 + outputOffset] = (intValue2 >>> 1) & mask;
++      output[12 + outputOffset] = (intValue2 >>> 4) & mask;
++      output[13 + outputOffset] = (intValue2 >>> 7) & mask;
++      output[14 + outputOffset] = (intValue2 >>> 10) & mask;
++      output[15 + outputOffset] = (intValue2 >>> 13) & mask;
++      output[16 + outputOffset] = (intValue2 >>> 16) & mask;
++      output[17 + outputOffset] = (intValue2 >>> 19) & mask;
++      output[18 + outputOffset] = (intValue2 >>> 22) & mask;
++      output[19 + outputOffset] = (intValue2 >>> 25) & mask;
++      output[20 + outputOffset] = (intValue2 >>> 28) & mask;
++      output[21 + outputOffset] = ((intValue2 >>> 31) | (intValue3 << 1)) & mask;
++      output[22 + outputOffset] = (intValue3 >>> 2) & mask;
++      output[23 + outputOffset] = (intValue3 >>> 5) & mask;
++      output[24 + outputOffset] = (intValue3 >>> 8) & mask;
++      output[25 + outputOffset] = (intValue3 >>> 11) & mask;
++      output[26 + outputOffset] = (intValue3 >>> 14) & mask;
++      output[27 + outputOffset] = (intValue3 >>> 17) & mask;
++      output[28 + outputOffset] = (intValue3 >>> 20) & mask;
++      output[29 + outputOffset] = (intValue3 >>> 23) & mask;
++      output[30 + outputOffset] = (intValue3 >>> 26) & mask;
++      output[31 + outputOffset] = intValue3 >>> 29;
++      inputSize -= 32;
++      outputOffset += 32;
++      bufIndex += numFrameBits;
++    }
++    
++    if (inputSize == 0) return;
++    decodeAnyFrame(intBuffer, bufIndex, inputSize, numFrameBits, output, outputOffset);
++  }
++}
+
+Property changes on: src/java/org/apache/lucene/util/pfor/For3Decompress.java
+___________________________________________________________________
+Name: svn:special
+   + *
+
+Index: src/java/org/apache/lucene/util/pfor/For4Decompress.java
+===================================================================
+--- src/java/org/apache/lucene/util/pfor/For4Decompress.java	(revision 0)
++++ src/java/org/apache/lucene/util/pfor/For4Decompress.java	(revision 0)
+@@ -0,0 +1,48 @@
++package org.apache.lucene.util.pfor;
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.nio.IntBuffer;
++
++/** PFor frame decompression specialized for 4 bit frame. */
++class For4Decompress extends ForDecompress {
++  static final int numFrameBits = 4;
++  static final int mask = (1<<numFrameBits) - 1;
++
++  static void decodeCompressedInts(
++        IntBuffer intBuffer, int bufIndex, int inputSize,
++        int[] output, int outputOffset) {
++    while (inputSize >= 8) {
++      int intValue = intBuffer.get(bufIndex++);
++      output[0 + outputOffset] = intValue & mask;
++      output[1 + outputOffset] = (intValue >>> 4) & mask;
++      output[2 + outputOffset] = (intValue >>> 8) & mask;
++      output[3 + outputOffset] = (intValue >>> 12) & mask;
++      output[4 + outputOffset] = (intValue >>> 16) & mask;
++      output[5 + outputOffset] = (intValue >>> 20) & mask;
++      output[6 + outputOffset] = (intValue >>> 24) & mask;
++      output[7 + outputOffset] = intValue >>> 28;
++      inputSize -= 8;
++      outputOffset += 8;
++    }
++    if (inputSize == 0) return;
++    int intValue = intBuffer.get(bufIndex);
++    for (int i = 0; i < inputSize; i++) {
++      output[i + outputOffset] = (intValue >>> (i << 2)) & mask;
++    }
++  }
++}
+Index: src/java/org/apache/lucene/util/pfor/For5Decompress.java
+===================================================================
+--- src/java/org/apache/lucene/util/pfor/For5Decompress.java	(revision 0)
++++ src/java/org/apache/lucene/util/pfor/For5Decompress.java	(revision 0)
+@@ -0,0 +1,76 @@
++package org.apache.lucene.util.pfor;
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.nio.IntBuffer;
++
++/** PFor frame decompression specialized for 5 frame bits. */
++class For5Decompress extends ForDecompress {
++  static final int numFrameBits = 5;
++  static final int mask = (1<<numFrameBits) - 1;
++
++  static void decodeCompressedInts(
++        IntBuffer intBuffer, int bufIndex, int inputSize,
++        int[] output, int outputOffset) {
++  
++    while (inputSize >= 32) {
++      int intValue1 = intBuffer.get(bufIndex);
++      int intValue2 = intBuffer.get(bufIndex + 1);
++      int intValue3 = intBuffer.get(bufIndex + 2);
++      int intValue4 = intBuffer.get(bufIndex + 3);
++      int intValue5 = intBuffer.get(bufIndex + 4);
++      output[0 + outputOffset] = intValue1 & mask;
++      output[1 + outputOffset] = (intValue1 >>> 5) & mask;
++      output[2 + outputOffset] = (intValue1 >>> 10) & mask;
++      output[3 + outputOffset] = (intValue1 >>> 15) & mask;
++      output[4 + outputOffset] = (intValue1 >>> 20) & mask;
++      output[5 + outputOffset] = (intValue1 >>> 25) & mask;
++      output[6 + outputOffset] = ((intValue1 >>> 30) | (intValue2 << 2)) & mask;
++      output[7 + outputOffset] = (intValue2 >>> 3) & mask;
++      output[8 + outputOffset] = (intValue2 >>> 8) & mask;
++      output[9 + outputOffset] = (intValue2 >>> 13) & mask;
++      output[10 + outputOffset] = (intValue2 >>> 18) & mask;
++      output[11 + outputOffset] = (intValue2 >>> 23) & mask;
++      output[12 + outputOffset] = ((intValue2 >>> 28) | (intValue3 << 4)) & mask;
++      output[13 + outputOffset] = (intValue3 >>> 1) & mask;
++      output[14 + outputOffset] = (intValue3 >>> 6) & mask;
++      output[15 + outputOffset] = (intValue3 >>> 11) & mask;
++      output[16 + outputOffset] = (intValue3 >>> 16) & mask;
++      output[17 + outputOffset] = (intValue3 >>> 21) & mask;
++      output[18 + outputOffset] = (intValue3 >>> 26) & mask;
++      output[19 + outputOffset] = ((intValue3 >>> 31) | (intValue4 << 1)) & mask;
++      output[20 + outputOffset] = (intValue4 >>> 4) & mask;
++      output[21 + outputOffset] = (intValue4 >>> 9) & mask;
++      output[22 + outputOffset] = (intValue4 >>> 14) & mask;
++      output[23 + outputOffset] = (intValue4 >>> 19) & mask;
++      output[24 + outputOffset] = (intValue4 >>> 24) & mask;
++      output[25 + outputOffset] = ((intValue4 >>> 29) | (intValue5 << 3)) & mask;
++      output[26 + outputOffset] = (intValue5 >>> 2) & mask;
++      output[27 + outputOffset] = (intValue5 >>> 7) & mask;
++      output[28 + outputOffset] = (intValue5 >>> 12) & mask;
++      output[29 + outputOffset] = (intValue5 >>> 17) & mask;
++      output[30 + outputOffset] = (intValue5 >>> 22) & mask;
++      output[31 + outputOffset] = intValue5 >>> 27;
++      inputSize -= 32;
++      outputOffset += 32;
++      bufIndex += numFrameBits;
++    }
++   
++    if (inputSize == 0) return;
++    decodeAnyFrame(intBuffer, bufIndex, inputSize, numFrameBits, output, outputOffset);
++  }
++}
+
+Property changes on: src/java/org/apache/lucene/util/pfor/For5Decompress.java
+___________________________________________________________________
+Name: svn:special
+   + *
+
+Index: src/java/org/apache/lucene/util/pfor/For6Decompress.java
+===================================================================
+--- src/java/org/apache/lucene/util/pfor/For6Decompress.java	(revision 0)
++++ src/java/org/apache/lucene/util/pfor/For6Decompress.java	(revision 0)
+@@ -0,0 +1,58 @@
++package org.apache.lucene.util.pfor;
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.nio.IntBuffer;
++
++/** PFor frame decompression specialized for 6 frame bits. */
++class For6Decompress extends ForDecompress {
++  static final int numFrameBits = 6;
++  static final int mask = (1<<numFrameBits) - 1;
++
++  static void decodeCompressedInts(
++        IntBuffer intBuffer, int bufIndex, int inputSize,
++        int[] output, int outputOffset) {
++  
++    while (inputSize >= 16) {
++      int intValue1 = intBuffer.get(bufIndex);
++      int intValue2 = intBuffer.get(bufIndex + 1);
++      int intValue3 = intBuffer.get(bufIndex + 2);
++      output[0 + outputOffset] = intValue1 & mask;
++      output[1 + outputOffset] = (intValue1 >>> 6) & mask;
++      output[2 + outputOffset] = (intValue1 >>> 12) & mask;
++      output[3 + outputOffset] = (intValue1 >>> 18) & mask;
++      output[4 + outputOffset] = (intValue1 >>> 24) & mask;
++      output[5 + outputOffset] = ((intValue1 >>> 30) | (intValue2 << 2)) & mask;
++      output[6 + outputOffset] = (intValue2 >>> 4) & mask;
++      output[7 + outputOffset] = (intValue2 >>> 10) & mask;
++      output[8 + outputOffset] = (intValue2 >>> 16) & mask;
++      output[9 + outputOffset] = (intValue2 >>> 22) & mask;
++      output[10 + outputOffset] = ((intValue2 >>> 28) | (intValue3 << 4)) & mask;
++      output[11 + outputOffset] = (intValue3 >>> 2) & mask;
++      output[12 + outputOffset] = (intValue3 >>> 8) & mask;
++      output[13 + outputOffset] = (intValue3 >>> 14) & mask;
++      output[14 + outputOffset] = (intValue3 >>> 20) & mask;
++      output[15 + outputOffset] = (intValue3 >>> 26);
++      inputSize -= 16;
++      outputOffset += 16;
++      bufIndex += numFrameBits >> 1;
++    }
++   
++    if (inputSize == 0) return;
++    decodeAnyFrame(intBuffer, bufIndex, inputSize, numFrameBits, output, outputOffset);
++  }
++}
+Index: src/test/org/apache/lucene/util/pfor/TestPFor.java
+===================================================================
+--- src/test/org/apache/lucene/util/pfor/TestPFor.java	(revision 0)
++++ src/test/org/apache/lucene/util/pfor/TestPFor.java	(revision 0)
+@@ -0,0 +1,421 @@
++package org.apache.lucene.util.pfor;
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/* When using the Sun 1.6 jvm, the performance tests below (using doPerfTestNoExceptions)
++ * should be run with the -server argument to the forked jvm that is used for the
++ * junit tests by adding this line just before the 1st batchtest line
++ * in common-build.xml:
++      <jvmarg value="-server"/>
++ * Using this -server may be slow for other tests, in particular for shorter tests.
++ */ 
++ 
++import junit.framework.TestCase;
++
++import java.nio.ByteBuffer;
++import java.nio.IntBuffer;
++import java.util.Arrays;
++
++public class TestPFor extends TestCase {
++  private void showByte(int b, StringBuffer buf) {
++    for (int i = 7; i >= 0; i--) {
++      buf.append((b >>> i) & 1);
++    }
++  }
++
++  private void showBytes(byte[] array) {
++    StringBuffer buf = new StringBuffer();
++    for (int i = 0; i < array.length; i++) {
++      showByte(array[i] & 255, buf);
++      if (((i+1) % 4) != 0) {
++        buf.append(' ');
++      } else {
++        System.out.println(buf);
++        buf.setLength(0);
++      }
++    }
++  }
++
++  /** Run compression without buffer, return the buffer byte size needed for compression. */
++  private int doNoBufferRun(int[] input, int offset, int numFrameBits) {
++    PFor pforNoBufferCompress = new PFor();
++    pforNoBufferCompress.compress(input, offset, input.length - offset, numFrameBits);
++    return pforNoBufferCompress.bufferByteSize();
++  }
++
++  /** Create an IntBuffer, compress the given input into this buffer, and return it. */
++  private IntBuffer compressToBuffer(int[] input, int offset, int numFrameBits, int bufferByteSize) {
++    // Allocate an IntBuffer as a view on a ByteBuffer
++    int bufferIntSize = bufferByteSize / 4;
++    if (bufferIntSize * 4 < bufferByteSize) bufferIntSize++;
++    ByteBuffer byteBuffer = ByteBuffer.allocate(4 * bufferIntSize);
++    assert byteBuffer.hasArray();
++    byte[] bufferByteArray = byteBuffer.array();
++    assert bufferByteArray != null;
++    IntBuffer intBuffer = byteBuffer.asIntBuffer(); // no offsets used here.
++    
++    // Compress to buffer:
++    PFor pforCompress = new PFor();
++    pforCompress.setBuffer(intBuffer);
++    pforCompress.compress(input, offset, input.length - offset, numFrameBits);
++// assert bufferByteArray.length == 4 * bufferIntSize; // for showBytes() below.
++// showBytes(bufferByteArray);
++    if (bufferByteSize >= 0) {
++      assertEquals("Buffer byte size after compress() to buffer", bufferByteSize, pforCompress.bufferByteSize());
++    }
++    int numInputBytes = (input.length - offset) * 4;
++    if (numInputBytes != 0) {
++  System.out.println("Compressed " + numInputBytes + " bytes into "
++                      + pforCompress.bufferByteSize()
++                      + ", ratio " + (pforCompress.bufferByteSize()/(float)numInputBytes));
++    }
++    return intBuffer;
++  }
++
++  private void deCompressFromBufferVerify(IntBuffer intBuffer, int[] input, int offset, int bufferByteSize) {
++    // Decompress from the buffer:   
++    PFor pforDecompress = new PFor();
++    pforDecompress.setBuffer(intBuffer);
++    assertEquals("Decompressed length before decompress()", input.length - offset, pforDecompress.getIntSize());
++    int[] output = new int[input.length]; // use same offset as input
++    pforDecompress.decompress(output, offset);
++    assertEquals("Buffer byte size after decompress()", bufferByteSize, pforDecompress.bufferByteSize());
++    if (! Arrays.equals(input, output)) {
++      for (int i = 0; i < input.length; i++) {
++        if (input[i] != output[i]) {
++          System.out.println("at index " + i + " output " + output[i]+ " != input " + input[i]);
++        }
++      }
++      assertEquals("equal array lengths", input.length, output.length);
++      assertTrue("input == output", Arrays.equals(input, output));
++    }
++  }
++  
++  private void doTestOffset(int[] input, int offset, int numFrameBits, int bufferByteSize) {
++System.out.println();
++System.out.println(getName());
++    int actBufferByteSize = doNoBufferRun(input, offset, numFrameBits);
++    assertEquals("Buffer byte size after noBuffer run compress()", bufferByteSize, actBufferByteSize);
++    IntBuffer intBuffer = compressToBuffer(input, offset, numFrameBits, actBufferByteSize);
++    // Decompress and verify against original input.
++    deCompressFromBufferVerify(intBuffer, input, offset, actBufferByteSize);
++  }
++
++  private void doTest(int[] input, int numBits, int bufferByteSize) {
++    int offset = 0;
++    doTestOffset(input, offset, numBits, bufferByteSize);
++  }
++
++  public void test01NoExc() {
++    int[] input = {1}; // no exception
++    int numBits = 1;
++    int bufferByteSize = 5;
++    doTest(input, numBits, bufferByteSize);
++  }
++
++  public void test02ExcByte() {
++    int[] input = {2}; // 1 byte exception
++    int numBits = 1;
++    int bufferByteSize = 6;
++    doTest(input, numBits, bufferByteSize);
++  }
++
++  public void test03ExcTwoByte() {
++    int[] input = {1<<8}; // 2 byte exception
++    int numBits = 1;
++    int bufferByteSize = 7;
++    doTest(input, numBits, bufferByteSize);
++  }
++
++  public void test05ExcThreeByte() {
++    int[] input = {1<<16}; // 4 byte exception
++    int numBits = 1;
++    int bufferByteSize = 9;
++    doTest(input, numBits, bufferByteSize);
++  }
++
++  public void test06ExcFourByte() {
++    int[] input = {1<<30}; // 4 byte exception, (1<<31 is negative, an assertion fails on negative values.
++    int numBits = 1;
++    int bufferByteSize = 9;
++    doTest(input, numBits, bufferByteSize);
++  }
++  
++  public void test07_Offset1() {
++    int[] input = {0,1};
++    int offset = 1;
++    int numBits = 1;
++    int bufferByteSize = 5;
++    doTestOffset(input, offset, numBits, bufferByteSize);
++  }
++  
++  public void test07_Offset2() {
++    int[] input = new int[10];
++    int offset = 9;
++    input[offset] = 1;
++    int numBits = 1;
++    int bufferByteSize = 5;
++    doTestOffset(input, offset, numBits, bufferByteSize);
++  }
++  
++  public void test08ForcedException1() {
++    int[] input = {2,1,1}; // 2 exceptions, 1 byte
++    int numBits = 1;
++    int bufferByteSize = 4 + 1 + 2;
++    doTest(input, numBits, bufferByteSize);
++  }
++
++  public void test09ForcedException2() {
++    int[] input = {(1<<24),1,0}; // 2 exceptions, 4 byte
++    int numBits = 1;
++    int bufferByteSize = 4 + 1 + 2 * 4;
++    doTest(input, numBits, bufferByteSize);
++  }
++
++  public void test10FirstException() {
++    int[] input = {0,1,2,3,0,1,6,7,8}; // Test for not forcing first exception at index 4 (2nd value 0)
++    int numBits = 2;
++    int bufferByteSize = 4 + (numBits * input.length / 8 + 1) + 3; //  3 exceptions from value 6
++    doTest(input, numBits, bufferByteSize);
++  }
++
++  public void test11Series8Base3() { // This also tests for not forcing first exception
++    int[] input = {0,1,2,3,4,5,6,7,8};
++    int numBits = 3;
++    int bufferByteSize = 4 + (numBits * input.length / 8 + 1) + 1; // 1 exception
++    doTest(input, numBits, bufferByteSize);
++  }
++
++  public void test12Series8Base4() {
++    int[] input = {0,1,2,3,4,5,6,7,8};
++    int numBits = 4;
++    int bufferByteSize = 4 + (numBits * input.length / 8 + 1);
++    doTest(input, numBits, bufferByteSize);
++  }
++
++  public void test13Series8Base5() {
++    int[] input = {0,1,2,3,4,5,6,7,8};
++    int numBits = 5;
++    int bufferByteSize = 4 + (numBits * input.length / 8 + 1);
++    doTest(input, numBits, bufferByteSize);
++  }
++
++  private void numFrameBitsTest(int[] input, int expectedNumFrameBits) {
++    System.out.println();
++    System.out.println(getName());
++    assertEquals("numFrameBits", expectedNumFrameBits, PFor.getNumFrameBits(input, 0, input.length));
++  }
++
++  public void test20getNumFrameBits() {
++    int[] input = {2};
++    numFrameBitsTest(input, 2);
++  }
++
++  public void test21getNumFrameBits() {
++    int[] input = {9,8,7,6,5,4,3,2,1,0};
++    numFrameBitsTest(input, 4);
++  }
++
++  public void test22getNumFrameBits() {
++    int[] input = {16000,16001,6,5,4,3,2,1,0};
++    numFrameBitsTest(input, 3);
++  }
++
++  private void noBufferCompressionTest(int[] input) {
++System.out.println();
++System.out.println(getName());
++    // Run compression without buffer:
++    final int offset = 0;
++    PFor pforNoBufferCompress = new PFor();
++    pforNoBufferCompress.compress(input, offset, input.length - offset);
++    int numInputBytes = input.length * 4;
++System.out.println("Compress w/o buffer " + numInputBytes + " bytes into "
++                    + pforNoBufferCompress.bufferByteSize()
++                    + ", ratio " + (pforNoBufferCompress.bufferByteSize()/(float)numInputBytes));
++  }
++
++  public void test30NoBufferCompression() {
++    int[] input = {0,1,0,1,0,1,0,70000}; // would force exceptions for numFrameBits == 1
++    noBufferCompressionTest(input);
++  }
++
++  public void test31NoBufferCompression() {
++    int[] input = {9,8,7,6,5,4,3,2,1,0,21,22,23,24,22,45,76,223,43,62,454};
++    noBufferCompressionTest(input);
++  }
++
++  public void test32NoBufferCompression() {
++    int[] input = {9,8,7,6,5,4,3,2,1,0,21,22,23,24,22,45,76,223,43,62,454,
++                   9,8,7,6,5,4,3,2,1,0,0};
++    noBufferCompressionTest(input);
++  }
++
++  public void test40For1Decompress() {
++    int[] input = {
++      1,0,1,0,1,0,1,0,
++      1,0,1,0,1,0,1,0,
++      1,0,1,0,1,0,1,0,
++      1,0,1,0,1,0,1,0,
++      1,0,1,0,1,0,1,0,
++      1,0,1,0,1,0,1,0,
++      1,0,1,0,1,0,1,0,
++      1,0,1,0};
++    int numBits = 1;
++    int bufferByteSize = 12;
++    doTest(input, numBits, bufferByteSize);
++  }
++  
++  public void test41For2Decompress() {
++    int[] input = {
++      1,0,3,2,2,3,0,1,
++      1,0,3,2,2,3,0,1,
++      1,0,3,2,2,3,0,1,
++      1,0,3,2};
++    int numBits = 2;
++    int bufferByteSize = 11;
++    doTest(input, numBits, bufferByteSize);
++  }
++  
++  public void test42For3Decompress() {
++    int[] input = {
++      1,0,3,2,7,6,5,4,
++      7,5,4,5,6,7,0,1,
++      1,0,3,6,4,7,5,1,
++      1,0,4,5,6,7,0,1, // 32 input, 3 ints compressed
++      1,0,4,5,6,7,0,1,
++      4,6,3,6,4,7,5,1,
++      1,0,4,5,6,7}; // 22 more input, 9 bytes compressed
++    int numBits = 3;
++    int bufferByteSize = 4 + 4*3 + 9; // 25
++    doTest(input, numBits, bufferByteSize);
++  }
++  
++  public void test43For4Decompress() {
++    int[] input = {
++      1,0,3,2,5,7,4,6,
++      8,9,10,2,15,0};
++    int numBits = 4;
++    int bufferByteSize = 11;
++    doTest(input, numBits, bufferByteSize);
++  }
++
++  private void doPerfTestNoExceptions(int[] input, int numBits) {
++System.out.println();
++System.out.println(getName() + " starting");
++    int bufferByteSize = doNoBufferRun(input, 0, numBits);
++    int sizeNoExceptions = 4 + (input.length * numBits + 7) / 8;
++    assertEquals("Performance test without exceptions, buffer byte size ", sizeNoExceptions, bufferByteSize);
++    IntBuffer intBuffer = compressToBuffer(input, 0, numBits, bufferByteSize);
++    // Verify that decompression is correct:
++    deCompressFromBufferVerify(intBuffer, input, 0, bufferByteSize);
++    
++    // Repeat decompressing from the buffer, report on performance.
++    PFor pforDecompress = new PFor();
++    pforDecompress.setBuffer(intBuffer);
++    for (int rep = 0; rep < 3; rep++) {
++      int[] output = new int[input.length]; // use 0 offset
++      long maxTestMillis = 1000;
++      long testMillis;
++      int iterations = 0;
++      long startMillis = System.currentTimeMillis();
++      final int decompsPerIter = 1024 * 128;
++      do {
++        for (int i = 0; i < decompsPerIter; i++) {
++          pforDecompress.decompress(output, 0);
++        }
++        iterations++;
++        testMillis = System.currentTimeMillis() - startMillis;
++      } while ((testMillis < maxTestMillis) && (iterations < 1000));
++      long totalDecompressed = (((long) input.length) * decompsPerIter * iterations);
++  System.out.println(getName() + " " + rep + " numFrameBits " + numBits
++      + " decompressed " + totalDecompressed
++      + " in " + testMillis + " msecs, "
++      + ((int)(totalDecompressed/((float)testMillis))) + " ints/msec, ("
++      + iterations + " iters).");
++    }
++  }
++  
++  public void test9PerfFor1Decompress() {
++    int[] input = {
++      1,0,1,0,1,0,1,0,
++      1,0,1,0,1,0,1,0,
++      1,0,1,0,1,0,1,0,
++      1,0,1,0,1,0,1,0}; // 32 input, int compressed
++    int numBits = 1;
++    doPerfTestNoExceptions(input, numBits);
++  }
++
++  public void test9PerfFor2Decompress() {
++    int[] input = {
++      1,0,3,2,3,2,1,0,
++      1,0,3,2,3,2,1,0,
++      1,0,3,2,3,1,0,1,
++      1,0,3,2,3,2,1,0}; // 32 input, 2 ints compressed
++    int numBits = 2;
++    doPerfTestNoExceptions(input, numBits);
++  }
++
++  public void test9PerfFor3Decompress() {
++    int[] input = {
++      1,0,3,2,7,6,5,4,
++      7,5,4,5,6,7,0,1,
++      1,0,3,6,4,7,5,1,
++      1,0,4,5,6,7,0,1}; // 32 input, 3 ints compressed
++    int numBits = 3;
++    doPerfTestNoExceptions(input, numBits);
++  }
++
++  public void test9PerfFor4Decompress() {
++    int[] input = {
++      1,0,3,2,7,6,5,4,
++      9,8,11,14,12,15,13,9,
++      7,5,4,5,6,7,0,1,
++      9,8,11,14,12,15,13,9}; // 32 input, 5 ints compressed
++    int numBits = 4;
++    doPerfTestNoExceptions(input, numBits);
++  }
++
++  public void test9PerfFor5Decompress() {
++    int[] input = {
++      1,0,3,2,7,6,5,4,
++      9,8,11,14,12,15,13,9,
++      23,21,20,21,22,23,16,17,
++      9,8,11,14,12,15,13,9}; // 32 input, 5 ints compressed
++    int numBits = 5;
++    doPerfTestNoExceptions(input, numBits);
++  }
++
++  public void test9PerfFor6Decompress() {
++    int[] input = {
++      1,0,3,2,7,6,5,4,
++      33,32,35,37,63,62,61,60,
++      9,8,11,14,12,15,13,9,
++      23,21,20,21,22,23,16,17}; // 32 input, 6 ints compressed
++    int numBits = 6;
++    doPerfTestNoExceptions(input, numBits);
++  }
++
++  public void test9PerfFor7Decompress() {
++    int[] input = {
++      1,0,3,2,7,6,5,4,
++      33,32,35,37,63,62,61,60,
++      9,8,11,14,127,126,13,9,
++      23,21,20,21,22,23,16,17}; // 32 input, 7 ints compressed
++    int numBits = 7;
++    doPerfTestNoExceptions(input, numBits);
++  }
++}
+
+Property changes on: src/test/org/apache/lucene/util/pfor/TestPFor.java
+___________________________________________________________________
+Name: svn:special
+   + *
+

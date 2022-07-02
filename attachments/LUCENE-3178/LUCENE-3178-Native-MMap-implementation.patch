@@ -1,0 +1,1650 @@
+From 27041a92fe5fca90a0969f90a63d691675d8bd14 Mon Sep 17 00:00:00 2001
+From: Greg Bowyer <gbowyer@apache.org>
+Date: Mon, 7 Jan 2013 13:57:01 -0800
+Subject: [PATCH] LUCENE-3178: Native MMap implementation
+
+---
+ .../src/java/org/apache/lucene/util/Constants.java |   4 +
+ .../src/java/org/apache/lucene/util/Guarantee.java | 476 +++++++++++++++++++++
+ .../apache/lucene/util/DifficultCtorException.java |  36 ++
+ .../org/apache/lucene/util/NoCtorException.java    |  31 ++
+ .../test/org/apache/lucene/util/TestGuarantee.java | 382 +++++++++++++++++
+ lucene/misc/build.xml                              |   1 +
+ .../lucene/store/NativePosixMMapDirectory.java     | 219 ++++++++++
+ .../org/apache/lucene/store/NativePosixUtil.cpp    |  88 +++-
+ .../org/apache/lucene/store/NativePosixUtil.java   |  18 +-
+ .../lucene/store/TestNativePosixMMapDirectory.java | 259 +++++++++++
+ .../apache/solr/core/ResourceLoaderFactory.java    |   9 +
+ 11 files changed, 1513 insertions(+), 10 deletions(-)
+ create mode 100644 lucene/core/src/java/org/apache/lucene/util/Guarantee.java
+ create mode 100644 lucene/core/src/test/org/apache/lucene/util/DifficultCtorException.java
+ create mode 100644 lucene/core/src/test/org/apache/lucene/util/NoCtorException.java
+ create mode 100644 lucene/core/src/test/org/apache/lucene/util/TestGuarantee.java
+ create mode 100644 lucene/misc/src/java/org/apache/lucene/store/NativePosixMMapDirectory.java
+ create mode 100644 lucene/misc/src/test/org/apache/lucene/store/TestNativePosixMMapDirectory.java
+ create mode 100644 solr/core/src/java/org/apache/solr/core/ResourceLoaderFactory.java
+
+diff --git a/lucene/core/src/java/org/apache/lucene/util/Constants.java b/lucene/core/src/java/org/apache/lucene/util/Constants.java
+index 086ba2b..71cb400 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/Constants.java
++++ b/lucene/core/src/java/org/apache/lucene/util/Constants.java
+@@ -46,6 +46,10 @@ public final class Constants {
+   public static final boolean SUN_OS = OS_NAME.startsWith("SunOS");
+   /** True iff running on Mac OS X */
+   public static final boolean MAC_OS_X = OS_NAME.startsWith("Mac OS X");
++  /** True iff the underlying OS is a sane posix complient OS
++   * (Technically windows /is/ but it only supports a subset and not SUS so it doesnt count
++   */
++  public static final boolean POSIX = LINUX || SUN_OS || MAC_OS_X;
+ 
+   public static final String OS_ARCH = System.getProperty("os.arch");
+   public static final String OS_VERSION = System.getProperty("os.version");
+diff --git a/lucene/core/src/java/org/apache/lucene/util/Guarantee.java b/lucene/core/src/java/org/apache/lucene/util/Guarantee.java
+new file mode 100644
+index 0000000..236cb4c
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/util/Guarantee.java
+@@ -0,0 +1,476 @@
++package org.apache.lucene.util;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.lang.reflect.Constructor;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++
++import static java.lang.String.format;
++import static sun.reflect.ReflectionFactory.getReflectionFactory;
++
++/**
++ * Runtime assertion utility that cannot be disabled with the usage of Java / JDK
++ * flags. This might seem redundant, but this class is able to make it easier to quickly test
++ * and guarantee invariants and similar conditions within code, making it easier to develop
++ * code that fails fast, and cleanly. <br />
++ *
++ * This class is similar to commons-lang validate, as well as the Preconditions class from google guava,
++ * however, in difference to most versions, this is able to throw any arbitrary exception as a cause.
++ */
++public final class Guarantee {
++
++  // Empty class array, designed such that the JVM can avoid
++  // leaks related to empty array sentinels
++  private static final Class[] EMPTY_CLASS_ARRAY = new Class[0];
++
++  private Guarantee() {}
++
++  private static final Constructor JAVA_LANG_OBJECT_CONSTRUCTOR;
++
++  ///CLOVER:OFF
++  static {
++    try {
++      JAVA_LANG_OBJECT_CONSTRUCTOR = Object.class.getConstructor((Class[]) null);
++    } catch (NoSuchMethodException e) {
++      throw new UnknownError("Missing the intrinsic constructor ?");
++    }
++  }
++  ///CLOVER:ON
++
++  /**
++   * Guarantees that the given object is not null
++   * @param reference the object to check
++   * @param message message used if the object is null
++   * @throws IllegalArgumentException if the object is null
++   */
++  public static void ensureNotNull(Object reference, String message) throws IllegalArgumentException {
++    if(reference == null) {
++      throw new IllegalArgumentException(message);
++    }
++  }
++
++  /**
++   * Guarantees that the given object is not null
++   * @param reference the object to check
++   * @param message message used if the object is null
++   * @param formatArgs arguments used for String.format calls (will only occur if any error happens)
++   * @throws IllegalArgumentException if the object is null
++   */
++  public static void ensureNotNull(Object reference, String message, Object... formatArgs) throws IllegalArgumentException {
++    if(reference == null) {
++      throw new IllegalArgumentException(format(message, formatArgs));
++    }
++  }
++
++  /**
++   * Guarantees that the given object is not null
++   * @param reference the object to check
++   * @param throwable the exception to throw if the object is null
++   * @param args arguments used to construct the exception
++   * @throws T the given exception to be thrown if the object is null
++   */
++  public static<T extends Throwable> void ensureNotNull(Object reference, Class<T> throwable, Object... args) throws T {
++    if(reference == null) {
++      throw createException(throwable, args);
++    }
++  }
++
++  /**
++   * Guarantees that the given object is null, useful for checking sentinals
++   * @param reference the object to check
++   * @param message the message to be used if the object is not null
++   * @throws IllegalArgumentException if the object is not null
++   */
++  public static void ensureIsNull(Object reference, String message) throws IllegalArgumentException {
++    if(reference != null) {
++      throw new IllegalArgumentException(message);
++    }
++  }
++
++  /**
++   * Guarantees that the given object is null, useful for checking sentinels
++   * @param reference the object to check
++   * @param message the message to be used if the object is not null
++   * @param formatArgs arguments used for String.format calls (will only occur if any error happens)
++   * @throws IllegalArgumentException if the object is not null
++   */
++  public static void ensureIsNull(Object reference, String message, Object... formatArgs) throws IllegalArgumentException {
++    if(reference != null) {
++      throw new IllegalArgumentException(format(message, formatArgs));
++    }
++  }
++
++  /**
++   * Guarantees that the given object is null, useful for checking sentinels
++   * @param reference the object to check
++   * @param throwable the exception to throw if the object is not null
++   * @param args arguments used to construct the exception
++   * @throws T the given exception to be throw if the object is not null
++   */
++  public static<T extends Throwable> void ensureIsNull(Object reference, Class<T> throwable, Object... args) throws T {
++    if(reference != null) {
++      throw createException(throwable, args);
++    }
++  }
++
++  /**
++   * Guarantees that the given expression evaluates to true. For example <br />
++   * <code>
++   *  Assert.ensureIsTrue(facets.size > 30, "The number of product results must be more than 30");
++   * </code>
++   * @param expression the expression to check for truth
++   * @param message the message to use if the expression is false
++   * @throws IllegalArgumentException if the given expression is false
++   */
++  public static void ensureIsTrue(boolean expression, String message) throws IllegalArgumentException {
++    if(!expression) {
++      throw new IllegalArgumentException(message);
++    }
++  }
++
++  /**
++   * Guarantees that the given expression evaluates to true. For example <br />
++   * <code>
++   *  Assert.ensureIsTrue(facets.size > 30, "Product results were [%d] wayyy more than 30!", facets.size);
++   * </code>
++   * @param expression the expression to check for truth
++   * @param message the message to use if the expression is false
++   * @param formatArgs arguments used for String.format calls (will only occur if any error happens)
++   * @throws IllegalArgumentException if the given expression is false
++   */
++  public static void ensureIsTrue(boolean expression, String message, Object... formatArgs) throws IllegalArgumentException {
++    if(!expression) {
++      throw new IllegalArgumentException(format(message, formatArgs));
++    }
++  }
++
++  /**
++   * Guarantees that the given expression evaluates to true. For example <br />
++   * <code>
++   *  Assert.ensureIsTrue(facets.size > 30, ServiceInvocationException.class, "The number of facets must be > 30");
++   * </code>
++   * @param expression the expression to check for truth
++   * @param throwable the exception to throw is the expression is false
++   * @param args arguments used to construct the exception
++   * @throws T the given exception to be throw if the expression is false
++   */
++  public static<T extends Throwable> void ensureIsTrue(boolean expression, Class<T> throwable, Object... args) throws T {
++    if(!expression) {
++      throw createException(throwable, args);
++    }
++  }
++
++  /**
++   * Guarantees that the given expression evaluates to false. For example <br />
++   * <code>
++   *  Assert.ensureIsFalse(facets.size > 30, "The number of facets must be less than 30");
++   * </code>
++   * @param expression the expression to check for falsehood
++   * @param message the message to use is the expression is true
++   * @throws IllegalArgumentException if the expression is true
++   */
++  public static void ensureIsFalse(boolean expression, String message) throws IllegalArgumentException {
++    if(expression) {
++      throw new IllegalArgumentException(message);
++    }
++  }
++
++  /**
++   * Guarantees that the given expression evaluates to false. For example <br />
++   * <code>
++   *  Assert.ensureIsFalse(facets.size > 30, "Facet results were [%s] way more than 30!", facets.size);
++   * </code>
++   * @param expression the expression to check for falsehood
++   * @param message the message to use is the expression is true
++   * @param formatArgs arguments used for String.format calls (will only occur if any error happens)
++   * @throws IllegalArgumentException if the expression is true
++   */
++  public static void ensureIsFalse(boolean expression, String message, Object... formatArgs) throws IllegalArgumentException {
++    if(expression) {
++      throw new IllegalArgumentException(format(message, formatArgs));
++    }
++  }
++
++  /**
++   * Guarantees that the given expression evaluates to false. For example <br />
++   * <code>
++   *  Assert.ensureIsFalse(facets.size > 30, ServiceInvocationException.class, "The number of facets must be < 30");
++   * </code>
++   * @param expression the expression to check for falsehood
++   * @param throwable the exception to throw is the expression is true
++   * @param args arguments used to construct the exception
++   * @throws T the given exception to be throw if the expression is true
++   */
++  public static<T extends Throwable> void ensureIsFalse(boolean expression, Class<T> throwable, Object... args) throws T {
++    if(expression) {
++      throw createException(throwable, args);
++    }
++  }
++
++  /**
++   * Guarantees that the given object is an instance of the given type
++   * @param reference the reference to test
++   * @param type the type to assert the reference against
++   * @param message the message to use if the object is not an instance of the given type
++   * @throws IllegalArgumentException if the reference is not of the given type
++   */
++  public static void ensureInstanceOf(Object reference, Class type, String message) throws IllegalArgumentException {
++    ensureNotNull(type, "type is null");
++    if(!(type.isInstance(reference))) {
++      throw new IllegalArgumentException(message);
++    }
++  }
++
++  /**
++   * Guarantees that the given object is an instance of the given type
++   * @param reference the reference to test
++   * @param type the type to assert the reference against
++   * @param message the message to use if the object is not an instance of the given type
++   * @param formatArgs arguments used for String.format calls (will only occur if any error happens)
++   * @throws IllegalArgumentException if the reference is not of the given type
++   */
++  public static void ensureInstanceOf(Object reference, Class type, String message, Object... formatArgs) throws IllegalArgumentException {
++    ensureNotNull(type, "type is null");
++    if(!(type.isInstance(reference))) {
++      throw new IllegalArgumentException(format(message, formatArgs));
++    }
++  }
++
++  /**
++   * Guarantees that the given object is an instance of the given type
++   * @param reference the reference to test
++   * @param type the type to assert the reference against
++   * @param throwable the exception to throw if the reference is not of the given type
++   * @param args arguments used to construct the exception
++   * @throws T the given exception to be throw if the reference is not of the given type
++   */
++  public static<T extends Throwable> void ensureInstanceOf(Object reference, Class type, Class<T> throwable, Object... args) throws T {
++    ensureNotNull(type, "type is null");
++    if(!(type.isInstance(reference))) {
++      throw createException(throwable, args);
++    }
++  }
++
++  /**
++   * Guarantees that the given string is not null, empty, or pure whitespace. For instance all the following are
++   * invalid <br />
++   * <code>
++   *  Assert.ensureNotBlank("      ", "String should not be blank");
++   *  Assert.ensureNotBlank(null, "String should not be null");
++   *  Assert.ensureNotBlank("", "String should not be empty");
++   * </code>
++   * @param string the string to check over
++   * @param message the message to use if the string is blank
++   * @throws IllegalArgumentException if the string is blank
++   */
++  public static void ensureNotBlank(CharSequence string, String message) throws IllegalArgumentException {
++    if(isBlank(string)) {
++      throw new IllegalArgumentException(message);
++    }
++  }
++
++  /**
++   * Guarantees that the given string is not null, empty, or pure whitespace. For instance all the following are
++   * invalid <br />
++   * <code>
++   *  Assert.ensureNotBlank(facets.getUrl(), "URL for [%s] should not be blank", facets.getName());
++   * </code>
++   * @param string the string to check over
++   * @param message the message to use if the string is blank
++   * @param formatArgs arguments used for String.format calls (will only occur if any error happens)
++   * @throws IllegalArgumentException if the string is blank
++   */
++  public static void ensureNotBlank(CharSequence string, String message, Object... formatArgs) throws IllegalArgumentException {
++    if(isBlank(string)) {
++      throw new IllegalArgumentException(format(message, formatArgs));
++    }
++  }
++
++  /**
++   * Guarantees that the given string is not null, empty, or pure whitespace. For instance all of the following
++   * are invalid <br />
++   * <code>
++   *  Assert.ensureNotBlank("      ", ServiceInvocationException.class, "String should not be blank");
++   *  Assert.ensureNotBlank(null, ServiceInvocationException.class, "String should not be null");
++   *  Assert.ensureNotBlank("", ServiceInvocationException.class, "String should not be empty");
++   * </code>
++   * @param string the string to check over
++   * @param throwable the exception to throw if the reference is not of the given type
++   * @param args arguments used to construct the exception
++   * @throws T the given exception to be throw if the reference is not of the given type
++   */
++  public static<T extends Throwable> void ensureNotBlank(CharSequence string, Class<T> throwable, Object... args) throws T {
++    if(isBlank(string)) {
++      throw createException(throwable, args);
++    }
++  }
++
++  // Implementation helper methods follow
++  //------------------------------------------------------------------------------------------
++
++  /**
++   * Attempts to create an exception as wanted by various assert lines, will attempt to construct with
++   * as many of the given args as makes sense, if this fails it will construct a default object, potentially
++   * using trickery
++   * @param throwable the class to construct
++   * @param args constructor params to attempt to honor
++   * @return instance of the throwable if possible
++   */
++  private static <T extends Throwable> T createException(Class<T> throwable, Object[] args) {
++    try {
++      List<Constructor<T>> cons = null;
++      for(int size=args.length; size > 0; size--) {
++        Object[] workingArgs = Arrays.copyOf(args, size);
++        cons = obtainPossibleCtors(throwable, collectTypes(workingArgs));
++        if (!cons.isEmpty()) {
++          Constructor<T> con = cons.get(0);
++          if(!con.isAccessible()) {
++            con.setAccessible(true);
++          }
++          T instance = throwableOrNull(con, workingArgs);
++          if(instance != null) {
++            return instance;
++          }
++        }
++      }
++      Constructor<T> mungedConstructor = getReflectionFactory()
++          .newConstructorForSerialization(throwable, JAVA_LANG_OBJECT_CONSTRUCTOR);
++      mungedConstructor.setAccessible(true);
++      return throwableOrNull(mungedConstructor);
++    } catch (Exception e) {
++      throw new IllegalStateException(e);
++    }
++  }
++
++  /**
++   * Given an array of objects (essentially anything that
++   * can exist in a var args call), this method will collect
++   * the types of these objects into a new array, designed to be
++   * suitable for deducing ctor, and method handles.
++   * @param args the arguments to collect
++   * @return array of Class types for the given arguments, empty
++   * array if the array is empty, or null.
++   */
++  public static Class[] collectTypes(Object... args) {
++    if(args == null || args.length == 0) {
++      return EMPTY_CLASS_ARRAY;
++    }
++
++    boolean deadArray = true;
++    Class[] toReturn = new Class[args.length];
++    for(int i=0; i<args.length;i++) {
++      Object o = args[i];
++      deadArray &= (o == null);
++      toReturn[i] = o != null ? args[i].getClass() : null;
++    }
++    return deadArray ? EMPTY_CLASS_ARRAY : toReturn;
++  }
++
++  private static <T> List<Constructor<T>> obtainPossibleCtors(Class<T> clazz, Class... types) {
++    // Do not depend on Assert to avoid circular deps
++    if(clazz == null) {
++      throw new RuntimeException("Must have a class to deduce ctors for");
++    }
++    try {
++      List<Constructor<T>> toReturn = new ArrayList<Constructor<T>>();
++
++      if(types == null) {
++        return Arrays.asList(clazz.getConstructor(EMPTY_CLASS_ARRAY));
++      } else {
++        boolean emptySentinals = false;
++        for (final Class type1 : types) {
++          if (type1 == null) {
++            emptySentinals = true;
++            break;
++          }
++        }
++
++        // We can attempt to find the best ctor on the fast path
++        if(!emptySentinals) {
++          // We got lucky and got the right ctor right away
++          try {
++            Constructor<T> ctor = clazz.getConstructor(types);
++            if(ctor != null) {
++              return Arrays.asList(ctor);
++            }
++          } catch(NoSuchMethodException nsm) {
++            // pass
++          }
++        }
++
++        extractFromDeclaredConstructors(clazz, toReturn, types);
++
++        return toReturn;
++      }
++    } catch (Exception e) {
++      throw new RuntimeException("Error deducing constructors", e);
++    }
++  }
++
++  private static <T> void extractFromDeclaredConstructors(Class<T> clazz, List<Constructor<T>> toReturn, Class[] types) {
++    Constructor[] ctors = clazz.getDeclaredConstructors();
++    for(Constructor ctor : ctors) {
++      Class[] ctorTypes = ctor.getParameterTypes();
++      if(ctorTypes.length == types.length) {
++        boolean match = true;
++        for(int i=0; i < ctorTypes.length; i++) {
++          final Class type = types[i];
++          final Class ctorType = ctorTypes[i];
++
++          if(type != null && !ctorType.equals(type)) {
++            match = false;
++            break;
++          }
++        }
++        if(match) {
++          toReturn.add(ctor);
++        }
++      }
++    }
++  }
++
++  /**
++   * Elides exception handling around the construction of exceptions
++   * @param cons the constructor to call newInstance upon
++   * @param args the constructor params to attempt to honor
++   * @return instance if construction was successful, null otherwise
++   */
++  private static <T extends Throwable> T throwableOrNull(Constructor<T> cons, Object... args) {
++    try {
++      return cons.newInstance(args);
++    } catch (Exception e) {
++      return null;
++    }
++  }
++
++  private static boolean isBlank(CharSequence chars) {
++    if(chars == null || chars.length() == 0) {
++      return true;
++    }
++
++    for(int i=0; i<chars.length(); i++) {
++      if(!Character.isWhitespace(chars.charAt(i))) {
++        return false;
++      }
++    }
++
++    return true;
++  }
++}
+diff --git a/lucene/core/src/test/org/apache/lucene/util/DifficultCtorException.java b/lucene/core/src/test/org/apache/lucene/util/DifficultCtorException.java
+new file mode 100644
+index 0000000..9770b28
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/util/DifficultCtorException.java
+@@ -0,0 +1,36 @@
++package org.apache.lucene.util;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * Exception at has and awkward ctor designed to make it
++ * more difficult to obtain at the traditional
++ * exception ctor
++ */
++class DifficultCtorException extends Exception {
++
++    // Provide only the extended ctor, and one
++    // with an arbitrary argument
++    public DifficultCtorException(String message, Throwable cause) {
++        super(message, cause);
++    }
++
++    public DifficultCtorException(String message, Integer exceptionVersion) {
++        super(message);
++    }
++}
+diff --git a/lucene/core/src/test/org/apache/lucene/util/NoCtorException.java b/lucene/core/src/test/org/apache/lucene/util/NoCtorException.java
+new file mode 100644
+index 0000000..64186bf
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/util/NoCtorException.java
+@@ -0,0 +1,31 @@
++package org.apache.lucene.util;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * Exception ensureThat lacks a public constructor, designed to be
++ * difficult to instantiate and for testing
++ */
++class NoCtorException extends Exception {
++
++    // Looks odd but such exceptions have been spotted in the wild
++    private NoCtorException() {
++        super();
++    }
++
++}
+diff --git a/lucene/core/src/test/org/apache/lucene/util/TestGuarantee.java b/lucene/core/src/test/org/apache/lucene/util/TestGuarantee.java
+new file mode 100644
+index 0000000..f60de7a
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/util/TestGuarantee.java
+@@ -0,0 +1,382 @@
++package org.apache.lucene.util;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.junit.Test;
++
++import java.io.IOException;
++import java.lang.reflect.InvocationTargetException;
++import java.lang.reflect.Method;
++import java.util.Arrays;
++import java.util.concurrent.Callable;
++
++import static java.lang.String.format;
++import static org.apache.lucene.util.Guarantee.ensureInstanceOf;
++import static org.apache.lucene.util.Guarantee.ensureIsFalse;
++import static org.apache.lucene.util.Guarantee.ensureIsNull;
++import static org.apache.lucene.util.Guarantee.ensureIsTrue;
++import static org.apache.lucene.util.Guarantee.ensureNotBlank;
++import static org.apache.lucene.util.Guarantee.ensureNotNull;
++
++public class TestGuarantee {
++
++    private static final Class[] NULL_TEST_TYPES = classes(Object.class, Class.class, Object[].class);
++    private static final Class[] EXPRESSION_TEST_TYPES = classes(boolean.class, Class.class, Object[].class);
++    private static final Class[] INSTANCEOF_TEST_TYPES = classes(Object.class, Class.class, Class.class, Object[].class);
++    private static final Class[] STRINGBLANK_TEST_TYPES = classes(CharSequence.class, Class.class, Object[].class);
++
++    @Test
++    public void testNotNull() throws Exception {
++        assertExceptionThrown(
++            bind("ensureNotNull", classes(Object.class, String.class), null, "Should fail"),
++            IllegalArgumentException.class);
++        assertExceptionThrown(
++            bind("ensureNotNull", classes(Object.class, String.class, Object[].class), null, "Should fail", 10),
++            IllegalArgumentException.class);
++        assertExceptionThrown(
++            bind("ensureNotNull", NULL_TEST_TYPES, null, IOException.class, "Should fail"),
++            IOException.class);
++
++        // Test exceptions at are difficult to create and cause us no end of grief trying to create
++        // First test at we can create them normally
++        assertExceptionThrown(
++            bind("ensureNotNull", NULL_TEST_TYPES, null, NoCtorException.class, "Should be failing"),
++            NoCtorException.class);
++        assertExceptionThrown(
++            bind("ensureNotNull", NULL_TEST_TYPES, null, DifficultCtorException.class, "Should be failing"),
++            DifficultCtorException.class);
++
++        // Assert at the code does as we expect when we pass its test
++        ensureNotNull(new Object(), "Should not fail");
++        ensureNotNull(new Object(), "Should not [%d] fail", 1);
++        ensureNotNull(new Object(), IOException.class, "Should not fail");
++        ensureNotNull(new Object(), IOException.class);
++        ensureNotNull(new Object(), NoCtorException.class, "Should be failng");
++        ensureNotNull(new Object(), DifficultCtorException.class, "Should be failng");
++    }
++
++    @Test
++    public void testIsNull() throws Exception {
++        assertExceptionThrown(
++            bind("ensureIsNull", classes(Object.class, String.class), new Object(), "Should fail"),
++            IllegalArgumentException.class);
++        assertExceptionThrown(
++            bind("ensureIsNull", classes(Object.class, String.class, Object[].class), new Object(), "Should fail %d", 10),
++            IllegalArgumentException.class);
++        assertExceptionThrown(
++            bind("ensureIsNull", NULL_TEST_TYPES, new Object(), IOException.class, "Should fail"),
++            IOException.class);
++
++        // Test exceptions at are difficult to create and cause us no end of grief trying to create
++        // First test at we can create them normally
++        assertExceptionThrown(
++            bind("ensureIsNull", NULL_TEST_TYPES, new Object(), NoCtorException.class, "Should be failing"),
++            NoCtorException.class);
++        assertExceptionThrown(
++            bind("ensureIsNull", NULL_TEST_TYPES, new Object(), DifficultCtorException.class, "Should be failing"),
++            DifficultCtorException.class);
++
++        // Assert at the code does as we expect when we pass its test
++        ensureIsNull(null, "Should not fail");
++        ensureIsNull(null, "Should not fail %d", 1);
++        ensureIsNull(null, IOException.class, "Should not fail");
++        ensureIsNull(null, IOException.class);
++        ensureIsNull(null, NoCtorException.class, "Should not fail");
++        ensureIsNull(null, DifficultCtorException.class, "Should not fail");
++    }
++
++    @Test
++    public void testIsTrue() throws Exception {
++        assertExceptionThrown(
++            bind("ensureIsTrue", classes(boolean.class, String.class), false, "Should be failing"),
++            IllegalArgumentException.class);
++        assertExceptionThrown(
++            bind("ensureIsTrue", classes(boolean.class, String.class, Object[].class), false, "Should be failing %s", "test"),
++            IllegalArgumentException.class);
++        assertExceptionThrown(
++            bind("ensureIsTrue", EXPRESSION_TEST_TYPES, false, IOException.class),
++            IOException.class);
++        assertExceptionThrown(
++            bind("ensureIsTrue", EXPRESSION_TEST_TYPES, false, IOException.class, "Should fail"),
++            IOException.class);
++
++        // Test exceptions at are difficult to create and cause us no end of grief trying to create
++        // First test at we can create them normally
++        assertExceptionThrown(
++            bind("ensureIsTrue", EXPRESSION_TEST_TYPES, false, NoCtorException.class, "Should be failing"),
++            NoCtorException.class);
++        assertExceptionThrown(
++            bind("ensureIsTrue", EXPRESSION_TEST_TYPES, false, DifficultCtorException.class, "Should be failing"),
++            DifficultCtorException.class);
++
++        // Assert at the code does as we expect when we pass its test
++        ensureIsTrue(true, "Should not fail");
++        ensureIsTrue(true, "Should not fail %s", "test");
++        ensureIsTrue(true, IOException.class, "Should not fail");
++        ensureIsTrue(true, IOException.class);
++        ensureIsTrue(true, NoCtorException.class, "Should be failng");
++        ensureIsTrue(true, DifficultCtorException.class, "Should be failng");
++    }
++
++    @Test
++    public void testIsFalse() throws Exception {
++        assertExceptionThrown(
++            bind("ensureIsFalse", classes(boolean.class, String.class), true, "Should be failing"),
++            IllegalArgumentException.class);
++        assertExceptionThrown(
++            bind("ensureIsFalse", classes(boolean.class, String.class, Object[].class), true, "Should be failing %s", "test"),
++            IllegalArgumentException.class);
++        assertExceptionThrown(
++            bind("ensureIsFalse", EXPRESSION_TEST_TYPES, true, IOException.class),
++            IOException.class);
++        assertExceptionThrown(
++            bind("ensureIsFalse", EXPRESSION_TEST_TYPES, true, IOException.class, "Should fail"),
++            IOException.class);
++
++        // Test exceptions at are difficult to create and cause us no end of grief trying to create
++        // First test at we can create them normally
++        assertExceptionThrown(
++            bind("ensureIsFalse", EXPRESSION_TEST_TYPES, true, NoCtorException.class, "Should be failing"),
++            NoCtorException.class);
++        assertExceptionThrown(
++            bind("ensureIsFalse", EXPRESSION_TEST_TYPES, true, DifficultCtorException.class, "Should be failing"),
++            DifficultCtorException.class);
++
++        // Assert at the code does as we expect when we pass its test
++        ensureIsFalse(false, "Should not fail");
++        ensureIsFalse(false, "Should not fail %s", "test");
++        ensureIsFalse(false, IOException.class, "Should not fail");
++        ensureIsFalse(false, IOException.class);
++        ensureIsFalse(false, NoCtorException.class, "Should not fail");
++        ensureIsFalse(false, DifficultCtorException.class, "Should not fail");
++    }
++
++    @Test
++    public void testInstanceOf() throws Exception {
++        assertExceptionThrown(
++            bind("ensureInstanceOf", classes(Object.class, Class.class, String.class), "", Long.class, "Should be failing"),
++            IllegalArgumentException.class);
++        assertExceptionThrown(
++            bind("ensureInstanceOf", classes(Object.class, Class.class, String.class, Object[].class), "", Long.class,
++                "Should be failing %s", "test"),
++            IllegalArgumentException.class);
++        assertExceptionThrown(
++            bind("ensureInstanceOf", INSTANCEOF_TEST_TYPES, "", Long.class, "Should be failing", IOException.class),
++            IllegalArgumentException.class);
++        assertExceptionThrown(
++            bind("ensureInstanceOf", INSTANCEOF_TEST_TYPES, "", Long.class, "Should be failing", IOException.class, "Should fail"),
++            IllegalArgumentException.class);
++
++        // Test exceptions at are difficult to create and cause us no end of grief trying to create
++        // First test at we can create them normally
++        assertExceptionThrown(
++            bind("ensureInstanceOf", INSTANCEOF_TEST_TYPES, "", Long.class, NoCtorException.class, "Should be failing"),
++            NoCtorException.class);
++        assertExceptionThrown(
++            bind("ensureInstanceOf", INSTANCEOF_TEST_TYPES, "", Long.class, DifficultCtorException.class, "Should be failing"),
++            DifficultCtorException.class);
++
++        // Test null handling
++        assertExceptionThrown(
++            bind("ensureInstanceOf", INSTANCEOF_TEST_TYPES, null, String.class, DifficultCtorException.class, "Should be failing"),
++            DifficultCtorException.class);
++
++        // Assert at the code does as we expect when we pass its test
++        ensureInstanceOf("", String.class, "Should not fail");
++        ensureInstanceOf("", String.class, "Should not fail %d", 1);
++        ensureInstanceOf("", String.class, IOException.class, "Should not fail");
++        ensureInstanceOf("", String.class, IOException.class);
++        ensureInstanceOf("", String.class, NoCtorException.class, "Should not fail");
++        ensureInstanceOf("", String.class, DifficultCtorException.class, "Should not fail");
++    }
++
++    @Test
++    public void testNotBlank() throws Exception {
++        assertExceptionThrown(
++            bind("ensureNotBlank", classes(CharSequence.class, String.class), "", "Should be failing"),
++            IllegalArgumentException.class);
++        assertExceptionThrown(
++            bind("ensureNotBlank", classes(CharSequence.class, String.class, Object[].class), "", "Should be failing %s", "test"),
++            IllegalArgumentException.class);
++        assertExceptionThrown(
++            bind("ensureNotBlank", classes(CharSequence.class, String.class), null, "Should be failing"),
++            IllegalArgumentException.class);
++        assertExceptionThrown(
++            bind("ensureNotBlank", classes(CharSequence.class, String.class), null, "Should be failing %s", "test"),
++            IllegalArgumentException.class);
++        assertExceptionThrown(
++            bind("ensureNotBlank", classes(CharSequence.class, String.class), "    ", "Should be failing"),
++            IllegalArgumentException.class);
++        assertExceptionThrown(
++            bind("ensureNotBlank", classes(CharSequence.class, String.class), "    ", "Should be failing %s", "test"),
++            IllegalArgumentException.class);
++        assertExceptionThrown(
++            bind("ensureNotBlank", classes(CharSequence.class, String.class), "\t\t\t", "Should be failing"),
++            IllegalArgumentException.class);
++        assertExceptionThrown(
++            bind("ensureNotBlank", classes(CharSequence.class, String.class), "\t\t\t", "Should be failing %s", "test"),
++            IllegalArgumentException.class);
++        assertExceptionThrown(
++            bind("ensureNotBlank", classes(CharSequence.class, String.class), "\n", "Should be failing"),
++            IllegalArgumentException.class);
++        assertExceptionThrown(
++            bind("ensureNotBlank", classes(CharSequence.class, String.class), "\n", "Should be failing %s", "test"),
++            IllegalArgumentException.class);
++
++        assertExceptionThrown(
++            bind("ensureNotBlank", STRINGBLANK_TEST_TYPES, "", IOException.class, "Should be failing"),
++            IOException.class);
++        assertExceptionThrown(
++            bind("ensureNotBlank", STRINGBLANK_TEST_TYPES, null, IOException.class, "Should be failing"),
++            IOException.class);
++        assertExceptionThrown(
++            bind("ensureNotBlank", STRINGBLANK_TEST_TYPES, "    ", IOException.class, "Should be failing"),
++            IOException.class);
++        assertExceptionThrown(
++            bind("ensureNotBlank", STRINGBLANK_TEST_TYPES, "\t\t\t", IOException.class, "Should be failing"),
++            IOException.class);
++        assertExceptionThrown(
++            bind("ensureNotBlank", STRINGBLANK_TEST_TYPES, "\n", IOException.class, "Should be failing"),
++            IOException.class);
++
++        assertExceptionThrown(
++            bind("ensureNotBlank", STRINGBLANK_TEST_TYPES, "", IOException.class, "Should be failing"),
++            IOException.class);
++        assertExceptionThrown(
++            bind("ensureNotBlank", STRINGBLANK_TEST_TYPES, null, IOException.class, "Should be failing"),
++            IOException.class);
++        assertExceptionThrown(
++            bind("ensureNotBlank", STRINGBLANK_TEST_TYPES, "    ", IOException.class, "Should be failing"),
++            IOException.class);
++        assertExceptionThrown(
++            bind("ensureNotBlank", STRINGBLANK_TEST_TYPES, "\t\t\t", IOException.class, "Should be failing"),
++            IOException.class);
++        assertExceptionThrown(
++            bind("ensureNotBlank", STRINGBLANK_TEST_TYPES, "\n", IOException.class, "Should be failing"),
++            IOException.class);
++
++        // Test exceptions at are difficult to create and cause us no end of grief trying to create
++        // First test at we can create them normally
++        assertExceptionThrown(
++            bind("ensureNotBlank", STRINGBLANK_TEST_TYPES, "", NoCtorException.class),
++            NoCtorException.class);
++        assertExceptionThrown(
++            bind("ensureNotBlank", STRINGBLANK_TEST_TYPES, null, NoCtorException.class),
++            NoCtorException.class);
++        assertExceptionThrown(
++            bind("ensureNotBlank", STRINGBLANK_TEST_TYPES, "    ", NoCtorException.class),
++            NoCtorException.class);
++        assertExceptionThrown(
++            bind("ensureNotBlank", STRINGBLANK_TEST_TYPES, "\t\t\t", NoCtorException.class),
++            NoCtorException.class);
++        assertExceptionThrown(
++            bind("ensureNotBlank", STRINGBLANK_TEST_TYPES, "\n", NoCtorException.class),
++            NoCtorException.class);
++
++        assertExceptionThrown(
++            bind("ensureNotBlank", STRINGBLANK_TEST_TYPES, "", DifficultCtorException.class, "Should be failing"),
++            DifficultCtorException.class);
++        assertExceptionThrown(
++            bind("ensureNotBlank", STRINGBLANK_TEST_TYPES, null, DifficultCtorException.class, "Should be failing"),
++            DifficultCtorException.class);
++        assertExceptionThrown(
++            bind("ensureNotBlank", STRINGBLANK_TEST_TYPES, "    ", DifficultCtorException.class, "Should be failing"),
++            DifficultCtorException.class);
++        assertExceptionThrown(
++            bind("ensureNotBlank", STRINGBLANK_TEST_TYPES, "\t\t\t", DifficultCtorException.class, "Should be failing"),
++            DifficultCtorException.class);
++        assertExceptionThrown(
++            bind("ensureNotBlank", STRINGBLANK_TEST_TYPES, "\n", DifficultCtorException.class, "Should be failing"),
++            DifficultCtorException.class);
++
++        // Assert at the code does as we expect when we pass its test
++        ensureNotBlank("test", "Should not fail");
++        ensureNotBlank("test", "Should not fail %s", "test");
++        ensureNotBlank("test", IOException.class, "Should not fail");
++        ensureNotBlank("test", IOException.class);
++        ensureNotBlank("test", NoCtorException.class, "Should not fail");
++        ensureNotBlank("test", DifficultCtorException.class, "Should not fail");
++
++        // Embeded spaces should not fail
++        ensureNotBlank(" test", DifficultCtorException.class, "Should not fail");
++        ensureNotBlank("\ttest", DifficultCtorException.class, "Should not fail");
++        ensureNotBlank(" test ", DifficultCtorException.class, "Should not fail");
++        ensureNotBlank("\ttest ", DifficultCtorException.class, "Should not fail");
++        ensureNotBlank("\ttest\t", DifficultCtorException.class, "Should not fail");
++        ensureNotBlank(" test\t", DifficultCtorException.class, "Should not fail");
++        ensureNotBlank("This is a general string", DifficultCtorException.class, "Should not fail");
++        ensureNotBlank("String \t with \n all manner of \r control chars\n\r", DifficultCtorException.class, "Should not fail");
++    }
++
++    /**
++     * Get the method with given types
++     * @param name The name of the method to use
++     * @param types The types to use in finding the given method
++     * @param args Arguments to bind to the method site
++     * @return Callable at when invoked will run the given method
++     * @throws Exception
++     */
++    public static Callable bind(String name, Class[] types, final Object... args) throws Exception {
++        final Method method = Guarantee.class.getMethod(name, types);
++        return createCallback(method, args);
++    }
++
++    private static Object[] processArgs(Method method, Object... args) {
++        final Object[] callArgs;
++        Class[] params = method.getParameterTypes();
++        if(params[params.length - 1].equals(Object[].class)) {
++            // Collect up var args
++            Object[] newArgs = new Object[params.length];
++            Object[] varArgs = Arrays.copyOfRange(args, params.length - 1, args.length);
++            System.arraycopy(args,0,newArgs,0, params.length - 1);
++            newArgs[newArgs.length - 1] = varArgs;
++            callArgs = newArgs;
++        } else {
++            callArgs = args;
++        }
++        return callArgs;
++    }
++
++    private static Callable createCallback(final Method method, Object... args) {
++        final Object[] callArgs = processArgs(method, args);
++        return new Callable() {
++            public Object call() throws Exception {
++                try {
++                    return method.invoke(null, callArgs);
++                } catch (InvocationTargetException ite) {
++                    throw (Exception) ite.getTargetException();
++                }
++            }
++        };
++    }
++
++    // Syntax hack to reduce the line noise
++    public static Class[] classes(Class... objs) {
++        return objs;
++    }
++
++    private static void assertExceptionThrown(Callable c, Class expected) throws AssertionError {
++        try {
++            c.call();
++        } catch (Throwable t) {
++            org.junit.Assert.assertTrue(
++                format("Should have thrown %s got %s", expected.getCanonicalName(), t.getClass().getCanonicalName()),
++                t.getClass().equals(expected));
++        }
++    }
++}
+diff --git a/lucene/misc/build.xml b/lucene/misc/build.xml
+index 7ed7fbc..cf00b04 100644
+--- a/lucene/misc/build.xml
++++ b/lucene/misc/build.xml
+@@ -45,6 +45,7 @@
+       </includepath>
+ 
+       <compilerarg value="-fPIC" />
++      <compilerarg value="-O2" />
+       <linkerarg value="-lstdc++" />
+     </cc>
+   </target>
+diff --git a/lucene/misc/src/java/org/apache/lucene/store/NativePosixMMapDirectory.java b/lucene/misc/src/java/org/apache/lucene/store/NativePosixMMapDirectory.java
+new file mode 100644
+index 0000000..b1255be
+--- /dev/null
++++ b/lucene/misc/src/java/org/apache/lucene/store/NativePosixMMapDirectory.java
+@@ -0,0 +1,219 @@
++package org.apache.lucene.store;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.util.Constants;
++import org.apache.lucene.util.WeakIdentityMap;
++import sun.misc.Unsafe;
++
++import java.io.File;
++import java.io.IOException;
++import java.io.RandomAccessFile;
++import java.lang.reflect.Field;
++import java.util.Iterator;
++
++import static java.lang.String.format;
++import static org.apache.lucene.util.Guarantee.ensureIsFalse;
++import static org.apache.lucene.util.Guarantee.ensureIsTrue;
++
++/**
++ * Implementation of file base {@link Directory} that directly uses the mmap(2)
++ * system call for reading, and {@link FSDirectory.FSIndexOutput} for writing.
++ *
++ * <p><b>NOTE</b>: memory mapping uses up a portion of the virtual memory
++ * address space in your process equal to the length of the file being mapped.
++ * Before using this class, be sure your have plenty of virtual address space,
++ * this implementation assumes a 64bit virtual machine and will fail if the VM is
++ * found to be 32bit. This implementation is also only assumed to work on posix
++ * compliant operating systems, and as such presently does not work on windows.
++ *
++ * <p>This will consume additional transient disk usage, and may lead to page
++ * faults in the OS.
++ *
++ */
++public class NativePosixMMapDirectory extends FSDirectory {
++
++  /**
++   * Create a new MMapDirectory for the named location and {@link NativeFSLockFactory}.
++   * @param path the path of the directory
++   * @throws IOException if there is a low-level I/O error
++   */
++  public NativePosixMMapDirectory(File path) throws IOException {
++    this(path, null);
++  }
++
++  /**
++   * Create a new MMapDirectory for the named location.
++   * @param path the path of the directory
++   * @param lockFactory the lock factory to use, or null for the default
++   * ({@link NativeFSLockFactory});
++   * @throws IOException if there is a low-level I/O error
++   */
++  public NativePosixMMapDirectory(File path, LockFactory lockFactory) throws IOException {
++    super(path, lockFactory);
++
++    ensureIsTrue(Constants.JRE_IS_64BIT, IOException.class, "The native posix mmap directory assumes a 64bit VM");
++    ensureIsFalse(Constants.WINDOWS, IOException.class, "This directory impl is unix specific");
++  }
++
++  /** Creates an IndexInput for the file with the given name. */
++  @Override
++  public IndexInput openInput(String name, IOContext context) throws IOException {
++    ensureOpen();
++    String path = new File(getDirectory(), name).getAbsolutePath();
++    RandomAccessFile raf = null;
++    try {
++      raf = new RandomAccessFile(path, "r");
++      return new NativePosixMMapIndexInput(path, raf, context);
++    } finally {
++      if (raf != null) {
++        raf.close();
++      }
++    }
++  }
++
++  private static final class NativePosixMMapIndexInput extends IndexInput {
++
++    private final static Unsafe unsafe;
++    static {
++      try {
++        Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
++        theUnsafe.setAccessible(true);
++        unsafe = (Unsafe) theUnsafe.get(null);
++      } catch (Exception e) {
++        throw new ExceptionInInitializerError("Could not acquire the Unsafe");
++      }
++    }
++
++    // Cached array base offset
++    private static final long arrayBaseOffset = (long)unsafe.arrayBaseOffset(byte[].class);
++
++    // Clones will make the VM go BOOM (SEGV) if we attempt to read bytes after the fact
++    private final boolean isClone;
++    private final WeakIdentityMap<NativePosixMMapIndexInput, Boolean> clones;
++
++    private final long mappingAddress;
++    private final long length;
++
++    private long offset;
++    private volatile boolean isOpen = false;
++
++    public NativePosixMMapIndexInput(String path, RandomAccessFile file, IOContext context) throws IOException {
++      super(format("NativePosixMMapIndexInput(path=%s)", path));
++      this.length = file.length();
++
++      this.isClone = false;
++      this.clones = WeakIdentityMap.newConcurrentHashMap();
++
++      if (this.length() > 0) {
++        // mmap all the things
++        this.mappingAddress = NativePosixUtil.mmap(file.getFD(), this.length);
++      } else {
++        this.mappingAddress = -1;
++      }
++      this.isOpen = true;
++    }
++
++    public NativePosixMMapIndexInput(NativePosixMMapIndexInput clonee) {
++      super(clonee.toString());
++      ensureIsTrue(clonee.isOpen, AlreadyClosedException.class);
++      this.length = clonee.length;
++
++      this.clones = clonee.clones;
++      this.mappingAddress = clonee.mappingAddress;
++      this.isOpen = clonee.isOpen;
++      this.isClone = true;
++      this.offset = clonee.offset;
++    }
++
++    @Override
++    public void close() throws IOException {
++      // munmap all the things
++      if (isOpen && !isClone) {
++
++        if (this.mappingAddress != -1) {
++          NativePosixUtil.munmap(this.mappingAddress, this.length);
++        }
++
++        // I think this is a potential race condition, does lucene ensure that clones are
++        // not used concurrently to a closed index input ?
++        for (Iterator<NativePosixMMapIndexInput> it = this.clones.keyIterator(); it.hasNext();) {
++          final NativePosixMMapIndexInput clone = it.next();
++          ensureIsTrue(clone.isClone, "Trying to indicate closure on a none clone");
++          clone.isOpen = false;
++        }
++        this.clones.clear();
++      }
++      this.isOpen = false;
++    }
++
++    @Override
++    public long getFilePointer() {
++      ensureIsTrue(isOpen, AlreadyClosedException.class);
++      return this.offset;
++    }
++
++    @Override
++    public void seek(long pos) throws IOException {
++      ensureIsTrue(isOpen, AlreadyClosedException.class);
++      ensureIsFalse(pos < 0, IOException.class, "Attempt to make a negative seek");
++      ensureIsTrue(pos <= length, IOException.class, "Attempting to seek beyond the end of the file");
++      this.offset = pos;
++    }
++
++    @Override
++    public long length() {
++      return length;
++    }
++
++    @Override
++    public byte readByte() throws IOException {
++      ensureIsTrue(isOpen, AlreadyClosedException.class);
++      ensureIsFalse(this.offset >= length, IOException.class, "read past EOF");
++      return unsafe.getByte(trueAddress(this.offset++));
++    }
++
++    @Override
++    public void readBytes(final byte[] b, final int destPosition, final int len) throws IOException {
++      ensureIsTrue(isOpen, AlreadyClosedException.class);
++      ensureIsFalse(b.length < len, "Requested to copy more bytes than array allows");
++      ensureIsFalse(len > this.length - this.offset, IOException.class, "Attempt to read past end of mmap area");
++
++      long srcAddr = trueAddress(this.offset);
++
++      if (len > unsafe.pageSize() * 32) {
++          NativePosixUtil.madvise2(trueAddress(offset), len);
++      }
++
++      long destOffset = arrayBaseOffset + destPosition;
++      unsafe.copyMemory(null, srcAddr, b, destOffset, len);
++      this.offset += len;
++    }
++
++    private long trueAddress(long pos) {
++      return this.mappingAddress + pos;
++    }
++
++    @Override
++    public IndexInput clone() {
++      NativePosixMMapIndexInput toReturn = new NativePosixMMapIndexInput(this);
++      clones.put(toReturn, true);
++      return toReturn;
++    }
++  }
++}
+diff --git a/lucene/misc/src/java/org/apache/lucene/store/NativePosixUtil.cpp b/lucene/misc/src/java/org/apache/lucene/store/NativePosixUtil.cpp
+index 999e6a2..7b8cf75 100644
+--- a/lucene/misc/src/java/org/apache/lucene/store/NativePosixUtil.cpp
++++ b/lucene/misc/src/java/org/apache/lucene/store/NativePosixUtil.cpp
+@@ -36,6 +36,42 @@
+ 
+ // java -cp .:lib/junit-4.10.jar:./build/classes/test:./build/classes/java:./build/classes/demo -Dlucene.version=2.9-dev -DtempDir=build -ea org.junit.runner.JUnitCore org.apache.lucene.index.TestDoc
+ 
++const int getFD(JNIEnv *env, jobject jfd) {
++  // get int fd:
++  jclass class_fdesc = env->FindClass("java/io/FileDescriptor");
++  if (class_fdesc == NULL) {
++    return -1;
++  }
++
++  jfieldID field_fd = env->GetFieldID(class_fdesc, "fd", "I");
++  if (field_fd == NULL) {
++    return -1;
++  }
++
++  return env->GetIntField(jfd, field_fd);
++}
++
++// Make a macro ?
++const int ensure(int statement, JNIEnv *env, const char* clazz) {
++  if (!statement) {
++    jclass class_ex = env->FindClass(clazz);
++    if (class_ex == NULL) {
++      class_ex = env->FindClass("java/lang/IllegalArgumentException");
++      if (class_ex == NULL) {
++        class_ex = env->FindClass("java/lang/UnknownError");
++        if (class_ex == NULL) {
++          // What now ? give up and die !
++          env->FatalError("Unable to create exception in JNI, could not even find java.lang.UnknownError - VM in primodial state ?");
++        }
++      }
++      return 2;
++    }
++    env->ThrowNew(class_ex, strerror(errno));
++    return 1;
++  }
++  return 0;
++}
++
+ #ifdef LINUX
+ /*
+  * Class:     org_apache_lucene_store_NativePosixUtil
+@@ -177,18 +213,11 @@ extern "C"
+ JNIEXPORT jlong JNICALL Java_org_apache_lucene_store_NativePosixUtil_pread(JNIEnv *env, jclass _ignore, jobject jfd, jlong pos, jobject byteBuf)
+ {
+   // get int fd:
+-  jclass class_fdesc = env->FindClass("java/io/FileDescriptor");
+-  if (class_fdesc == NULL) {
++  const int fd = getFD(env, jfd);
++  if (fd == -1) {
+     return -1;
+   }
+ 
+-  jfieldID field_fd = env->GetFieldID(class_fdesc, "fd", "I");
+-  if (field_fd == NULL) {
+-    return -1;
+-  }
+-
+-  const int fd = env->GetIntField(jfd, field_fd);
+-
+   void *p = env->GetDirectBufferAddress(byteBuf);
+   if (p == NULL) {
+     return -1;
+@@ -344,3 +373,44 @@ JNIEXPORT jint JNICALL Java_org_apache_lucene_store_NativePosixUtil_madvise(JNIE
+   
+   return 0;
+ }
++
++/*
++ * Class: org_apache_lucene_store_NativePosixUtil
++ * Method: mmap
++ * Signature: (Ljava/io/FileDescriptor)J
++ */
++extern "C"
++JNIEXPORT jlong JNICALL Java_org_apache_lucene_store_NativePosixUtil_mmap(JNIEnv *env, jclass _ignore, jobject jfd, jlong length) {
++  const int fd = getFD(env, jfd);
++  if (ensure(fd != -1, env, "java/io/IOException"))
++    return -1;
++
++  off_t offset = 0;
++  void *addr = mmap(NULL, length, PROT_READ, MAP_SHARED, fd, offset);
++  if (ensure(addr != NULL && ((size_t) addr) != -1, env, "java/io/IOException"))
++    return -1;
++
++  madvise(addr, length, MADV_SEQUENTIAL);
++
++  return (long) addr;
++}
++
++/*
++ * Class: org_apache_lucene_store_NativePosixUtil
++ * Method: munmap
++ * Signature: (Ljava/io/FileDescriptor;J)J
++ */
++extern "C"
++JNIEXPORT void JNICALL Java_org_apache_lucene_store_NativePosixUtil_munmap(JNIEnv *env, jclass _ignore, jlong addr, jlong length) {
++  ensure(!munmap((void*) addr, length), env, "java/io/IOException");
++}
++
++extern "C"
++JNIEXPORT void JNICALL Java_org_apache_lucene_store_NativePosixUtil_madvise2(JNIEnv *env, jclass _ignore, jlong addr, jlong length) {
++  long page_sz = sysconf(_SC_PAGESIZE);
++  addr = ((addr + (page_sz - 1)) / page_sz) * page_sz;
++  madvise((void*) addr, length, MADV_WILLNEED);
++  //ensure(!madvise((void*) addr, length, MADV_WILLNEED), env, "java/io/IOException");
++}
++
++/* vim: set et fenc=utf-8 ff=unix sts=4 sw=2 ts=2 : */
+diff --git a/lucene/misc/src/java/org/apache/lucene/store/NativePosixUtil.java b/lucene/misc/src/java/org/apache/lucene/store/NativePosixUtil.java
+index 0618318..e77cd5a 100644
+--- a/lucene/misc/src/java/org/apache/lucene/store/NativePosixUtil.java
++++ b/lucene/misc/src/java/org/apache/lucene/store/NativePosixUtil.java
+@@ -33,8 +33,15 @@ public final class NativePosixUtil {
+   public final static int DONTNEED = 4;
+   public final static int NOREUSE = 5;
+ 
++  private static boolean libLoaded;
++
+   static {
+-    System.loadLibrary("NativePosixUtil");
++    try {
++      System.loadLibrary("NativePosixUtil");
++    } catch (Exception e) {
++      libLoaded = false;
++    }
++    libLoaded = true;
+   }
+ 
+   private static native int posix_fadvise(FileDescriptor fd, long offset, long len, int advise) throws IOException;
+@@ -43,11 +50,20 @@ public final class NativePosixUtil {
+   public static native FileDescriptor open_direct(String filename, boolean read) throws IOException;
+   public static native long pread(FileDescriptor fd, long pos, ByteBuffer byteBuf) throws IOException;
+ 
++  public static native long mmap(FileDescriptor fd, long length) throws IOException;
++  public static native void munmap(long address, long length) throws IOException;
++
+   public static void advise(FileDescriptor fd, long offset, long len, int advise) throws IOException {
+     final int code = posix_fadvise(fd, offset, len, advise);
+     if (code != 0) {
+       throw new RuntimeException("posix_fadvise failed code=" + code);
+     }
+   }
++
++  public static boolean isLibLoaded() {
++    return libLoaded;
++  }
++
++  public static native void madvise2(long l, long len);
+ }
+     
+diff --git a/lucene/misc/src/test/org/apache/lucene/store/TestNativePosixMMapDirectory.java b/lucene/misc/src/test/org/apache/lucene/store/TestNativePosixMMapDirectory.java
+new file mode 100644
+index 0000000..3fd83be
+--- /dev/null
++++ b/lucene/misc/src/test/org/apache/lucene/store/TestNativePosixMMapDirectory.java
+@@ -0,0 +1,259 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.store;
++
++import java.io.File;
++
++import org.apache.lucene.store.Directory.IndexInputSlicer;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.Constants;
++import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util._TestUtil;
++
++/**
++ * Tests the native posix mmap directory
++ */
++public class TestNativePosixMMapDirectory extends LuceneTestCase {
++
++  private File workDir;
++
++  @Override
++  public void setUp() throws Exception {
++    super.setUp();
++    assumeTrue("test requires a posix compliant OS", Constants.POSIX);
++    assumeTrue("test requires the native library to be in the java lib path", NativePosixUtil.isLibLoaded());
++    workDir = _TestUtil.getTempDir("TestNativePosixMMapDirectory");
++    workDir.mkdirs();
++  }
++
++  public void testCloneSafety() throws Exception {
++    NativePosixMMapDirectory mmapDir = new NativePosixMMapDirectory(_TestUtil.getTempDir("testCloneSafety"));
++    IndexOutput io = mmapDir.createOutput("bytes", newIOContext(random()));
++    io.writeVInt(5);
++    io.close();
++    IndexInput one = mmapDir.openInput("bytes", IOContext.DEFAULT);
++    IndexInput two = one.clone();
++    IndexInput three = two.clone(); // clone of clone
++    one.close();
++    try {
++      one.readVInt();
++      fail("Must throw AlreadyClosedException");
++    } catch (AlreadyClosedException ignore) {
++      // pass
++    }
++    try {
++      two.readVInt();
++      fail("Must throw AlreadyClosedException");
++    } catch (AlreadyClosedException ignore) {
++      // pass
++    }
++    try {
++      three.readVInt();
++      fail("Must throw AlreadyClosedException");
++    } catch (AlreadyClosedException ignore) {
++      // pass
++    }
++    two.close();
++    three.close();
++    // test double close of master:
++    one.close();
++    mmapDir.close();
++  }
++
++  public void testCloneClose() throws Exception {
++    NativePosixMMapDirectory mmapDir = new NativePosixMMapDirectory(_TestUtil.getTempDir("testCloneClose"));
++    IndexOutput io = mmapDir.createOutput("bytes", newIOContext(random()));
++    io.writeVInt(5);
++    io.close();
++    IndexInput one = mmapDir.openInput("bytes", IOContext.DEFAULT);
++    IndexInput two = one.clone();
++    IndexInput three = two.clone(); // clone of clone
++    two.close();
++    assertEquals(5, one.readVInt());
++    try {
++      two.readVInt();
++      fail("Must throw AlreadyClosedException");
++    } catch (AlreadyClosedException ignore) {
++      // pass
++    }
++    assertEquals(5, three.readVInt());
++    one.close();
++    three.close();
++    mmapDir.close();
++  }
++
++  public void testCloneSliceSafety() throws Exception {
++    NativePosixMMapDirectory mmapDir = new NativePosixMMapDirectory(_TestUtil.getTempDir("testCloneSliceSafety"));
++    IndexOutput io = mmapDir.createOutput("bytes", newIOContext(random()));
++    io.writeInt(1);
++    io.writeInt(2);
++    io.close();
++    IndexInputSlicer slicer = mmapDir.createSlicer("bytes", newIOContext(random()));
++    IndexInput one = slicer.openSlice("first int", 0, 4);
++    IndexInput two = slicer.openSlice("second int", 4, 4);
++    IndexInput three = one.clone(); // clone of clone
++    IndexInput four = two.clone(); // clone of clone
++    slicer.close();
++    try {
++      one.readInt();
++      fail("Must throw AlreadyClosedException");
++    } catch (AlreadyClosedException ignore) {
++      // pass
++    }
++    try {
++      two.readInt();
++      fail("Must throw AlreadyClosedException");
++    } catch (AlreadyClosedException ignore) {
++      // pass
++    }
++    try {
++      three.readInt();
++      fail("Must throw AlreadyClosedException");
++    } catch (AlreadyClosedException ignore) {
++      // pass
++    }
++    try {
++      four.readInt();
++      fail("Must throw AlreadyClosedException");
++    } catch (AlreadyClosedException ignore) {
++      // pass
++    }
++    one.close();
++    two.close();
++    three.close();
++    four.close();
++    // test double-close of slicer:
++    slicer.close();
++    mmapDir.close();
++  }
++
++  public void testCloneSliceClose() throws Exception {
++    NativePosixMMapDirectory mmapDir = new NativePosixMMapDirectory(_TestUtil.getTempDir("testCloneSliceClose"));
++    IndexOutput io = mmapDir.createOutput("bytes", newIOContext(random()));
++    io.writeInt(1);
++    io.writeInt(2);
++    io.close();
++    IndexInputSlicer slicer = mmapDir.createSlicer("bytes", newIOContext(random()));
++    IndexInput one = slicer.openSlice("first int", 0, 4);
++    IndexInput two = slicer.openSlice("second int", 4, 4);
++    one.close();
++    try {
++      one.readInt();
++      fail("Must throw AlreadyClosedException");
++    } catch (AlreadyClosedException ignore) {
++      // pass
++    }
++    assertEquals(2, two.readInt());
++    // reopen a new slice "one":
++    one = slicer.openSlice("first int", 0, 4);
++    assertEquals(1, one.readInt());
++    one.close();
++    two.close();
++    slicer.close();
++    mmapDir.close();
++  }
++
++  public void testSeekZero() throws Exception {
++    for (int i = 0; i < 31; i++) {
++      NativePosixMMapDirectory mmapDir = new NativePosixMMapDirectory(_TestUtil.getTempDir("testSeekZero"), null);
++      IndexOutput io = mmapDir.createOutput("zeroBytes", newIOContext(random()));
++      io.close();
++      IndexInput ii = mmapDir.openInput("zeroBytes", newIOContext(random()));
++      ii.seek(0L);
++      ii.close();
++      mmapDir.close();
++    }
++  }
++
++  public void testSeekSliceZero() throws Exception {
++    for (int i = 0; i < 31; i++) {
++      NativePosixMMapDirectory mmapDir = new NativePosixMMapDirectory(_TestUtil.getTempDir("testSeekSliceZero"), null);
++      IndexOutput io = mmapDir.createOutput("zeroBytes", newIOContext(random()));
++      io.close();
++      IndexInputSlicer slicer = mmapDir.createSlicer("zeroBytes", newIOContext(random()));
++      IndexInput ii = slicer.openSlice("zero-length slice", 0, 0);
++      ii.seek(0L);
++      ii.close();
++      slicer.close();
++      mmapDir.close();
++    }
++  }
++
++  public void testSeekEnd() throws Exception {
++    for (int i = 0; i < 17; i++) {
++      NativePosixMMapDirectory mmapDir = new NativePosixMMapDirectory(_TestUtil.getTempDir("testSeekEnd"), null);
++      IndexOutput io = mmapDir.createOutput("bytes", newIOContext(random()));
++      byte bytes[] = new byte[1<<i];
++      random().nextBytes(bytes);
++      io.writeBytes(bytes, bytes.length);
++      io.close();
++      IndexInput ii = mmapDir.openInput("bytes", newIOContext(random()));
++      byte actual[] = new byte[1<<i];
++      ii.readBytes(actual, 0, actual.length);
++      assertEquals(new BytesRef(bytes), new BytesRef(actual));
++      ii.seek(1<<i);
++      ii.close();
++      mmapDir.close();
++    }
++  }
++
++  public void testSeekSliceEnd() throws Exception {
++    for (int i = 0; i < 17; i++) {
++      NativePosixMMapDirectory mmapDir = new NativePosixMMapDirectory(_TestUtil.getTempDir("testSeekSliceEnd"), null);
++      IndexOutput io = mmapDir.createOutput("bytes", newIOContext(random()));
++      byte bytes[] = new byte[1<<i];
++      random().nextBytes(bytes);
++      io.writeBytes(bytes, bytes.length);
++      io.close();
++      IndexInputSlicer slicer = mmapDir.createSlicer("bytes", newIOContext(random()));
++      IndexInput ii = slicer.openSlice("full slice", 0, bytes.length);
++      byte actual[] = new byte[1<<i];
++      ii.readBytes(actual, 0, actual.length);
++      assertEquals(new BytesRef(bytes), new BytesRef(actual));
++      ii.seek(1<<i);
++      ii.close();
++      slicer.close();
++      mmapDir.close();
++    }
++  }
++
++  public void testSeeking() throws Exception {
++    for (int i = 0; i < 10; i++) {
++      NativePosixMMapDirectory mmapDir = new NativePosixMMapDirectory(_TestUtil.getTempDir("testSeeking"), null);
++      IndexOutput io = mmapDir.createOutput("bytes", newIOContext(random()));
++      byte bytes[] = new byte[1<<(i+1)]; // make sure we switch buffers
++      random().nextBytes(bytes);
++      io.writeBytes(bytes, bytes.length);
++      io.close();
++      IndexInput ii = mmapDir.openInput("bytes", newIOContext(random()));
++      byte actual[] = new byte[1<<(i+1)]; // first read all bytes
++      ii.readBytes(actual, 0, actual.length);
++      assertEquals(new BytesRef(bytes), new BytesRef(actual));
++      for (int sliceStart = 0; sliceStart < bytes.length; sliceStart++) {
++        for (int sliceLength = 0; sliceLength < bytes.length - sliceStart; sliceLength++) {
++          byte slice[] = new byte[sliceLength];
++          ii.seek(sliceStart);
++          ii.readBytes(slice, 0, slice.length);
++          assertEquals(new BytesRef(bytes, sliceStart, sliceLength), new BytesRef(slice));
++        }
++      }
++      ii.close();
++      mmapDir.close();
++    }
++  }
++
++}
+-- 
+1.8.1
+

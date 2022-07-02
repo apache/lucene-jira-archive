@@ -1,0 +1,238 @@
+Index: lucene/CHANGES.txt
+===================================================================
+--- lucene/CHANGES.txt	(revision 1415244)
++++ lucene/CHANGES.txt	(working copy)
+@@ -104,6 +104,10 @@
+ * LUCENE-4489: Added consumeAllTokens option to LimitTokenCountFilter
+   (hossman, Robert Muir)
+ 
++* LUCENE-4566: Add NRT/SearcherManager.RefreshListener/addListener to
++  be notified whenever a new searcher was opened. (selckin via Shai
++  Erera, Mike McCandless)
++
+ API Changes
+ 
+ * LUCENE-4399: Deprecated AppendingCodec. Lucene's term dictionaries
+Index: lucene/core/src/test/org/apache/lucene/search/TestNRTManager.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/search/TestNRTManager.java	(revision 1415244)
++++ lucene/core/src/test/org/apache/lucene/search/TestNRTManager.java	(working copy)
+@@ -32,7 +32,6 @@
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.IndexWriter;
+ import org.apache.lucene.index.IndexWriterConfig;
+-import org.apache.lucene.index.IndexableField;
+ import org.apache.lucene.index.RandomIndexWriter;
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.index.ThreadedIndexingAndSearchingTestCase;
+@@ -411,4 +410,25 @@
+     other.close();
+     dir.close();
+   }
++
++  public void testListenerCalled() throws Exception {
++    Directory dir = newDirectory();
++    IndexWriter iw = new IndexWriter(dir, new IndexWriterConfig(TEST_VERSION_CURRENT, null));
++    final AtomicBoolean afterRefreshCalled = new AtomicBoolean(false);
++    NRTManager sm = new NRTManager(new NRTManager.TrackingIndexWriter(iw),new SearcherFactory());
++    sm.addListener(new ReferenceManager.RefreshListener() {
++      @Override
++      public void afterRefresh() {
++        afterRefreshCalled.set(true);
++      }
++    });
++    iw.addDocument(new Document());
++    iw.commit();
++    assertFalse(afterRefreshCalled.get());
++    sm.maybeRefreshBlocking();
++    assertTrue(afterRefreshCalled.get());
++    sm.close();
++    iw.close();
++    dir.close();
++  }
+ }
+Index: lucene/core/src/test/org/apache/lucene/search/TestSearcherManager.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/search/TestSearcherManager.java	(revision 1415244)
++++ lucene/core/src/test/org/apache/lucene/search/TestSearcherManager.java	(working copy)
+@@ -324,6 +324,27 @@
+     dir.close();
+   }
+ 
++  public void testListenerCalled() throws Exception {
++    Directory dir = newDirectory();
++    IndexWriter iw = new IndexWriter(dir, new IndexWriterConfig(TEST_VERSION_CURRENT, null));
++    final AtomicBoolean afterRefreshCalled = new AtomicBoolean(false);
++    SearcherManager sm = new SearcherManager(iw, false, new SearcherFactory());
++    sm.addListener(new ReferenceManager.RefreshListener() {
++      @Override
++      public void afterRefresh() {
++        afterRefreshCalled.set(true);
++      }
++    });
++    iw.addDocument(new Document());
++    iw.commit();
++    assertFalse(afterRefreshCalled.get());
++    sm.maybeRefreshBlocking();
++    assertTrue(afterRefreshCalled.get());
++    sm.close();
++    iw.close();
++    dir.close();
++  }
++
+   public void testEvilSearcherFactory() throws Exception {
+     final Random random = random();
+     final Directory dir = newDirectory();
+Index: lucene/core/src/java/org/apache/lucene/search/ReferenceManager.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/search/ReferenceManager.java	(revision 1415244)
++++ lucene/core/src/java/org/apache/lucene/search/ReferenceManager.java	(working copy)
+@@ -19,6 +19,8 @@
+ 
+ import java.io.Closeable;
+ import java.io.IOException;
++import java.util.List;
++import java.util.concurrent.CopyOnWriteArrayList;
+ import java.util.concurrent.locks.Lock;
+ import java.util.concurrent.locks.ReentrantLock;
+ 
+@@ -44,7 +46,9 @@
+   protected volatile G current;
+   
+   private final Lock refreshLock = new ReentrantLock();
+-  
++
++  private final List<RefreshListener> refreshListeners = new CopyOnWriteArrayList<RefreshListener>();
++
+   private void ensureOpen() {
+     if (current == null) {
+       throw new AlreadyClosedException(REFERENCE_MANAGER_IS_CLOSED_MSG);
+@@ -142,18 +146,18 @@
+     // Per ReentrantLock's javadoc, calling lock() by the same thread more than
+     // once is ok, as long as unlock() is called a matching number of times.
+     refreshLock.lock();
++    boolean refreshed = false;
+     try {
+       final G reference = acquire();
+       try {
+         G newReference = refreshIfNeeded(reference);
+         if (newReference != null) {
+           assert newReference != reference : "refreshIfNeeded should return null if refresh wasn't needed";
+-          boolean success = false;
+           try {
+             swapReference(newReference);
+-            success = true;
++            refreshed = true;
+           } finally {
+-            if (!success) {
++            if (!refreshed) {
+               release(newReference);
+             }
+           }
+@@ -161,12 +165,15 @@
+       } finally {
+         release(reference);
+       }
+-      afterRefresh();
++      afterMaybeRefresh();
++      if (refreshed) {
++        notifyRefreshListeners();
++      }
+     } finally {
+       refreshLock.unlock();
+     }
+   }
+-  
++
+   /**
+    * You must call this (or {@link #maybeRefreshBlocking()}), periodically, if
+    * you want that {@link #acquire()} will return refreshed instances.
+@@ -228,11 +235,11 @@
+     }
+   }
+ 
+-  /** Called after swapReference has installed a new
+-   *  instance.
++  /** Called after a refresh was attempted, regardless of
++   *  whether a new reference was in fact created.
+    *  @throws IOException if a low level I/O exception occurs  
+    **/
+-  protected void afterRefresh() throws IOException {
++  protected void afterMaybeRefresh() throws IOException {
+   }
+   
+   /**
+@@ -245,4 +252,40 @@
+     assert reference != null;
+     decRef(reference);
+   }
++
++  private void notifyRefreshListeners() {
++    for (RefreshListener refreshListener : refreshListeners) {
++      refreshListener.afterRefresh();
++    }
++  }
++
++  /**
++   * Adds a listener, to be notified when a reference is refreshed/swapped.
++   */
++  public void addListener(RefreshListener listener) {
++    if (listener == null) {
++      throw new NullPointerException("Listener cannot be null");
++    }
++    refreshListeners.add(listener);
++  }
++
++  /**
++   * Remove a listener added with {@link #addListener(RefreshListener)}.
++   */
++  public void removeListener(RefreshListener listener) {
++    if (listener == null) {
++      throw new NullPointerException("Listener cannot be null");
++    }
++    refreshListeners.remove(listener);
++  }
++
++  /** Use to receive notification when a refresh has
++   *  finished.  See {@link #addListener}. */
++  public interface RefreshListener {
++
++    /**
++     * Called after a successful refresh and a new reference has been installed. When this is called {@link #acquire()} is guaranteed to return a new instance.
++     */
++    void afterRefresh();
++  }
+ }
+Index: lucene/core/src/java/org/apache/lucene/search/NRTManager.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/search/NRTManager.java	(revision 1415244)
++++ lucene/core/src/java/org/apache/lucene/search/NRTManager.java	(working copy)
+@@ -28,10 +28,8 @@
+ import org.apache.lucene.analysis.Analyzer;
+ import org.apache.lucene.index.DirectoryReader;
+ import org.apache.lucene.index.IndexDocument;
+-import org.apache.lucene.index.SegmentInfoPerCommit;
+ import org.apache.lucene.index.IndexReader; // javadocs
+ import org.apache.lucene.index.IndexWriter;
+-import org.apache.lucene.index.IndexableField;
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.search.IndexSearcher; // javadocs
+ import org.apache.lucene.search.SearcherFactory; // javadocs
+@@ -70,7 +68,7 @@
+  * @lucene.experimental
+  */
+ 
+-public class NRTManager extends ReferenceManager<IndexSearcher> {
++public final class NRTManager extends ReferenceManager<IndexSearcher> {
+   private static final long MAX_SEARCHER_GEN = Long.MAX_VALUE;
+   private final TrackingIndexWriter writer;
+   private final List<WaitingListener> waitingListeners = new CopyOnWriteArrayList<WaitingListener>();
+@@ -361,7 +359,7 @@
+   }
+ 
+   @Override
+-  protected void afterRefresh() {
++  protected void afterMaybeRefresh() {
+     genLock.lock();
+     try {
+       if (searchingGen != MAX_SEARCHER_GEN) {

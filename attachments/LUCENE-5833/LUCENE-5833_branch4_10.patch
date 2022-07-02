@@ -1,0 +1,280 @@
+Index: lucene/CHANGES.txt
+===================================================================
+--- lucene/CHANGES.txt	(revision 1662860)
++++ lucene/CHANGES.txt	(working copy)
+@@ -56,6 +56,11 @@
+   merge was aborted so IndexWriter.rollback can more promptly abort a
+   running merge. (Robert Muir, Mike McCandless)
+ 
++* LUCENE-5833: DocumentDictionary now enumerates each value separately
++  in a multi-valued field (not just the first value), so you can build
++  suggesters from multi-valued fields.  (Varun Thacker via Mike
++  McCandless)
++
+ API Changes
+ 
+ * LUCENE-6212: Deprecate IndexWriter APIs that accept per-document Analyzer.
+
+Property changes on: lucene/CHANGES.txt
+___________________________________________________________________
+Modified: svn:mergeinfo
+   Merged /lucene/dev/branches/branch_5x/lucene/CHANGES.txt:r1640887
+   Merged /lucene/dev/trunk/lucene/CHANGES.txt:r1640886
+Index: lucene/suggest/src/java/org/apache/lucene/search/suggest/DocumentDictionary.java
+===================================================================
+--- lucene/suggest/src/java/org/apache/lucene/search/suggest/DocumentDictionary.java	(revision 1662860)
++++ lucene/suggest/src/java/org/apache/lucene/search/suggest/DocumentDictionary.java	(working copy)
+@@ -16,6 +16,7 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
++
+ import java.io.IOException;
+ import java.util.Comparator;
+ import java.util.HashSet;
+@@ -32,6 +33,8 @@
+ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.BytesRef;
+ 
++
++
+ /**
+  * <p>
+  * Dictionary with terms, weights, payload (optional) and contexts (optional)
+@@ -117,6 +120,8 @@
+     private BytesRef currentPayload;
+     private Set<BytesRef> currentContexts;
+     private final NumericDocValues weightValues;
++    IndexableField[] currentDocFields = new IndexableField[0];
++    int nextFieldsPosition = 0;
+ 
+     
+     /**
+@@ -145,7 +150,24 @@
+ 
+     @Override
+     public BytesRef next() throws IOException {
+-      while (currentDocId < docCount) {
++      while (true) {
++        if (nextFieldsPosition < currentDocFields.length) {
++          // Still values left from the document
++          IndexableField fieldValue = currentDocFields[nextFieldsPosition++];
++          if (fieldValue.binaryValue() != null) {
++            return fieldValue.binaryValue();
++          } else if (fieldValue.stringValue() != null) {
++            return new BytesRef(fieldValue.stringValue());
++          } else {
++            continue;
++          }
++        }
++
++        if (currentDocId == docCount) {
++          // Iterated over all the documents.
++          break;
++        }
++
+         currentDocId++;
+         if (liveDocs != null && !liveDocs.get(currentDocId)) { 
+           continue;
+@@ -153,34 +175,51 @@
+ 
+         Document doc = reader.document(currentDocId, relevantFields);
+ 
+-        BytesRef tempPayload = null;
+-        BytesRef tempTerm = null;
+         Set<BytesRef> tempContexts = new HashSet<>();
+ 
++        BytesRef tempPayload;
+         if (hasPayloads) {
+           IndexableField payload = doc.getField(payloadField);
+-          if (payload == null || (payload.binaryValue() == null && payload.stringValue() == null)) {
++          if (payload == null) {
+             continue;
++          } else if (payload.binaryValue() != null) {
++            tempPayload =  payload.binaryValue();
++          } else if (payload.stringValue() != null) {
++            tempPayload = new BytesRef(payload.stringValue());
++          } else {
++            continue;
+           }
+-          tempPayload = (payload.binaryValue() != null) ? payload.binaryValue() : new BytesRef(payload.stringValue());
++        } else {
++          tempPayload = null;
+         }
+ 
+         if (hasContexts) {
+           final IndexableField[] contextFields = doc.getFields(contextsField);
+           for (IndexableField contextField : contextFields) {
+-            if (contextField.binaryValue() == null && contextField.stringValue() == null) {
++            if (contextField.binaryValue() != null) {
++              tempContexts.add(contextField.binaryValue());
++            } else if (contextField.stringValue() != null) {
++              tempContexts.add(new BytesRef(contextField.stringValue()));
++            } else {
+               continue;
+-            } else {
+-              tempContexts.add((contextField.binaryValue() != null) ? contextField.binaryValue() : new BytesRef(contextField.stringValue()));
+             }
+           }
+         }
+ 
+-        IndexableField fieldVal = doc.getField(field);
+-        if (fieldVal == null || (fieldVal.binaryValue() == null && fieldVal.stringValue() == null)) {
++        currentDocFields = doc.getFields(field);
++        nextFieldsPosition = 0;
++        if (currentDocFields.length == 0) { // no values in this document
+           continue;
+         }
+-        tempTerm = (fieldVal.stringValue() != null) ? new BytesRef(fieldVal.stringValue()) : fieldVal.binaryValue();
++        IndexableField fieldValue = currentDocFields[nextFieldsPosition++];
++        BytesRef tempTerm;
++        if (fieldValue.binaryValue() != null) {
++          tempTerm = fieldValue.binaryValue();
++        } else if (fieldValue.stringValue() != null) {
++          tempTerm = new BytesRef(fieldValue.stringValue());
++        } else {
++          continue;
++        }
+ 
+         currentPayload = tempPayload;
+         currentContexts = tempContexts;
+@@ -188,6 +227,7 @@
+ 
+         return tempTerm;
+       }
++
+       return null;
+     }
+ 
+Index: lucene/suggest/src/test/org/apache/lucene/search/suggest/DocumentDictionaryTest.java
+===================================================================
+--- lucene/suggest/src/test/org/apache/lucene/search/suggest/DocumentDictionaryTest.java	(revision 1662860)
++++ lucene/suggest/src/test/org/apache/lucene/search/suggest/DocumentDictionaryTest.java	(working copy)
+@@ -5,6 +5,7 @@
+ import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.HashSet;
++import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Random;
+@@ -300,4 +301,89 @@
+     ir.close();
+     dir.close();
+   }
++
++  @Test
++  public void testMultiValuedField() throws IOException {
++    Directory dir = newDirectory();
++    IndexWriterConfig iwc = newIndexWriterConfig(random(), TEST_VERSION_CURRENT, new MockAnalyzer(random()));
++    iwc.setMergePolicy(newLogMergePolicy());
++    RandomIndexWriter writer = new RandomIndexWriter(random(), dir, iwc);
++
++    List<Suggestion> suggestions = indexMultiValuedDocuments(atLeast(1000), writer);
++    writer.commit();
++    writer.close();
++
++    IndexReader ir = DirectoryReader.open(dir);
++    Dictionary dictionary = new DocumentDictionary(ir, FIELD_NAME, WEIGHT_FIELD_NAME, PAYLOAD_FIELD_NAME, CONTEXT_FIELD_NAME);
++    InputIterator inputIterator = dictionary.getEntryIterator();
++    BytesRef f;
++    Iterator<Suggestion> suggestionsIter = suggestions.iterator();
++    while((f = inputIterator.next())!=null) {
++      Suggestion nextSuggestion = suggestionsIter.next();
++      assertTrue(f.equals(nextSuggestion.term));
++      long weight = nextSuggestion.weight;
++      assertEquals(inputIterator.weight(), (weight != -1) ? weight : 0);
++      assertTrue(inputIterator.payload().equals(nextSuggestion.payload));
++      assertTrue(inputIterator.contexts().equals(nextSuggestion.contexts));
++    }
++    assertFalse(suggestionsIter.hasNext());
++    ir.close();
++    dir.close();
++  }
++
++  private List<Suggestion> indexMultiValuedDocuments(int numDocs, RandomIndexWriter writer) throws IOException {
++    List<Suggestion> suggestionList = new ArrayList<>(numDocs);
++
++    for(int i=0; i<numDocs; i++) {
++      Document doc = new Document();
++      Field field;
++      BytesRef payloadValue;
++      Set<BytesRef> contextValues = new HashSet<>();
++      long numericValue = -1; //-1 for missing weight
++      BytesRef term;
++
++      payloadValue = new BytesRef("payload_" + i);
++      field = new StoredField(PAYLOAD_FIELD_NAME, payloadValue);
++      doc.add(field);
++
++      if (usually()) {
++        numericValue = 100 + i;
++        field = new NumericDocValuesField(WEIGHT_FIELD_NAME, numericValue);
++        doc.add(field);
++      }
++
++      int numContexts = atLeast(1);
++      for (int j=0; j<numContexts; j++) {
++        BytesRef contextValue = new BytesRef("context_" + i + "_" + j);
++        field = new StoredField(CONTEXT_FIELD_NAME, contextValue);
++        doc.add(field);
++        contextValues.add(contextValue);
++      }
++
++      int numSuggestions = atLeast(2);
++      for (int j=0; j<numSuggestions; j++) {
++        term = new BytesRef("field_" + i + "_" + j);
++        field = new StoredField(FIELD_NAME, term);
++        doc.add(field);
++
++        Suggestion suggestionValue = new Suggestion();
++        suggestionValue.payload = payloadValue;
++        suggestionValue.contexts = contextValues;
++        suggestionValue.weight = numericValue;
++        suggestionValue.term = term;
++        suggestionList.add(suggestionValue);
++      }
++      writer.addDocument(doc);
++    }
++    return suggestionList;
++  }
++
++  private class Suggestion {
++    private long weight;
++    private BytesRef payload;
++    private Set<BytesRef> contexts;
++    private BytesRef term;
++  }
++
++
+ }
+Index: lucene/suggest
+===================================================================
+--- lucene/suggest	(revision 1662860)
++++ lucene/suggest	(working copy)
+
+Property changes on: lucene/suggest
+___________________________________________________________________
+Modified: svn:mergeinfo
+   Merged /lucene/dev/branches/branch_5x/lucene/suggest:r1640887
+   Merged /lucene/dev/trunk/lucene/suggest:r1640886
+Index: lucene
+===================================================================
+--- lucene	(revision 1662860)
++++ lucene	(working copy)
+
+Property changes on: lucene
+___________________________________________________________________
+Modified: svn:mergeinfo
+   Merged /lucene/dev/branches/branch_5x/lucene:r1640887
+   Merged /lucene/dev/trunk/lucene:r1640886
+Index: .
+===================================================================
+--- .	(revision 1662860)
++++ .	(working copy)
+
+Property changes on: .
+___________________________________________________________________
+Modified: svn:mergeinfo
+   Merged /lucene/dev/branches/branch_5x:r1640887
+   Merged /lucene/dev/trunk:r1640886

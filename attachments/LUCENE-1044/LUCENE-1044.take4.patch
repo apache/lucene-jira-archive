@@ -1,0 +1,265 @@
+Index: src/java/org/apache/lucene/index/IndexFileDeleter.java
+===================================================================
+--- src/java/org/apache/lucene/index/IndexFileDeleter.java	(revision 598361)
++++ src/java/org/apache/lucene/index/IndexFileDeleter.java	(working copy)
+@@ -168,7 +168,8 @@
+             SegmentInfos sis = new SegmentInfos();
+             try {
+               sis.read(directory, fileName);
+-            } catch (FileNotFoundException e) {
++              // nocommit -- put back to FNFE
++            } catch (IOException e) {
+               // LUCENE-948: on NFS (and maybe others), if
+               // you have writers switching back and forth
+               // between machines, it's very likely that the
+Index: src/java/org/apache/lucene/store/FSDirectory.java
+===================================================================
+--- src/java/org/apache/lucene/store/FSDirectory.java	(revision 598361)
++++ src/java/org/apache/lucene/store/FSDirectory.java	(working copy)
+@@ -25,6 +25,7 @@
+ import java.security.MessageDigest;
+ import java.security.NoSuchAlgorithmException;
+ import java.util.Hashtable;
++import java.util.ArrayList;
+ 
+ import org.apache.lucene.index.IndexFileNameFilter;
+ 
+@@ -62,7 +63,7 @@
+ 
+   private static boolean disableLocks = false;
+ 
+-  private static boolean DEFAULT_DO_SYNC = false;
++  private static boolean DEFAULT_DO_SYNC = true;
+ 
+   // True if we should call sync() before closing a file.
+   // This improves chances that index will still be
+@@ -291,8 +292,9 @@
+     lockFactory.clearLock(IndexWriter.WRITE_LOCK_NAME);
+   }
+ 
+-  private File directory = null;
++  private File directory;
+   private int refCount;
++  private SyncThread syncThread;
+ 
+   protected FSDirectory() {};                     // permit subclassing
+ 
+@@ -306,6 +308,13 @@
+     directory = path;
+     this.doSync = doSync;
+ 
++    if (doSync) {
++      syncThread = new SyncThread();
++      // nocommit
++      syncThread.setDaemon(true);
++      syncThread.start();
++    }
++
+     boolean doClearLockID = false;
+ 
+     if (lockFactory == null) {
+@@ -475,17 +484,23 @@
+     if (file.exists() && !file.delete())          // delete existing, if any
+       throw new IOException("Cannot overwrite: " + file);
+ 
+-    return new FSIndexOutput(file, doSync);
++    return new FSIndexOutput(file, doSync, syncThread);
+   }
+ 
+   // Inherit javadoc
+   public IndexInput openInput(String name) throws IOException {
+-    return new FSIndexInput(new File(directory, name));
++    return openInput(name, BufferedIndexInput.BUFFER_SIZE);
+   }
+ 
+   // Inherit javadoc
+   public IndexInput openInput(String name, int bufferSize) throws IOException {
+-    return new FSIndexInput(new File(directory, name), bufferSize);
++    final File filePath = new File(directory, name);
++    if (doSync)
++      // Make sure if this file was recently closed that
++      // the BG sync thread has actually finished closing
++      // it:
++      syncThread.sync(filePath);
++    return new FSIndexInput(filePath, bufferSize);
+   }
+ 
+   /**
+@@ -520,7 +535,12 @@
+ 
+   /** Closes the store to future operations. */
+   public synchronized void close() {
++    if (doSync)
++      syncThread.sync();
++
+     if (--refCount <= 0) {
++      if (doSync)
++        syncThread.finish();
+       synchronized (DIRECTORIES) {
+         DIRECTORIES.remove(directory);
+       }
+@@ -632,16 +652,23 @@
+     // more than once
+     private boolean isOpen;
+     private boolean doSync;
++    private File path;
++    private SyncThread syncThread;
+ 
+     public FSIndexOutput(File path) throws IOException {
+-      this(path, DEFAULT_DO_SYNC);
++      this(path, DEFAULT_DO_SYNC, null);
+     }
+ 
+     public FSIndexOutput(File path, boolean doSync) throws IOException {
++      this(path, doSync, null);
++    }
++
++    public FSIndexOutput(File path, boolean doSync, SyncThread syncThread) throws IOException {
+       file = new RandomAccessFile(path, "rw");
+-
+       isOpen = true;
++      this.syncThread = syncThread;
+       this.doSync = doSync;
++      this.path = path;
+     }
+   
+     /** output methods: */
+@@ -651,14 +678,11 @@
+     public void close() throws IOException {
+       // only close the file if it has not been closed yet
+       if (isOpen) {
+-        try {
+-          super.close();
+-          if (doSync)
+-            file.getFD().sync();
+-        } finally {
+-          file.close();
+-          isOpen = false;
+-        }
++        super.close();
++        file.close();
++        isOpen = false;
++        if (doSync)
++          syncThread.add(path);
+       }
+     }
+   
+@@ -670,6 +694,117 @@
+     public long length() throws IOException {
+       return file.length();
+     }
+-  
+   }
++
++  private class SyncThread extends Thread {
++    volatile boolean done = false;
++    ArrayList a = new ArrayList();
++    
++    public void add(File path) {
++      //System.out.println("BG: " + path);
++      synchronized(a) {
++        a.add(path);
++        a.notifyAll();
++      }
++    }
++    
++    public void finish() {
++      done = true;
++      synchronized(a) {
++        a.notifyAll();
++      }
++    }
++
++    /** Wait until all pending syncs are complete */
++    public void sync() {
++      while(true) {
++        synchronized(a) {
++          if (a.size() > 0) {
++            try {
++              a.wait();
++            } catch (InterruptedException e) {
++              // Restore the interrupted status
++              Thread.currentThread().interrupt();
++            }
++          } else
++            break;
++        }
++      }
++    }
++
++    /** Wait until this path is done being sync'd */
++    public void sync(File path) {
++
++      // Check whether this path is still in line.  If so,
++      // move it to the front and wait for it to finish
++      int idx = -1;
++      synchronized(a) {
++        idx = a.indexOf(path);
++        if (idx != -1 && idx != 0) {
++          // Move it to front of the line:
++          a.remove(path);
++          a.add(0, path);
++        }
++      }
++
++      if (idx != -1) {
++        // It is still in line
++        while(true) {
++          synchronized(a) {
++            if (a.contains(path))
++              try {
++                a.wait();
++              } catch (InterruptedException e) {
++                // Restore the interrupted status
++                Thread.currentThread().interrupt();
++              }
++            else
++              break;
++          }
++        }
++      }
++    }
++
++    public void run() {
++      while (!done) {
++        File path = null;
++        synchronized(a) {
++          if (0 == a.size()) {
++            try {
++              a.wait();
++            } catch (InterruptedException e) {
++              // Restore the interrupted status
++              Thread.currentThread().interrupt();
++            }
++          } else
++            path = (File) a.get(0);
++        }
++        //System.out.println("cycle " + this + ": done=" + done + " out=" + out);
++        if (path != null) {
++
++          // nocommit: need more robustness here to handle
++          // errant IOExceptions
++          try {
++            RandomAccessFile file = null;
++            try {
++              file = new RandomAccessFile(path, "rw");
++              System.out.println("sync " + path);
++              file.getFD().sync();
++            } finally {
++              if (file != null)
++                file.close();
++            }
++            // System.out.println("BG:   done " + path);
++          } catch (Exception e) {
++            // nocommit
++            //e.printStackTrace(System.out);
++          }
++          synchronized(a) {
++            a.remove(path);
++            a.notifyAll();
++          }
++        }
++      }
++    }
++  }
+ }

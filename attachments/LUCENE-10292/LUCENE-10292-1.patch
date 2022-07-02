@@ -1,0 +1,275 @@
+diff --git a/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/AnalyzingInfixSuggester.java b/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/AnalyzingInfixSuggester.java
+index 7b312062f1d..43e93990ae4 100644
+--- a/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/AnalyzingInfixSuggester.java
++++ b/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/AnalyzingInfixSuggester.java
+@@ -25,6 +25,9 @@ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.concurrent.locks.Lock;
++import java.util.concurrent.locks.ReadWriteLock;
++import java.util.concurrent.locks.ReentrantReadWriteLock;
+ import org.apache.lucene.analysis.Analyzer;
+ import org.apache.lucene.analysis.AnalyzerWrapper;
+ import org.apache.lucene.analysis.TokenFilter;
+@@ -125,14 +128,26 @@ public class AnalyzingInfixSuggester extends Lookup implements Closeable {
+   private final boolean commitOnBuild;
+   private final boolean closeIndexWriterOnBuild;
+ 
+-  /** Used for ongoing NRT additions/updates. */
++  /**
++   * Used for ongoing NRT additions/updates. May be null depending on <code>closeIndexWriterOnBuild
++   * </code> constructor arg
++   */
+   protected IndexWriter writer;
+ 
+-  /** {@link IndexSearcher} used for lookups. */
++  /** Used to manage concurrent access to writer */
++  protected final Object writerLock = new Object();
++
++  /**
++   * {@link IndexSearcher} used for lookups. May be null if {@link Directory} did not exist on
++   * instantiation and neither {@link #build}, {@link #add}, or {@link #update} have been called
++   */
+   protected SearcherManager searcherMgr;
+ 
+   /** Used to manage concurrent access to searcherMgr */
+-  protected final Object searcherMgrLock = new Object();
++  protected final ReadWriteLock searcherMgrLock = new ReentrantReadWriteLock();
++
++  private final Lock searcherMgrReadLock = searcherMgrLock.readLock();
++  private final Lock searcherMgrWriteLock = searcherMgrLock.writeLock();
+ 
+   /** Default minimum number of leading characters before PrefixQuery is used (4). */
+   public static final int DEFAULT_MIN_PREFIX_CHARS = 4;
+@@ -274,6 +289,20 @@ public class AnalyzingInfixSuggester extends Lookup implements Closeable {
+     }
+   }
+ 
++  private void setAndCloseOldSearcherManager(final SearcherManager newSearcherMgr)
++      throws IOException {
++    searcherMgrWriteLock.lock();
++    try {
++      final SearcherManager oldSearcherMgr = searcherMgr;
++      searcherMgr = newSearcherMgr;
++      if (oldSearcherMgr != null) {
++        oldSearcherMgr.close();
++      }
++    } finally {
++      searcherMgrWriteLock.unlock();
++    }
++  }
++
+   /** Override this to customize index settings, e.g. which codec to use. */
+   protected IndexWriterConfig getIndexWriterConfig(
+       Analyzer indexAnalyzer, IndexWriterConfig.OpenMode openMode) {
+@@ -296,12 +325,7 @@ public class AnalyzingInfixSuggester extends Lookup implements Closeable {
+   @Override
+   public void build(InputIterator iter) throws IOException {
+ 
+-    synchronized (searcherMgrLock) {
+-      if (searcherMgr != null) {
+-        searcherMgr.close();
+-        searcherMgr = null;
+-      }
+-
++    synchronized (writerLock) {
+       if (writer != null) {
+         writer.close();
+         writer = null;
+@@ -334,7 +358,7 @@ public class AnalyzingInfixSuggester extends Lookup implements Closeable {
+         if (commitOnBuild || closeIndexWriterOnBuild) {
+           commit();
+         }
+-        searcherMgr = new SearcherManager(writer, null);
++        setAndCloseOldSearcherManager(new SearcherManager(writer, null));
+         success = true;
+       } finally {
+         if (success) {
+@@ -394,7 +418,7 @@ public class AnalyzingInfixSuggester extends Lookup implements Closeable {
+   }
+ 
+   private void ensureOpen() throws IOException {
+-    synchronized (searcherMgrLock) {
++    synchronized (writerLock) {
+       if (writer == null) {
+         if (DirectoryReader.indexExists(dir)) {
+           // Already built; open it:
+@@ -406,12 +430,7 @@ public class AnalyzingInfixSuggester extends Lookup implements Closeable {
+               new IndexWriter(
+                   dir, getIndexWriterConfig(getGramAnalyzer(), IndexWriterConfig.OpenMode.CREATE));
+         }
+-
+-        SearcherManager oldSearcherMgr = searcherMgr;
+-        searcherMgr = new SearcherManager(writer, null);
+-        if (oldSearcherMgr != null) {
+-          oldSearcherMgr.close();
+-        }
++        setAndCloseOldSearcherManager(new SearcherManager(writer, null));
+       }
+     }
+   }
+@@ -712,9 +731,12 @@ public class AnalyzingInfixSuggester extends Lookup implements Closeable {
+     List<LookupResult> results = null;
+     SearcherManager mgr;
+     IndexSearcher searcher;
+-    synchronized (searcherMgrLock) {
++    searcherMgrReadLock.lock();
++    try {
+       mgr = searcherMgr; // acquire & release on same SearcherManager, via local reference
+       searcher = mgr.acquire();
++    } finally {
++      searcherMgrReadLock.unlock();
+     }
+     try {
+       // System.out.println("got searcher=" + searcher);
+@@ -948,9 +970,12 @@ public class AnalyzingInfixSuggester extends Lookup implements Closeable {
+     }
+     SearcherManager mgr;
+     IndexSearcher searcher;
+-    synchronized (searcherMgrLock) {
++    searcherMgrReadLock.lock();
++    try {
+       mgr = searcherMgr; // acquire & release on same SearcherManager, via local reference
+       searcher = mgr.acquire();
++    } finally {
++      searcherMgrReadLock.unlock();
+     }
+     try {
+       return searcher.getIndexReader().numDocs();
+diff --git a/lucene/suggest/src/test/org/apache/lucene/search/suggest/analyzing/TestAnalyzingInfixSuggester.java b/lucene/suggest/src/test/org/apache/lucene/search/suggest/analyzing/TestAnalyzingInfixSuggester.java
+index a9cf00e9dcd..40b45dce59a 100644
+--- a/lucene/suggest/src/test/org/apache/lucene/search/suggest/analyzing/TestAnalyzingInfixSuggester.java
++++ b/lucene/suggest/src/test/org/apache/lucene/search/suggest/analyzing/TestAnalyzingInfixSuggester.java
+@@ -21,12 +21,17 @@ import java.io.StringReader;
+ import java.io.UncheckedIOException;
+ import java.nio.file.Path;
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.HashSet;
++import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.concurrent.Callable;
++import java.util.concurrent.Semaphore;
++import java.util.concurrent.atomic.AtomicReference;
+ import org.apache.lucene.analysis.Analyzer;
+ import org.apache.lucene.analysis.CharArraySet;
+ import org.apache.lucene.analysis.StopFilter;
+@@ -180,6 +185,76 @@ public class TestAnalyzingInfixSuggester extends LuceneTestCase {
+     a.close();
+   }
+ 
++  public void testDurringReLoad() throws Exception {
++    final List<Input> keys =
++        new ArrayList<>(
++            Arrays.asList(
++                new Input("lend me your ear", 8, new BytesRef("foobar")),
++                new Input("a penny saved is a penny earned", 10, new BytesRef("foobaz"))));
++
++    Analyzer a = new MockAnalyzer(random(), MockTokenizer.WHITESPACE, false);
++    AnalyzingInfixSuggester suggester = new AnalyzingInfixSuggester(newDirectory(), a, a, 3, false);
++    suggester.build(new InputArrayIterator(keys));
++    assertEquals(2, suggester.getCount());
++
++    // we're going to re-use these checks...
++    final Callable<Throwable> checkPenny =
++        () -> {
++          try {
++            List<LookupResult> results =
++                suggester.lookup(TestUtil.stringToCharSequence("ear", random()), 10, true, true);
++            assertEquals(2, results.size());
++            assertEquals("a penny saved is a penny earned", results.get(0).key);
++            assertEquals("a penny saved is a penny <b>ear</b>ned", results.get(0).highlightKey);
++            assertEquals(10, results.get(0).value);
++            assertEquals(new BytesRef("foobaz"), results.get(0).payload);
++          } catch (Throwable t) {
++            return t;
++          }
++          return null;
++        };
++
++    // sanity check initial results
++    assertNull(checkPenny.call());
++
++    // modify source data we're going to build from, and spin up background thread that
++    // will rebuild (slowly)
++    keys.add(new Input("earned run average", 42, new BytesRef("yakbaz")));
++    final Semaphore rebuildGate = new Semaphore(0);
++    final AtomicReference<Throwable> error = new AtomicReference<>();
++    final Thread rebuilder =
++        new Thread(
++            () -> {
++              try {
++                suggester.build(
++                    new InputArrayIterator(new DelayedIterator<>(rebuildGate, keys.iterator())));
++              } catch (Throwable t) {
++                error.set(t);
++              }
++            });
++    rebuilder.start();
++    // at every stage of the slow rebuild, we should still be able to get our original suggestions
++    for (int i = 0; i < keys.size(); i++) {
++      assertNull(checkPenny.call());
++      rebuildGate.release();
++    }
++    // once all the keys are released, the background rebuild should finish, and suggest results
++    // should change
++    rebuilder.join();
++    assertNull(error.get());
++    assertEquals(3, suggester.getCount());
++    List<LookupResult> results =
++        suggester.lookup(TestUtil.stringToCharSequence("ear", random()), 10, true, true);
++    assertEquals(3, results.size());
++    assertEquals("earned run average", results.get(0).key);
++    assertEquals("<b>ear</b>ned run average", results.get(0).highlightKey);
++    assertEquals(42, results.get(0).value);
++    assertEquals(new BytesRef("yakbaz"), results.get(0).payload);
++
++    suggester.close();
++    a.close();
++  }
++
+   /** Used to return highlighted result; see {@link LookupResult#highlightKey} */
+   private static final class LookupHighlightFragment {
+     /** Portion of text for this fragment. */
+@@ -1645,4 +1720,36 @@ public class TestAnalyzingInfixSuggester extends LuceneTestCase {
+ 
+     a.close();
+   }
++
++  /**
++   * And iterator wrapper whose {@link Iterator#next} method will only return when a Semaphore
++   * permit is acquirable
++   */
++  private static final class DelayedIterator<E> implements Iterator<E> {
++    final Iterator<E> inner;
++    final Semaphore gate;
++
++    public DelayedIterator(final Semaphore gate, final Iterator<E> inner) {
++      assert null != gate;
++      assert null != inner;
++      this.gate = gate;
++      this.inner = inner;
++    }
++
++    @Override
++    public boolean hasNext() {
++      return inner.hasNext();
++    }
++
++    @Override
++    public E next() {
++      gate.acquireUninterruptibly();
++      return inner.next();
++    }
++
++    @Override
++    public void remove() {
++      inner.remove();
++    }
++  }
+ }

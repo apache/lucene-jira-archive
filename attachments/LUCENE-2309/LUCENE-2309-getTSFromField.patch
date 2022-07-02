@@ -1,0 +1,481 @@
+Index: lucene/src/test/org/apache/lucene/index/TestIndexableField.java
+===================================================================
+--- lucene/src/test/org/apache/lucene/index/TestIndexableField.java	(revision 1167668)
++++ lucene/src/test/org/apache/lucene/index/TestIndexableField.java	(revision )
+@@ -17,10 +17,12 @@
+  * limitations under the License.
+  */
+ 
++import java.io.IOException;
+ import java.io.Reader;
+ import java.io.StringReader;
+ import java.util.Iterator;
+ 
++import org.apache.lucene.analysis.Analyzer;
+ import org.apache.lucene.analysis.TokenStream;
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.NumericField.DataType;
+@@ -132,15 +134,6 @@
+       }
+     }
+ 
+-    @Override
+-    public TokenStream tokenStreamValue() {
+-      if (numeric()) {
+-        return new NumericField(name()).setIntValue(counter).tokenStreamValue();
+-      } else {
+-        return null;
+-      }
+-    }
+-
+     // Numeric field:
+     @Override
+     public boolean numeric() {
+@@ -172,7 +165,16 @@
+     public ValueType docValuesType() {
+       return null;
+     }
++
++    @Override
++    public TokenStream tokenStream(Analyzer analyzer) throws IOException {
++      if (numeric()) {
++        return new NumericField(name()).setIntValue(counter).tokenStream(analyzer);
+-  }
++      }
++      return readerValue() != null ? analyzer.reusableTokenStream(name(), readerValue()) :
++          analyzer.reusableTokenStream(name(), new StringReader(stringValue()));
++    }
++  }
+ 
+   // Silly test showing how to index documents w/o using Lucene's core
+   // Document nor Field class
+Index: lucene/src/java/org/apache/lucene/document/NumericField.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/document/NumericField.java	(revision 1167668)
++++ lucene/src/java/org/apache/lucene/document/NumericField.java	(revision )
+@@ -19,6 +19,7 @@
+ 
+ import java.io.Reader;
+ 
++import org.apache.lucene.analysis.Analyzer;
+ import org.apache.lucene.analysis.TokenStream;
+ import org.apache.lucene.analysis.NumericTokenStream;
+ import org.apache.lucene.index.FieldInfo.IndexOptions;
+@@ -237,7 +238,7 @@
+   }
+   
+   /** Returns a {@link NumericTokenStream} for indexing the numeric value. */
+-  public TokenStream tokenStreamValue() {
++  public TokenStream tokenStream(Analyzer analyzer) {
+     if (!type.indexed()) return null;
+     if (numericTS == null) {
+       // lazy init the TokenStream as it is heavy to instantiate
+Index: lucene/src/java/org/apache/lucene/document/Field.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/document/Field.java	(revision 1169470)
++++ lucene/src/java/org/apache/lucene/document/Field.java	(revision )
+@@ -17,9 +17,14 @@
+  * limitations under the License.
+  */
+ 
++import java.io.IOException;
+ import java.io.Reader;
++import java.io.StringReader;
+ 
++import org.apache.lucene.analysis.Analyzer;
+ import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
++import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
+ import org.apache.lucene.index.IndexableFieldType;
+ import org.apache.lucene.index.IndexableField;
+ import org.apache.lucene.index.values.PerDocFieldValues;
+@@ -297,4 +302,44 @@
+   public IndexableFieldType fieldType() {
+     return type;
+   }
++
++  public TokenStream tokenStream(Analyzer analyzer) throws IOException {
++    if (!fieldType().indexed()) {
++      return null;
+-}
++    }
++
++    if (!fieldType().tokenized()) {
++      return new TokenStream() {
++        CharTermAttribute termAttribute = addAttribute(CharTermAttribute.class);
++        OffsetAttribute offsetAttribute = addAttribute(OffsetAttribute.class);
++        boolean used;
++
++        @Override
++        public boolean incrementToken() throws IOException {
++          if (used) {
++            return false;
++          }
++          termAttribute.setEmpty().append(stringValue());
++          offsetAttribute.setOffset(0, stringValue().length());
++          used = true;
++          return true;
++        }
++
++        @Override
++        public void reset() throws IOException {
++          used = false;
++        }
++      };
++    }
++
++    if (tokenStream != null) {
++      return tokenStream;
++    } else if (readerValue() != null) {
++      return analyzer.reusableTokenStream(name(), readerValue());
++    } else if (stringValue() != null) {
++      return analyzer.reusableTokenStream(name(), new StringReader(stringValue()));
++    }
++
++    throw new IllegalArgumentException("Field must have either TokenStream, String or Reader value");
++  }
++}
+Index: lucene/src/java/org/apache/lucene/index/DocInverterPerField.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/index/DocInverterPerField.java	(revision 1167668)
++++ lucene/src/java/org/apache/lucene/index/DocInverterPerField.java	(revision )
+@@ -75,122 +75,71 @@
+       // consumer if it wants to see this particular field
+       // tokenized.
+       if (field.fieldType().indexed() && doInvert) {
+-        
++
+         if (i > 0)
+           fieldState.position += docState.analyzer == null ? 0 : docState.analyzer.getPositionIncrementGap(fieldInfo.name);
+ 
+-        // TODO (LUCENE-2309): this analysis logic should be
+-        // outside of indexer -- field should simply give us
+-        // a TokenStream, even for multi-valued fields
+-
+-        if (!field.fieldType().tokenized()) {		  // un-tokenized field
+-          final String stringValue = field.stringValue();
+-          assert stringValue != null;
+-          final int valueLength = stringValue.length();
+-          parent.singleToken.reinit(stringValue, 0, valueLength);
+-          fieldState.attributeSource = parent.singleToken;
+-          consumer.start(field);
+-
+-          boolean success = false;
+-          try {
+-            consumer.add();
+-            success = true;
+-          } finally {
+-            if (!success) {
+-              docState.docWriter.setAborting();
+-            }
+-          }
+-          fieldState.offset += valueLength;
+-          fieldState.length++;
+-          fieldState.position++;
+-        } else {                                  // tokenized field
+-          final TokenStream stream;
+-          final TokenStream streamValue = field.tokenStreamValue();
+-
+-          if (streamValue != null) {
+-            stream = streamValue;
+-          } else {
+-            // the field does not have a TokenStream,
+-            // so we have to obtain one from the analyzer
+-            final Reader reader;			  // find or make Reader
+-            final Reader readerValue = field.readerValue();
+-
+-            if (readerValue != null) {
+-              reader = readerValue;
+-            } else {
+-              String stringValue = field.stringValue();
+-              if (stringValue == null) {
+-                throw new IllegalArgumentException("field must have either TokenStream, String or Reader value");
+-              }
+-              parent.stringReader.init(stringValue);
+-              reader = parent.stringReader;
+-            }
+-          
+-            // Tokenize field and add to postingTable
+-            stream = docState.analyzer.reusableTokenStream(fieldInfo.name, reader);
+-          }
+-
++        final TokenStream stream = field.tokenStream(docState.analyzer);
+-          // reset the TokenStream to the first token
+-          stream.reset();
+-          
+-          try {
+-            boolean hasMoreTokens = stream.incrementToken();
++        // reset the TokenStream to the first token
++        stream.reset();
++
++        try {
++          boolean hasMoreTokens = stream.incrementToken();
+ 
+-            fieldState.attributeSource = stream;
++          fieldState.attributeSource = stream;
+ 
+-            OffsetAttribute offsetAttribute = fieldState.attributeSource.addAttribute(OffsetAttribute.class);
+-            PositionIncrementAttribute posIncrAttribute = fieldState.attributeSource.addAttribute(PositionIncrementAttribute.class);
+-            
+-            consumer.start(field);
+-            
++          OffsetAttribute offsetAttribute = fieldState.attributeSource.addAttribute(OffsetAttribute.class);
++          PositionIncrementAttribute posIncrAttribute = fieldState.attributeSource.addAttribute(PositionIncrementAttribute.class);
++
++          consumer.start(field);
++
+-            for(;;) {
++          for (;;) {
+ 
+-              // If we hit an exception in stream.next below
+-              // (which is fairly common, eg if analyzer
+-              // chokes on a given document), then it's
+-              // non-aborting and (above) this one document
+-              // will be marked as deleted, but still
+-              // consume a docID
+-              
+-              if (!hasMoreTokens) break;
+-              
+-              final int posIncr = posIncrAttribute.getPositionIncrement();
+-              fieldState.position += posIncr;
+-              if (fieldState.position > 0) {
+-                fieldState.position--;
+-              }
++            // If we hit an exception in stream.next below
++            // (which is fairly common, eg if analyzer
++            // chokes on a given document), then it's
++            // non-aborting and (above) this one document
++            // will be marked as deleted, but still
++            // consume a docID
++
++            if (!hasMoreTokens) break;
++
++            final int posIncr = posIncrAttribute.getPositionIncrement();
++            fieldState.position += posIncr;
++            if (fieldState.position > 0) {
++              fieldState.position--;
++            }
+ 
+-              if (posIncr == 0)
+-                fieldState.numOverlap++;
++            if (posIncr == 0)
++              fieldState.numOverlap++;
+ 
+-              boolean success = false;
+-              try {
+-                // If we hit an exception in here, we abort
+-                // all buffered documents since the last
+-                // flush, on the likelihood that the
+-                // internal state of the consumer is now
+-                // corrupt and should not be flushed to a
+-                // new segment:
+-                consumer.add();
+-                success = true;
+-              } finally {
+-                if (!success) {
+-                  docState.docWriter.setAborting();
+-                }
+-              }
+-              fieldState.length++;
+-              fieldState.position++;
++            boolean success = false;
++            try {
++              // If we hit an exception in here, we abort
++              // all buffered documents since the last
++              // flush, on the likelihood that the
++              // internal state of the consumer is now
++              // corrupt and should not be flushed to a
++              // new segment:
++              consumer.add();
++              success = true;
++            } finally {
++              if (!success) {
++                docState.docWriter.setAborting();
++              }
++            }
++            fieldState.length++;
++            fieldState.position++;
+ 
+-              hasMoreTokens = stream.incrementToken();
+-            }
+-            // trigger streams to perform end-of-stream operations
+-            stream.end();
+-            
+-            fieldState.offset += offsetAttribute.endOffset();
+-          } finally {
+-            stream.close();
+-          }
++            hasMoreTokens = stream.incrementToken();
++          }
++          // trigger streams to perform end-of-stream operations
++          stream.end();
++
++          fieldState.offset += offsetAttribute.endOffset();
++        } finally {
++          stream.close();
++        }
+-        }
+ 
+         fieldState.offset += docState.analyzer == null ? 0 : docState.analyzer.getOffsetGap(field);
+         fieldState.boost *= field.boost();
+Index: lucene/contrib/instantiated/src/java/org/apache/lucene/store/instantiated/InstantiatedIndexWriter.java
+===================================================================
+--- lucene/contrib/instantiated/src/java/org/apache/lucene/store/instantiated/InstantiatedIndexWriter.java	(revision 1169470)
++++ lucene/contrib/instantiated/src/java/org/apache/lucene/store/instantiated/InstantiatedIndexWriter.java	(revision )
+@@ -525,14 +525,7 @@
+         tokensByField.put(field, tokens);
+ 
+         if (field.fieldType().tokenized()) {
+-          final TokenStream tokenStream;
+-          // todo readerValue(), binaryValue()
+-          if (field.tokenStreamValue() != null) {
+-            tokenStream = field.tokenStreamValue();
+-          } else {
+-            tokenStream = analyzer.reusableTokenStream(field.name(), new StringReader(field.stringValue()));
+-          }
+-
++          final TokenStream tokenStream = field.tokenStream(analyzer);
+           // reset the TokenStream to the first token          
+           tokenStream.reset();
+ 
+Index: solr/core/src/test/org/apache/solr/schema/PolyFieldTest.java
+===================================================================
+--- solr/core/src/test/org/apache/solr/schema/PolyFieldTest.java	(revision 1162347)
++++ solr/core/src/test/org/apache/solr/schema/PolyFieldTest.java	(revision )
+@@ -87,10 +87,9 @@
+     assertEquals(fields.length, 3);//should be 3, we have a stored field
+     //first two fields contain the values, third is just stored and contains the original
+     for (int i = 0; i < 3; i++) {
+-      boolean hasValue = fields[1].tokenStreamValue() != null
+-              || fields[1].binaryValue() != null
+-              || fields[1].stringValue() != null;
+-      assertTrue("Doesn't have a value: " + fields[1], hasValue);
++      boolean hasValue = fields[i].binaryValue() != null
++          || fields[i].stringValue() != null;
++      assertTrue("Doesn't have a value: " + fields[i], hasValue);
+     }
+     /*assertTrue("first field " + fields[0].tokenStreamValue() +  " is not 35.0", pt.getSubType().toExternal(fields[0]).equals(String.valueOf(xy[0])));
+     assertTrue("second field is not -79.34", pt.getSubType().toExternal(fields[1]).equals(String.valueOf(xy[1])));
+Index: lucene/contrib/misc/src/java/org/apache/lucene/document/FieldSelectorVisitor.java
+===================================================================
+--- lucene/contrib/misc/src/java/org/apache/lucene/document/FieldSelectorVisitor.java	(revision 1163251)
++++ lucene/contrib/misc/src/java/org/apache/lucene/document/FieldSelectorVisitor.java	(revision )
+@@ -19,7 +19,6 @@
+ import java.io.IOException;
+ import java.io.Reader;
+ 
+-import org.apache.lucene.analysis.TokenStream;
+ import org.apache.lucene.document.NumericField.DataType;
+ import org.apache.lucene.index.FieldInfo;
+ import org.apache.lucene.index.FieldReaderException;
+@@ -246,14 +245,6 @@
+       return null;
+     }
+ 
+-    /** The value of the field as a TokenStream, or null.  If null, the Reader value,
+-     * String value, or binary value is used. Exactly one of stringValue(), 
+-     * readerValue(), getBinaryValue(), and tokenStreamValue() must be set. */
+-    @Override
+-    public TokenStream tokenStreamValue() {
+-      return null;
+-    }
+-
+     /** The value of the field as a String, or null.  If null, the Reader value,
+      * binary value, or TokenStream value is used.  Exactly one of stringValue(), 
+      * readerValue(), getBinaryValue(), and tokenStreamValue() must be set. */
+Index: lucene/src/java/org/apache/lucene/document/IndexDocValuesField.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/document/IndexDocValuesField.java	(revision 1167668)
++++ lucene/src/java/org/apache/lucene/document/IndexDocValuesField.java	(revision )
+@@ -307,13 +307,6 @@
+     return null;
+   }
+ 
+-  /**
+-   * Returns always <code>null</code>
+-   */
+-  public TokenStream tokenStreamValue() {
+-    return null;
+-  }
+-
+   @Override
+   public ValueType docValuesType() {
+     return type;
+Index: modules/benchmark/src/java/org/apache/lucene/benchmark/byTask/tasks/ReadTokensTask.java
+===================================================================
+--- modules/benchmark/src/java/org/apache/lucene/benchmark/byTask/tasks/ReadTokensTask.java	(revision 1167668)
++++ modules/benchmark/src/java/org/apache/lucene/benchmark/byTask/tasks/ReadTokensTask.java	(revision )
+@@ -71,31 +71,7 @@
+     for(final IndexableField field : fields) {
+       if (!field.fieldType().tokenized() || field instanceof NumericField) continue;
+       
+-      final TokenStream stream;
+-      final TokenStream streamValue = field.tokenStreamValue();
+-
+-      if (streamValue != null) 
+-        stream = streamValue;
+-      else {
+-        // the field does not have a TokenStream,
+-        // so we have to obtain one from the analyzer
+-        final Reader reader;			  // find or make Reader
+-        final Reader readerValue = field.readerValue();
+-
+-        if (readerValue != null)
+-          reader = readerValue;
+-        else {
+-          String stringValue = field.stringValue();
+-          if (stringValue == null)
+-            throw new IllegalArgumentException("field must have either TokenStream, String or Reader value");
+-          stringReader.init(stringValue);
+-          reader = stringReader;
+-        }
+-        
+-        // Tokenize field
+-        stream = analyzer.reusableTokenStream(field.name(), reader);
+-      }
+-
++      final TokenStream stream = field.tokenStream(analyzer);
+       // reset the TokenStream to the first token
+       stream.reset();
+ 
+Index: lucene/src/java/org/apache/lucene/index/IndexableField.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/index/IndexableField.java	(revision 1167668)
++++ lucene/src/java/org/apache/lucene/index/IndexableField.java	(revision )
+@@ -17,8 +17,10 @@
+  * limitations under the License.
+  */
+ 
++import java.io.IOException;
+ import java.io.Reader;
+ 
++import org.apache.lucene.analysis.Analyzer;
+ import org.apache.lucene.analysis.TokenStream;
+ import org.apache.lucene.document.NumericField;
+ import org.apache.lucene.index.values.PerDocFieldValues;
+@@ -56,9 +58,6 @@
+   /* Non-null if this field has a Reader value */
+   public Reader readerValue();
+ 
+-  /* Non-null if this field has a pre-tokenized ({@link TokenStream}) value */
+-  public TokenStream tokenStreamValue();
+-
+   // Numeric field:
+   /* True if this field is numeric */
+   public boolean numeric();
+@@ -82,4 +81,15 @@
+ 
+   /* DocValues type; only used if docValues is non-null */
+   public ValueType docValuesType();
++
++  /**
++   * Creates the TokenStream used for indexing this field.  If appropriate,
++   * implementations should use the given Analyzer to create the TokenStreams.
++   *
++   * @param analyzer Analyzer that should be used to create the TokenStreams from
++   * @return TokenStream value for indexing the document.  Should always return
++   *         a non-null value if the field is to be indexed
++   * @throws IOException Can be thrown while creating the TokenStream
++   */
++  public TokenStream tokenStream(Analyzer analyzer) throws IOException;
+ }

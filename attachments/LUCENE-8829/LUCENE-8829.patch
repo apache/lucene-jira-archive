@@ -1,0 +1,300 @@
+From 326cc51c8cc7e4d31f75a07abe64a2622960fff2 Mon Sep 17 00:00:00 2001
+From: Atri Sharma <atri@apache.org>
+Date: Wed, 5 Jun 2019 13:29:06 +0530
+Subject: [PATCH] LUCENE-8829: Use DocID For Tie Breaks When All ShardIndices
+ Are Same
+
+TopDocs#merge tie breaks on shardIndex + hit index when no sort
+order is specified and scores of hits are equal. This can be
+problematic for cases when all hits belong to same IndexSearcher
+but are present in different Collectors (parallel search case).
+
+This commit introduces tie breaking on docID for the above
+described case.
+---
+ .../apache/lucene/search/IndexSearcher.java   |   2 +-
+ .../org/apache/lucene/search/TopDocs.java     |  46 ++++--
+ .../lucene/search/TestMultiSliceMerge.java    | 143 ++++++++++++++++++
+ .../lucene/search/TestTopDocsMerge.java       |   4 +-
+ 4 files changed, 177 insertions(+), 18 deletions(-)
+ create mode 100644 lucene/core/src/test/org/apache/lucene/search/TestMultiSliceMerge.java
+
+diff --git a/lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java b/lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java
+index 1748dd4821..1a74569136 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java
++++ b/lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java
+@@ -462,7 +462,7 @@ public class IndexSearcher {
+         for (TopScoreDocCollector collector : collectors) {
+           topDocs[i++] = collector.topDocs();
+         }
+-        return TopDocs.merge(0, cappedNumHits, topDocs, true);
++        return TopDocs.merge(0, cappedNumHits, topDocs, false);
+       }
+ 
+     };
+diff --git a/lucene/core/src/java/org/apache/lucene/search/TopDocs.java b/lucene/core/src/java/org/apache/lucene/search/TopDocs.java
+index d466893078..e66f613d6a 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/TopDocs.java
++++ b/lucene/core/src/java/org/apache/lucene/search/TopDocs.java
+@@ -57,9 +57,6 @@ public class TopDocs {
+ 
+     int getShardIndex(ScoreDoc scoreDoc) {
+       if (useScoreDocIndex) {
+-        if (scoreDoc.shardIndex == -1) {
+-          throw new IllegalArgumentException("setShardIndex is false but TopDocs[" + shardIndex + "].scoreDocs[" + hitIndex + "] is not set");
+-        }
+         return scoreDoc.shardIndex;
+       } else {
+         // NOTE: we don't assert that shardIndex is -1 here, because caller could in fact have set it but asked us to ignore it now
+@@ -81,11 +78,25 @@ public class TopDocs {
+     } else if (firstShardIndex > secondShardIndex) {
+       return false;
+     } else {
+-      // Tie break in same shard: resolve however the
+-      // shard had resolved it:
+-      assert first.hitIndex != second.hitIndex;
+-      return first.hitIndex < second.hitIndex;
++      //Safety Check: same doc should not be collected more than once
++      assert firstDoc.doc != secondDoc.doc;
++
++      return (firstDoc.doc < secondDoc.doc);
++    }
++  }
++
++  /**
++   * If all hits belong to same shardIndex, then we use docID to tie break instead
++   */
++  static boolean tieBreakLessThanWithDocID(ScoreDoc firstDoc, ScoreDoc secondDoc) {
++    //Safety Check: same doc should not be collected more than once
++    assert firstDoc.doc != secondDoc.doc;
++
++    if (firstDoc.doc < secondDoc.doc) {
++      return true;
+     }
++
++    return false;
+   }
+ 
+   // Specialized MergeSortQueue that just merges by
+@@ -194,9 +205,8 @@ public class TopDocs {
+    * {@code start} top docs. This is typically useful for pagination.
+    *
+    * Note: If {@code setShardIndex} is true, this method will assume the incoming order of {@code shardHits} reflects
+-   * each shard's index and will fill the {@link ScoreDoc#shardIndex}, otherwise
+-   * it must already be set for all incoming {@code ScoreDoc}s, which can be useful when doing multiple reductions
+-   * (merges) of TopDocs.
++   * each shard's index and will fill the {@link ScoreDoc#shardIndex}, otherwise docIDs are expected to be in consistent pattern
++   * i.e. either all ScoreDocs have their shardIndex set, or all have them as -1 (signifying that all hits belong to same searcher)
+    *
+    * @lucene.experimental
+    */
+@@ -221,9 +231,8 @@ public class TopDocs {
+    * {@code start} top docs. This is typically useful for pagination.
+    *
+    * Note: If {@code setShardIndex} is true, this method will assume the incoming order of {@code shardHits} reflects
+-   * each shard's index and will fill the {@link ScoreDoc#shardIndex}, otherwise
+-   * it must already be set for all incoming {@code ScoreDoc}s, which can be useful when doing multiple reductions
+-   * (merges) of TopDocs.
++   * each shard's index and will fill the {@link ScoreDoc#shardIndex}, otherwise docIDs are expected to be in consistent pattern
++   * i.e. either all ScoreDocs have their shardIndex set, or all have them as -1 (signifying that all hits belong to same searcher)
+    *
+    * @lucene.experimental
+    */
+@@ -272,6 +281,7 @@ public class TopDocs {
+       int requestedResultWindow = start + size;
+       int numIterOnHits = Math.min(availHitCount, requestedResultWindow);
+       int hitUpto = 0;
++      boolean unsetValueOfShardIndex = shardHits[0].scoreDocs[0].shardIndex == -1 ? true : false;
+       while (hitUpto < numIterOnHits) {
+         assert queue.size() > 0;
+         ShardRef ref = queue.top();
+@@ -279,8 +289,14 @@ public class TopDocs {
+         if (setShardIndex) {
+           // caller asked us to record shardIndex (index of the TopDocs array) this hit is coming from:
+           hit.shardIndex = ref.shardIndex;
+-        } else if (hit.shardIndex == -1) {
+-          throw new IllegalArgumentException("setShardIndex is false but TopDocs[" + ref.shardIndex + "].scoreDocs[" + (ref.hitIndex-1) + "] is not set");
++        }
++        else {
++          // We only perform validation checks if setting shard indices is not requested, as in the opposite case,
++          // the existing value of shardIndex that was passed in is redundant
++          if ((unsetValueOfShardIndex && hit.shardIndex != -1) ||
++              (unsetValueOfShardIndex == false && hit.shardIndex == -1)) {
++            throw new IllegalArgumentException("Inconsistent values of shardIndex");
++          }
+         }
+           
+         if (hitUpto >= start) {
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestMultiSliceMerge.java b/lucene/core/src/test/org/apache/lucene/search/TestMultiSliceMerge.java
+new file mode 100644
+index 0000000000..b373b23e14
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/search/TestMultiSliceMerge.java
+@@ -0,0 +1,143 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.lucene.search;
++
++import java.util.Random;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.LinkedBlockingQueue;
++import java.util.concurrent.ThreadPoolExecutor;
++import java.util.concurrent.TimeUnit;
++
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.Field;
++import org.apache.lucene.document.SortedDocValuesField;
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.RandomIndexWriter;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util.NamedThreadFactory;
++import org.apache.lucene.util.TestUtil;
++
++public class TestMultiSliceMerge extends LuceneTestCase {
++  Directory dir1;
++  Directory dir2;
++  IndexReader reader1;
++  IndexReader reader2;
++
++  @Override
++  public void setUp() throws Exception {
++    super.setUp();
++    dir1 = newDirectory();
++    dir2 = newDirectory();
++    Random random = random();
++    RandomIndexWriter iw1 = new RandomIndexWriter(random(), dir1);
++    for (int i = 0; i < 100; i++) {
++      Document doc = new Document();
++      doc.add(newStringField("field", Integer.toString(i), Field.Store.NO));
++      doc.add(newStringField("field2", Boolean.toString(i % 2 == 0), Field.Store.NO));
++      doc.add(new SortedDocValuesField("field2", new BytesRef(Boolean.toString(i % 2 == 0))));
++      iw1.addDocument(doc);
++
++      if (random.nextBoolean()) {
++        iw1.commit();
++      }
++    }
++    reader1 = iw1.getReader();
++    iw1.close();
++
++    RandomIndexWriter iw2 = new RandomIndexWriter(random(), dir2);
++    for (int i = 0; i < 100; i++) {
++      Document doc = new Document();
++      doc.add(newStringField("field", Integer.toString(i), Field.Store.NO));
++      doc.add(newStringField("field2", Boolean.toString(i % 2 == 0), Field.Store.NO));
++      doc.add(new SortedDocValuesField("field2", new BytesRef(Boolean.toString(i % 2 == 0))));
++      iw2.addDocument(doc);
++
++      if (random.nextBoolean()) {
++        iw2.commit();
++      }
++    }
++    reader2 = iw2.getReader();
++    iw2.close();
++  }
++
++  @Override
++  public void tearDown() throws Exception {
++    super.tearDown();
++    reader1.close();
++    reader2.close();
++    dir1.close();
++    dir2.close();
++  }
++
++  public void testMultipleSlicesOfSameIndexSearcher() throws Exception {
++    ExecutorService service1 = new ThreadPoolExecutor(4, 4, 0L, TimeUnit.MILLISECONDS,
++        new LinkedBlockingQueue<Runnable>(),
++        new NamedThreadFactory("TestMultiSliceMerge"));
++    ExecutorService service2 = new ThreadPoolExecutor(4, 4, 0L, TimeUnit.MILLISECONDS,
++        new LinkedBlockingQueue<Runnable>(),
++        new NamedThreadFactory("TestMultiSliceMerge"));
++
++    IndexSearcher searchers[] = new IndexSearcher[] {
++        new IndexSearcher(reader1, service1),
++        new IndexSearcher(reader2, service2)
++    };
++
++    Query query = new MatchAllDocsQuery();
++
++    TopDocs topDocs1 = searchers[0].search(query, Integer.MAX_VALUE);
++    TopDocs topDocs2 = searchers[1].search(query, Integer.MAX_VALUE);
++
++    CheckHits.checkEqual(query, topDocs1.scoreDocs, topDocs2.scoreDocs);
++
++    TestUtil.shutdownExecutorService(service1);
++    TestUtil.shutdownExecutorService(service2);
++  }
++
++  public void testMultipleSlicesOfMultipleIndexSearchers() throws Exception {
++    ExecutorService service1 = new ThreadPoolExecutor(4, 4, 0L, TimeUnit.MILLISECONDS,
++        new LinkedBlockingQueue<Runnable>(),
++        new NamedThreadFactory("TestMultiSliceMerge"));
++    ExecutorService service2 = new ThreadPoolExecutor(4, 4, 0L, TimeUnit.MILLISECONDS,
++        new LinkedBlockingQueue<Runnable>(),
++        new NamedThreadFactory("TestMultiSliceMerge"));
++
++    IndexSearcher searchers[] = new IndexSearcher[] {
++        new IndexSearcher(reader1, service1),
++        new IndexSearcher(reader2, service2)
++    };
++
++    Query query = new MatchAllDocsQuery();
++
++    TopDocs topDocs1 = searchers[0].search(query, Integer.MAX_VALUE);
++    TopDocs topDocs2 = searchers[1].search(query, Integer.MAX_VALUE);
++
++    assertEquals(topDocs1.scoreDocs.length, topDocs2.scoreDocs.length);
++
++    TopDocs[] shardHits = {topDocs1, topDocs2};
++
++    TopDocs mergedHits1 = TopDocs.merge(0, topDocs1.scoreDocs.length, shardHits, true);
++    TopDocs mergedHits2 = TopDocs.merge(0, topDocs1.scoreDocs.length, shardHits, true);
++
++    CheckHits.checkEqual(query, mergedHits1.scoreDocs, mergedHits2.scoreDocs);
++
++    TestUtil.shutdownExecutorService(service1);
++    TestUtil.shutdownExecutorService(service2);
++  }
++}
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestTopDocsMerge.java b/lucene/core/src/test/org/apache/lucene/search/TestTopDocsMerge.java
+index db8b10503c..6c2563b101 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestTopDocsMerge.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestTopDocsMerge.java
+@@ -77,14 +77,14 @@ public class TestTopDocsMerge extends LuceneTestCase {
+ 
+   public void testInconsistentTopDocsFail() {
+     TopDocs[] topDocs = new TopDocs[] {
+-        new TopDocs(new TotalHits(1, TotalHits.Relation.EQUAL_TO), new ScoreDoc[] { new ScoreDoc(1, 1.0f) }),
++        new TopDocs(new TotalHits(1, TotalHits.Relation.EQUAL_TO), new ScoreDoc[] { new ScoreDoc(1, 1.0f, 5) }),
+         new TopDocs(new TotalHits(1, TotalHits.Relation.EQUAL_TO), new ScoreDoc[] { new ScoreDoc(1, 1.0f, -1) })
+     };
+     if (random().nextBoolean()) {
+       ArrayUtil.swap(topDocs, 0, 1);
+     }
+     expectThrows(IllegalArgumentException.class, () -> {
+-        TopDocs.merge(0, 1, topDocs, false);
++        TopDocs.merge(0, 2, topDocs, false);
+     });
+   }
+ 
+-- 
+2.17.2 (Apple Git-113)
+

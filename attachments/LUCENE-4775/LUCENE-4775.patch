@@ -1,0 +1,236 @@
+Index: lucene/core/src/test/org/apache/lucene/index/TestConcurrentMergeScheduler.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/index/TestConcurrentMergeScheduler.java	(revision 1445397)
++++ lucene/core/src/test/org/apache/lucene/index/TestConcurrentMergeScheduler.java	(working copy)
+@@ -324,4 +324,40 @@
+     w.close(false);
+     dir.close();
+   }
++
++
++  private static class TrackingCMS extends ConcurrentMergeScheduler {
++    long totMergedBytes;
++
++    public TrackingCMS() {
++      setMaxMergeCount(5);
++      setMaxThreadCount(5);
++    }
++
++    @Override
++    public void doMerge(MergePolicy.OneMerge merge) throws IOException {
++      totMergedBytes += merge.totalBytesSize();
++      super.doMerge(merge);
++    }
++  }
++
++  public void testTotalBytesSize() throws Exception {
++    Directory d = newDirectory();
++    IndexWriterConfig iwc = newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random()));
++    iwc.setMaxBufferedDocs(5);
++    iwc.setMergeScheduler(new TrackingCMS());
++    RandomIndexWriter w = new RandomIndexWriter(random(), d);
++    for(int i=0;i<100000;i++) {
++      Document doc = new Document();
++      doc.add(newStringField("id", ""+i, Field.Store.NO));
++      doc.add(newTextField("field", "here is some text", Field.Store.NO));
++      w.addDocument(doc);
++
++      if (random().nextBoolean()) {
++        w.deleteDocuments(new Term("id", ""+random().nextInt(i+1)));
++      }
++    }
++    w.close();
++    d.close();
++  }
+ }
+Index: lucene/core/src/java/org/apache/lucene/index/TieredMergePolicy.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/index/TieredMergePolicy.java	(revision 1445397)
++++ lucene/core/src/java/org/apache/lucene/index/TieredMergePolicy.java	(working copy)
+@@ -374,7 +374,7 @@
+       for(int idx = tooBigCount; idx<infosSorted.size(); idx++) {
+         final SegmentInfoPerCommit info = infosSorted.get(idx);
+         if (merging.contains(info)) {
+-          mergingBytes += info.info.sizeInBytes();
++          mergingBytes += info.sizeInBytes();
+         } else if (!toBeMerged.contains(info)) {
+           eligible.add(info);
+         }
+@@ -470,7 +470,7 @@
+       final long segBytes = size(info);
+       totAfterMergeBytes += segBytes;
+       totAfterMergeBytesFloored += floorSize(segBytes);
+-      totBeforeMergeBytes += info.info.sizeInBytes();
++      totBeforeMergeBytes += info.sizeInBytes();
+     }
+ 
+     // Measure "skew" of the merge, which can range
+@@ -670,7 +670,7 @@
+ 
+   // Segment size in bytes, pro-rated by % deleted
+   private long size(SegmentInfoPerCommit info) throws IOException {
+-    final long byteSize = info.info.sizeInBytes();    
++    final long byteSize = info.sizeInBytes();    
+     final int delCount = writer.get().numDeletedDocs(info);
+     final double delRatio = (info.info.getDocCount() <= 0 ? 0.0f : ((double)delCount / (double)info.info.getDocCount()));    
+     assert delRatio <= 1.0;
+Index: lucene/core/src/java/org/apache/lucene/index/MergePolicy.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/index/MergePolicy.java	(revision 1445397)
++++ lucene/core/src/java/org/apache/lucene/index/MergePolicy.java	(working copy)
+@@ -74,7 +74,11 @@
+     int maxNumSegments = -1;        // used by IndexWriter
+ 
+     /** Estimated size in bytes of the merged segment. */
+-    public long estimatedMergeBytes;       // used by IndexWriter
++    public volatile long estimatedMergeBytes;       // used by IndexWriter
++
++    // Sum of sizeInBytes of all SegmentInfos; set by IW.mergeInit
++    volatile long totalMergeBytes;
++
+     List<SegmentReader> readers;        // used by IndexWriter
+ 
+     /** Segments to be merged. */
+@@ -187,14 +191,12 @@
+     
+     /**
+      * Returns the total size in bytes of this merge. Note that this does not
+-     * indicate the size of the merged segment, but the input total size.
+-     * */
++     * indicate the size of the merged segment, but the
++     * input total size. This is only set once the merge is
++     * initialized by IndexWriter.
++     */
+     public long totalBytesSize() throws IOException {
+-      long total = 0;
+-      for (SegmentInfoPerCommit info : segments) {
+-        total += info.info.sizeInBytes();
+-      }
+-      return total;
++      return totalMergeBytes;
+     }
+ 
+     /**
+Index: lucene/core/src/java/org/apache/lucene/index/IndexWriter.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/index/IndexWriter.java	(revision 1445397)
++++ lucene/core/src/java/org/apache/lucene/index/IndexWriter.java	(working copy)
+@@ -2301,7 +2301,7 @@
+               infoStream.message("IW", "addIndexes: process segment origName=" + info.info.name + " newName=" + newSegName + " info=" + info);
+             }
+ 
+-            IOContext context = new IOContext(new MergeInfo(info.info.getDocCount(), info.info.sizeInBytes(), true, -1));
++            IOContext context = new IOContext(new MergeInfo(info.info.getDocCount(), info.sizeInBytes(), true, -1));
+ 
+             for(FieldInfo fi : getFieldInfos(info.info)) {
+               globalFieldNumberMap.addOrGet(fi.name, fi.number, fi.getDocValuesType());
+@@ -3458,7 +3458,8 @@
+         final int delCount = numDeletedDocs(info);
+         assert delCount <= info.info.getDocCount();
+         final double delRatio = ((double) delCount)/info.info.getDocCount();
+-        merge.estimatedMergeBytes += info.info.sizeInBytes() * (1.0 - delRatio);
++        merge.estimatedMergeBytes += info.sizeInBytes() * (1.0 - delRatio);
++        merge.totalMergeBytes += info.sizeInBytes();
+       }
+     }
+   }
+@@ -3759,7 +3760,7 @@
+       // lost... 
+ 
+       if (infoStream.isEnabled("IW")) {
+-        infoStream.message("IW", String.format(Locale.ROOT, "merged segment size=%.3f MB vs estimate=%.3f MB", merge.info.info.sizeInBytes()/1024./1024., merge.estimatedMergeBytes/1024/1024.));
++        infoStream.message("IW", String.format(Locale.ROOT, "merged segment size=%.3f MB vs estimate=%.3f MB", merge.info.sizeInBytes()/1024./1024., merge.estimatedMergeBytes/1024/1024.));
+       }
+ 
+       final IndexReaderWarmer mergedSegmentWarmer = config.getMergedSegmentWarmer();
+Index: lucene/core/src/java/org/apache/lucene/index/SegmentInfo.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/index/SegmentInfo.java	(revision 1445397)
++++ lucene/core/src/java/org/apache/lucene/index/SegmentInfo.java	(working copy)
+@@ -18,7 +18,6 @@
+  */
+ 
+ 
+-import java.io.IOException;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.HashMap;
+@@ -57,8 +56,6 @@
+ 
+   private boolean isCompoundFile;
+ 
+-  private volatile long sizeInBytes = -1;         // total byte size of all files (computed on demand)
+-
+   private Codec codec;
+ 
+   private Map<String,String> diagnostics;
+@@ -101,23 +98,6 @@
+   }
+ 
+   /**
+-   * Returns total size in bytes of all of files used by
+-   * this segment.  Note that this will not include any live
+-   * docs for the segment; to include that use {@link
+-   * SegmentInfoPerCommit#sizeInBytes()} instead.
+-   */
+-  public long sizeInBytes() throws IOException {
+-    if (sizeInBytes == -1) {
+-      long sum = 0;
+-      for (final String fileName : files()) {
+-        sum += dir.fileLength(fileName);
+-      }
+-      sizeInBytes = sum;
+-    }
+-    return sizeInBytes;
+-  }
+-
+-  /**
+    * Mark whether this segment is stored as a compound file.
+    *
+    * @param isCompoundFile true if this is a compound file;
+@@ -254,7 +234,6 @@
+   public void setFiles(Set<String> files) {
+     checkFileNames(files);
+     setFiles = files;
+-    sizeInBytes = -1;
+   }
+ 
+   /** Add these files to the set of files written for this
+@@ -262,7 +241,6 @@
+   public void addFiles(Collection<String> files) {
+     checkFileNames(files);
+     setFiles.addAll(files);
+-    sizeInBytes = -1;
+   }
+ 
+   /** Add this file to the set of files written for this
+@@ -270,7 +248,6 @@
+   public void addFile(String file) {
+     checkFileNames(Collections.singleton(file));
+     setFiles.add(file);
+-    sizeInBytes = -1;
+   }
+   
+   private void checkFileNames(Collection<String> files) {
+Index: lucene/core/src/java/org/apache/lucene/index/DocumentsWriterPerThread.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/index/DocumentsWriterPerThread.java	(revision 1445397)
++++ lucene/core/src/java/org/apache/lucene/index/DocumentsWriterPerThread.java	(working copy)
+@@ -520,7 +520,7 @@
+       }
+ 
+       if (infoStream.isEnabled("DWPT")) {
+-        final double newSegmentSize = segmentInfo.sizeInBytes()/1024./1024.;
++        final double newSegmentSize = segmentInfoPerCommit.sizeInBytes()/1024./1024.;
+         infoStream.message("DWPT", "flushed: segment=" + segmentInfo.name + 
+                 " ramUsed=" + nf.format(startMBUsed) + " MB" +
+                 " newFlushedSize(includes docstores)=" + nf.format(newSegmentSize) + " MB" +
+@@ -557,7 +557,7 @@
+ 
+     IndexWriter.setDiagnostics(newSegment.info, "flush");
+     
+-    IOContext context = new IOContext(new FlushInfo(newSegment.info.getDocCount(), newSegment.info.sizeInBytes()));
++    IOContext context = new IOContext(new FlushInfo(newSegment.info.getDocCount(), newSegment.sizeInBytes()));
+ 
+     boolean success = false;
+     try {

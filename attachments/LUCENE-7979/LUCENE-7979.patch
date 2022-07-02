@@ -1,0 +1,428 @@
+diff --git a/lucene/core/src/java/org/apache/lucene/search/BooleanWeight.java b/lucene/core/src/java/org/apache/lucene/search/BooleanWeight.java
+index 778cb63..036c286 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/BooleanWeight.java
++++ b/lucene/core/src/java/org/apache/lucene/search/BooleanWeight.java
+@@ -278,7 +278,7 @@ final class BooleanWeight extends Weight {
+     }
+   }
+ 
+-  @Override
++  /*@Override
+   public BulkScorer bulkScorer(LeafReaderContext context) throws IOException {
+     final BulkScorer bulkScorer = booleanScorer(context);
+     if (bulkScorer != null) {
+@@ -288,7 +288,7 @@ final class BooleanWeight extends Weight {
+       // use a Scorer-based impl (BS2)
+       return super.bulkScorer(context);
+     }
+-  }
++  }*/
+ 
+   @Override
+   public Scorer scorer(LeafReaderContext context) throws IOException {
+diff --git a/lucene/core/src/java/org/apache/lucene/search/DisiWrapper.java b/lucene/core/src/java/org/apache/lucene/search/DisiWrapper.java
+index f254340..2646132 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/DisiWrapper.java
++++ b/lucene/core/src/java/org/apache/lucene/search/DisiWrapper.java
+@@ -30,6 +30,7 @@ public class DisiWrapper {
+   public final float matchCost; // the match cost for two-phase iterators, 0 otherwise
+   public int doc; // the current doc, used for comparison
+   public DisiWrapper next; // reference to a next element, see #topList
++  DisiWrapper pqNext;
+ 
+   // An approximation of the iterator, or the iterator itself if it does not
+   // support two-phase iteration
+diff --git a/lucene/core/src/java/org/apache/lucene/search/DisjunctionApproximation.java b/lucene/core/src/java/org/apache/lucene/search/DisjunctionApproximation.java
+new file mode 100644
+index 0000000..1507d10
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/search/DisjunctionApproximation.java
+@@ -0,0 +1,35 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.search;
++
++import java.util.List;
++
++/** A disjunction of the approximation of multiple sub scorers. */
++abstract class DisjunctionApproximation extends DocIdSetIterator {
++
++  /** Create a {@link DisjunctionApproximation} over the given sub iterators. */
++  static DisjunctionApproximation of(List<DisiWrapper> disis) {
++    // TODO: specialize low numbers of clauses?
++    return new DisjunctionNApproximation(disis);
++  }
++
++  /**
++   * Return a linked list of all sub clauses that are positioned on the current document.
++   */
++  abstract DisiWrapper matchList();
++
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/search/DisjunctionNApproximation.java b/lucene/core/src/java/org/apache/lucene/search/DisjunctionNApproximation.java
+new file mode 100644
+index 0000000..5a7d099
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/search/DisjunctionNApproximation.java
+@@ -0,0 +1,244 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.search;
++
++import java.io.IOException;
++import java.util.Collection;
++
++/**
++ * 
++ */
++final class DisjunctionNApproximation extends DisjunctionApproximation {
++
++  private static final int NUM_BUCKETS = 33;
++
++  // radix heaps work with unsigned integers, so since our doc ids are between -1 and 2^31-1
++  // we just add 1 to all doc ids
++  private static int bucket(int doc, int lastPop) {
++    // number of common leading bits between doc+1 and lastPop+1
++    return 32 - Integer.numberOfLeadingZeros((doc + 1) ^ (lastPop + 1));
++  }
++
++  private final long cost;
++
++  private final DisiWrapper[] heap;
++  private long usedHeapBuckets;
++  private int lastPop = -1;
++
++  private DisiWrapper top;
++  private int topBucket = NUM_BUCKETS;
++
++  private final DisiWrapper[] scratch;
++
++  DisjunctionNApproximation(Collection<DisiWrapper> disis) {
++    if (disis.size() < 2) {
++      throw new IllegalArgumentException();
++    }
++    heap = new DisiWrapper[NUM_BUCKETS];
++    scratch = new DisiWrapper[disis.size()];
++    long cost = 0;
++    for (DisiWrapper disi : disis) {
++      assert disi.doc >= lastPop;
++      relocate(disi);
++      cost += disi.approximation.cost();
++    }
++    this.cost = cost;
++    setTop();
++  }
++
++  private void setTop() {
++    topBucket = Long.numberOfTrailingZeros(usedHeapBuckets);
++    top = heap[topBucket];
++    for (DisiWrapper w = top.pqNext; w != null; w = w.pqNext) {
++      if (w.doc < top.doc) {
++        top = w;
++      }
++    }
++  }
++
++  @Override
++  public DisiWrapper matchList() {
++    // in case of ties, top is the first DISI positioned on the current doc ID
++    // in the linked list formed by pqNext entries
++
++    final int topDoc = top.doc;
++    DisiWrapper topList = top;
++    topList.next = null;
++    for (DisiWrapper w = topList.pqNext; w != null; w = w.pqNext) {
++      if (w.doc == topDoc) {
++        w.next = topList;
++        topList = w;
++      }
++    }
++
++    return topList;
++  }
++
++  /*private void assertSane() {
++    int c = 0;
++    for (int i = 0; i < NUM_BUCKETS; ++i) {
++      boolean used = (usedHeapBuckets & (1L << i)) != 0;
++      assert used == (heap[i] != null) : used + " " + i;
++
++      for (DisiWrapper w = heap[i]; w != null; w = w.pqNext) {
++        assert i == bucket(w.doc, lastPop);
++        assert w.doc == w.approximation.docID();
++        c++;
++      }
++    }
++    assert c == scratch.length;
++
++    int topBucket = Integer.MAX_VALUE;
++    for (int i = 0; i < NUM_BUCKETS; ++i) {
++      if (heap[i] != null) {
++        topBucket = i;
++        break;
++      }
++    }
++    assert topBucket == this.topBucket : topBucket + " " + this.topBucket;
++    assert alone == (heap[topBucket].pqNext == null);
++
++    if (topBucket < NUM_BUCKETS) {
++      boolean found = false;
++      for (DisiWrapper w = heap[topBucket]; w != null; w = w.pqNext) {
++        assert w.doc >= top.doc;
++        if (w == top) {
++          found = true;
++        }
++      }
++      assert found;
++    }
++  }*/
++
++  @Override
++  public long cost() {
++    return cost;
++  }
++
++  @Override
++  public int docID() {
++    return top.doc;
++  }
++
++  @Override
++  public int advance(int target) throws IOException {
++    assert target > top.doc;
++    final int targetBucket = bucket(target, lastPop);
++
++    if (heap[topBucket].pqNext == null) {
++      // Try to optimize the case that only the top of the pq needs advancing
++      // This is useful in combination with high-cardinality clauses
++      DisiWrapper w = getListAndClear(topBucket);
++      w.doc = w.approximation.advance(target);
++      relocate(w);
++      setTop();
++      if (top.doc >= target) {
++        return top.doc;
++      }
++    }
++
++    int count = 0;
++    for (int bucket = topBucket; bucket < targetBucket; ++bucket) {
++      for (DisiWrapper w = getListAndClear(bucket); w != null; w = w.pqNext) {
++        w.doc = w.approximation.advance(target);
++        scratch[count++] = w;
++      }
++    }
++
++    DisiWrapper targetList = getListAndClear(targetBucket);
++
++    lastPop = target;
++
++    for (DisiWrapper toRelocate = targetList; toRelocate != null; ) {
++      DisiWrapper next = toRelocate.pqNext;
++      if (toRelocate.doc < target) {
++        toRelocate.doc = toRelocate.approximation.advance(target);
++      }
++      relocate(toRelocate);
++      toRelocate = next;
++    }
++
++    for (int i = 0; i < count; ++i) {
++      DisiWrapper toRelocate = scratch[i];
++      relocate(toRelocate);
++    }
++
++    setTop();
++    return top.doc;
++  }
++
++  @Override
++  public int nextDoc() throws IOException {
++    if (heap[topBucket].pqNext == null) {
++      // When the 'top' iterator is alone in its bucket, we just advance it
++      // and do not care about updating lastPop
++      // This helps reorganize the priority queue less often, which helps
++      // when there are few clauses
++      doNextDocAlone();
++    } else {
++      doNextDoc();
++    }
++
++    setTop();
++    return top.doc;
++  }
++
++  private void doNextDocAlone() throws IOException {
++    DisiWrapper w = getListAndClear(topBucket);
++    w.doc = w.approximation.nextDoc();
++    relocate(w);
++  }
++
++  private void doNextDoc() throws IOException {
++    int target = top.doc + 1;
++    int targetBucket = bucket(target, lastPop);
++    lastPop = target;
++
++    DisiWrapper topList = getListAndClear(topBucket);
++    DisiWrapper targetList = getListAndClear(targetBucket);
++
++    for (DisiWrapper toRelocate = topList; toRelocate != null; ) {
++      DisiWrapper next = toRelocate.pqNext;
++      if (toRelocate.doc < target) {
++        toRelocate.doc = toRelocate.approximation.nextDoc();
++      }
++      relocate(toRelocate);
++      toRelocate = next;
++    }
++
++    for (DisiWrapper toRelocate = targetList; toRelocate != null; ) {
++      DisiWrapper next = toRelocate.pqNext;
++      relocate(toRelocate);
++      toRelocate = next;
++    }
++  }
++
++  private DisiWrapper getListAndClear(int bucket) {
++    DisiWrapper r = heap[bucket];
++    heap[bucket] = null;
++    usedHeapBuckets &= ~(1L << bucket);
++    return r;
++  }
++
++  private void relocate(DisiWrapper toRelocate) {
++    int bucket = bucket(toRelocate.doc, lastPop);
++    toRelocate.pqNext = heap[bucket];
++    heap[bucket] = toRelocate;
++    usedHeapBuckets |= 1L << bucket;
++  }
++
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/search/DisjunctionScorer.java b/lucene/core/src/java/org/apache/lucene/search/DisjunctionScorer.java
+index 8180dc4..0cb3619 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/DisjunctionScorer.java
++++ b/lucene/core/src/java/org/apache/lucene/search/DisjunctionScorer.java
+@@ -21,6 +21,7 @@ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.List;
++import java.util.stream.Collectors;
+ 
+ import org.apache.lucene.util.PriorityQueue;
+ 
+@@ -31,8 +32,7 @@ abstract class DisjunctionScorer extends Scorer {
+ 
+   private final boolean needsScores;
+ 
+-  private final DisiPriorityQueue subScorers;
+-  private final DisjunctionDISIApproximation approximation;
++  private final DisjunctionApproximation approximation;
+   private final TwoPhase twoPhase;
+ 
+   protected DisjunctionScorer(Weight weight, List<Scorer> subScorers, boolean needsScores) {
+@@ -40,20 +40,19 @@ abstract class DisjunctionScorer extends Scorer {
+     if (subScorers.size() <= 1) {
+       throw new IllegalArgumentException("There must be at least 2 subScorers");
+     }
+-    this.subScorers = new DisiPriorityQueue(subScorers.size());
+-    for (Scorer scorer : subScorers) {
+-      final DisiWrapper w = new DisiWrapper(scorer);
+-      this.subScorers.add(w);
+-    }
++    
++    List<DisiWrapper> disis = subScorers.stream()
++        .map(DisiWrapper::new)
++        .collect(Collectors.toList());
++    this.approximation = DisjunctionApproximation.of(disis);
+     this.needsScores = needsScores;
+-    this.approximation = new DisjunctionDISIApproximation(this.subScorers);
+ 
+     boolean hasApproximation = false;
+     float sumMatchCost = 0;
+     long sumApproxCost = 0;
+     // Compute matchCost as the average over the matchCost of the subScorers.
+     // This is weighted by the cost, which is an expected number of matching documents.
+-    for (DisiWrapper w : this.subScorers) {
++    for (DisiWrapper w : disis) {
+       long costWeight = (w.cost <= 1) ? 1 : w.cost;
+       sumApproxCost += costWeight;
+       if (w.twoPhaseView != null) {
+@@ -66,7 +65,7 @@ abstract class DisjunctionScorer extends Scorer {
+       twoPhase = null;
+     } else {
+       final float matchCost = sumMatchCost / sumApproxCost;
+-      twoPhase = new TwoPhase(approximation, matchCost);
++      twoPhase = new TwoPhase(approximation, disis.size(), matchCost);
+     }
+   }
+ 
+@@ -86,16 +85,18 @@ abstract class DisjunctionScorer extends Scorer {
+ 
+   private class TwoPhase extends TwoPhaseIterator {
+ 
++    private final DisjunctionApproximation approximation;
+     private final float matchCost;
+     // list of verified matches on the current doc
+     DisiWrapper verifiedMatches;
+     // priority queue of approximations on the current doc that have not been verified yet
+     final PriorityQueue<DisiWrapper> unverifiedMatches;
+ 
+-    private TwoPhase(DocIdSetIterator approximation, float matchCost) {
++    private TwoPhase(DisjunctionApproximation approximation, int numClauses, float matchCost) {
+       super(approximation);
++      this.approximation = approximation;
+       this.matchCost = matchCost;
+-      unverifiedMatches = new PriorityQueue<DisiWrapper>(DisjunctionScorer.this.subScorers.size()) {
++      unverifiedMatches = new PriorityQueue<DisiWrapper>(numClauses) {
+         @Override
+         protected boolean lessThan(DisiWrapper a, DisiWrapper b) {
+           return a.matchCost < b.matchCost;
+@@ -120,7 +121,7 @@ abstract class DisjunctionScorer extends Scorer {
+       verifiedMatches = null;
+       unverifiedMatches.clear();
+       
+-      for (DisiWrapper w = subScorers.topList(); w != null; ) {
++      for (DisiWrapper w = approximation.matchList(); w != null; ) {
+         DisiWrapper next = w.next;
+         
+         if (w.twoPhaseView == null) {
+@@ -164,12 +165,12 @@ abstract class DisjunctionScorer extends Scorer {
+ 
+   @Override
+   public final int docID() {
+-   return subScorers.top().doc;
++   return approximation.docID();
+   }
+ 
+   DisiWrapper getSubMatches() throws IOException {
+     if (twoPhase == null) {
+-      return subScorers.topList();
++      return approximation.matchList();
+     } else {
+       return twoPhase.getSubMatches();
+     }

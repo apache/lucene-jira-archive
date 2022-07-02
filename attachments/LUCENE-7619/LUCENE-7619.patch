@@ -1,0 +1,4187 @@
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/core/FlattenGraphFilter.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/core/FlattenGraphFilter.java
+new file mode 100644
+index 0000000..01e1f6f
+--- /dev/null
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/core/FlattenGraphFilter.java
+@@ -0,0 +1,418 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.lucene.analysis.core;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++
++import org.apache.lucene.analysis.TokenFilter;
++import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.analysis.synonym.SynonymGraphFilter;
++import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
++import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
++import org.apache.lucene.analysis.tokenattributes.PositionLengthAttribute;
++import org.apache.lucene.util.AttributeSource;
++import org.apache.lucene.util.RollingBuffer;
++
++/**
++ * Converts an incoming graph token stream, such as one from
++ * {@link SynonymGraphFilter}, into a flat form so that
++ * all nodes form a single linear chain with no side paths.  Every
++ * path through the graph touches every node.  This is necessary
++ * when indexing a graph token stream, because the index does not
++ * save {@link PositionLengthAttribute} and so it cannot
++ * preserve the graph structure.  However, at search time,
++ * query parsers can correctly handle the graph and this token
++ * filter should <b>not</b> be used.
++ *
++ * <p>If the graph was not already flat to start, this
++ * is likely a lossy process, i.e. it will often cause the 
++ * graph to accept token sequences it should not, and to
++ * reject token sequences it should not.
++ *
++ * <p>However, when applying synonyms during indexing, this
++ * is necessary because Lucene already does not index a graph 
++ * and so the indexing process is already lossy
++ * (it ignores the {@link PositionLengthAttribute}).
++ *
++ * @lucene.experimental
++ */
++public final class FlattenGraphFilter extends TokenFilter {
++
++  /** Holds all tokens leaving a given input position. */
++  private final static class InputNode implements RollingBuffer.Resettable {
++    private final List<AttributeSource.State> tokens = new ArrayList<>();
++
++    /** Our input node, or -1 if we haven't been assigned yet */
++    int node = -1;
++
++    /** Maximum to input node for all tokens leaving here; we use this
++     *  to know when we can freeze. */
++    int maxToNode = -1;
++
++    /** Where we currently map to; this changes (can only
++     *  increase as we see more input tokens), until we are finished
++     *  with this position. */
++    int outputNode = -1;
++
++    /** Which token (index into {@link #tokens}) we will next output. */
++    int nextOut;
++
++    @Override
++    public void reset() {
++      tokens.clear();
++      node = -1;
++      outputNode = -1;
++      maxToNode = -1;
++      nextOut = 0;
++    }
++  }
++
++  /** Gathers up merged input positions into a single output position,
++   *  only for the current "frontier" of nodes we've seen but can't yet
++   *  output because they are not frozen. */
++  private final static class OutputNode implements RollingBuffer.Resettable {
++    private final List<Integer> inputNodes = new ArrayList<>();
++
++    /** Node ID for this output, or -1 if we haven't been assigned yet. */
++    int node = -1;
++
++    /** Which input node (index into {@link #inputNodes}) we will next output. */
++    int nextOut;
++    
++    /** Start offset of tokens leaving this node. */
++    int startOffset = -1;
++
++    /** End offset of tokens arriving to this node. */
++    int endOffset = -1;
++
++    @Override
++    public void reset() {
++      inputNodes.clear();
++      node = -1;
++      nextOut = 0;
++      startOffset = -1;
++      endOffset = -1;
++    }
++  }
++
++  private final RollingBuffer<InputNode> inputNodes = new RollingBuffer<InputNode>() {
++    @Override
++    protected InputNode newInstance() {
++      return new InputNode();
++    }
++  };
++
++  private final RollingBuffer<OutputNode> outputNodes = new RollingBuffer<OutputNode>() {
++    @Override
++    protected OutputNode newInstance() {
++      return new OutputNode();
++    }
++  };
++
++  private final PositionIncrementAttribute posIncAtt = addAttribute(PositionIncrementAttribute.class);
++  private final PositionLengthAttribute posLenAtt = addAttribute(PositionLengthAttribute.class);
++  private final OffsetAttribute offsetAtt = addAttribute(OffsetAttribute.class);
++
++  /** Which input node the last seen token leaves from */
++  private int inputFrom;
++
++  /** We are currently releasing tokens leaving from this output node */
++  private int outputFrom;
++
++  // for debugging:
++  //private int retOutputFrom;
++
++  private boolean done;
++
++  private int lastOutputFrom;
++
++  private int finalOffset;
++
++  private int finalPosInc;
++
++  private int maxLookaheadUsed;
++
++  private int lastStartOffset;
++
++  public FlattenGraphFilter(TokenStream in) {
++    super(in);
++  }
++
++  private boolean releaseBufferedToken() {
++
++    // We only need the while loop (retry) if we have a hole (an output node that has no tokens leaving):
++    while (outputFrom < outputNodes.getMaxPos()) {
++      OutputNode output = outputNodes.get(outputFrom);
++      if (output.inputNodes.isEmpty()) {
++        // No tokens arrived to this node, which happens for the first node
++        // after a hole:
++        //System.out.println("    skip empty outputFrom=" + outputFrom);
++        outputFrom++;
++        continue;
++      }
++
++      int maxToNode = -1;
++      for(int inputNodeID : output.inputNodes) {
++        InputNode inputNode = inputNodes.get(inputNodeID);
++        assert inputNode.outputNode == outputFrom;
++        maxToNode = Math.max(maxToNode, inputNode.maxToNode);
++      }
++      //System.out.println("  release maxToNode=" + maxToNode + " vs inputFrom=" + inputFrom);
++
++      // TODO: we could shrink the frontier here somewhat if we
++      // always output posLen=1 as part of our "sausagizing":
++      if (maxToNode <= inputFrom || done) {
++        //System.out.println("  output node merged these inputs: " + output.inputNodes);
++        // These tokens are now frozen
++        assert output.nextOut < output.inputNodes.size(): "output.nextOut=" + output.nextOut + " vs output.inputNodes.size()=" + output.inputNodes.size();
++        InputNode inputNode = inputNodes.get(output.inputNodes.get(output.nextOut));
++        if (done && inputNode.tokens.size() == 0 && outputFrom >= outputNodes.getMaxPos()) {
++          return false;
++        }
++        if (inputNode.tokens.size() == 0) {
++          assert inputNode.nextOut == 0;
++          assert output.nextOut == 0;
++          // Hole dest nodes should never be merged since 1) we always
++          // assign them to a new output position, and 2) since they never
++          // have arriving tokens they cannot be pushed:
++          assert output.inputNodes.size() == 1: output.inputNodes.size();
++          outputFrom++;
++          inputNodes.freeBefore(output.inputNodes.get(0));
++          outputNodes.freeBefore(outputFrom);
++          continue;
++        }
++
++        assert inputNode.nextOut < inputNode.tokens.size();
++
++        restoreState(inputNode.tokens.get(inputNode.nextOut));
++
++        // Correct posInc
++        assert outputFrom >= lastOutputFrom;
++        posIncAtt.setPositionIncrement(outputFrom - lastOutputFrom);
++        int toInputNodeID = inputNode.node + posLenAtt.getPositionLength();
++        InputNode toInputNode = inputNodes.get(toInputNodeID);
++
++        // Correct posLen
++        assert toInputNode.outputNode > outputFrom;
++        posLenAtt.setPositionLength(toInputNode.outputNode - outputFrom);
++        lastOutputFrom = outputFrom;
++        inputNode.nextOut++;
++        //System.out.println("  ret " + this);
++
++        OutputNode outputEndNode = outputNodes.get(toInputNode.outputNode);
++
++        // Correct offsets
++
++        // This is a bit messy; we must do this so offset don't go backwards,
++        // which would otherwise happen if the replacement has more tokens
++        // than the input:
++        int startOffset = Math.max(lastStartOffset, output.startOffset);
++
++        // We must do this in case the incoming tokens have broken offsets:
++        int endOffset = Math.max(startOffset, outputEndNode.endOffset);
++        
++        offsetAtt.setOffset(startOffset, endOffset);
++        lastStartOffset = startOffset;
++
++        if (inputNode.nextOut == inputNode.tokens.size()) {
++          output.nextOut++;
++          if (output.nextOut == output.inputNodes.size()) {
++            outputFrom++;
++            inputNodes.freeBefore(output.inputNodes.get(0));
++            outputNodes.freeBefore(outputFrom);
++          }
++        }
++
++        return true;
++      } else {
++        return false;
++      }
++    }
++
++    //System.out.println("    break false");
++    return false;
++  }
++
++  @Override
++  public boolean incrementToken() throws IOException {
++    //System.out.println("\nF.increment inputFrom=" + inputFrom + " outputFrom=" + outputFrom);
++
++    while (true) {
++      if (releaseBufferedToken()) {
++        //retOutputFrom += posIncAtt.getPositionIncrement();
++        //System.out.println("    return buffered: " + termAtt + " " + retOutputFrom + "-" + (retOutputFrom + posLenAtt.getPositionLength()));
++        //printStates();
++        return true;
++      } else if (done) {
++        //System.out.println("    done, return false");
++        return false;
++      }
++
++      if (input.incrementToken()) {
++        // Input node this token leaves from:
++        inputFrom += posIncAtt.getPositionIncrement();
++
++        int startOffset = offsetAtt.startOffset();
++        int endOffset = offsetAtt.endOffset();
++
++        // Input node this token goes to:
++        int inputTo = inputFrom + posLenAtt.getPositionLength();
++        //System.out.println("  input.inc " + termAtt + ": " + inputFrom + "-" + inputTo);
++
++        InputNode src = inputNodes.get(inputFrom);
++        if (src.node == -1) {
++          // This means the "from" node of this token was never seen as a "to" node,
++          // which should only happen if we just crossed a hole.  This is a challenging
++          // case for us because we normally rely on the full dependencies expressed
++          // by the arcs to assign outgoing node IDs.  It would be better if tokens
++          // were never dropped but instead just marked deleted with a new
++          // TermDeletedAttribute (boolean valued) ... but until that future, we have
++          // a hack here to forcefully jump the output node ID:
++          assert src.outputNode == -1;
++          src.node = inputFrom;
++
++          src.outputNode = outputNodes.getMaxPos() + 1;
++          //System.out.println("    hole: force to outputNode=" + src.outputNode);
++          OutputNode outSrc = outputNodes.get(src.outputNode);
++
++          // Not assigned yet:
++          assert outSrc.node == -1;
++          outSrc.node = src.outputNode;
++          outSrc.inputNodes.add(inputFrom);
++          outSrc.startOffset = startOffset;
++        } else {
++          OutputNode outSrc = outputNodes.get(src.outputNode);
++          if (outSrc.startOffset == -1 || startOffset > outSrc.startOffset) {
++            // "shrink wrap" the offsets so the original tokens (with most
++            // restrictive offsets) win:
++            outSrc.startOffset = Math.max(startOffset, outSrc.startOffset);
++          }
++        }
++
++        // Buffer this token:
++        src.tokens.add(captureState());
++        src.maxToNode = Math.max(src.maxToNode, inputTo);
++        maxLookaheadUsed = Math.max(maxLookaheadUsed, inputNodes.getBufferSize());
++
++        InputNode dest = inputNodes.get(inputTo);
++        if (dest.node == -1) {
++          // Common case: first time a token is arriving to this input position:
++          dest.node = inputTo;
++        }
++
++        // Always number output nodes sequentially:
++        int outputEndNode = src.outputNode + 1;
++
++        if (outputEndNode > dest.outputNode) {
++          if (dest.outputNode != -1) {
++            boolean removed = outputNodes.get(dest.outputNode).inputNodes.remove(Integer.valueOf(inputTo));
++            assert removed;
++          }
++          //System.out.println("    increase output node: " + dest.outputNode + " vs " + outputEndNode);
++          outputNodes.get(outputEndNode).inputNodes.add(inputTo);
++          dest.outputNode = outputEndNode;
++
++          // Since all we ever do is merge incoming nodes together, and then renumber
++          // the merged nodes sequentially, we should only ever assign smaller node
++          // numbers:
++          assert outputEndNode <= inputTo: "outputEndNode=" + outputEndNode + " vs inputTo=" + inputTo;
++        }
++
++        OutputNode outDest = outputNodes.get(dest.outputNode);
++        // "shrink wrap" the offsets so the original tokens (with most
++        // restrictive offsets) win:
++        if (outDest.endOffset == -1 || endOffset < outDest.endOffset) {
++          outDest.endOffset = endOffset;
++        }
++
++      } else {
++        //System.out.println("  got false from input");
++        input.end();
++        finalPosInc = posIncAtt.getPositionIncrement();
++        finalOffset = offsetAtt.endOffset();
++        done = true;
++        // Don't return false here: we need to force release any buffered tokens now
++      }
++    }
++  }
++
++  // Only for debugging:
++  /*
++  private void printStates() {
++    System.out.println("states:");
++    for(int i=outputFrom;i<outputNodes.getMaxPos();i++) {
++      OutputNode outputNode = outputNodes.get(i);
++      System.out.println("  output " + i + ": inputs " + outputNode.inputNodes);
++      for(int inputNodeID : outputNode.inputNodes) {
++        InputNode inputNode = inputNodes.get(inputNodeID);
++        assert inputNode.outputNode == i;
++      }
++    }
++  }
++  */
++
++  @Override
++  public void end() throws IOException {
++    if (done == false) {
++      super.end();
++    } else {
++      // NOTE, shady: don't call super.end, because we did already from incrementToken
++    }
++
++    clearAttributes();
++    if (done) {
++      // On exc, done is false, and we will not have set these:
++      posIncAtt.setPositionIncrement(finalPosInc);
++      offsetAtt.setOffset(finalOffset, finalOffset);
++    } else {
++      super.end();
++    }
++  }
++  
++  @Override
++  public void reset() throws IOException {
++    //System.out.println("F: reset");
++    super.reset();
++    inputFrom = -1;
++    inputNodes.reset();
++    InputNode in = inputNodes.get(0);
++    in.node = 0;
++    in.outputNode = 0;
++
++    outputNodes.reset();
++    OutputNode out = outputNodes.get(0);
++    out.node = 0;
++    out.inputNodes.add(0);
++    out.startOffset = 0;
++    outputFrom = 0;
++    //retOutputFrom = -1;
++    lastOutputFrom = -1;
++    done = false;
++    finalPosInc = -1;
++    finalOffset = -1;
++    lastStartOffset = 0;
++    maxLookaheadUsed = 0;
++  }
++
++  /** For testing */
++  public int getMaxLookaheadUsed() {
++    return maxLookaheadUsed;
++  }
++}
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/core/FlattenGraphFilterFactory.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/core/FlattenGraphFilterFactory.java
+new file mode 100644
+index 0000000..920ab3d
+--- /dev/null
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/core/FlattenGraphFilterFactory.java
+@@ -0,0 +1,44 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.lucene.analysis.core;
++
++import java.util.Map;
++
++import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.analysis.util.TokenFilterFactory;
++
++/** 
++ * Factory for {@link FlattenGraphFilter}. 
++ *
++ * @lucene.experimental
++ */
++public class FlattenGraphFilterFactory extends TokenFilterFactory {
++
++  /** Creates a new FlattenGraphFilterFactory */
++  public FlattenGraphFilterFactory(Map<String,String> args) {
++    super(args);
++    if (!args.isEmpty()) {
++      throw new IllegalArgumentException("Unknown parameters: " + args);
++    }
++  }
++  
++  @Override
++  public TokenStream create(TokenStream input) {
++    return new FlattenGraphFilter(input);
++  }
++}
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/miscellaneous/WordDelimiterFilter.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/miscellaneous/WordDelimiterFilter.java
+index f80ed8a..aef697c 100644
+--- a/lucene/analysis/common/src/java/org/apache/lucene/analysis/miscellaneous/WordDelimiterFilter.java
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/miscellaneous/WordDelimiterFilter.java
+@@ -28,6 +28,7 @@ import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
+ import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
+ import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
+ import org.apache.lucene.analysis.tokenattributes.TypeAttribute;
++import org.apache.lucene.search.PhraseQuery;
+ import org.apache.lucene.util.ArrayUtil;
+ import org.apache.lucene.util.AttributeSource;
+ import org.apache.lucene.util.InPlaceMergeSorter;
+@@ -80,7 +81,12 @@ import org.apache.lucene.util.InPlaceMergeSorter;
+  * the current {@link StandardTokenizer} immediately removes many intra-word
+  * delimiters, it is recommended that this filter be used after a tokenizer that
+  * does not do this (such as {@link WhitespaceTokenizer}).
++ *
++ * @deprecated Use {@link WordDelimiterGraphFilter} instead: it produces a correct
++ * token graph so that e.g. {@link PhraseQuery} works correctly when it's used in
++ * the search time analyzer.
+  */
++@Deprecated
+ public final class WordDelimiterFilter extends TokenFilter {
+   
+   public static final int LOWER = 0x01;
+@@ -116,7 +122,7 @@ public final class WordDelimiterFilter extends TokenFilter {
+   /**
+    * Causes maximum runs of word parts to be catenated:
+    * <p>
+-   * "wi-fi" =&gt; "wifi"
++   * "500-42" =&gt; "50042"
+    */
+   public static final int CATENATE_NUMBERS = 8;
+ 
+@@ -494,7 +500,6 @@ public final class WordDelimiterFilter extends TokenFilter {
+   private void generatePart(boolean isSingleWord) {
+     clearAttributes();
+     termAttribute.copyBuffer(savedBuffer, iterator.current, iterator.end - iterator.current);
+-
+     int startOffset = savedStartOffset + iterator.current;
+     int endOffset = savedStartOffset + iterator.end;
+     
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/miscellaneous/WordDelimiterFilterFactory.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/miscellaneous/WordDelimiterFilterFactory.java
+index 6a15b55..0002d65 100644
+--- a/lucene/analysis/common/src/java/org/apache/lucene/analysis/miscellaneous/WordDelimiterFilterFactory.java
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/miscellaneous/WordDelimiterFilterFactory.java
+@@ -31,6 +31,7 @@ import org.apache.lucene.analysis.TokenStream;
+ import org.apache.lucene.analysis.util.ResourceLoader;
+ import org.apache.lucene.analysis.util.ResourceLoaderAware;
+ import org.apache.lucene.analysis.util.TokenFilterFactory;
++import org.apache.lucene.search.PhraseQuery;
+ 
+ import static org.apache.lucene.analysis.miscellaneous.WordDelimiterFilter.*;
+ 
+@@ -47,7 +48,12 @@ import static org.apache.lucene.analysis.miscellaneous.WordDelimiterFilter.*;
+  *             types="wdfftypes.txt" /&gt;
+  *   &lt;/analyzer&gt;
+  * &lt;/fieldType&gt;</pre>
++ *
++ * @deprecated Use {@link WordDelimiterGraphFilterFactory} instead: it produces a correct
++ * token graph so that e.g. {@link PhraseQuery} works correctly when it's used in
++ * the search time analyzer.
+  */
++@Deprecated
+ public class WordDelimiterFilterFactory extends TokenFilterFactory implements ResourceLoaderAware {
+   public static final String PROTECTED_TOKENS = "protected";
+   public static final String TYPES = "types";
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/miscellaneous/WordDelimiterGraphFilter.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/miscellaneous/WordDelimiterGraphFilter.java
+new file mode 100644
+index 0000000..ea6f6cd
+--- /dev/null
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/miscellaneous/WordDelimiterGraphFilter.java
+@@ -0,0 +1,692 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */ 
++package org.apache.lucene.analysis.miscellaneous;
++
++import java.io.IOException;
++
++import org.apache.lucene.analysis.CharArraySet;
++import org.apache.lucene.analysis.TokenFilter;
++import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.analysis.core.WhitespaceTokenizer;
++import org.apache.lucene.analysis.standard.StandardTokenizer;
++import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
++import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
++import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
++import org.apache.lucene.analysis.tokenattributes.PositionLengthAttribute;
++import org.apache.lucene.analysis.tokenattributes.TypeAttribute;
++import org.apache.lucene.search.PhraseQuery;
++import org.apache.lucene.util.ArrayUtil;
++import org.apache.lucene.util.AttributeSource;
++import org.apache.lucene.util.InPlaceMergeSorter;
++import org.apache.lucene.util.RamUsageEstimator;
++
++/**
++ * Splits words into subwords and performs optional transformations on subword
++ * groups, producing a correct token graph so that e.g. {@link PhraseQuery} can
++ * work correctly when this filter is used in the search-time analyzer.  Unlike
++ * the deprecated {@link WordDelimiterFilter}, this token filter produces a
++ * correct token graph as output.  However, it cannot consume an input token
++ * graph correctly.
++ *
++ * <p>
++ * Words are split into subwords with the following rules:
++ * <ul>
++ * <li>split on intra-word delimiters (by default, all non alpha-numeric
++ * characters): <code>"Wi-Fi"</code> &#8594; <code>"Wi", "Fi"</code></li>
++ * <li>split on case transitions: <code>"PowerShot"</code> &#8594;
++ * <code>"Power", "Shot"</code></li>
++ * <li>split on letter-number transitions: <code>"SD500"</code> &#8594;
++ * <code>"SD", "500"</code></li>
++ * <li>leading and trailing intra-word delimiters on each subword are ignored:
++ * <code>"//hello---there, 'dude'"</code> &#8594;
++ * <code>"hello", "there", "dude"</code></li>
++ * <li>trailing "'s" are removed for each subword: <code>"O'Neil's"</code>
++ * &#8594; <code>"O", "Neil"</code>
++ * <ul>
++ * <li>Note: this step isn't performed in a separate filter because of possible
++ * subword combinations.</li>
++ * </ul>
++ * </li>
++ * </ul>
++ * 
++ * The <b>combinations</b> parameter affects how subwords are combined:
++ * <ul>
++ * <li>combinations="0" causes no subword combinations: <code>"PowerShot"</code>
++ * &#8594; <code>0:"Power", 1:"Shot"</code> (0 and 1 are the token positions)</li>
++ * <li>combinations="1" means that in addition to the subwords, maximum runs of
++ * non-numeric subwords are catenated and produced at the same position of the
++ * last subword in the run:
++ * <ul>
++ * <li><code>"PowerShot"</code> &#8594;
++ * <code>0:"Power", 1:"Shot" 1:"PowerShot"</code></li>
++ * <li><code>"A's+B's&amp;C's"</code> &gt; <code>0:"A", 1:"B", 2:"C", 2:"ABC"</code>
++ * </li>
++ * <li><code>"Super-Duper-XL500-42-AutoCoder!"</code> &#8594;
++ * <code>0:"Super", 1:"Duper", 2:"XL", 2:"SuperDuperXL", 3:"500" 4:"42", 5:"Auto", 6:"Coder", 6:"AutoCoder"</code>
++ * </li>
++ * </ul>
++ * </li>
++ * </ul>
++ * One use for {@link WordDelimiterGraphFilter} is to help match words with different
++ * subword delimiters. For example, if the source text contained "wi-fi" one may
++ * want "wifi" "WiFi" "wi-fi" "wi+fi" queries to all match. One way of doing so
++ * is to specify combinations="1" in the analyzer used for indexing, and
++ * combinations="0" (the default) in the analyzer used for querying. Given that
++ * the current {@link StandardTokenizer} immediately removes many intra-word
++ * delimiters, it is recommended that this filter be used after a tokenizer that
++ * does not do this (such as {@link WhitespaceTokenizer}).
++ */
++
++public final class WordDelimiterGraphFilter extends TokenFilter {
++  
++  /**
++   * Causes parts of words to be generated:
++   * <p>
++   * "PowerShot" =&gt; "Power" "Shot"
++   */
++  public static final int GENERATE_WORD_PARTS = 1;
++
++  /**
++   * Causes number subwords to be generated:
++   * <p>
++   * "500-42" =&gt; "500" "42"
++   */
++  public static final int GENERATE_NUMBER_PARTS = 2;
++
++  /**
++   * Causes maximum runs of word parts to be catenated:
++   * <p>
++   * "wi-fi" =&gt; "wifi"
++   */
++  public static final int CATENATE_WORDS = 4;
++
++  /**
++   * Causes maximum runs of number parts to be catenated:
++   * <p>
++   * "500-42" =&gt; "50042"
++   */
++  public static final int CATENATE_NUMBERS = 8;
++
++  /**
++   * Causes all subword parts to be catenated:
++   * <p>
++   * "wi-fi-4000" =&gt; "wifi4000"
++   */
++  public static final int CATENATE_ALL = 16;
++
++  /**
++   * Causes original words are preserved and added to the subword list (Defaults to false)
++   * <p>
++   * "500-42" =&gt; "500" "42" "500-42"
++   */
++  public static final int PRESERVE_ORIGINAL = 32;
++
++  /**
++   * Causes lowercase -&gt; uppercase transition to start a new subword.
++   */
++  public static final int SPLIT_ON_CASE_CHANGE = 64;
++
++  /**
++   * If not set, causes numeric changes to be ignored (subwords will only be generated
++   * given SUBWORD_DELIM tokens).
++   */
++  public static final int SPLIT_ON_NUMERICS = 128;
++
++  /**
++   * Causes trailing "'s" to be removed for each subword
++   * <p>
++   * "O'Neil's" =&gt; "O", "Neil"
++   */
++  public static final int STEM_ENGLISH_POSSESSIVE = 256;
++  
++  /**
++   * If not null is the set of tokens to protect from being delimited
++   *
++   */
++  final CharArraySet protWords;
++
++  private final int flags;
++
++  // packs start pos, end pos, start part, end part (= slice of the term text) for each buffered part:
++  private int[] bufferedParts = new int[16];
++  private int bufferedLen;
++  private int bufferedPos;
++
++  // holds text for each buffered part, or null if it's a simple slice of the original term
++  private char[][] bufferedTermParts = new char[4][];
++  
++  private final CharTermAttribute termAttribute = addAttribute(CharTermAttribute.class);
++  private final OffsetAttribute offsetAttribute = addAttribute(OffsetAttribute.class);
++  private final PositionIncrementAttribute posIncAttribute = addAttribute(PositionIncrementAttribute.class);
++  private final PositionLengthAttribute posLenAttribute = addAttribute(PositionLengthAttribute.class);
++  private final TypeAttribute typeAttribute = addAttribute(TypeAttribute.class);
++
++  // used for iterating word delimiter breaks
++  private final WordDelimiterIterator iterator;
++
++  // used for concatenating runs of similar typed subwords (word,number)
++  private final WordDelimiterConcatenation concat = new WordDelimiterConcatenation();
++
++  // number of subwords last output by concat.
++  private int lastConcatCount;
++
++  // used for catenate all
++  private final WordDelimiterConcatenation concatAll = new WordDelimiterConcatenation();
++
++  // used for accumulating position increment gaps so that we preserve incoming holes:
++  private int accumPosInc;
++
++  private char[] savedTermBuffer = new char[16];
++  private int savedTermLength;
++  private int savedStartOffset;
++  private int savedEndOffset;
++  private AttributeSource.State savedState;
++  
++  // if length by start + end offsets doesn't match the term text then assume
++  // this is a synonym and don't adjust the offsets.
++  private boolean hasIllegalOffsets;
++
++  private int wordPos;
++
++  /**
++   * Creates a new WordDelimiterGraphFilter
++   *
++   * @param in TokenStream to be filtered
++   * @param charTypeTable table containing character types
++   * @param configurationFlags Flags configuring the filter
++   * @param protWords If not null is the set of tokens to protect from being delimited
++   */
++  public WordDelimiterGraphFilter(TokenStream in, byte[] charTypeTable, int configurationFlags, CharArraySet protWords) {
++    super(in);
++    if ((configurationFlags &
++        ~(GENERATE_WORD_PARTS |
++          GENERATE_NUMBER_PARTS |
++          CATENATE_WORDS |
++          CATENATE_NUMBERS |
++          CATENATE_ALL |
++          PRESERVE_ORIGINAL |
++          SPLIT_ON_CASE_CHANGE |
++          SPLIT_ON_NUMERICS |
++          STEM_ENGLISH_POSSESSIVE)) != 0) {
++      throw new IllegalArgumentException("flags contains unrecognized flag: " + configurationFlags);
++    }
++    this.flags = configurationFlags;
++    this.protWords = protWords;
++    this.iterator = new WordDelimiterIterator(
++        charTypeTable, has(SPLIT_ON_CASE_CHANGE), has(SPLIT_ON_NUMERICS), has(STEM_ENGLISH_POSSESSIVE));
++  }
++
++  /**
++   * Creates a new WordDelimiterGraphFilter using {@link WordDelimiterIterator#DEFAULT_WORD_DELIM_TABLE}
++   * as its charTypeTable
++   *
++   * @param in TokenStream to be filtered
++   * @param configurationFlags Flags configuring the filter
++   * @param protWords If not null is the set of tokens to protect from being delimited
++   */
++  public WordDelimiterGraphFilter(TokenStream in, int configurationFlags, CharArraySet protWords) {
++    this(in, WordDelimiterIterator.DEFAULT_WORD_DELIM_TABLE, configurationFlags, protWords);
++  }
++
++  /** Iterates all words parts and concatenations, buffering up the term parts we should return. */
++  private void bufferWordParts() throws IOException {
++
++    saveState();
++
++    // if length by start + end offsets doesn't match the term's text then set offsets for all our word parts/concats to the incoming
++    // offsets.  this can happen if WDGF is applied to an injected synonym, or to a stem'd form, etc:
++    hasIllegalOffsets = (savedEndOffset - savedStartOffset != savedTermLength);
++
++    bufferedLen = 0;
++    lastConcatCount = 0;
++    wordPos = 0;
++
++    if (iterator.isSingleWord()) {
++      buffer(wordPos, wordPos+1, iterator.current, iterator.end);
++      wordPos++;
++      iterator.next();
++    } else {
++
++      // iterate all words parts, possibly buffering them, building up concatenations and possibly buffering them too:
++      while (iterator.end != WordDelimiterIterator.DONE) {
++        int wordType = iterator.type();
++      
++        // do we already have queued up incompatible concatenations?
++        if (concat.isNotEmpty() && (concat.type & wordType) == 0) {
++          flushConcatenation(concat);
++        }
++
++        // add subwords depending upon options
++        if (shouldConcatenate(wordType)) {
++          concatenate(concat);
++        }
++      
++        // add all subwords (catenateAll)
++        if (has(CATENATE_ALL)) {
++          concatenate(concatAll);
++        }
++      
++        // if we should output the word or number part
++        if (shouldGenerateParts(wordType)) {
++          buffer(wordPos, wordPos+1, iterator.current, iterator.end);
++          wordPos++;
++        }
++        iterator.next();
++      }
++
++      if (concat.isNotEmpty()) {
++        // flush final concatenation
++        flushConcatenation(concat);
++      }
++        
++      if (concatAll.isNotEmpty()) {
++        // only if we haven't output this same combo above, e.g. PowerShot with CATENATE_WORDS:
++        if (concatAll.subwordCount > lastConcatCount) {
++          if (wordPos == concatAll.startPos) {
++            // we are not generating parts, so we must advance wordPos now
++            wordPos++;
++          }
++          concatAll.write();
++        }
++        concatAll.clear();
++      }
++    }
++
++    if (has(PRESERVE_ORIGINAL)) {
++      if (wordPos == 0) {
++        // can happen w/ strange flag combos and inputs :)
++        wordPos++;
++      }
++      // add the original token now so that we can set the correct end position
++      buffer(0, wordPos, 0, savedTermLength);
++    }
++            
++    sorter.sort(0, bufferedLen);
++    wordPos = 0;
++
++    // set back to 0 for iterating from the buffer
++    bufferedPos = 0;
++  }
++
++  @Override
++  public boolean incrementToken() throws IOException {
++    while (true) {
++      if (savedState == null) {
++
++        // process a new input token
++        if (input.incrementToken() == false) {
++          return false;
++        }
++
++        int termLength = termAttribute.length();
++        char[] termBuffer = termAttribute.buffer();
++
++        accumPosInc += posIncAttribute.getPositionIncrement();
++
++        // iterate & cache all word parts up front:
++        iterator.setText(termBuffer, termLength);
++        iterator.next();
++        
++        // word of no delimiters, or protected word: just return it
++        if ((iterator.current == 0 && iterator.end == termLength) ||
++            (protWords != null && protWords.contains(termBuffer, 0, termLength))) {
++          posIncAttribute.setPositionIncrement(accumPosInc);
++          accumPosInc = 0;
++          return true;
++        }
++        
++        // word of simply delimiters: swallow this token, creating a hole, and move on to next token
++        if (iterator.end == WordDelimiterIterator.DONE) {
++          if (has(PRESERVE_ORIGINAL) == false) {
++            continue;
++          } else {
++            return true;
++          }
++        }
++
++        // otherwise, we have delimiters, process & buffer all parts:
++        bufferWordParts();
++      }
++
++      if (bufferedPos < bufferedLen) {
++        clearAttributes();
++        restoreState(savedState);
++
++        char[] termPart = bufferedTermParts[bufferedPos];
++        int startPos = bufferedParts[4*bufferedPos];
++        int endPos = bufferedParts[4*bufferedPos+1];
++        int startPart = bufferedParts[4*bufferedPos+2];
++        int endPart = bufferedParts[4*bufferedPos+3];
++        bufferedPos++;
++
++        if (hasIllegalOffsets) {
++          offsetAttribute.setOffset(savedStartOffset, savedEndOffset);
++        } else {
++          offsetAttribute.setOffset(savedStartOffset + startPart, savedStartOffset + endPart);
++        }
++
++        if (termPart == null) {
++          termAttribute.copyBuffer(savedTermBuffer, startPart, endPart - startPart);
++        } else {
++          termAttribute.copyBuffer(termPart, 0, termPart.length);
++        }
++
++        posIncAttribute.setPositionIncrement(accumPosInc + startPos - wordPos);
++        accumPosInc = 0;
++        posLenAttribute.setPositionLength(endPos - startPos);
++        wordPos = startPos;
++        return true;
++      }
++        
++      // no saved concatenations, on to the next input word
++      savedState = null;
++    }
++  }
++
++  @Override
++  public void reset() throws IOException {
++    super.reset();
++    accumPosInc = 0;
++    savedState = null;
++    concat.clear();
++    concatAll.clear();
++  }
++
++  // ================================================= Helper Methods ================================================
++
++  private class PositionSorter extends InPlaceMergeSorter {
++    @Override
++    protected int compare(int i, int j) {
++      // sort by smaller start position
++      int iPosStart = bufferedParts[4*i];
++      int jPosStart = bufferedParts[4*j];
++      int cmp = Integer.compare(iPosStart, jPosStart);
++      if (cmp != 0) {
++        return cmp;
++      }
++
++      // tie break by longest pos length:
++      int iPosEnd = bufferedParts[4*i+1];
++      int jPosEnd = bufferedParts[4*j+1];
++      return Integer.compare(jPosEnd, iPosEnd);
++    }
++
++    @Override
++    protected void swap(int i, int j) {
++      int iOffset = 4*i;
++      int jOffset = 4*j;
++      for(int x=0;x<4;x++) {
++        int tmp = bufferedParts[iOffset+x];
++        bufferedParts[iOffset+x] = bufferedParts[jOffset+x];
++        bufferedParts[jOffset+x] = tmp;
++      }
++
++      char[] tmp2 = bufferedTermParts[i];
++      bufferedTermParts[i] = bufferedTermParts[j];
++      bufferedTermParts[j] = tmp2;
++    }
++  }
++  
++  final PositionSorter sorter = new PositionSorter();
++
++  /** 
++   * startPos, endPos -> graph start/end position
++   * startPart, endPart -> slice of the original term for this part
++   */
++
++  void buffer(int startPos, int endPos, int startPart, int endPart) {
++    buffer(null, startPos, endPos, startPart, endPart);
++  }
++
++  /** 
++   * a null termPart means it's a simple slice of the original term
++   */
++  void buffer(char[] termPart, int startPos, int endPos, int startPart, int endPart) {
++    /*
++    System.out.println("buffer: pos=" + startPos + "-" + endPos + " part=" + startPart + "-" + endPart);
++    if (termPart != null) {
++      System.out.println("  termIn=" + new String(termPart));
++    } else {
++      System.out.println("  term=" + new String(savedTermBuffer, startPart, endPart-startPart));
++    }
++    */
++    assert endPos > startPos: "startPos=" + startPos + " endPos=" + endPos;
++    assert endPart > startPart || (endPart == 0 && startPart == 0 && savedTermLength == 0): "startPart=" + startPart + " endPart=" + endPart;
++    if ((bufferedLen+1)*4 > bufferedParts.length) {
++      bufferedParts = ArrayUtil.grow(bufferedParts, (bufferedLen+1)*4);
++    }
++    if (bufferedTermParts.length == bufferedLen) {
++      int newSize = ArrayUtil.oversize(bufferedLen+1, RamUsageEstimator.NUM_BYTES_OBJECT_REF);
++      char[][] newArray = new char[newSize][];
++      System.arraycopy(bufferedTermParts, 0, newArray, 0, bufferedTermParts.length);
++      bufferedTermParts = newArray;
++    }
++    bufferedTermParts[bufferedLen] = termPart;
++    bufferedParts[bufferedLen*4] = startPos;
++    bufferedParts[bufferedLen*4+1] = endPos;
++    bufferedParts[bufferedLen*4+2] = startPart;
++    bufferedParts[bufferedLen*4+3] = endPart;
++    bufferedLen++;
++  }
++  
++  /**
++   * Saves the existing attribute states
++   */
++  private void saveState() {
++    savedTermLength = termAttribute.length();
++    savedStartOffset = offsetAttribute.startOffset();
++    savedEndOffset = offsetAttribute.endOffset();
++    savedState = captureState();
++
++    if (savedTermBuffer.length < savedTermLength) {
++      savedTermBuffer = new char[ArrayUtil.oversize(savedTermLength, Character.BYTES)];
++    }
++
++    System.arraycopy(termAttribute.buffer(), 0, savedTermBuffer, 0, savedTermLength);
++  }
++
++  /**
++   * Flushes the given WordDelimiterConcatenation by either writing its concat and then clearing, or just clearing.
++   *
++   * @param concat WordDelimiterConcatenation that will be flushed
++   */
++  private void flushConcatenation(WordDelimiterConcatenation concat) {
++    if (wordPos == concat.startPos) {
++      // we are not generating parts, so we must advance wordPos now
++      wordPos++;
++    }
++    lastConcatCount = concat.subwordCount;
++    if (concat.subwordCount != 1 || shouldGenerateParts(concat.type) == false) {
++      concat.write();
++    }
++    concat.clear();
++  }
++
++  /**
++   * Determines whether to concatenate a word or number if the current word is the given type
++   *
++   * @param wordType Type of the current word used to determine if it should be concatenated
++   * @return {@code true} if concatenation should occur, {@code false} otherwise
++   */
++  private boolean shouldConcatenate(int wordType) {
++    return (has(CATENATE_WORDS) && WordDelimiterIterator.isAlpha(wordType)) || (has(CATENATE_NUMBERS) && WordDelimiterIterator.isDigit(wordType));
++  }
++
++  /**
++   * Determines whether a word/number part should be generated for a word of the given type
++   *
++   * @param wordType Type of the word used to determine if a word/number part should be generated
++   * @return {@code true} if a word/number part should be generated, {@code false} otherwise
++   */
++  private boolean shouldGenerateParts(int wordType) {
++    return (has(GENERATE_WORD_PARTS) && WordDelimiterIterator.isAlpha(wordType)) || (has(GENERATE_NUMBER_PARTS) && WordDelimiterIterator.isDigit(wordType));
++  }
++
++  /**
++   * Concatenates the saved buffer to the given WordDelimiterConcatenation
++   *
++   * @param concatenation WordDelimiterConcatenation to concatenate the buffer to
++   */
++  private void concatenate(WordDelimiterConcatenation concatenation) {
++    if (concatenation.isEmpty()) {
++      concatenation.type = iterator.type();
++      concatenation.startPart = iterator.current;
++      concatenation.startPos = wordPos;
++    }
++    concatenation.append(savedTermBuffer, iterator.current, iterator.end - iterator.current);
++    concatenation.endPart = iterator.end;
++  }
++
++  /**
++   * Determines whether the given flag is set
++   *
++   * @param flag Flag to see if set
++   * @return {@code true} if flag is set
++   */
++  private boolean has(int flag) {
++    return (flags & flag) != 0;
++  }
++
++  // ================================================= Inner Classes =================================================
++
++  /**
++   * A WDF concatenated 'run'
++   */
++  final class WordDelimiterConcatenation {
++    final StringBuilder buffer = new StringBuilder();
++    int startPart;
++    int endPart;
++    int startPos;
++    int type;
++    int subwordCount;
++
++    /**
++     * Appends the given text of the given length, to the concetenation at the given offset
++     *
++     * @param text Text to append
++     * @param offset Offset in the concetenation to add the text
++     * @param length Length of the text to append
++     */
++    void append(char text[], int offset, int length) {
++      buffer.append(text, offset, length);
++      subwordCount++;
++    }
++
++    /**
++     * Writes the concatenation to part buffer
++     */
++    void write() {
++      char[] termPart = new char[buffer.length()];
++      buffer.getChars(0, buffer.length(), termPart, 0);
++      buffer(termPart, startPos, wordPos, startPart, endPart);
++    }
++
++    /**
++     * Determines if the concatenation is empty
++     *
++     * @return {@code true} if the concatenation is empty, {@code false} otherwise
++     */
++    boolean isEmpty() {
++      return buffer.length() == 0;
++    }
++
++    boolean isNotEmpty() {
++      return isEmpty() == false;
++    }
++
++    /**
++     * Clears the concatenation and resets its state
++     */
++    void clear() {
++      buffer.setLength(0);
++      startPart = endPart = type = subwordCount = 0;
++    }
++  }
++
++  /** Returns string representation of configuration flags */
++  public static String flagsToString(int flags) {
++    StringBuilder b = new StringBuilder();
++    if ((flags & GENERATE_WORD_PARTS) != 0) {
++      b.append("GENERATE_WORD_PARTS");
++    }
++    if ((flags & GENERATE_NUMBER_PARTS) != 0) {
++      if (b.length() > 0) {
++        b.append(" | ");
++      }
++      b.append("GENERATE_NUMBER_PARTS");
++    }
++    if ((flags & CATENATE_WORDS) != 0) {
++      if (b.length() > 0) {
++        b.append(" | ");
++      }
++      b.append("CATENATE_WORDS");
++    }
++    if ((flags & CATENATE_NUMBERS) != 0) {
++      if (b.length() > 0) {
++        b.append(" | ");
++      }
++      b.append("CATENATE_NUMBERS");
++    }
++    if ((flags & CATENATE_ALL) != 0) {
++      if (b.length() > 0) {
++        b.append(" | ");
++      }
++      b.append("CATENATE_ALL");
++    }
++    if ((flags & PRESERVE_ORIGINAL) != 0) {
++      if (b.length() > 0) {
++        b.append(" | ");
++      }
++      b.append("PRESERVE_ORIGINAL");
++    }
++    if ((flags & SPLIT_ON_CASE_CHANGE) != 0) {
++      if (b.length() > 0) {
++        b.append(" | ");
++      }
++      b.append("SPLIT_ON_CASE_CHANGE");
++    }
++    if ((flags & SPLIT_ON_NUMERICS) != 0) {
++      if (b.length() > 0) {
++        b.append(" | ");
++      }
++      b.append("SPLIT_ON_NUMERICS");
++    }
++    if ((flags & STEM_ENGLISH_POSSESSIVE) != 0) {
++      if (b.length() > 0) {
++        b.append(" | ");
++      }
++      b.append("STEM_ENGLISH_POSSESSIVE");
++    }
++
++    return b.toString();
++  }
++
++  @Override
++  public String toString() {
++    StringBuilder b = new StringBuilder();
++    b.append("WordDelimiterGraphFilter(flags=");
++    b.append(flagsToString(flags));
++    b.append(')');
++    return b.toString();
++  }
++  
++  // questions:
++  // negative numbers?  -42 indexed as just 42?
++  // dollar sign?  $42
++  // percent sign?  33%
++  // downsides:  if source text is "powershot" then a query of "PowerShot" won't match!
++}
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/miscellaneous/WordDelimiterGraphFilterFactory.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/miscellaneous/WordDelimiterGraphFilterFactory.java
+new file mode 100644
+index 0000000..a06cc75
+--- /dev/null
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/miscellaneous/WordDelimiterGraphFilterFactory.java
+@@ -0,0 +1,199 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.analysis.miscellaneous;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Map;
++import java.util.SortedMap;
++import java.util.TreeMap;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++import org.apache.lucene.analysis.CharArraySet;
++import org.apache.lucene.analysis.TokenFilter;
++import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.analysis.util.ResourceLoader;
++import org.apache.lucene.analysis.util.ResourceLoaderAware;
++import org.apache.lucene.analysis.util.TokenFilterFactory;
++
++import static org.apache.lucene.analysis.miscellaneous.WordDelimiterGraphFilter.*;
++import static org.apache.lucene.analysis.miscellaneous.WordDelimiterIterator.*;
++
++/**
++ * Factory for {@link WordDelimiterGraphFilter}.
++ * <pre class="prettyprint">
++ * &lt;fieldType name="text_wd" class="solr.TextField" positionIncrementGap="100"&gt;
++ *   &lt;analyzer&gt;
++ *     &lt;tokenizer class="solr.WhitespaceTokenizerFactory"/&gt;
++ *     &lt;filter class="solr.WordDelimiterGraphFilterFactory" protected="protectedword.txt"
++ *             preserveOriginal="0" splitOnNumerics="1" splitOnCaseChange="1"
++ *             catenateWords="0" catenateNumbers="0" catenateAll="0"
++ *             generateWordParts="1" generateNumberParts="1" stemEnglishPossessive="1"
++ *             types="wdfftypes.txt" /&gt;
++ *   &lt;/analyzer&gt;
++ * &lt;/fieldType&gt;</pre>
++ */
++public class WordDelimiterGraphFilterFactory extends TokenFilterFactory implements ResourceLoaderAware {
++  public static final String PROTECTED_TOKENS = "protected";
++  public static final String TYPES = "types";
++
++  private final String wordFiles;
++  private final String types;
++  private final int flags;
++  byte[] typeTable = null;
++  private CharArraySet protectedWords = null;
++  
++  /** Creates a new WordDelimiterGraphFilterFactory */
++  public WordDelimiterGraphFilterFactory(Map<String, String> args) {
++    super(args);
++    int flags = 0;
++    if (getInt(args, "generateWordParts", 1) != 0) {
++      flags |= GENERATE_WORD_PARTS;
++    }
++    if (getInt(args, "generateNumberParts", 1) != 0) {
++      flags |= GENERATE_NUMBER_PARTS;
++    }
++    if (getInt(args, "catenateWords", 0) != 0) {
++      flags |= CATENATE_WORDS;
++    }
++    if (getInt(args, "catenateNumbers", 0) != 0) {
++      flags |= CATENATE_NUMBERS;
++    }
++    if (getInt(args, "catenateAll", 0) != 0) {
++      flags |= CATENATE_ALL;
++    }
++    if (getInt(args, "splitOnCaseChange", 1) != 0) {
++      flags |= SPLIT_ON_CASE_CHANGE;
++    }
++    if (getInt(args, "splitOnNumerics", 1) != 0) {
++      flags |= SPLIT_ON_NUMERICS;
++    }
++    if (getInt(args, "preserveOriginal", 0) != 0) {
++      flags |= PRESERVE_ORIGINAL;
++    }
++    if (getInt(args, "stemEnglishPossessive", 1) != 0) {
++      flags |= STEM_ENGLISH_POSSESSIVE;
++    }
++    wordFiles = get(args, PROTECTED_TOKENS);
++    types = get(args, TYPES);
++    this.flags = flags;
++    if (!args.isEmpty()) {
++      throw new IllegalArgumentException("Unknown parameters: " + args);
++    }
++  }
++  
++  @Override
++  public void inform(ResourceLoader loader) throws IOException {
++    if (wordFiles != null) {  
++      protectedWords = getWordSet(loader, wordFiles, false);
++    }
++    if (types != null) {
++      List<String> files = splitFileNames( types );
++      List<String> wlist = new ArrayList<>();
++      for( String file : files ){
++        List<String> lines = getLines(loader, file.trim());
++        wlist.addAll( lines );
++      }
++      typeTable = parseTypes(wlist);
++    }
++  }
++
++  @Override
++  public TokenFilter create(TokenStream input) {
++    return new WordDelimiterGraphFilter(input, typeTable == null ? WordDelimiterIterator.DEFAULT_WORD_DELIM_TABLE : typeTable,
++                                        flags, protectedWords);
++  }
++  
++  // source => type
++  private static Pattern typePattern = Pattern.compile( "(.*)\\s*=>\\s*(.*)\\s*$" );
++  
++  // parses a list of MappingCharFilter style rules into a custom byte[] type table
++  private byte[] parseTypes(List<String> rules) {
++    SortedMap<Character,Byte> typeMap = new TreeMap<>();
++    for( String rule : rules ){
++      Matcher m = typePattern.matcher(rule);
++      if( !m.find() )
++        throw new IllegalArgumentException("Invalid Mapping Rule : [" + rule + "]");
++      String lhs = parseString(m.group(1).trim());
++      Byte rhs = parseType(m.group(2).trim());
++      if (lhs.length() != 1)
++        throw new IllegalArgumentException("Invalid Mapping Rule : [" + rule + "]. Only a single character is allowed.");
++      if (rhs == null)
++        throw new IllegalArgumentException("Invalid Mapping Rule : [" + rule + "]. Illegal type.");
++      typeMap.put(lhs.charAt(0), rhs);
++    }
++    
++    // ensure the table is always at least as big as DEFAULT_WORD_DELIM_TABLE for performance
++    byte types[] = new byte[Math.max(typeMap.lastKey()+1, WordDelimiterIterator.DEFAULT_WORD_DELIM_TABLE.length)];
++    for (int i = 0; i < types.length; i++)
++      types[i] = WordDelimiterIterator.getType(i);
++    for (Map.Entry<Character,Byte> mapping : typeMap.entrySet())
++      types[mapping.getKey()] = mapping.getValue();
++    return types;
++  }
++  
++  private Byte parseType(String s) {
++    if (s.equals("LOWER"))
++      return LOWER;
++    else if (s.equals("UPPER"))
++      return UPPER;
++    else if (s.equals("ALPHA"))
++      return ALPHA;
++    else if (s.equals("DIGIT"))
++      return DIGIT;
++    else if (s.equals("ALPHANUM"))
++      return ALPHANUM;
++    else if (s.equals("SUBWORD_DELIM"))
++      return SUBWORD_DELIM;
++    else
++      return null;
++  }
++  
++  char[] out = new char[256];
++  
++  private String parseString(String s){
++    int readPos = 0;
++    int len = s.length();
++    int writePos = 0;
++    while( readPos < len ){
++      char c = s.charAt( readPos++ );
++      if( c == '\\' ){
++        if( readPos >= len )
++          throw new IllegalArgumentException("Invalid escaped char in [" + s + "]");
++        c = s.charAt( readPos++ );
++        switch( c ) {
++          case '\\' : c = '\\'; break;
++          case 'n' : c = '\n'; break;
++          case 't' : c = '\t'; break;
++          case 'r' : c = '\r'; break;
++          case 'b' : c = '\b'; break;
++          case 'f' : c = '\f'; break;
++          case 'u' :
++            if( readPos + 3 >= len )
++              throw new IllegalArgumentException("Invalid escaped char in [" + s + "]");
++            c = (char)Integer.parseInt( s.substring( readPos, readPos + 4 ), 16 );
++            readPos += 4;
++            break;
++        }
++      }
++      out[writePos++] = c;
++    }
++    return new String( out, 0, writePos );
++  }
++}
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/miscellaneous/WordDelimiterIterator.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/miscellaneous/WordDelimiterIterator.java
+index 0367dab..86b983d 100644
+--- a/lucene/analysis/common/src/java/org/apache/lucene/analysis/miscellaneous/WordDelimiterIterator.java
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/miscellaneous/WordDelimiterIterator.java
+@@ -16,15 +16,21 @@
+  */
+ package org.apache.lucene.analysis.miscellaneous;
+ 
+-
+-import static org.apache.lucene.analysis.miscellaneous.WordDelimiterFilter.*;
+-
+ /**
+- * A BreakIterator-like API for iterating over subwords in text, according to WordDelimiterFilter rules.
++ * A BreakIterator-like API for iterating over subwords in text, according to WordDelimiterGraphFilter rules.
+  * @lucene.internal
+  */
+ public final class WordDelimiterIterator {
+ 
++  static final int LOWER = 0x01;
++  static final int UPPER = 0x02;
++  static final int DIGIT = 0x04;
++  static final int SUBWORD_DELIM = 0x08;
++
++  // combinations: for testing, not for setting bits
++  public static final int ALPHA = 0x03;
++  public static final int ALPHANUM = 0x07;
++
+   /** Indicates the end of iteration */
+   public static final int DONE = -1;
+   
+@@ -97,7 +103,7 @@ public final class WordDelimiterIterator {
+    * Create a new WordDelimiterIterator operating with the supplied rules.
+    * 
+    * @param charTypeTable table containing character types
+-   * @param splitOnCaseChange if true, causes "PowerShot" to be two tokens; ("Power-Shot" remains two parts regards)
++   * @param splitOnCaseChange if true, causes "PowerShot" to be two tokens; ("Power-Shot" remains two parts regardless)
+    * @param splitOnNumerics if true, causes "j2se" to be three tokens; "j" "2" "se"
+    * @param stemEnglishPossessive if true, causes trailing "'s" to be removed for each subword: "O'Neil's" =&gt; "O", "Neil"
+    */
+@@ -323,4 +329,45 @@ public final class WordDelimiterIterator {
+       default: return SUBWORD_DELIM;
+     }
+   }
+-}
+\ No newline at end of file
++
++  /**
++   * Checks if the given word type includes {@link #ALPHA}
++   *
++   * @param type Word type to check
++   * @return {@code true} if the type contains ALPHA, {@code false} otherwise
++   */
++  static boolean isAlpha(int type) {
++    return (type & ALPHA) != 0;
++  }
++
++  /**
++   * Checks if the given word type includes {@link #DIGIT}
++   *
++   * @param type Word type to check
++   * @return {@code true} if the type contains DIGIT, {@code false} otherwise
++   */
++  static boolean isDigit(int type) {
++    return (type & DIGIT) != 0;
++  }
++
++  /**
++   * Checks if the given word type includes {@link #SUBWORD_DELIM}
++   *
++   * @param type Word type to check
++   * @return {@code true} if the type contains SUBWORD_DELIM, {@code false} otherwise
++   */
++  static boolean isSubwordDelim(int type) {
++    return (type & SUBWORD_DELIM) != 0;
++  }
++
++  /**
++   * Checks if the given word type includes {@link #UPPER}
++   *
++   * @param type Word type to check
++   * @return {@code true} if the type contains UPPER, {@code false} otherwise
++   */
++  static boolean isUpper(int type) {
++    return (type & UPPER) != 0;
++  }
++
++}
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/FlattenGraphFilter.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/FlattenGraphFilter.java
+deleted file mode 100644
+index c1fa1f7..0000000
+--- a/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/FlattenGraphFilter.java
++++ /dev/null
+@@ -1,417 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.lucene.analysis.synonym;
+-
+-import java.io.IOException;
+-import java.util.ArrayList;
+-import java.util.List;
+-
+-import org.apache.lucene.analysis.TokenFilter;
+-import org.apache.lucene.analysis.TokenStream;
+-import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
+-import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
+-import org.apache.lucene.analysis.tokenattributes.PositionLengthAttribute;
+-import org.apache.lucene.util.AttributeSource;
+-import org.apache.lucene.util.RollingBuffer;
+-
+-/**
+- * Converts an incoming graph token stream, such as one from
+- * {@link SynonymGraphFilter}, into a flat form so that
+- * all nodes form a single linear chain with no side paths.  Every
+- * path through the graph touches every node.  This is necessary
+- * when indexing a graph token stream, because the index does not
+- * save {@link PositionLengthAttribute} and so it cannot
+- * preserve the graph structure.  However, at search time,
+- * query parsers can correctly handle the graph and this token
+- * filter should <b>not</b> be used.
+- *
+- * <p>If the graph was not already flat to start, this
+- * is likely a lossy process, i.e. it will often cause the 
+- * graph to accept token sequences it should not, and to
+- * reject token sequences it should not.
+- *
+- * <p>However, when applying synonyms during indexing, this
+- * is necessary because Lucene already does not index a graph 
+- * and so the indexing process is already lossy
+- * (it ignores the {@link PositionLengthAttribute}).
+- *
+- * @lucene.experimental
+- */
+-public final class FlattenGraphFilter extends TokenFilter {
+-
+-  /** Holds all tokens leaving a given input position. */
+-  private final static class InputNode implements RollingBuffer.Resettable {
+-    private final List<AttributeSource.State> tokens = new ArrayList<>();
+-
+-    /** Our input node, or -1 if we haven't been assigned yet */
+-    int node = -1;
+-
+-    /** Maximum to input node for all tokens leaving here; we use this
+-     *  to know when we can freeze. */
+-    int maxToNode = -1;
+-
+-    /** Where we currently map to; this changes (can only
+-     *  increase as we see more input tokens), until we are finished
+-     *  with this position. */
+-    int outputNode = -1;
+-
+-    /** Which token (index into {@link #tokens}) we will next output. */
+-    int nextOut;
+-
+-    @Override
+-    public void reset() {
+-      tokens.clear();
+-      node = -1;
+-      outputNode = -1;
+-      maxToNode = -1;
+-      nextOut = 0;
+-    }
+-  }
+-
+-  /** Gathers up merged input positions into a single output position,
+-   *  only for the current "frontier" of nodes we've seen but can't yet
+-   *  output because they are not frozen. */
+-  private final static class OutputNode implements RollingBuffer.Resettable {
+-    private final List<Integer> inputNodes = new ArrayList<>();
+-
+-    /** Node ID for this output, or -1 if we haven't been assigned yet. */
+-    int node = -1;
+-
+-    /** Which input node (index into {@link #inputNodes}) we will next output. */
+-    int nextOut;
+-    
+-    /** Start offset of tokens leaving this node. */
+-    int startOffset = -1;
+-
+-    /** End offset of tokens arriving to this node. */
+-    int endOffset = -1;
+-
+-    @Override
+-    public void reset() {
+-      inputNodes.clear();
+-      node = -1;
+-      nextOut = 0;
+-      startOffset = -1;
+-      endOffset = -1;
+-    }
+-  }
+-
+-  private final RollingBuffer<InputNode> inputNodes = new RollingBuffer<InputNode>() {
+-    @Override
+-    protected InputNode newInstance() {
+-      return new InputNode();
+-    }
+-  };
+-
+-  private final RollingBuffer<OutputNode> outputNodes = new RollingBuffer<OutputNode>() {
+-    @Override
+-    protected OutputNode newInstance() {
+-      return new OutputNode();
+-    }
+-  };
+-
+-  private final PositionIncrementAttribute posIncAtt = addAttribute(PositionIncrementAttribute.class);
+-  private final PositionLengthAttribute posLenAtt = addAttribute(PositionLengthAttribute.class);
+-  private final OffsetAttribute offsetAtt = addAttribute(OffsetAttribute.class);
+-
+-  /** Which input node the last seen token leaves from */
+-  private int inputFrom;
+-
+-  /** We are currently releasing tokens leaving from this output node */
+-  private int outputFrom;
+-
+-  // for debugging:
+-  //private int retOutputFrom;
+-
+-  private boolean done;
+-
+-  private int lastOutputFrom;
+-
+-  private int finalOffset;
+-
+-  private int finalPosInc;
+-
+-  private int maxLookaheadUsed;
+-
+-  private int lastStartOffset;
+-
+-  public FlattenGraphFilter(TokenStream in) {
+-    super(in);
+-  }
+-
+-  private boolean releaseBufferedToken() {
+-
+-    // We only need the while loop (retry) if we have a hole (an output node that has no tokens leaving):
+-    while (outputFrom < outputNodes.getMaxPos()) {
+-      OutputNode output = outputNodes.get(outputFrom);
+-      if (output.inputNodes.isEmpty()) {
+-        // No tokens arrived to this node, which happens for the first node
+-        // after a hole:
+-        //System.out.println("    skip empty outputFrom=" + outputFrom);
+-        outputFrom++;
+-        continue;
+-      }
+-
+-      int maxToNode = -1;
+-      for(int inputNodeID : output.inputNodes) {
+-        InputNode inputNode = inputNodes.get(inputNodeID);
+-        assert inputNode.outputNode == outputFrom;
+-        maxToNode = Math.max(maxToNode, inputNode.maxToNode);
+-      }
+-      //System.out.println("  release maxToNode=" + maxToNode + " vs inputFrom=" + inputFrom);
+-
+-      // TODO: we could shrink the frontier here somewhat if we
+-      // always output posLen=1 as part of our "sausagizing":
+-      if (maxToNode <= inputFrom || done) {
+-        //System.out.println("  output node merged these inputs: " + output.inputNodes);
+-        // These tokens are now frozen
+-        assert output.nextOut < output.inputNodes.size(): "output.nextOut=" + output.nextOut + " vs output.inputNodes.size()=" + output.inputNodes.size();
+-        InputNode inputNode = inputNodes.get(output.inputNodes.get(output.nextOut));
+-        if (done && inputNode.tokens.size() == 0 && outputFrom >= outputNodes.getMaxPos()) {
+-          return false;
+-        }
+-        if (inputNode.tokens.size() == 0) {
+-          assert inputNode.nextOut == 0;
+-          assert output.nextOut == 0;
+-          // Hole dest nodes should never be merged since 1) we always
+-          // assign them to a new output position, and 2) since they never
+-          // have arriving tokens they cannot be pushed:
+-          assert output.inputNodes.size() == 1: output.inputNodes.size();
+-          outputFrom++;
+-          inputNodes.freeBefore(output.inputNodes.get(0));
+-          outputNodes.freeBefore(outputFrom);
+-          continue;
+-        }
+-
+-        assert inputNode.nextOut < inputNode.tokens.size();
+-
+-        restoreState(inputNode.tokens.get(inputNode.nextOut));
+-
+-        // Correct posInc
+-        assert outputFrom >= lastOutputFrom;
+-        posIncAtt.setPositionIncrement(outputFrom - lastOutputFrom);
+-        int toInputNodeID = inputNode.node + posLenAtt.getPositionLength();
+-        InputNode toInputNode = inputNodes.get(toInputNodeID);
+-
+-        // Correct posLen
+-        assert toInputNode.outputNode > outputFrom;
+-        posLenAtt.setPositionLength(toInputNode.outputNode - outputFrom);
+-        lastOutputFrom = outputFrom;
+-        inputNode.nextOut++;
+-        //System.out.println("  ret " + this);
+-
+-        OutputNode outputEndNode = outputNodes.get(toInputNode.outputNode);
+-
+-        // Correct offsets
+-
+-        // This is a bit messy; we must do this so offset don't go backwards,
+-        // which would otherwise happen if the replacement has more tokens
+-        // than the input:
+-        int startOffset = Math.max(lastStartOffset, output.startOffset);
+-
+-        // We must do this in case the incoming tokens have broken offsets:
+-        int endOffset = Math.max(startOffset, outputEndNode.endOffset);
+-        
+-        offsetAtt.setOffset(startOffset, endOffset);
+-        lastStartOffset = startOffset;
+-
+-        if (inputNode.nextOut == inputNode.tokens.size()) {
+-          output.nextOut++;
+-          if (output.nextOut == output.inputNodes.size()) {
+-            outputFrom++;
+-            inputNodes.freeBefore(output.inputNodes.get(0));
+-            outputNodes.freeBefore(outputFrom);
+-          }
+-        }
+-
+-        return true;
+-      } else {
+-        return false;
+-      }
+-    }
+-
+-    //System.out.println("    break false");
+-    return false;
+-  }
+-
+-  @Override
+-  public boolean incrementToken() throws IOException {
+-    //System.out.println("\nF.increment inputFrom=" + inputFrom + " outputFrom=" + outputFrom);
+-
+-    while (true) {
+-      if (releaseBufferedToken()) {
+-        //retOutputFrom += posIncAtt.getPositionIncrement();
+-        //System.out.println("    return buffered: " + termAtt + " " + retOutputFrom + "-" + (retOutputFrom + posLenAtt.getPositionLength()));
+-        //printStates();
+-        return true;
+-      } else if (done) {
+-        //System.out.println("    done, return false");
+-        return false;
+-      }
+-
+-      if (input.incrementToken()) {
+-        // Input node this token leaves from:
+-        inputFrom += posIncAtt.getPositionIncrement();
+-
+-        int startOffset = offsetAtt.startOffset();
+-        int endOffset = offsetAtt.endOffset();
+-
+-        // Input node this token goes to:
+-        int inputTo = inputFrom + posLenAtt.getPositionLength();
+-        //System.out.println("  input.inc " + termAtt + ": " + inputFrom + "-" + inputTo);
+-
+-        InputNode src = inputNodes.get(inputFrom);
+-        if (src.node == -1) {
+-          // This means the "from" node of this token was never seen as a "to" node,
+-          // which should only happen if we just crossed a hole.  This is a challenging
+-          // case for us because we normally rely on the full dependencies expressed
+-          // by the arcs to assign outgoing node IDs.  It would be better if tokens
+-          // were never dropped but instead just marked deleted with a new
+-          // TermDeletedAttribute (boolean valued) ... but until that future, we have
+-          // a hack here to forcefully jump the output node ID:
+-          assert src.outputNode == -1;
+-          src.node = inputFrom;
+-
+-          src.outputNode = outputNodes.getMaxPos() + 1;
+-          //System.out.println("    hole: force to outputNode=" + src.outputNode);
+-          OutputNode outSrc = outputNodes.get(src.outputNode);
+-
+-          // Not assigned yet:
+-          assert outSrc.node == -1;
+-          outSrc.node = src.outputNode;
+-          outSrc.inputNodes.add(inputFrom);
+-          outSrc.startOffset = startOffset;
+-        } else {
+-          OutputNode outSrc = outputNodes.get(src.outputNode);
+-          if (outSrc.startOffset == -1 || startOffset > outSrc.startOffset) {
+-            // "shrink wrap" the offsets so the original tokens (with most
+-            // restrictive offsets) win:
+-            outSrc.startOffset = Math.max(startOffset, outSrc.startOffset);
+-          }
+-        }
+-
+-        // Buffer this token:
+-        src.tokens.add(captureState());
+-        src.maxToNode = Math.max(src.maxToNode, inputTo);
+-        maxLookaheadUsed = Math.max(maxLookaheadUsed, inputNodes.getBufferSize());
+-
+-        InputNode dest = inputNodes.get(inputTo);
+-        if (dest.node == -1) {
+-          // Common case: first time a token is arriving to this input position:
+-          dest.node = inputTo;
+-        }
+-
+-        // Always number output nodes sequentially:
+-        int outputEndNode = src.outputNode + 1;
+-
+-        if (outputEndNode > dest.outputNode) {
+-          if (dest.outputNode != -1) {
+-            boolean removed = outputNodes.get(dest.outputNode).inputNodes.remove(Integer.valueOf(inputTo));
+-            assert removed;
+-          }
+-          //System.out.println("    increase output node: " + dest.outputNode + " vs " + outputEndNode);
+-          outputNodes.get(outputEndNode).inputNodes.add(inputTo);
+-          dest.outputNode = outputEndNode;
+-
+-          // Since all we ever do is merge incoming nodes together, and then renumber
+-          // the merged nodes sequentially, we should only ever assign smaller node
+-          // numbers:
+-          assert outputEndNode <= inputTo: "outputEndNode=" + outputEndNode + " vs inputTo=" + inputTo;
+-        }
+-
+-        OutputNode outDest = outputNodes.get(dest.outputNode);
+-        // "shrink wrap" the offsets so the original tokens (with most
+-        // restrictive offsets) win:
+-        if (outDest.endOffset == -1 || endOffset < outDest.endOffset) {
+-          outDest.endOffset = endOffset;
+-        }
+-
+-      } else {
+-        //System.out.println("  got false from input");
+-        input.end();
+-        finalPosInc = posIncAtt.getPositionIncrement();
+-        finalOffset = offsetAtt.endOffset();
+-        done = true;
+-        // Don't return false here: we need to force release any buffered tokens now
+-      }
+-    }
+-  }
+-
+-  // Only for debugging:
+-  /*
+-  private void printStates() {
+-    System.out.println("states:");
+-    for(int i=outputFrom;i<outputNodes.getMaxPos();i++) {
+-      OutputNode outputNode = outputNodes.get(i);
+-      System.out.println("  output " + i + ": inputs " + outputNode.inputNodes);
+-      for(int inputNodeID : outputNode.inputNodes) {
+-        InputNode inputNode = inputNodes.get(inputNodeID);
+-        assert inputNode.outputNode == i;
+-      }
+-    }
+-  }
+-  */
+-
+-  @Override
+-  public void end() throws IOException {
+-    if (done == false) {
+-      super.end();
+-    } else {
+-      // NOTE, shady: don't call super.end, because we did already from incrementToken
+-    }
+-
+-    clearAttributes();
+-    if (done) {
+-      // On exc, done is false, and we will not have set these:
+-      posIncAtt.setPositionIncrement(finalPosInc);
+-      offsetAtt.setOffset(finalOffset, finalOffset);
+-    } else {
+-      super.end();
+-    }
+-  }
+-  
+-  @Override
+-  public void reset() throws IOException {
+-    //System.out.println("F: reset");
+-    super.reset();
+-    inputFrom = -1;
+-    inputNodes.reset();
+-    InputNode in = inputNodes.get(0);
+-    in.node = 0;
+-    in.outputNode = 0;
+-
+-    outputNodes.reset();
+-    OutputNode out = outputNodes.get(0);
+-    out.node = 0;
+-    out.inputNodes.add(0);
+-    out.startOffset = 0;
+-    outputFrom = 0;
+-    //retOutputFrom = -1;
+-    lastOutputFrom = -1;
+-    done = false;
+-    finalPosInc = -1;
+-    finalOffset = -1;
+-    lastStartOffset = 0;
+-    maxLookaheadUsed = 0;
+-  }
+-
+-  // for testing
+-  int getMaxLookaheadUsed() {
+-    return maxLookaheadUsed;
+-  }
+-}
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/FlattenGraphFilterFactory.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/FlattenGraphFilterFactory.java
+deleted file mode 100644
+index a6cba97..0000000
+--- a/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/FlattenGraphFilterFactory.java
++++ /dev/null
+@@ -1,44 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.lucene.analysis.synonym;
+-
+-import java.util.Map;
+-
+-import org.apache.lucene.analysis.TokenStream;
+-import org.apache.lucene.analysis.util.TokenFilterFactory;
+-
+-/** 
+- * Factory for {@link FlattenGraphFilter}. 
+- *
+- * @lucene.experimental
+- */
+-public class FlattenGraphFilterFactory extends TokenFilterFactory {
+-
+-  /** Creates a new FlattenGraphFilterFactory */
+-  public FlattenGraphFilterFactory(Map<String,String> args) {
+-    super(args);
+-    if (!args.isEmpty()) {
+-      throw new IllegalArgumentException("Unknown parameters: " + args);
+-    }
+-  }
+-  
+-  @Override
+-  public TokenStream create(TokenStream input) {
+-    return new FlattenGraphFilter(input);
+-  }
+-}
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymFilter.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymFilter.java
+index 29f6e1c..ec2676f 100644
+--- a/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymFilter.java
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymFilter.java
+@@ -21,6 +21,7 @@ import java.util.Arrays;
+ 
+ import org.apache.lucene.analysis.TokenFilter;
+ import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.analysis.core.FlattenGraphFilter;
+ import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
+ import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
+ import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymFilterFactory.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymFilterFactory.java
+index df10e9b..87ddc08 100644
+--- a/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymFilterFactory.java
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymFilterFactory.java
+@@ -33,6 +33,7 @@ import org.apache.lucene.analysis.Analyzer;
+ import org.apache.lucene.analysis.LowerCaseFilter;
+ import org.apache.lucene.analysis.TokenStream;
+ import org.apache.lucene.analysis.Tokenizer;
++import org.apache.lucene.analysis.core.FlattenGraphFilterFactory;
+ import org.apache.lucene.analysis.core.WhitespaceTokenizer;
+ import org.apache.lucene.analysis.util.ResourceLoader;
+ import org.apache.lucene.analysis.util.ResourceLoaderAware;
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymGraphFilter.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymGraphFilter.java
+index 3d50e08..788db0a 100644
+--- a/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymGraphFilter.java
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/synonym/SynonymGraphFilter.java
+@@ -17,8 +17,14 @@
+ 
+ package org.apache.lucene.analysis.synonym;
+ 
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.LinkedList;
++import java.util.List;
++
+ import org.apache.lucene.analysis.TokenFilter;
+ import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.analysis.core.FlattenGraphFilter;
+ import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
+ import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
+ import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
+@@ -31,11 +37,6 @@ import org.apache.lucene.util.CharsRefBuilder;
+ import org.apache.lucene.util.RollingBuffer;
+ import org.apache.lucene.util.fst.FST;
+ 
+-import java.io.IOException;
+-import java.util.ArrayList;
+-import java.util.LinkedList;
+-import java.util.List;
+-
+ // TODO: maybe we should resolve token -> wordID then run
+ // FST on wordIDs, for better perf?
+  
+diff --git a/lucene/analysis/common/src/resources/META-INF/services/org.apache.lucene.analysis.util.TokenFilterFactory b/lucene/analysis/common/src/resources/META-INF/services/org.apache.lucene.analysis.util.TokenFilterFactory
+index 73986d7..9164579 100644
+--- a/lucene/analysis/common/src/resources/META-INF/services/org.apache.lucene.analysis.util.TokenFilterFactory
++++ b/lucene/analysis/common/src/resources/META-INF/services/org.apache.lucene.analysis.util.TokenFilterFactory
+@@ -77,6 +77,7 @@ org.apache.lucene.analysis.miscellaneous.StemmerOverrideFilterFactory
+ org.apache.lucene.analysis.miscellaneous.TrimFilterFactory
+ org.apache.lucene.analysis.miscellaneous.TruncateTokenFilterFactory
+ org.apache.lucene.analysis.miscellaneous.WordDelimiterFilterFactory
++org.apache.lucene.analysis.miscellaneous.WordDelimiterGraphFilterFactory
+ org.apache.lucene.analysis.miscellaneous.ScandinavianFoldingFilterFactory
+ org.apache.lucene.analysis.miscellaneous.ScandinavianNormalizationFilterFactory
+ org.apache.lucene.analysis.ngram.EdgeNGramFilterFactory
+@@ -102,6 +103,6 @@ org.apache.lucene.analysis.standard.StandardFilterFactory
+ org.apache.lucene.analysis.sv.SwedishLightStemFilterFactory
+ org.apache.lucene.analysis.synonym.SynonymFilterFactory
+ org.apache.lucene.analysis.synonym.SynonymGraphFilterFactory
+-org.apache.lucene.analysis.synonym.FlattenGraphFilterFactory
++org.apache.lucene.analysis.core.FlattenGraphFilterFactory
+ org.apache.lucene.analysis.tr.TurkishLowerCaseFilterFactory
+ org.apache.lucene.analysis.util.ElisionFilterFactory
+diff --git a/lucene/analysis/common/src/test/org/apache/lucene/analysis/core/TestFlattenGraphFilter.java b/lucene/analysis/common/src/test/org/apache/lucene/analysis/core/TestFlattenGraphFilter.java
+new file mode 100644
+index 0000000..c69bcca
+--- /dev/null
++++ b/lucene/analysis/common/src/test/org/apache/lucene/analysis/core/TestFlattenGraphFilter.java
+@@ -0,0 +1,284 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.lucene.analysis.core;
++
++import org.apache.lucene.analysis.Analyzer;
++import org.apache.lucene.analysis.BaseTokenStreamTestCase;
++import org.apache.lucene.analysis.CannedTokenStream;
++import org.apache.lucene.analysis.MockTokenizer;
++import org.apache.lucene.analysis.Token;
++import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.analysis.Tokenizer;
++
++public class TestFlattenGraphFilter extends BaseTokenStreamTestCase {
++  
++  private static Token token(String term, int posInc, int posLength, int startOffset, int endOffset) {
++    final Token t = new Token(term, startOffset, endOffset);
++    t.setPositionIncrement(posInc);
++    t.setPositionLength(posLength);
++    return t;
++  }
++
++  public void testSimpleMock() throws Exception {
++    Analyzer a = new Analyzer() {
++        @Override
++        protected TokenStreamComponents createComponents(String fieldName) {
++          Tokenizer tokenizer = new MockTokenizer(MockTokenizer.SIMPLE, true);
++          TokenStream ts = new FlattenGraphFilter(tokenizer);
++          return new TokenStreamComponents(tokenizer, ts);
++        }
++      };
++
++    assertAnalyzesTo(a, "wtf happened",
++                     new String[] {"wtf", "happened"},
++                     new int[]    {    0,          4},
++                     new int[]    {    3,         12},
++                     null,
++                     new int[]    {    1,          1},
++                     new int[]    {    1,          1},
++                     true);
++  }
++
++  // Make sure graph is unchanged if it's already flat
++  public void testAlreadyFlatten() throws Exception {
++    TokenStream in = new CannedTokenStream(0, 12, new Token[] {
++        token("wtf", 1, 1, 0, 3),
++        token("what", 0, 1, 0, 3),
++        token("wow", 0, 1, 0, 3),
++        token("the", 1, 1, 0, 3),
++        token("that's", 0, 1, 0, 3),
++        token("fudge", 1, 1, 0, 3),
++        token("funny", 0, 1, 0, 3),
++        token("happened", 1, 1, 4, 12)
++      });
++
++    TokenStream out = new FlattenGraphFilter(in);
++
++    // ... but on output, it's flattened to wtf/what/wow that's/the fudge/funny happened:
++    assertTokenStreamContents(out,
++                              new String[] {"wtf", "what", "wow", "the", "that's", "fudge", "funny", "happened"},
++                              new int[] {0, 0, 0, 0, 0, 0, 0, 4},
++                              new int[] {3, 3, 3, 3, 3, 3, 3, 12},
++                              new int[] {1, 0, 0, 1, 0, 1, 0, 1},
++                              new int[] {1, 1, 1, 1, 1, 1, 1, 1},
++                              12);
++  }
++
++  public void testWTF1() throws Exception {
++
++    // "wow that's funny" and "what the fudge" are separate side paths, in parallel with "wtf", on input:
++    TokenStream in = new CannedTokenStream(0, 12, new Token[] {
++        token("wtf", 1, 5, 0, 3),
++        token("what", 0, 1, 0, 3),
++        token("wow", 0, 3, 0, 3),
++        token("the", 1, 1, 0, 3),
++        token("fudge", 1, 3, 0, 3),
++        token("that's", 1, 1, 0, 3),
++        token("funny", 1, 1, 0, 3),
++        token("happened", 1, 1, 4, 12)
++      });
++
++
++    TokenStream out = new FlattenGraphFilter(in);
++
++    // ... but on output, it's flattened to wtf/what/wow that's/the fudge/funny happened:
++    assertTokenStreamContents(out,
++                              new String[] {"wtf", "what", "wow", "the", "that's", "fudge", "funny", "happened"},
++                              new int[] {0, 0, 0, 0, 0, 0, 0, 4},
++                              new int[] {3, 3, 3, 3, 3, 3, 3, 12},
++                              new int[] {1, 0, 0, 1, 0, 1, 0, 1},
++                              new int[] {3, 1, 1, 1, 1, 1, 1, 1},
++                              12);
++    
++  }
++
++  /** Same as testWTF1 except the "wtf" token comes out later */
++  public void testWTF2() throws Exception {
++
++    // "wow that's funny" and "what the fudge" are separate side paths, in parallel with "wtf", on input:
++    TokenStream in = new CannedTokenStream(0, 12, new Token[] {
++        token("what", 1, 1, 0, 3),
++        token("wow", 0, 3, 0, 3),
++        token("wtf", 0, 5, 0, 3),
++        token("the", 1, 1, 0, 3),
++        token("fudge", 1, 3, 0, 3),
++        token("that's", 1, 1, 0, 3),
++        token("funny", 1, 1, 0, 3),
++        token("happened", 1, 1, 4, 12)
++      });
++
++
++    TokenStream out = new FlattenGraphFilter(in);
++
++    // ... but on output, it's flattened to wtf/what/wow that's/the fudge/funny happened:
++    assertTokenStreamContents(out,
++                              new String[] {"what", "wow", "wtf", "the", "that's", "fudge", "funny", "happened"},
++                              new int[] {0, 0, 0, 0, 0, 0, 0, 4},
++                              new int[] {3, 3, 3, 3, 3, 3, 3, 12},
++                              new int[] {1, 0, 0, 1, 0, 1, 0, 1},
++                              new int[] {1, 1, 3, 1, 1, 1, 1, 1},
++                              12);
++    
++  }
++
++  public void testNonGreedySynonyms() throws Exception {
++    // This is just "hypothetical" for Lucene today, because SynFilter is
++    // greedy: when two syn rules match on overlapping tokens, only one
++    // (greedily) wins.  This test pretends all syn matches could match:
++
++    TokenStream in = new CannedTokenStream(0, 20, new Token[] {
++        token("wizard", 1, 1, 0, 6),
++        token("wizard_of_oz", 0, 3, 0, 12),
++        token("of", 1, 1, 7, 9),
++        token("oz", 1, 1, 10, 12),
++        token("oz_screams", 0, 2, 10, 20),
++        token("screams", 1, 1, 13, 20),
++      });
++
++
++    TokenStream out = new FlattenGraphFilter(in);
++
++    // ... but on output, it's flattened to wtf/what/wow that's/the fudge/funny happened:
++    assertTokenStreamContents(out,
++                              new String[] {"wizard", "wizard_of_oz", "of", "oz", "oz_screams", "screams"},
++                              new int[] {0, 0, 7, 10, 10, 13},
++                              new int[] {6, 12, 9, 12, 20, 20},
++                              new int[] {1, 0, 1, 1, 0, 1},
++                              new int[] {1, 3, 1, 1, 2, 1},
++                              20);
++    
++  }
++
++  public void testNonGraph() throws Exception {
++    TokenStream in = new CannedTokenStream(0, 22, new Token[] {
++        token("hello", 1, 1, 0, 5),
++        token("pseudo", 1, 1, 6, 12),
++        token("world", 1, 1, 13, 18),
++        token("fun", 1, 1, 19, 22),
++      });
++
++
++    TokenStream out = new FlattenGraphFilter(in);
++
++    // ... but on output, it's flattened to wtf/what/wow that's/the fudge/funny happened:
++    assertTokenStreamContents(out,
++                              new String[] {"hello", "pseudo", "world", "fun"},
++                              new int[] {0, 6, 13, 19},
++                              new int[] {5, 12, 18, 22},
++                              new int[] {1, 1, 1, 1},
++                              new int[] {1, 1, 1, 1},
++                              22);
++  }
++
++  public void testSimpleHole() throws Exception {
++    TokenStream in = new CannedTokenStream(0, 13, new Token[] {
++        token("hello", 1, 1, 0, 5),
++        token("hole", 2, 1, 6, 10),
++        token("fun", 1, 1, 11, 13),
++      });
++
++
++    TokenStream out = new FlattenGraphFilter(in);
++
++    // ... but on output, it's flattened to wtf/what/wow that's/the fudge/funny happened:
++    assertTokenStreamContents(out,
++                              new String[] {"hello", "hole", "fun"},
++                              new int[] {0, 6, 11},
++                              new int[] {5, 10, 13},
++                              new int[] {1, 2, 1},
++                              new int[] {1, 1, 1},
++                              13);
++  }
++
++  public void testHoleUnderSyn() throws Exception {
++    // Tests a StopFilter after SynFilter where a stopword in a syn is removed
++    //
++    //   wizard of oz -> woz syn, but then "of" becomes a hole
++
++    TokenStream in = new CannedTokenStream(0, 12, new Token[] {
++        token("wizard", 1, 1, 0, 6),
++        token("woz", 0, 3, 0, 12),
++        token("oz", 2, 1, 10, 12),
++      });
++
++
++    TokenStream out = new FlattenGraphFilter(in);
++
++    assertTokenStreamContents(out,
++                              new String[] {"wizard", "woz", "oz"},
++                              new int[] {0, 0, 10},
++                              new int[] {6, 12, 12},
++                              new int[] {1, 0, 2},
++                              new int[] {1, 3, 1},
++                              12);
++  }
++
++  public void testStrangelyNumberedNodes() throws Exception {
++
++    // Uses only nodes 0, 2, 3, i.e. 1 is just never used (it is not a hole!!)
++    TokenStream in = new CannedTokenStream(0, 27, new Token[] {
++        token("dog", 1, 3, 0, 5),
++        token("puppy", 0, 3, 0, 5),
++        token("flies", 3, 1, 6, 11),
++      });
++
++    TokenStream out = new FlattenGraphFilter(in);
++
++    assertTokenStreamContents(out,
++                              new String[] {"dog", "puppy", "flies"},
++                              new int[] {0, 0, 6},
++                              new int[] {5, 5, 11},
++                              new int[] {1, 0, 1},
++                              new int[] {1, 1, 1},
++                              27);
++  }
++
++  public void testTwoLongParallelPaths() throws Exception {
++
++    // "a a a a a a" in parallel with "b b b b b b"
++    TokenStream in = new CannedTokenStream(0, 11, new Token[] {
++        token("a", 1, 1, 0, 1),
++        token("b", 0, 2, 0, 1),
++        token("a", 1, 2, 2, 3),
++        token("b", 1, 2, 2, 3),
++        token("a", 1, 2, 4, 5),
++        token("b", 1, 2, 4, 5),
++        token("a", 1, 2, 6, 7),
++        token("b", 1, 2, 6, 7),
++        token("a", 1, 2, 8, 9),
++        token("b", 1, 2, 8, 9),
++        token("a", 1, 2, 10, 11),
++        token("b", 1, 2, 10, 11),
++      });
++
++
++    TokenStream out = new FlattenGraphFilter(in);
++    
++    // ... becomes flattened to a single path with overlapping a/b token between each node:
++    assertTokenStreamContents(out,
++                              new String[] {"a", "b", "a", "b", "a", "b", "a", "b", "a", "b", "a", "b"},
++                              new int[] {0, 0, 2, 2, 4, 4, 6, 6, 8, 8, 10, 10},
++                              new int[] {1, 1, 3, 3, 5, 5, 7, 7, 9, 9, 11, 11},
++                              new int[] {1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0},
++                              new int[] {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
++                              11);
++    
++  }
++
++  // NOTE: TestSynonymGraphFilter's testRandomSyns also tests FlattenGraphFilter
++}
+diff --git a/lucene/analysis/common/src/test/org/apache/lucene/analysis/miscellaneous/TestWordDelimiterFilter.java b/lucene/analysis/common/src/test/org/apache/lucene/analysis/miscellaneous/TestWordDelimiterFilter.java
+index 7f35298..f0d0b7d 100644
+--- a/lucene/analysis/common/src/test/org/apache/lucene/analysis/miscellaneous/TestWordDelimiterFilter.java
++++ b/lucene/analysis/common/src/test/org/apache/lucene/analysis/miscellaneous/TestWordDelimiterFilter.java
+@@ -446,4 +446,93 @@ public class TestWordDelimiterFilter extends BaseTokenStreamTestCase {
+       a.close();
+     }
+   }
++
++  /*
++  public void testToDot() throws Exception {
++    int flags = GENERATE_WORD_PARTS | GENERATE_NUMBER_PARTS | CATENATE_ALL | SPLIT_ON_CASE_CHANGE | SPLIT_ON_NUMERICS | STEM_ENGLISH_POSSESSIVE | PRESERVE_ORIGINAL | CATENATE_WORDS | CATENATE_NUMBERS | STEM_ENGLISH_POSSESSIVE;
++    String text = "PowerSystem2000-5-Shot's";
++    WordDelimiterFilter wdf = new WordDelimiterFilter(new CannedTokenStream(new Token(text, 0, text.length())), DEFAULT_WORD_DELIM_TABLE, flags, null);
++    //StringWriter sw = new StringWriter();
++    // TokenStreamToDot toDot = new TokenStreamToDot(text, wdf, new PrintWriter(sw));
++    PrintWriter pw = new PrintWriter("/x/tmp/before.dot");
++    TokenStreamToDot toDot = new TokenStreamToDot(text, wdf, pw);
++    toDot.toDot();
++    pw.close();
++    System.out.println("TEST DONE");
++    //System.out.println("DOT:\n" + sw.toString());
++  }
++  */
++
++  public void testOnlyNumbers() throws Exception {
++    int flags = GENERATE_WORD_PARTS | SPLIT_ON_CASE_CHANGE | SPLIT_ON_NUMERICS;
++    Analyzer a = new Analyzer() {
++        
++      @Override
++      protected TokenStreamComponents createComponents(String fieldName) {
++        Tokenizer tokenizer = new MockTokenizer(MockTokenizer.WHITESPACE, false);
++        return new TokenStreamComponents(tokenizer, new WordDelimiterFilter(tokenizer, flags, null));
++      }
++    };
++
++    assertAnalyzesTo(a, "7-586", 
++                     new String[] {},
++                     new int[] {},
++                     new int[] {},
++                     null,
++                     new int[] {},
++                     null,
++                     false);
++  }
++
++  public void testNumberPunct() throws Exception {
++    int flags = GENERATE_WORD_PARTS | SPLIT_ON_CASE_CHANGE | SPLIT_ON_NUMERICS;
++    Analyzer a = new Analyzer() {
++        
++      @Override
++      protected TokenStreamComponents createComponents(String fieldName) {
++        Tokenizer tokenizer = new MockTokenizer(MockTokenizer.WHITESPACE, false);
++        return new TokenStreamComponents(tokenizer, new WordDelimiterFilter(tokenizer, flags, null));
++      }
++    };
++
++    assertAnalyzesTo(a, "6-", 
++                     new String[] {"6"},
++                     new int[] {0},
++                     new int[] {1},
++                     null,
++                     new int[] {1},
++                     null,
++                     false);
++  }
++
++  private Analyzer getAnalyzer(final int flags) {
++    return new Analyzer() {
++        
++      @Override
++      protected TokenStreamComponents createComponents(String fieldName) {
++        Tokenizer tokenizer = new MockTokenizer(MockTokenizer.WHITESPACE, false);
++        return new TokenStreamComponents(tokenizer, new WordDelimiterFilter(tokenizer, flags, null));
++      }
++    };
++  }
++
++  public void testCuriousCase1() throws Exception {
++    int flags = CATENATE_WORDS | CATENATE_ALL | SPLIT_ON_CASE_CHANGE | SPLIT_ON_NUMERICS | STEM_ENGLISH_POSSESSIVE;
++    System.out.println("HERE: " + toString(getAnalyzer(flags), "u-0L-4836-ip4Gw--13--q7--L07E1"));
++  }
++
++  public void testCuriousCase2() throws Exception {
++    int flags = GENERATE_NUMBER_PARTS | CATENATE_NUMBERS | SPLIT_ON_CASE_CHANGE | SPLIT_ON_NUMERICS;
++    System.out.println("HERE:\n" + toString(getAnalyzer(flags), "cQzk4-GL0izl0mKM-J8--4m-'s"));
++  }
++
++  public void testCuriousCase3() throws Exception {
++    int flags = CATENATE_WORDS | CATENATE_ALL | STEM_ENGLISH_POSSESSIVE;
++    System.out.println("HERE:\n" + toString(getAnalyzer(flags), "7--D-u5f3d53IM-8Bxq-0B--K32--9nH-'s"));
++  }
++
++  public void testCuriousCase4() throws Exception {
++    int flags = GENERATE_WORD_PARTS | CATENATE_NUMBERS | PRESERVE_ORIGINAL | STEM_ENGLISH_POSSESSIVE;
++    System.out.println("HERE:\n" + toString(getAnalyzer(flags), "-Q3-45g-0I-L02kmYJeP9M's-"));
++  }
+ }
+diff --git a/lucene/analysis/common/src/test/org/apache/lucene/analysis/miscellaneous/TestWordDelimiterGraphFilter.java b/lucene/analysis/common/src/test/org/apache/lucene/analysis/miscellaneous/TestWordDelimiterGraphFilter.java
+new file mode 100644
+index 0000000..2daf886
+--- /dev/null
++++ b/lucene/analysis/common/src/test/org/apache/lucene/analysis/miscellaneous/TestWordDelimiterGraphFilter.java
+@@ -0,0 +1,897 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.analysis.miscellaneous;
++
++import java.io.IOException;
++import java.util.*;
++
++import org.apache.lucene.analysis.*;
++import org.apache.lucene.analysis.CharArraySet;
++import org.apache.lucene.analysis.StopFilter;
++import org.apache.lucene.analysis.core.KeywordTokenizer;
++import org.apache.lucene.analysis.standard.StandardAnalyzer;
++import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
++import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
++import org.apache.lucene.util.IOUtils;
++import org.apache.lucene.util.TestUtil;
++
++import static org.apache.lucene.analysis.miscellaneous.WordDelimiterGraphFilter.*;
++import static org.apache.lucene.analysis.miscellaneous.WordDelimiterIterator.DEFAULT_WORD_DELIM_TABLE;
++
++/**
++ * New WordDelimiterGraphFilter tests... most of the tests are in ConvertedLegacyTest
++ * TODO: should explicitly test things like protWords and not rely on
++ * the factory tests in Solr.
++ */
++public class TestWordDelimiterGraphFilter extends BaseTokenStreamTestCase {
++
++  public void testOffsets() throws IOException {
++    int flags = GENERATE_WORD_PARTS | GENERATE_NUMBER_PARTS | CATENATE_ALL | SPLIT_ON_CASE_CHANGE | SPLIT_ON_NUMERICS | STEM_ENGLISH_POSSESSIVE;
++    // test that subwords and catenated subwords have
++    // the correct offsets.
++    WordDelimiterGraphFilter wdf = new WordDelimiterGraphFilter(new CannedTokenStream(new Token("foo-bar", 5, 12)), DEFAULT_WORD_DELIM_TABLE, flags, null);
++
++    assertTokenStreamContents(wdf, 
++                              new String[] { "foobar", "foo", "bar" },
++                              new int[] { 5, 5, 9 }, 
++                              new int[] { 12, 8, 12 });
++
++    // with illegal offsets:
++    wdf = new WordDelimiterGraphFilter(new CannedTokenStream(new Token("foo-bar", 5, 6)), DEFAULT_WORD_DELIM_TABLE, flags, null);
++    assertTokenStreamContents(wdf,
++                              new String[] { "foobar", "foo", "bar" },
++                              new int[] { 5, 5, 5 },
++                              new int[] { 6, 6, 6 });
++  }
++  
++  public void testOffsetChange() throws Exception {
++    int flags = GENERATE_WORD_PARTS | GENERATE_NUMBER_PARTS | CATENATE_ALL | SPLIT_ON_CASE_CHANGE | SPLIT_ON_NUMERICS | STEM_ENGLISH_POSSESSIVE;
++    WordDelimiterGraphFilter wdf = new WordDelimiterGraphFilter(new CannedTokenStream(new Token("übelkeit)", 7, 16)), DEFAULT_WORD_DELIM_TABLE, flags, null);
++    
++    assertTokenStreamContents(wdf,
++        new String[] { "übelkeit" },
++        new int[] { 7 },
++        new int[] { 15 });
++  }
++  
++  public void testOffsetChange2() throws Exception {
++    int flags = GENERATE_WORD_PARTS | GENERATE_NUMBER_PARTS | CATENATE_ALL | SPLIT_ON_CASE_CHANGE | SPLIT_ON_NUMERICS | STEM_ENGLISH_POSSESSIVE;
++    WordDelimiterGraphFilter wdf = new WordDelimiterGraphFilter(new CannedTokenStream(new Token("(übelkeit", 7, 17)), DEFAULT_WORD_DELIM_TABLE, flags, null);
++    // illegal offsets:
++    assertTokenStreamContents(wdf,
++                              new String[] { "übelkeit" },
++                              new int[] { 7 },
++                              new int[] { 17 });
++  }
++  
++  public void testOffsetChange3() throws Exception {
++    int flags = GENERATE_WORD_PARTS | GENERATE_NUMBER_PARTS | CATENATE_ALL | SPLIT_ON_CASE_CHANGE | SPLIT_ON_NUMERICS | STEM_ENGLISH_POSSESSIVE;
++    WordDelimiterGraphFilter wdf = new WordDelimiterGraphFilter(new CannedTokenStream(new Token("(übelkeit", 7, 16)), DEFAULT_WORD_DELIM_TABLE, flags, null);
++    assertTokenStreamContents(wdf,
++                              new String[] { "übelkeit" },
++                              new int[] { 8 },
++                              new int[] { 16 });
++  }
++  
++  public void testOffsetChange4() throws Exception {
++    int flags = GENERATE_WORD_PARTS | GENERATE_NUMBER_PARTS | CATENATE_ALL | SPLIT_ON_CASE_CHANGE | SPLIT_ON_NUMERICS | STEM_ENGLISH_POSSESSIVE;
++    WordDelimiterGraphFilter wdf = new WordDelimiterGraphFilter(new CannedTokenStream(new Token("(foo,bar)", 7, 16)), DEFAULT_WORD_DELIM_TABLE, flags, null);
++    
++    assertTokenStreamContents(wdf,
++        new String[] { "foobar", "foo", "bar"},
++        new int[] { 8, 8, 12 },
++        new int[] { 15, 11, 15 });
++  }
++
++  public void doSplit(final String input, String... output) throws Exception {
++    int flags = GENERATE_WORD_PARTS | GENERATE_NUMBER_PARTS | SPLIT_ON_CASE_CHANGE | SPLIT_ON_NUMERICS | STEM_ENGLISH_POSSESSIVE;
++    WordDelimiterGraphFilter wdf = new WordDelimiterGraphFilter(keywordMockTokenizer(input),
++        WordDelimiterIterator.DEFAULT_WORD_DELIM_TABLE, flags, null);
++    
++    assertTokenStreamContents(wdf, output);
++  }
++
++  public void testSplits() throws Exception {
++    doSplit("basic-split","basic","split");
++    doSplit("camelCase","camel","Case");
++
++    // non-space marking symbol shouldn't cause split
++    // this is an example in Thai    
++    doSplit("\u0e1a\u0e49\u0e32\u0e19","\u0e1a\u0e49\u0e32\u0e19");
++    // possessive followed by delimiter
++    doSplit("test's'", "test");
++
++    // some russian upper and lowercase
++    doSplit("Роберт", "Роберт");
++    // now cause a split (russian camelCase)
++    doSplit("РобЕрт", "Роб", "Ерт");
++
++    // a composed titlecase character, don't split
++    doSplit("aǅungla", "aǅungla");
++    
++    // a modifier letter, don't split
++    doSplit("ســـــــــــــــــلام", "ســـــــــــــــــلام");
++    
++    // enclosing mark, don't split
++    doSplit("test⃝", "test⃝");
++    
++    // combining spacing mark (the virama), don't split
++    doSplit("हिन्दी", "हिन्दी");
++    
++    // don't split non-ascii digits
++    doSplit("١٢٣٤", "١٢٣٤");
++    
++    // don't split supplementaries into unpaired surrogates
++    doSplit("𠀀𠀀", "𠀀𠀀");
++  }
++  
++  public void doSplitPossessive(int stemPossessive, final String input, final String... output) throws Exception {
++    int flags = GENERATE_WORD_PARTS | GENERATE_NUMBER_PARTS | SPLIT_ON_CASE_CHANGE | SPLIT_ON_NUMERICS;
++    flags |= (stemPossessive == 1) ? STEM_ENGLISH_POSSESSIVE : 0;
++    WordDelimiterGraphFilter wdf = new WordDelimiterGraphFilter(keywordMockTokenizer(input), flags, null);
++
++    assertTokenStreamContents(wdf, output);
++  }
++  
++  /*
++   * Test option that allows disabling the special "'s" stemming, instead treating the single quote like other delimiters. 
++   */
++  public void testPossessives() throws Exception {
++    doSplitPossessive(1, "ra's", "ra");
++    doSplitPossessive(0, "ra's", "ra", "s");
++  }
++  
++  /*
++   * Set a large position increment gap of 10 if the token is "largegap" or "/"
++   */
++  private final class LargePosIncTokenFilter extends TokenFilter {
++    private CharTermAttribute termAtt = addAttribute(CharTermAttribute.class);
++    private PositionIncrementAttribute posIncAtt = addAttribute(PositionIncrementAttribute.class);
++    
++    protected LargePosIncTokenFilter(TokenStream input) {
++      super(input);
++    }
++
++    @Override
++    public boolean incrementToken() throws IOException {
++      if (input.incrementToken()) {
++        if (termAtt.toString().equals("largegap") || termAtt.toString().equals("/"))
++          posIncAtt.setPositionIncrement(10);
++        return true;
++      } else {
++        return false;
++      }
++    }  
++  }
++  
++  public void testPositionIncrements() throws Exception {
++    final int flags = GENERATE_WORD_PARTS | GENERATE_NUMBER_PARTS | CATENATE_ALL | SPLIT_ON_CASE_CHANGE | SPLIT_ON_NUMERICS | STEM_ENGLISH_POSSESSIVE;
++    final CharArraySet protWords = new CharArraySet(new HashSet<>(Arrays.asList("NUTCH")), false);
++    
++    /* analyzer that uses whitespace + wdf */
++    Analyzer a = new Analyzer() {
++      @Override
++      public TokenStreamComponents createComponents(String field) {
++        Tokenizer tokenizer = new MockTokenizer(MockTokenizer.WHITESPACE, false);
++        return new TokenStreamComponents(tokenizer, new WordDelimiterGraphFilter(
++            tokenizer,
++            flags, protWords));
++      }
++    };
++
++    /* in this case, works as expected. */
++    assertAnalyzesTo(a, "LUCENE / SOLR", new String[] { "LUCENE", "SOLR" },
++        new int[] { 0, 9 },
++        new int[] { 6, 13 },
++        null,
++        new int[] { 1, 2 },
++        null,
++        false);
++
++    /* only in this case, posInc of 2 ?! */
++    assertAnalyzesTo(a, "LUCENE / solR", new String[] { "LUCENE", "solR", "sol", "R" },
++        new int[] { 0, 9, 9, 12 },
++        new int[] { 6, 13, 12, 13 },
++        null,                     
++        new int[] { 1, 2, 0, 1 },
++        null,
++        false);
++    
++    assertAnalyzesTo(a, "LUCENE / NUTCH SOLR", new String[] { "LUCENE", "NUTCH", "SOLR" },
++        new int[] { 0, 9, 15 },
++        new int[] { 6, 14, 19 },
++        null,
++        new int[] { 1, 2, 1 },
++        null,
++        false);
++    
++    /* analyzer that will consume tokens with large position increments */
++    Analyzer a2 = new Analyzer() {
++      @Override
++      public TokenStreamComponents createComponents(String field) {
++        Tokenizer tokenizer = new MockTokenizer(MockTokenizer.WHITESPACE, false);
++        return new TokenStreamComponents(tokenizer, new WordDelimiterGraphFilter(
++            new LargePosIncTokenFilter(tokenizer),
++            flags, protWords));
++      }
++    };
++    
++    /* increment of "largegap" is preserved */
++    assertAnalyzesTo(a2, "LUCENE largegap SOLR", new String[] { "LUCENE", "largegap", "SOLR" },
++        new int[] { 0, 7, 16 },
++        new int[] { 6, 15, 20 },
++        null,
++        new int[] { 1, 10, 1 },
++        null,
++        false);
++    
++    /* the "/" had a position increment of 10, where did it go?!?!! */
++    assertAnalyzesTo(a2, "LUCENE / SOLR", new String[] { "LUCENE", "SOLR" },
++        new int[] { 0, 9 },
++        new int[] { 6, 13 },
++        null,
++        new int[] { 1, 11 },
++        null,
++        false);
++    
++    /* in this case, the increment of 10 from the "/" is carried over */
++    assertAnalyzesTo(a2, "LUCENE / solR", new String[] { "LUCENE", "solR", "sol", "R" },
++        new int[] { 0, 9, 9, 12 },
++        new int[] { 6, 13, 12, 13 },
++        null,
++        new int[] { 1, 11, 0, 1 },
++        null,
++        false);
++    
++    assertAnalyzesTo(a2, "LUCENE / NUTCH SOLR", new String[] { "LUCENE", "NUTCH", "SOLR" },
++        new int[] { 0, 9, 15 },
++        new int[] { 6, 14, 19 },
++        null,
++        new int[] { 1, 11, 1 },
++        null,
++        false);
++
++    Analyzer a3 = new Analyzer() {
++      @Override
++      public TokenStreamComponents createComponents(String field) {
++        Tokenizer tokenizer = new MockTokenizer(MockTokenizer.WHITESPACE, false);
++        StopFilter filter = new StopFilter(tokenizer, StandardAnalyzer.STOP_WORDS_SET);
++        return new TokenStreamComponents(tokenizer, new WordDelimiterGraphFilter(filter, flags, protWords));
++      }
++    };
++
++    assertAnalyzesTo(a3, "lucene.solr", 
++        new String[] { "lucenesolr", "lucene", "solr" },
++        new int[] { 0, 0, 7 },
++        new int[] { 11, 6, 11 },
++        null,
++        new int[] { 1, 0, 1 },
++        null,
++        false);
++
++    /* the stopword should add a gap here */
++    assertAnalyzesTo(a3, "the lucene.solr", 
++        new String[] { "lucenesolr", "lucene", "solr" }, 
++        new int[] { 4, 4, 11 }, 
++        new int[] { 15, 10, 15 },
++        null,
++        new int[] { 2, 0, 1 },
++        null,
++        false);
++
++    IOUtils.close(a, a2, a3);
++  }
++  
++  /** concat numbers + words + all */
++  public void testLotsOfConcatenating() throws Exception {
++    final int flags = GENERATE_WORD_PARTS | GENERATE_NUMBER_PARTS | CATENATE_WORDS | CATENATE_NUMBERS | CATENATE_ALL | SPLIT_ON_CASE_CHANGE | SPLIT_ON_NUMERICS | STEM_ENGLISH_POSSESSIVE;    
++
++    /* analyzer that uses whitespace + wdf */
++    Analyzer a = new Analyzer() {
++      @Override
++      public TokenStreamComponents createComponents(String field) {
++        Tokenizer tokenizer = new MockTokenizer(MockTokenizer.WHITESPACE, false);
++        return new TokenStreamComponents(tokenizer, new WordDelimiterGraphFilter(tokenizer, flags, null));
++      }
++    };
++    
++    assertAnalyzesTo(a, "abc-def-123-456", 
++        new String[] { "abcdef123456", "abcdef", "abc", "def", "123456", "123", "456" }, 
++        new int[] { 0, 0, 0, 4, 8, 8, 12 }, 
++        new int[] { 15, 7, 3, 7, 15, 11, 15 },
++        null,
++        new int[] { 1, 0, 0, 1, 1, 0, 1 },
++        null,
++        false);
++    a.close();
++  }
++  
++  /** concat numbers + words + all + preserve original */
++  public void testLotsOfConcatenating2() throws Exception {
++    final int flags = PRESERVE_ORIGINAL | GENERATE_WORD_PARTS | GENERATE_NUMBER_PARTS | CATENATE_WORDS | CATENATE_NUMBERS | CATENATE_ALL | SPLIT_ON_CASE_CHANGE | SPLIT_ON_NUMERICS | STEM_ENGLISH_POSSESSIVE;    
++
++    /* analyzer that uses whitespace + wdf */
++    Analyzer a = new Analyzer() {
++      @Override
++      public TokenStreamComponents createComponents(String field) {
++        Tokenizer tokenizer = new MockTokenizer(MockTokenizer.WHITESPACE, false);
++        return new TokenStreamComponents(tokenizer, new WordDelimiterGraphFilter(tokenizer, flags, null));
++      }
++    };
++    
++    assertAnalyzesTo(a, "abc-def-123-456", 
++                     new String[] { "abcdef123456", "abc-def-123-456", "abcdef", "abc", "def", "123456", "123", "456" }, 
++                     new int[] { 0, 0, 0, 0, 4, 8, 8, 12 }, 
++                     new int[] { 15, 15, 7, 3, 7, 15, 11, 15 },
++                     null,
++                     new int[] { 1, 0, 0, 0, 1, 1, 0, 1 },
++                     null,
++                     false);
++    a.close();
++  }
++  
++  /** blast some random strings through the analyzer */
++  public void testRandomStrings() throws Exception {
++    int numIterations = atLeast(5);
++    for (int i = 0; i < numIterations; i++) {
++      final int flags = random().nextInt(512);
++      final CharArraySet protectedWords;
++      if (random().nextBoolean()) {
++        protectedWords = new CharArraySet(new HashSet<>(Arrays.asList("a", "b", "cd")), false);
++      } else {
++        protectedWords = null;
++      }
++      
++      Analyzer a = new Analyzer() {
++        
++        @Override
++        protected TokenStreamComponents createComponents(String fieldName) {
++          Tokenizer tokenizer = new MockTokenizer(MockTokenizer.WHITESPACE, false);
++          return new TokenStreamComponents(tokenizer, new WordDelimiterGraphFilter(tokenizer, flags, protectedWords));
++        }
++      };
++      // TODO: properly support positionLengthAttribute
++      checkRandomData(random(), a, 200*RANDOM_MULTIPLIER, 20, false, false);
++      a.close();
++    }
++  }
++  
++  /** blast some enormous random strings through the analyzer */
++  public void testRandomHugeStrings() throws Exception {
++    int numIterations = atLeast(5);
++    for (int i = 0; i < numIterations; i++) {
++      final int flags = random().nextInt(512);
++      final CharArraySet protectedWords;
++      if (random().nextBoolean()) {
++        protectedWords = new CharArraySet(new HashSet<>(Arrays.asList("a", "b", "cd")), false);
++      } else {
++        protectedWords = null;
++      }
++      
++      Analyzer a = new Analyzer() {
++        
++        @Override
++        protected TokenStreamComponents createComponents(String fieldName) {
++          Tokenizer tokenizer = new MockTokenizer(MockTokenizer.WHITESPACE, false);
++          TokenStream wdgf = new WordDelimiterGraphFilter(tokenizer, flags, protectedWords);
++          return new TokenStreamComponents(tokenizer, wdgf);
++        }
++      };
++      // TODO: properly support positionLengthAttribute
++      checkRandomData(random(), a, 20*RANDOM_MULTIPLIER, 8192, false, false);
++      a.close();
++    }
++  }
++  
++  public void testEmptyTerm() throws IOException {
++    Random random = random();
++    for (int i = 0; i < 512; i++) {
++      final int flags = i;
++      final CharArraySet protectedWords;
++      if (random.nextBoolean()) {
++        protectedWords = new CharArraySet(new HashSet<>(Arrays.asList("a", "b", "cd")), false);
++      } else {
++        protectedWords = null;
++      }
++    
++      Analyzer a = new Analyzer() { 
++        @Override
++        protected TokenStreamComponents createComponents(String fieldName) {
++          Tokenizer tokenizer = new KeywordTokenizer();
++          return new TokenStreamComponents(tokenizer, new WordDelimiterGraphFilter(tokenizer, flags, protectedWords));
++        }
++      };
++      // depending upon options, this thing may or may not preserve the empty term
++      checkAnalysisConsistency(random, a, random.nextBoolean(), "");
++      a.close();
++    }
++  }
++
++  private Analyzer getAnalyzer(int flags) {
++    return getAnalyzer(flags, null);
++  }
++  
++  private Analyzer getAnalyzer(int flags, CharArraySet protectedWords) {
++    return new Analyzer() { 
++      @Override
++      protected TokenStreamComponents createComponents(String fieldName) {
++        Tokenizer tokenizer = new KeywordTokenizer();
++        return new TokenStreamComponents(tokenizer, new WordDelimiterGraphFilter(tokenizer, flags, protectedWords));
++      }
++    };
++  }
++
++  private static boolean has(int flags, int flag) {
++    return (flags & flag) != 0;
++  }
++
++  private static boolean isEnglishPossessive(String text, int pos) {
++    if (pos > 2) {
++      if ((text.charAt(pos-1) == 's' || text.charAt(pos-1) == 'S') &&
++          (pos == text.length() || text.charAt(pos) != '-')) {
++        text = text.substring(0, text.length()-2);
++      }
++    }
++    return true;
++  }
++
++  private static class WordPart {
++    final String part;
++    final int startOffset;
++    final int endOffset;
++    final int type;
++
++    public WordPart(String text, int startOffset, int endOffset) {
++      this.part = text.substring(startOffset, endOffset);
++      this.startOffset = startOffset;
++      this.endOffset = endOffset;
++      this.type = toType(part.charAt(0));
++    }
++
++    @Override
++    public String toString() {
++      return "WordPart(" + part + " " + startOffset + "-" + endOffset + ")";
++    }
++  }
++
++  private static final int NUMBER = 0;
++  private static final int LETTER = 1;
++  private static final int DELIM = 2;
++
++  private static int toType(char ch) {
++    if (Character.isDigit(ch)) {
++      // numbers
++      return NUMBER;
++    } else if (Character.isLetter(ch)) {
++      // letters
++      return LETTER;
++    } else {
++      // delimiter
++      return DELIM;
++    }
++  }
++
++  /** Does (hopefully) the same thing as WordDelimiterGraphFilter, according to the flags, but more slowly, returning all string paths combinations. */
++  private Set<String> slowWDF(String text, int flags) {
++
++    // first make word parts:
++    List<WordPart> wordParts = new ArrayList<>();
++    int lastCH = -1;
++    int wordPartStart = 0;
++    boolean inToken = false;
++
++    for(int i=0;i<text.length();i++) {
++      char ch = text.charAt(i);
++      if (toType(ch) == DELIM) {
++        // delimiter
++        if (inToken) {
++          // end current token
++          wordParts.add(new WordPart(text, wordPartStart, i));
++          inToken = false;
++        }
++
++        // strip english possessive at the end of this token?:
++        if (has(flags, STEM_ENGLISH_POSSESSIVE) &&
++            ch == '\'' && i > 0 &&
++            i < text.length()-1 &&
++            (text.charAt(i+1) == 's' || text.charAt(i+1) == 'S') &&
++            toType(text.charAt(i-1)) == LETTER &&
++            (i+2 == text.length() || toType(text.charAt(i+2)) == DELIM)) {
++          i += 2;
++        }
++    
++      } else if (inToken == false) {
++        // start new token
++        inToken = true;
++        wordPartStart = i;
++      } else {
++        boolean newToken = false;
++        if (Character.isLetter(lastCH)) {
++          if (Character.isLetter(ch)) {
++            if (has(flags, SPLIT_ON_CASE_CHANGE) && Character.isLowerCase(lastCH) && Character.isLowerCase(ch) == false) {
++              // start new token on lower -> UPPER case change (but not vice versa!)
++              newToken = true;
++            }
++          } else if (has(flags, SPLIT_ON_NUMERICS) && Character.isDigit(ch)) {
++            // start new token on letter -> number change
++            newToken = true;
++          }
++        } else {
++          assert Character.isDigit(lastCH);
++          if (Character.isLetter(ch) && has(flags, SPLIT_ON_NUMERICS) ) {
++            // start new token on number -> letter change
++            newToken = true;
++          }
++        }
++        if (newToken) {
++          wordParts.add(new WordPart(text, wordPartStart, i));
++          wordPartStart = i;
++        }
++      }
++      lastCH = ch;
++    }
++
++    if (inToken) {
++      // add last token
++      wordParts.add(new WordPart(text, wordPartStart, text.length()));
++    }
++    
++    Set<String> paths = new HashSet<>();
++    if (wordParts.isEmpty() == false) {
++      enumerate(flags, 0, text, wordParts, paths, new StringBuilder());
++    }
++
++    if (has(flags, PRESERVE_ORIGINAL)) {
++      paths.add(text);
++    }
++
++    if (has(flags, CATENATE_ALL) && wordParts.isEmpty() == false) {
++      StringBuilder b = new StringBuilder();
++      for(WordPart wordPart : wordParts) {
++        b.append(wordPart.part);
++      }
++      paths.add(b.toString());
++    }
++    
++    return paths;
++  }
++
++  private void add(StringBuilder path, String part) {
++    if (path.length() != 0) {
++      path.append(' ');
++    }
++    path.append(part);
++  }
++
++  private void add(StringBuilder path, List<WordPart> wordParts, int from, int to) {
++    if (path.length() != 0) {
++      path.append(' ');
++    }
++    // no spaces:
++    for(int i=from;i<to;i++) {
++      path.append(wordParts.get(i).part);
++    }
++  }
++
++  private void addWithSpaces(StringBuilder path, List<WordPart> wordParts, int from, int to) {
++    for(int i=from;i<to;i++) {
++      add(path, wordParts.get(i).part);
++    }
++  }
++
++  /** Finds the end (exclusive) of the series of part with the same type */
++  private int endOfRun(List<WordPart> wordParts, int start) {
++    int upto = start+1;
++    while(upto < wordParts.size() && wordParts.get(upto).type == wordParts.get(start).type) {
++      upto++;
++    }
++    return upto;
++  }
++
++  /** Recursively enumerates all paths through the word parts */
++  private void enumerate(int flags, int upto, String text, List<WordPart> wordParts, Set<String> paths, StringBuilder path) {
++    if (upto == wordParts.size()) {
++      if (path.length() > 0) {
++        paths.add(path.toString());
++      }
++    } else {
++      int savLength = path.length();
++      int end = endOfRun(wordParts, upto);
++
++      if (wordParts.get(upto).type == NUMBER) {
++        // always output single word, optionally surrounded by delims:
++        if (has(flags, GENERATE_NUMBER_PARTS) || wordParts.size() == 1) {
++          addWithSpaces(path, wordParts, upto, end);
++          if (has(flags, CATENATE_NUMBERS)) {
++            // recurse first with the parts
++            enumerate(flags, end, text, wordParts, paths, path);
++            path.setLength(savLength);
++            // .. and second with the concat
++            add(path, wordParts, upto, end);
++          }
++        } else if (has(flags, CATENATE_NUMBERS)) {
++          add(path, wordParts, upto, end);
++        }
++        enumerate(flags, end, text, wordParts, paths, path);
++        path.setLength(savLength);
++      } else {
++        assert wordParts.get(upto).type == LETTER;
++        // always output single word, optionally surrounded by delims:
++        if (has(flags, GENERATE_WORD_PARTS) || wordParts.size() == 1) {
++          addWithSpaces(path, wordParts, upto, end);
++          if (has(flags, CATENATE_WORDS)) {
++            // recurse first with the parts
++            enumerate(flags, end, text, wordParts, paths, path);
++            path.setLength(savLength);
++            // .. and second with the concat
++            add(path, wordParts, upto, end);
++          }
++        } else if (has(flags, CATENATE_WORDS)) {
++          add(path, wordParts, upto, end);
++        }
++        enumerate(flags, end, text, wordParts, paths, path);
++        path.setLength(savLength);
++      }
++    }
++  }
++
++  public void testBasicGraphSplits() throws Exception {
++    assertGraphStrings(getAnalyzer(0),
++                       "PowerShotPlus",
++                       "PowerShotPlus");
++    assertGraphStrings(getAnalyzer(GENERATE_WORD_PARTS),
++                       "PowerShotPlus",
++                       "PowerShotPlus");
++    assertGraphStrings(getAnalyzer(GENERATE_WORD_PARTS | SPLIT_ON_CASE_CHANGE),
++                       "PowerShotPlus",
++                       "Power Shot Plus");
++    assertGraphStrings(getAnalyzer(GENERATE_WORD_PARTS | SPLIT_ON_CASE_CHANGE | PRESERVE_ORIGINAL),
++                       "PowerShotPlus",
++                       "PowerShotPlus",
++                       "Power Shot Plus");
++
++    assertGraphStrings(getAnalyzer(GENERATE_WORD_PARTS),
++                       "Power-Shot-Plus",
++                       "Power Shot Plus");
++    assertGraphStrings(getAnalyzer(GENERATE_WORD_PARTS | SPLIT_ON_CASE_CHANGE),
++                       "Power-Shot-Plus",
++                       "Power Shot Plus");
++    assertGraphStrings(getAnalyzer(GENERATE_WORD_PARTS | SPLIT_ON_CASE_CHANGE | PRESERVE_ORIGINAL),
++                       "Power-Shot-Plus",
++                       "Power-Shot-Plus",
++                       "Power Shot Plus");
++
++    assertGraphStrings(getAnalyzer(GENERATE_WORD_PARTS | SPLIT_ON_CASE_CHANGE),
++                       "PowerShotPlus",
++                       "Power Shot Plus");
++    assertGraphStrings(getAnalyzer(GENERATE_WORD_PARTS | SPLIT_ON_CASE_CHANGE),
++                       "PowerShot1000Plus",
++                       "Power Shot1000Plus");
++    assertGraphStrings(getAnalyzer(GENERATE_WORD_PARTS | SPLIT_ON_CASE_CHANGE),
++                       "Power-Shot-Plus",
++                       "Power Shot Plus");
++
++    assertGraphStrings(getAnalyzer(GENERATE_WORD_PARTS | SPLIT_ON_CASE_CHANGE | CATENATE_WORDS),
++                       "PowerShotPlus",
++                       "Power Shot Plus",
++                       "PowerShotPlus");
++    assertGraphStrings(getAnalyzer(GENERATE_WORD_PARTS | SPLIT_ON_CASE_CHANGE | CATENATE_WORDS),
++                       "PowerShot1000Plus",
++                       "Power Shot1000Plus",
++                       "PowerShot1000Plus");
++    assertGraphStrings(getAnalyzer(GENERATE_WORD_PARTS | GENERATE_NUMBER_PARTS | SPLIT_ON_CASE_CHANGE | CATENATE_WORDS | CATENATE_NUMBERS),
++                       "Power-Shot-1000-17-Plus",
++                       "Power Shot 1000 17 Plus",
++                       "Power Shot 100017 Plus",
++                       "PowerShot 1000 17 Plus",
++                       "PowerShot 100017 Plus");
++    assertGraphStrings(getAnalyzer(GENERATE_WORD_PARTS | GENERATE_NUMBER_PARTS | SPLIT_ON_CASE_CHANGE | CATENATE_WORDS | CATENATE_NUMBERS | PRESERVE_ORIGINAL),
++                       "Power-Shot-1000-17-Plus",
++                       "Power-Shot-1000-17-Plus",
++                       "Power Shot 1000 17 Plus",
++                       "Power Shot 100017 Plus",
++                       "PowerShot 1000 17 Plus",
++                       "PowerShot 100017 Plus");
++  }
++
++  /*
++  public void testToDot() throws Exception {
++    int flags = GENERATE_WORD_PARTS | GENERATE_NUMBER_PARTS | CATENATE_ALL | SPLIT_ON_CASE_CHANGE | SPLIT_ON_NUMERICS | STEM_ENGLISH_POSSESSIVE | PRESERVE_ORIGINAL | CATENATE_WORDS | CATENATE_NUMBERS | STEM_ENGLISH_POSSESSIVE;
++    String text = "PowerSystem2000-5-Shot's";
++    WordDelimiterGraphFilter wdf = new WordDelimiterGraphFilter(new CannedTokenStream(new Token(text, 0, text.length())), DEFAULT_WORD_DELIM_TABLE, flags, null);
++    //StringWriter sw = new StringWriter();
++    // TokenStreamToDot toDot = new TokenStreamToDot(text, wdf, new PrintWriter(sw));
++    PrintWriter pw = new PrintWriter("/tmp/foo2.dot");
++    TokenStreamToDot toDot = new TokenStreamToDot(text, wdf, pw);
++    toDot.toDot();
++    pw.close();
++    //System.out.println("DOT:\n" + sw.toString());
++  }
++  */
++
++  private String randomWDFText() {
++    StringBuilder b = new StringBuilder();
++    int length = TestUtil.nextInt(random(), 1, 50);
++    for(int i=0;i<length;i++) {
++      int surpriseMe = random().nextInt(37);
++      int lower = -1;
++      int upper = -1;
++      if (surpriseMe < 10) {
++        // lowercase letter
++        lower = 'a';
++        upper = 'z';
++      } else if (surpriseMe < 20) {
++        // uppercase letter
++        lower = 'A';
++        upper = 'Z';
++      } else if (surpriseMe < 30) {
++        // digit
++        lower = '0';
++        upper = '9';
++      } else if (surpriseMe < 35) {
++        // punct
++        lower = '-';
++        upper = '-';
++      } else {
++        b.append("'s");
++      }
++
++      if (lower != -1) {
++        b.append((char) TestUtil.nextInt(random(), lower, upper));
++      }
++    }
++
++    return b.toString();
++  }
++
++  public void testInvalidFlag() throws Exception {
++    expectThrows(IllegalArgumentException.class,
++                 () -> {
++                   new WordDelimiterGraphFilter(new CannedTokenStream(), 1 << 31, null);
++                 });
++  }
++
++  public void testRandomPaths() throws Exception {
++    int iters = atLeast(100);
++    for(int iter=0;iter<iters;iter++) {
++      String text = randomWDFText();
++      if (VERBOSE) {
++        System.out.println("\nTEST: text=" + text + " len=" + text.length());
++      }
++
++      int flags = 0;
++      if (random().nextBoolean()) {
++        flags |= GENERATE_WORD_PARTS;
++      }
++      if (random().nextBoolean()) {
++        flags |= GENERATE_NUMBER_PARTS;
++      }
++      if (random().nextBoolean()) {
++        flags |= CATENATE_WORDS;
++      }
++      if (random().nextBoolean()) {
++        flags |= CATENATE_NUMBERS;
++      }
++      if (random().nextBoolean()) {
++        flags |= CATENATE_ALL;
++      }
++      if (random().nextBoolean()) {
++        flags |= PRESERVE_ORIGINAL;
++      }
++      if (random().nextBoolean()) {
++        flags |= SPLIT_ON_CASE_CHANGE;
++      }
++      if (random().nextBoolean()) {
++        flags |= SPLIT_ON_NUMERICS;
++      }
++      if (random().nextBoolean()) {
++        flags |= STEM_ENGLISH_POSSESSIVE;
++      }
++
++      verify(text, flags);
++    }
++  }
++
++  /** Runs normal and slow WDGF and compares results */
++  private void verify(String text, int flags) throws IOException {
++
++    Set<String> expected = slowWDF(text, flags);
++    if (VERBOSE) {
++      for(String path : expected) {
++        System.out.println("  " + path);
++      }
++    }
++
++    Set<String> actual = getGraphStrings(getAnalyzer(flags), text);
++    if (actual.equals(expected) == false) {
++      StringBuilder b = new StringBuilder();
++      b.append("\n\nFAIL: text=");
++      b.append(text);
++      b.append(" flags=");
++      b.append(WordDelimiterGraphFilter.flagsToString(flags));
++      b.append('\n');
++      b.append("  expected paths:\n");
++      for (String s : expected) {
++        b.append("    ");
++        b.append(s);
++        if (actual.contains(s) == false) {
++          b.append(" [missing!]");
++        }
++        b.append('\n');
++      }
++
++      b.append("  actual paths:\n");
++      for (String s : actual) {
++        b.append("    ");
++        b.append(s);
++        if (expected.contains(s) == false) {
++          b.append(" [unexpected!]");
++        }
++        b.append('\n');
++      }
++
++      fail(b.toString());
++    }
++  }
++
++  public void testOnlyNumbers() throws Exception {
++    // no token should be produced
++    assertGraphStrings(getAnalyzer(GENERATE_WORD_PARTS | SPLIT_ON_CASE_CHANGE | SPLIT_ON_NUMERICS), "7-586");
++  }
++
++  public void testNoCatenate() throws Exception {
++    // no token should be produced
++    assertGraphStrings(getAnalyzer(GENERATE_WORD_PARTS | GENERATE_NUMBER_PARTS | SPLIT_ON_CASE_CHANGE | SPLIT_ON_NUMERICS), "a-b-c-9-d", "a b c 9 d");
++  }
++
++  public void testCuriousCase1() throws Exception {
++    verify("u-0L-4836-ip4Gw--13--q7--L07E1", CATENATE_WORDS | CATENATE_ALL | SPLIT_ON_CASE_CHANGE | SPLIT_ON_NUMERICS | STEM_ENGLISH_POSSESSIVE);
++  }
++
++  public void testCuriousCase2() throws Exception {
++    verify("u-l-p", CATENATE_ALL);
++  }
++
++  public void testOriginalPosLength() throws Exception {
++    verify("Foo-Bar-Baz", CATENATE_WORDS | SPLIT_ON_CASE_CHANGE | PRESERVE_ORIGINAL);
++  }
++
++  public void testCuriousCase3() throws Exception {
++    verify("cQzk4-GL0izl0mKM-J8--4m-'s", GENERATE_NUMBER_PARTS | CATENATE_NUMBERS | SPLIT_ON_CASE_CHANGE | SPLIT_ON_NUMERICS);
++  }
++
++  public void testEmptyString() throws Exception {
++    WordDelimiterGraphFilter wdf = new WordDelimiterGraphFilter(new CannedTokenStream(new Token("", 0, 0)), DEFAULT_WORD_DELIM_TABLE, GENERATE_WORD_PARTS | CATENATE_ALL | PRESERVE_ORIGINAL, null);
++    wdf.reset();
++    assertTrue(wdf.incrementToken());
++    assertFalse(wdf.incrementToken());
++    wdf.end();
++    wdf.close();
++  }
++
++  public void testProtectedWords() throws Exception {
++    TokenStream tokens = new CannedTokenStream(new Token("foo17-bar", 0, 9),
++                                               new Token("foo-bar", 0, 7));
++
++    CharArraySet protectedWords = new CharArraySet(new HashSet<>(Arrays.asList("foo17-BAR")), true);
++    WordDelimiterGraphFilter wdf = new WordDelimiterGraphFilter(tokens, DEFAULT_WORD_DELIM_TABLE, GENERATE_WORD_PARTS | PRESERVE_ORIGINAL | CATENATE_ALL, protectedWords);
++    assertGraphStrings(wdf,
++                       "foo17-bar foo bar",
++                       "foo17-bar foo-bar",
++                       "foo17-bar foobar");
++  }
++}
+diff --git a/lucene/analysis/common/src/test/org/apache/lucene/analysis/synonym/TestFlattenGraphFilter.java b/lucene/analysis/common/src/test/org/apache/lucene/analysis/synonym/TestFlattenGraphFilter.java
+deleted file mode 100644
+index d61fa96..0000000
+--- a/lucene/analysis/common/src/test/org/apache/lucene/analysis/synonym/TestFlattenGraphFilter.java
++++ /dev/null
+@@ -1,284 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.lucene.analysis.synonym;
+-
+-import org.apache.lucene.analysis.Analyzer;
+-import org.apache.lucene.analysis.BaseTokenStreamTestCase;
+-import org.apache.lucene.analysis.CannedTokenStream;
+-import org.apache.lucene.analysis.MockTokenizer;
+-import org.apache.lucene.analysis.Token;
+-import org.apache.lucene.analysis.TokenStream;
+-import org.apache.lucene.analysis.Tokenizer;
+-
+-public class TestFlattenGraphFilter extends BaseTokenStreamTestCase {
+-  
+-  private static Token token(String term, int posInc, int posLength, int startOffset, int endOffset) {
+-    final Token t = new Token(term, startOffset, endOffset);
+-    t.setPositionIncrement(posInc);
+-    t.setPositionLength(posLength);
+-    return t;
+-  }
+-
+-  public void testSimpleMock() throws Exception {
+-    Analyzer a = new Analyzer() {
+-        @Override
+-        protected TokenStreamComponents createComponents(String fieldName) {
+-          Tokenizer tokenizer = new MockTokenizer(MockTokenizer.SIMPLE, true);
+-          TokenStream ts = new FlattenGraphFilter(tokenizer);
+-          return new TokenStreamComponents(tokenizer, ts);
+-        }
+-      };
+-
+-    assertAnalyzesTo(a, "wtf happened",
+-                     new String[] {"wtf", "happened"},
+-                     new int[]    {    0,          4},
+-                     new int[]    {    3,         12},
+-                     null,
+-                     new int[]    {    1,          1},
+-                     new int[]    {    1,          1},
+-                     true);
+-  }
+-
+-  // Make sure graph is unchanged if it's already flat
+-  public void testAlreadyFlatten() throws Exception {
+-    TokenStream in = new CannedTokenStream(0, 12, new Token[] {
+-        token("wtf", 1, 1, 0, 3),
+-        token("what", 0, 1, 0, 3),
+-        token("wow", 0, 1, 0, 3),
+-        token("the", 1, 1, 0, 3),
+-        token("that's", 0, 1, 0, 3),
+-        token("fudge", 1, 1, 0, 3),
+-        token("funny", 0, 1, 0, 3),
+-        token("happened", 1, 1, 4, 12)
+-      });
+-
+-    TokenStream out = new FlattenGraphFilter(in);
+-
+-    // ... but on output, it's flattened to wtf/what/wow that's/the fudge/funny happened:
+-    assertTokenStreamContents(out,
+-                              new String[] {"wtf", "what", "wow", "the", "that's", "fudge", "funny", "happened"},
+-                              new int[] {0, 0, 0, 0, 0, 0, 0, 4},
+-                              new int[] {3, 3, 3, 3, 3, 3, 3, 12},
+-                              new int[] {1, 0, 0, 1, 0, 1, 0, 1},
+-                              new int[] {1, 1, 1, 1, 1, 1, 1, 1},
+-                              12);
+-  }
+-
+-  public void testWTF1() throws Exception {
+-
+-    // "wow that's funny" and "what the fudge" are separate side paths, in parallel with "wtf", on input:
+-    TokenStream in = new CannedTokenStream(0, 12, new Token[] {
+-        token("wtf", 1, 5, 0, 3),
+-        token("what", 0, 1, 0, 3),
+-        token("wow", 0, 3, 0, 3),
+-        token("the", 1, 1, 0, 3),
+-        token("fudge", 1, 3, 0, 3),
+-        token("that's", 1, 1, 0, 3),
+-        token("funny", 1, 1, 0, 3),
+-        token("happened", 1, 1, 4, 12)
+-      });
+-
+-
+-    TokenStream out = new FlattenGraphFilter(in);
+-
+-    // ... but on output, it's flattened to wtf/what/wow that's/the fudge/funny happened:
+-    assertTokenStreamContents(out,
+-                              new String[] {"wtf", "what", "wow", "the", "that's", "fudge", "funny", "happened"},
+-                              new int[] {0, 0, 0, 0, 0, 0, 0, 4},
+-                              new int[] {3, 3, 3, 3, 3, 3, 3, 12},
+-                              new int[] {1, 0, 0, 1, 0, 1, 0, 1},
+-                              new int[] {3, 1, 1, 1, 1, 1, 1, 1},
+-                              12);
+-    
+-  }
+-
+-  /** Same as testWTF1 except the "wtf" token comes out later */
+-  public void testWTF2() throws Exception {
+-
+-    // "wow that's funny" and "what the fudge" are separate side paths, in parallel with "wtf", on input:
+-    TokenStream in = new CannedTokenStream(0, 12, new Token[] {
+-        token("what", 1, 1, 0, 3),
+-        token("wow", 0, 3, 0, 3),
+-        token("wtf", 0, 5, 0, 3),
+-        token("the", 1, 1, 0, 3),
+-        token("fudge", 1, 3, 0, 3),
+-        token("that's", 1, 1, 0, 3),
+-        token("funny", 1, 1, 0, 3),
+-        token("happened", 1, 1, 4, 12)
+-      });
+-
+-
+-    TokenStream out = new FlattenGraphFilter(in);
+-
+-    // ... but on output, it's flattened to wtf/what/wow that's/the fudge/funny happened:
+-    assertTokenStreamContents(out,
+-                              new String[] {"what", "wow", "wtf", "the", "that's", "fudge", "funny", "happened"},
+-                              new int[] {0, 0, 0, 0, 0, 0, 0, 4},
+-                              new int[] {3, 3, 3, 3, 3, 3, 3, 12},
+-                              new int[] {1, 0, 0, 1, 0, 1, 0, 1},
+-                              new int[] {1, 1, 3, 1, 1, 1, 1, 1},
+-                              12);
+-    
+-  }
+-
+-  public void testNonGreedySynonyms() throws Exception {
+-    // This is just "hypothetical" for Lucene today, because SynFilter is
+-    // greedy: when two syn rules match on overlapping tokens, only one
+-    // (greedily) wins.  This test pretends all syn matches could match:
+-
+-    TokenStream in = new CannedTokenStream(0, 20, new Token[] {
+-        token("wizard", 1, 1, 0, 6),
+-        token("wizard_of_oz", 0, 3, 0, 12),
+-        token("of", 1, 1, 7, 9),
+-        token("oz", 1, 1, 10, 12),
+-        token("oz_screams", 0, 2, 10, 20),
+-        token("screams", 1, 1, 13, 20),
+-      });
+-
+-
+-    TokenStream out = new FlattenGraphFilter(in);
+-
+-    // ... but on output, it's flattened to wtf/what/wow that's/the fudge/funny happened:
+-    assertTokenStreamContents(out,
+-                              new String[] {"wizard", "wizard_of_oz", "of", "oz", "oz_screams", "screams"},
+-                              new int[] {0, 0, 7, 10, 10, 13},
+-                              new int[] {6, 12, 9, 12, 20, 20},
+-                              new int[] {1, 0, 1, 1, 0, 1},
+-                              new int[] {1, 3, 1, 1, 2, 1},
+-                              20);
+-    
+-  }
+-
+-  public void testNonGraph() throws Exception {
+-    TokenStream in = new CannedTokenStream(0, 22, new Token[] {
+-        token("hello", 1, 1, 0, 5),
+-        token("pseudo", 1, 1, 6, 12),
+-        token("world", 1, 1, 13, 18),
+-        token("fun", 1, 1, 19, 22),
+-      });
+-
+-
+-    TokenStream out = new FlattenGraphFilter(in);
+-
+-    // ... but on output, it's flattened to wtf/what/wow that's/the fudge/funny happened:
+-    assertTokenStreamContents(out,
+-                              new String[] {"hello", "pseudo", "world", "fun"},
+-                              new int[] {0, 6, 13, 19},
+-                              new int[] {5, 12, 18, 22},
+-                              new int[] {1, 1, 1, 1},
+-                              new int[] {1, 1, 1, 1},
+-                              22);
+-  }
+-
+-  public void testSimpleHole() throws Exception {
+-    TokenStream in = new CannedTokenStream(0, 13, new Token[] {
+-        token("hello", 1, 1, 0, 5),
+-        token("hole", 2, 1, 6, 10),
+-        token("fun", 1, 1, 11, 13),
+-      });
+-
+-
+-    TokenStream out = new FlattenGraphFilter(in);
+-
+-    // ... but on output, it's flattened to wtf/what/wow that's/the fudge/funny happened:
+-    assertTokenStreamContents(out,
+-                              new String[] {"hello", "hole", "fun"},
+-                              new int[] {0, 6, 11},
+-                              new int[] {5, 10, 13},
+-                              new int[] {1, 2, 1},
+-                              new int[] {1, 1, 1},
+-                              13);
+-  }
+-
+-  public void testHoleUnderSyn() throws Exception {
+-    // Tests a StopFilter after SynFilter where a stopword in a syn is removed
+-    //
+-    //   wizard of oz -> woz syn, but then "of" becomes a hole
+-
+-    TokenStream in = new CannedTokenStream(0, 12, new Token[] {
+-        token("wizard", 1, 1, 0, 6),
+-        token("woz", 0, 3, 0, 12),
+-        token("oz", 2, 1, 10, 12),
+-      });
+-
+-
+-    TokenStream out = new FlattenGraphFilter(in);
+-
+-    assertTokenStreamContents(out,
+-                              new String[] {"wizard", "woz", "oz"},
+-                              new int[] {0, 0, 10},
+-                              new int[] {6, 12, 12},
+-                              new int[] {1, 0, 2},
+-                              new int[] {1, 3, 1},
+-                              12);
+-  }
+-
+-  public void testStrangelyNumberedNodes() throws Exception {
+-
+-    // Uses only nodes 0, 2, 3, i.e. 1 is just never used (it is not a hole!!)
+-    TokenStream in = new CannedTokenStream(0, 27, new Token[] {
+-        token("dog", 1, 3, 0, 5),
+-        token("puppy", 0, 3, 0, 5),
+-        token("flies", 3, 1, 6, 11),
+-      });
+-
+-    TokenStream out = new FlattenGraphFilter(in);
+-
+-    assertTokenStreamContents(out,
+-                              new String[] {"dog", "puppy", "flies"},
+-                              new int[] {0, 0, 6},
+-                              new int[] {5, 5, 11},
+-                              new int[] {1, 0, 1},
+-                              new int[] {1, 1, 1},
+-                              27);
+-  }
+-
+-  public void testTwoLongParallelPaths() throws Exception {
+-
+-    // "a a a a a a" in parallel with "b b b b b b"
+-    TokenStream in = new CannedTokenStream(0, 11, new Token[] {
+-        token("a", 1, 1, 0, 1),
+-        token("b", 0, 2, 0, 1),
+-        token("a", 1, 2, 2, 3),
+-        token("b", 1, 2, 2, 3),
+-        token("a", 1, 2, 4, 5),
+-        token("b", 1, 2, 4, 5),
+-        token("a", 1, 2, 6, 7),
+-        token("b", 1, 2, 6, 7),
+-        token("a", 1, 2, 8, 9),
+-        token("b", 1, 2, 8, 9),
+-        token("a", 1, 2, 10, 11),
+-        token("b", 1, 2, 10, 11),
+-      });
+-
+-
+-    TokenStream out = new FlattenGraphFilter(in);
+-    
+-    // ... becomes flattened to a single path with overlapping a/b token between each node:
+-    assertTokenStreamContents(out,
+-                              new String[] {"a", "b", "a", "b", "a", "b", "a", "b", "a", "b", "a", "b"},
+-                              new int[] {0, 0, 2, 2, 4, 4, 6, 6, 8, 8, 10, 10},
+-                              new int[] {1, 1, 3, 3, 5, 5, 7, 7, 9, 9, 11, 11},
+-                              new int[] {1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0},
+-                              new int[] {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+-                              11);
+-    
+-  }
+-
+-  // NOTE: TestSynonymGraphFilter's testRandomSyns also tests FlattenGraphFilter
+-}
+diff --git a/lucene/analysis/common/src/test/org/apache/lucene/analysis/synonym/TestSynonymGraphFilter.java b/lucene/analysis/common/src/test/org/apache/lucene/analysis/synonym/TestSynonymGraphFilter.java
+index edf2d2a..e00a165 100644
+--- a/lucene/analysis/common/src/test/org/apache/lucene/analysis/synonym/TestSynonymGraphFilter.java
++++ b/lucene/analysis/common/src/test/org/apache/lucene/analysis/synonym/TestSynonymGraphFilter.java
+@@ -17,14 +17,22 @@
+ 
+ package org.apache.lucene.analysis.synonym;
+ 
++import java.io.IOException;
++import java.io.StringReader;
++import java.text.ParseException;
++import java.util.ArrayList;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++
+ import org.apache.lucene.analysis.Analyzer;
+ import org.apache.lucene.analysis.BaseTokenStreamTestCase;
+ import org.apache.lucene.analysis.MockAnalyzer;
+ import org.apache.lucene.analysis.MockGraphTokenFilter;
+ import org.apache.lucene.analysis.MockTokenizer;
+ import org.apache.lucene.analysis.TokenStream;
+-import org.apache.lucene.analysis.TokenStreamToAutomaton;
+ import org.apache.lucene.analysis.Tokenizer;
++import org.apache.lucene.analysis.core.FlattenGraphFilter;
+ import org.apache.lucene.analysis.tokenattributes.*;
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.Field;
+@@ -35,7 +43,6 @@ import org.apache.lucene.search.PhraseQuery;
+ import org.apache.lucene.store.ByteArrayDataInput;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.util.BytesRef;
+-import org.apache.lucene.util.BytesRefBuilder;
+ import org.apache.lucene.util.CharsRef;
+ import org.apache.lucene.util.CharsRefBuilder;
+ import org.apache.lucene.util.IOUtils;
+@@ -49,15 +56,6 @@ import org.apache.lucene.util.automaton.TooComplexToDeterminizeException;
+ import org.apache.lucene.util.automaton.Transition;
+ import org.apache.lucene.util.fst.Util;
+ 
+-import java.io.IOException;
+-import java.io.StringReader;
+-import java.text.ParseException;
+-import java.util.ArrayList;
+-import java.util.Arrays;
+-import java.util.HashSet;
+-import java.util.List;
+-import java.util.Set;
+-
+ public class TestSynonymGraphFilter extends BaseTokenStreamTestCase {
+ 
+   /** Set as a side effect by {@link #getAnalyzer} and {@link #getFlattenAnalyzer}. */
+@@ -1832,7 +1830,7 @@ public class TestSynonymGraphFilter extends BaseTokenStreamTestCase {
+                      new int[]      {1,        1,   0,        0,     0,        1,   0,        0,   1,    0,         1,    1,         1},
+                      new int[]      {1,        1,   1,        1,     4,        3,   1,        1,   2,    1,         1,    1,         1});
+     
+-    assertAllStrings(analyzer, "the usa is wealthy", new String[] {
++    assertGraphStrings(analyzer, "the usa is wealthy", new String[] {
+         "the usa is wealthy",
+         "the united states is wealthy",
+         "the u s a is wealthy",
+@@ -1924,33 +1922,4 @@ public class TestSynonymGraphFilter extends BaseTokenStreamTestCase {
+         new int[]{1, 1, 0, 1, 1});
+     a.close();
+   }
+-
+-  /**
+-   * Helper method to validate all strings that can be generated from a token stream.
+-   * Uses {@link TokenStreamToAutomaton} to create an automaton. Asserts the finite strings of the automaton are all
+-   * and only the given valid strings.
+-   * @param analyzer analyzer containing the SynonymFilter under test.
+-   * @param text text to be analyzed.
+-   * @param expectedStrings all expected finite strings.
+-   */
+-  public void assertAllStrings(Analyzer analyzer, String text, String[] expectedStrings) throws IOException {
+-    TokenStream tokenStream = analyzer.tokenStream("dummy", text);
+-    try {
+-      Automaton automaton = new TokenStreamToAutomaton().toAutomaton(tokenStream);
+-      Set<IntsRef> finiteStrings = AutomatonTestUtil.getFiniteStringsRecursive(automaton, -1);
+-
+-      assertEquals("Invalid resulting strings count. Expected " + expectedStrings.length + " was " + finiteStrings.size(),
+-          expectedStrings.length, finiteStrings.size());
+-
+-      Set<String> expectedStringsSet = new HashSet<>(Arrays.asList(expectedStrings));
+-
+-      BytesRefBuilder scratchBytesRefBuilder = new BytesRefBuilder();
+-      for (IntsRef ir: finiteStrings) {
+-        String s = Util.toBytesRef(ir, scratchBytesRefBuilder).utf8ToString().replace((char) TokenStreamToAutomaton.POS_SEP, ' ');
+-        assertTrue("Unexpected string found: " + s, expectedStringsSet.contains(s));
+-      }
+-    } finally {
+-      tokenStream.close();
+-    }
+-  }
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/analysis/TokenStreamToAutomaton.java b/lucene/core/src/java/org/apache/lucene/analysis/TokenStreamToAutomaton.java
+index 64bac66..0675abe 100644
+--- a/lucene/core/src/java/org/apache/lucene/analysis/TokenStreamToAutomaton.java
++++ b/lucene/core/src/java/org/apache/lucene/analysis/TokenStreamToAutomaton.java
+@@ -39,6 +39,7 @@ import org.apache.lucene.util.automaton.Automaton;
+ public class TokenStreamToAutomaton {
+ 
+   private boolean preservePositionIncrements;
++  private boolean finalOffsetGapAsHole;
+   private boolean unicodeArcs;
+ 
+   /** Sole constructor. */
+@@ -51,6 +52,11 @@ public class TokenStreamToAutomaton {
+     this.preservePositionIncrements = enablePositionIncrements;
+   }
+ 
++  /** If true, any final offset gaps will result in adding a position hole. */
++  public void setFinalOffsetGapAsHole(boolean finalOffsetGapAsHole) {
++    this.finalOffsetGapAsHole = finalOffsetGapAsHole;
++  }
++
+   /** Whether to make transition labels Unicode code points instead of UTF8 bytes, 
+    *  <code>false</code> by default */
+   public void setUnicodeArcs(boolean unicodeArcs) {
+@@ -118,7 +124,7 @@ public class TokenStreamToAutomaton {
+     int maxOffset = 0;
+     while (in.incrementToken()) {
+       int posInc = posIncAtt.getPositionIncrement();
+-      if (!preservePositionIncrements && posInc > 1) {
++      if (preservePositionIncrements == false && posInc > 1) {
+         posInc = 1;
+       }
+       assert pos > -1 || posInc > 0;
+@@ -201,10 +207,35 @@ public class TokenStreamToAutomaton {
+     }
+ 
+     in.end();
++
+     int endState = -1;
+-    if (offsetAtt.endOffset() > maxOffset) {
++
++    int endPosInc = posIncAtt.getPositionIncrement();
++
++    if (endPosInc == 0 && finalOffsetGapAsHole && offsetAtt.endOffset() > maxOffset) {
++      endPosInc = 1;
++    }
++    
++    if (endPosInc > 0) {
++      // there were hole(s) after the last token
+       endState = builder.createState();
+-      builder.setAccept(endState, true);
++
++      // add trailing holes now:
++      int lastState = endState;
++      while (true) {
++        int state1 = builder.createState();
++        builder.addTransition(lastState, state1, HOLE);
++        endPosInc--;
++        if (endPosInc == 0) {
++          builder.setAccept(state1, true);
++          break;
++        }
++        int state2 = builder.createState();
++        builder.addTransition(state1, state2, POS_SEP);
++        lastState = state2;
++      }
++    } else {
++      endState = -1;
+     }
+ 
+     pos++;
+@@ -219,7 +250,7 @@ public class TokenStreamToAutomaton {
+       }
+       pos++;
+     }
+-
++    
+     return builder.finish();
+   }
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/analysis/tokenattributes/OffsetAttributeImpl.java b/lucene/core/src/java/org/apache/lucene/analysis/tokenattributes/OffsetAttributeImpl.java
+index cdc5d42..166d6b2 100644
+--- a/lucene/core/src/java/org/apache/lucene/analysis/tokenattributes/OffsetAttributeImpl.java
++++ b/lucene/core/src/java/org/apache/lucene/analysis/tokenattributes/OffsetAttributeImpl.java
+@@ -43,7 +43,7 @@ public class OffsetAttributeImpl extends AttributeImpl implements OffsetAttribut
+     // OffsetAtt
+ 
+     if (startOffset < 0 || endOffset < startOffset) {
+-      throw new IllegalArgumentException("startOffset must be non-negative, and endOffset must be >= startOffset, "
++      throw new IllegalArgumentException("startOffset must be non-negative, and endOffset must be >= startOffset; got "
+           + "startOffset=" + startOffset + ",endOffset=" + endOffset);
+     }
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/analysis/tokenattributes/PackedTokenAttributeImpl.java b/lucene/core/src/java/org/apache/lucene/analysis/tokenattributes/PackedTokenAttributeImpl.java
+index c89a374..ad1e232 100644
+--- a/lucene/core/src/java/org/apache/lucene/analysis/tokenattributes/PackedTokenAttributeImpl.java
++++ b/lucene/core/src/java/org/apache/lucene/analysis/tokenattributes/PackedTokenAttributeImpl.java
+@@ -107,7 +107,7 @@ public class PackedTokenAttributeImpl extends CharTermAttributeImpl
+   @Override
+   public void setOffset(int startOffset, int endOffset) {
+     if (startOffset < 0 || endOffset < startOffset) {
+-      throw new IllegalArgumentException("startOffset must be non-negative, and endOffset must be >= startOffset, "
++      throw new IllegalArgumentException("startOffset must be non-negative, and endOffset must be >= startOffset; got "
+           + "startOffset=" + startOffset + ",endOffset=" + endOffset);
+     }
+     this.startOffset = startOffset;
+diff --git a/lucene/core/src/java/org/apache/lucene/analysis/tokenattributes/PositionIncrementAttributeImpl.java b/lucene/core/src/java/org/apache/lucene/analysis/tokenattributes/PositionIncrementAttributeImpl.java
+index 4d63d6f..e89fec1 100644
+--- a/lucene/core/src/java/org/apache/lucene/analysis/tokenattributes/PositionIncrementAttributeImpl.java
++++ b/lucene/core/src/java/org/apache/lucene/analysis/tokenattributes/PositionIncrementAttributeImpl.java
+@@ -30,8 +30,7 @@ public class PositionIncrementAttributeImpl extends AttributeImpl implements Pos
+   @Override
+   public void setPositionIncrement(int positionIncrement) {
+     if (positionIncrement < 0) {
+-      throw new IllegalArgumentException
+-        ("Increment must be zero or greater: got " + positionIncrement);
++      throw new IllegalArgumentException("Position increment must be zero or greater; got " + positionIncrement);
+     }
+     this.positionIncrement = positionIncrement;
+   }
+diff --git a/lucene/core/src/java/org/apache/lucene/analysis/tokenattributes/PositionLengthAttributeImpl.java b/lucene/core/src/java/org/apache/lucene/analysis/tokenattributes/PositionLengthAttributeImpl.java
+index 9bfdb49..d019a2b 100644
+--- a/lucene/core/src/java/org/apache/lucene/analysis/tokenattributes/PositionLengthAttributeImpl.java
++++ b/lucene/core/src/java/org/apache/lucene/analysis/tokenattributes/PositionLengthAttributeImpl.java
+@@ -30,8 +30,7 @@ public class PositionLengthAttributeImpl extends AttributeImpl implements Positi
+   @Override
+   public void setPositionLength(int positionLength) {
+     if (positionLength < 1) {
+-      throw new IllegalArgumentException
+-        ("Position length must be 1 or greater: got " + positionLength);
++      throw new IllegalArgumentException("Position length must be 1 or greater; got " + positionLength);
+     }
+     this.positionLength = positionLength;
+   }
+diff --git a/lucene/core/src/test/org/apache/lucene/analysis/TestGraphTokenizers.java b/lucene/core/src/test/org/apache/lucene/analysis/TestGraphTokenizers.java
+index 8899dd1..7e98662 100644
+--- a/lucene/core/src/test/org/apache/lucene/analysis/TestGraphTokenizers.java
++++ b/lucene/core/src/test/org/apache/lucene/analysis/TestGraphTokenizers.java
+@@ -21,16 +21,22 @@ import java.io.PrintWriter;
+ import java.io.StringWriter;
+ import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.HashSet;
+ import java.util.List;
+ import java.util.Random;
++import java.util.Set;
+ 
+ import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
+ import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
+ import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
+ import org.apache.lucene.analysis.tokenattributes.PositionLengthAttribute;
++import org.apache.lucene.util.BytesRefBuilder;
++import org.apache.lucene.util.IntsRef;
+ import org.apache.lucene.util.automaton.Automata;
+ import org.apache.lucene.util.automaton.Automaton;
++import org.apache.lucene.util.automaton.AutomatonTestUtil;
+ import org.apache.lucene.util.automaton.Operations;
++import org.apache.lucene.util.fst.Util;
+ 
+ import static org.apache.lucene.util.automaton.Operations.DEFAULT_MAX_DETERMINIZED_STATES;
+ 
+@@ -565,7 +571,13 @@ public class TestGraphTokenizers extends BaseTokenStreamTestCase {
+     assertSameLanguage(join(HOLE_A, SEP_A, s2a("abc")), ts);
+   }
+ 
+-  // TODO: testEndsWithHole... but we need posInc to set in TS.end()
++  public void testEndsWithHole() throws Exception {
++    final TokenStream ts = new CannedTokenStream(1, 0,
++                                                 new Token[] {
++                                                   token("abc", 2, 1),
++                                                 });
++    assertSameLanguage(join(HOLE_A, SEP_A, s2a("abc"), SEP_A, HOLE_A), ts);
++  }
+ 
+   public void testSynHangingOverEnd() throws Exception {
+     final TokenStream ts = new CannedTokenStream(
+@@ -576,14 +588,47 @@ public class TestGraphTokenizers extends BaseTokenStreamTestCase {
+     assertSameLanguage(Operations.union(s2a("a"), s2a("X")), ts);
+   }
+ 
++  /** Returns all paths */
++  private Set<String> toPathStrings(Automaton a) {
++    BytesRefBuilder scratchBytesRefBuilder = new BytesRefBuilder();
++    Set<String> paths = new HashSet<>();
++    for (IntsRef ir: AutomatonTestUtil.getFiniteStringsRecursive(a, -1)) {
++      paths.add(Util.toBytesRef(ir, scratchBytesRefBuilder).utf8ToString().replace((char) TokenStreamToAutomaton.POS_SEP, ' '));
++    }
++    return paths;
++  }
++
+   private void assertSameLanguage(Automaton expected, TokenStream ts) throws IOException {
+     assertSameLanguage(expected, new TokenStreamToAutomaton().toAutomaton(ts));
+   }
+ 
+   private void assertSameLanguage(Automaton expected, Automaton actual) {
+-    assertTrue(Operations.sameLanguage(
+-      Operations.determinize(Operations.removeDeadStates(expected), DEFAULT_MAX_DETERMINIZED_STATES),
+-      Operations.determinize(Operations.removeDeadStates(actual), DEFAULT_MAX_DETERMINIZED_STATES)));
++    Automaton expectedDet = Operations.determinize(Operations.removeDeadStates(expected), DEFAULT_MAX_DETERMINIZED_STATES);
++    Automaton actualDet = Operations.determinize(Operations.removeDeadStates(actual), DEFAULT_MAX_DETERMINIZED_STATES);
++    if (Operations.sameLanguage(expectedDet, actualDet) == false) {
++      Set<String> expectedPaths = toPathStrings(expectedDet);
++      Set<String> actualPaths = toPathStrings(actualDet);
++      StringBuilder b = new StringBuilder();
++      b.append("expected:\n");
++      for(String path : expectedPaths) {
++        b.append("  ");
++        b.append(path);
++        if (actualPaths.contains(path) == false) {
++          b.append(" [missing!]");
++        }
++        b.append('\n');
++      }
++      b.append("actual:\n");
++      for(String path : actualPaths) {
++        b.append("  ");
++        b.append(path);
++        if (expectedPaths.contains(path) == false) {
++          b.append(" [unexpected!]");
++        }
++        b.append('\n');
++      }
++      fail("accepted language is different:\n\n" + b.toString());
++    }
+   }
+ 
+   public void testTokenStreamGraphWithHoles() throws Exception {
+diff --git a/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/AnalyzingSuggester.java b/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/AnalyzingSuggester.java
+index 19982a5..9c6a624 100644
+--- a/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/AnalyzingSuggester.java
++++ b/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/AnalyzingSuggester.java
+@@ -332,6 +332,7 @@ public class AnalyzingSuggester extends Lookup implements Accountable {
+   TokenStreamToAutomaton getTokenStreamToAutomaton() {
+     final TokenStreamToAutomaton tsta = new TokenStreamToAutomaton();
+     tsta.setPreservePositionIncrements(preservePositionIncrements);
++    tsta.setFinalOffsetGapAsHole(true);
+     return tsta;
+   }
+   
+@@ -865,7 +866,7 @@ public class AnalyzingSuggester extends Lookup implements Accountable {
+     // Turn tokenstream into automaton:
+     Automaton automaton = null;
+     try (TokenStream ts = queryAnalyzer.tokenStream("", key.toString())) {
+-        automaton = getTokenStreamToAutomaton().toAutomaton(ts);
++      automaton = getTokenStreamToAutomaton().toAutomaton(ts);
+     }
+ 
+     automaton = replaceSep(automaton);
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/analysis/BaseTokenStreamTestCase.java b/lucene/test-framework/src/java/org/apache/lucene/analysis/BaseTokenStreamTestCase.java
+index 924756e..070eab2 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/analysis/BaseTokenStreamTestCase.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/analysis/BaseTokenStreamTestCase.java
+@@ -41,11 +41,16 @@ import org.apache.lucene.util.Attribute;
+ import org.apache.lucene.util.AttributeFactory;
+ import org.apache.lucene.util.AttributeImpl;
+ import org.apache.lucene.util.AttributeReflector;
++import org.apache.lucene.util.BytesRefBuilder;
+ import org.apache.lucene.util.IOUtils;
++import org.apache.lucene.util.IntsRef;
+ import org.apache.lucene.util.LineFileDocs;
+ import org.apache.lucene.util.LuceneTestCase;
+ import org.apache.lucene.util.Rethrow;
+ import org.apache.lucene.util.TestUtil;
++import org.apache.lucene.util.automaton.Automaton;
++import org.apache.lucene.util.automaton.AutomatonTestUtil;
++import org.apache.lucene.util.fst.Util;
+ 
+ /** 
+  * Base class for all Lucene unit tests that use TokenStreams. 
+@@ -166,6 +171,8 @@ public abstract class BaseTokenStreamTestCase extends LuceneTestCase {
+     final Map<Integer,Integer> posToStartOffset = new HashMap<>();
+     final Map<Integer,Integer> posToEndOffset = new HashMap<>();
+ 
++    // TODO: would be nice to be able to assert silly duplicated tokens are not created, but a number of cases do this "legitimately": LUCENE-7622
++
+     ts.reset();
+     int pos = -1;
+     int lastStartOffset = 0;
+@@ -182,7 +189,7 @@ public abstract class BaseTokenStreamTestCase extends LuceneTestCase {
+       checkClearAtt.getAndResetClearCalled(); // reset it, because we called clearAttribute() before
+       assertTrue("token "+i+" does not exist", ts.incrementToken());
+       assertTrue("clearAttributes() was not called correctly in TokenStream chain", checkClearAtt.getAndResetClearCalled());
+-      
++
+       assertEquals("term "+i, output[i], termAtt.toString());
+       if (startOffsets != null) {
+         assertEquals("startOffset " + i + " term=" + termAtt, startOffsets[i], offsetAtt.startOffset());
+@@ -261,12 +268,12 @@ public abstract class BaseTokenStreamTestCase extends LuceneTestCase {
+         }
+       }
+       if (posLengthAtt != null) {
+-        assertTrue("posLength must be >= 1", posLengthAtt.getPositionLength() >= 1);
++        assertTrue("posLength must be >= 1; got: " + posLengthAtt.getPositionLength(), posLengthAtt.getPositionLength() >= 1);
+       }
+     }
+ 
+     if (ts.incrementToken()) {
+-      fail("TokenStream has more tokens than expected (expected count=" + output.length + "); extra token=" + termAtt);
++      fail("TokenStream has more tokens than expected (expected count=" + output.length + "); extra token=" + ts.getAttribute(CharTermAttribute.class));
+     }
+ 
+     // repeat our extra safety checks for end()
+@@ -977,4 +984,105 @@ public abstract class BaseTokenStreamTestCase extends LuceneTestCase {
+   public static AttributeFactory newAttributeFactory() {
+     return newAttributeFactory(random());
+   }
++
++  private static String toString(Set<String> strings) {
++    List<String> stringsList = new ArrayList<>(strings);
++    Collections.sort(stringsList);
++    StringBuilder b = new StringBuilder();
++    for(String s : stringsList) {
++      b.append("  ");
++      b.append(s);
++      b.append('\n');
++    }
++    return b.toString();
++  }
++
++  /**
++   * Enumerates all accepted strings in the token graph created by the analyzer on the provided text, and then
++   * asserts that it's equal to the expected strings.
++   * Uses {@link TokenStreamToAutomaton} to create an automaton. Asserts the finite strings of the automaton are all
++   * and only the given valid strings.
++   * @param analyzer analyzer containing the SynonymFilter under test.
++   * @param text text to be analyzed.
++   * @param expectedStrings all expected finite strings.
++   */
++  public static void assertGraphStrings(Analyzer analyzer, String text, String... expectedStrings) throws IOException {
++    checkAnalysisConsistency(random(), analyzer, true, text, true);
++    try (TokenStream tokenStream = analyzer.tokenStream("dummy", text)) {
++      assertGraphStrings(tokenStream, expectedStrings);
++    }
++  }
++
++  /**
++   * Enumerates all accepted strings in the token graph created by the already initialized {@link TokenStream}.
++   */
++  public static void assertGraphStrings(TokenStream tokenStream, String... expectedStrings) throws IOException {
++    Automaton automaton = new TokenStreamToAutomaton().toAutomaton(tokenStream);
++    Set<IntsRef> actualStringPaths = AutomatonTestUtil.getFiniteStringsRecursive(automaton, -1);
++
++    Set<String> expectedStringsSet = new HashSet<>(Arrays.asList(expectedStrings));
++
++    BytesRefBuilder scratchBytesRefBuilder = new BytesRefBuilder();
++    Set<String> actualStrings = new HashSet<>();
++    for (IntsRef ir: actualStringPaths) {
++      actualStrings.add(Util.toBytesRef(ir, scratchBytesRefBuilder).utf8ToString().replace((char) TokenStreamToAutomaton.POS_SEP, ' '));
++    }
++    for (String s : actualStrings) {
++      assertTrue("Analyzer created unexpected string path: " + s + "\nexpected:\n" + toString(expectedStringsSet) + "\nactual:\n" + toString(actualStrings), expectedStringsSet.contains(s));
++    }
++    for (String s : expectedStrings) {
++      assertTrue("Analyzer created unexpected string path: " + s + "\nexpected:\n" + toString(expectedStringsSet) + "\nactual:\n" + toString(actualStrings), actualStrings.contains(s));
++    }
++  }
++
++  /** Returns all paths accepted by the token stream graph produced by analyzing text with the provided analyzer.  The tokens {@link
++   *  CharTermAttribute} values are concatenated, and separated with space. */
++  public static Set<String> getGraphStrings(Analyzer analyzer, String text) throws IOException {
++    try(TokenStream tokenStream = analyzer.tokenStream("dummy", text)) {
++      return getGraphStrings(tokenStream);
++    }
++  }
++
++  /** Returns all paths accepted by the token stream graph produced by the already initialized {@link TokenStream}. */
++  public static Set<String> getGraphStrings(TokenStream tokenStream) throws IOException {
++    Automaton automaton = new TokenStreamToAutomaton().toAutomaton(tokenStream);
++    Set<IntsRef> actualStringPaths = AutomatonTestUtil.getFiniteStringsRecursive(automaton, -1);
++    BytesRefBuilder scratchBytesRefBuilder = new BytesRefBuilder();
++    Set<String> paths = new HashSet<>();
++    for (IntsRef ir: actualStringPaths) {
++      paths.add(Util.toBytesRef(ir, scratchBytesRefBuilder).utf8ToString().replace((char) TokenStreamToAutomaton.POS_SEP, ' '));
++    }
++    return paths;
++  }
++
++  /** Returns a {@code String} summary of the tokens this analyzer produces on this text */
++  public static String toString(Analyzer analyzer, String text) throws IOException {
++    try(TokenStream ts = analyzer.tokenStream("field", text)) {
++      StringBuilder b = new StringBuilder();
++      CharTermAttribute termAtt = ts.getAttribute(CharTermAttribute.class);
++      PositionIncrementAttribute posIncAtt = ts.getAttribute(PositionIncrementAttribute.class);
++      PositionLengthAttribute posLengthAtt = ts.getAttribute(PositionLengthAttribute.class);
++      OffsetAttribute offsetAtt = ts.getAttribute(OffsetAttribute.class);
++      assertNotNull(offsetAtt);
++      ts.reset();
++      int pos = -1;
++      while (ts.incrementToken()) {
++        pos += posIncAtt.getPositionIncrement();
++        b.append(termAtt);
++        b.append(" at pos=");
++        b.append(pos);
++        if (posLengthAtt != null) {
++          b.append(" to pos=");
++          b.append(pos + posLengthAtt.getPositionLength());
++        }
++        b.append(" offsets=");
++        b.append(offsetAtt.startOffset());
++        b.append('-');
++        b.append(offsetAtt.endOffset());
++        b.append('\n');
++      }
++      ts.end();
++      return b.toString();
++    }
++  }
+ }
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/analysis/TokenStreamToDot.java b/lucene/test-framework/src/java/org/apache/lucene/analysis/TokenStreamToDot.java
+index 4e8eeb8..9d449e3 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/analysis/TokenStreamToDot.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/analysis/TokenStreamToDot.java
+@@ -88,12 +88,18 @@ public class TokenStreamToDot {
+       }
+ 
+       String arcLabel = termAtt.toString();
++      System.out.println("TOKEN " + arcLabel);
++      System.out.println("  posInc=" + posInc);
++      System.out.println("  posLen=" + posLengthAtt.getPositionLength());
+       if (offsetAtt != null) {
+         final int startOffset = offsetAtt.startOffset();
+         final int endOffset = offsetAtt.endOffset();
+         //System.out.println("start=" + startOffset + " end=" + endOffset + " len=" + inputText.length());
+         if (inputText != null) {
+-          arcLabel += " / " + inputText.substring(startOffset, endOffset);
++          String fragment = inputText.substring(startOffset, endOffset);
++          if (fragment.equals(termAtt.toString()) == false) {
++            arcLabel += " / " + fragment;
++          }
+         } else {
+           arcLabel += " / " + startOffset + "-" + endOffset;
+         }

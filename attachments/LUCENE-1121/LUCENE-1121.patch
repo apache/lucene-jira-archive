@@ -1,0 +1,245 @@
+Index: src/java/org/apache/lucene/index/CompoundFileWriter.java
+===================================================================
+--- src/java/org/apache/lucene/index/CompoundFileWriter.java	(revision 613620)
++++ src/java/org/apache/lucene/index/CompoundFileWriter.java	(working copy)
+@@ -165,12 +165,11 @@
+ 
+             // Open the files and copy their data into the stream.
+             // Remember the locations of each file's data section.
+-            byte buffer[] = new byte[16384];
+             it = entries.iterator();
+             while(it.hasNext()) {
+                 FileEntry fe = (FileEntry) it.next();
+                 fe.dataOffset = os.getFilePointer();
+-                copyFile(fe, os, buffer);
++                copyFile(fe, os);
+             }
+ 
+             // Write the data offsets into the directory of the compound stream
+@@ -195,10 +194,8 @@
+     }
+ 
+     /** Copy the contents of the file with specified extension into the
+-     *  provided output stream. Use the provided buffer for moving data
+-     *  to reduce memory allocation.
+-     */
+-    private void copyFile(FileEntry source, IndexOutput os, byte buffer[])
++     *  provided output stream. */
++    private void copyFile(FileEntry source, IndexOutput os)
+     throws IOException
+     {
+         IndexInput is = null;
+@@ -206,35 +203,36 @@
+             long startPtr = os.getFilePointer();
+ 
+             is = directory.openInput(source.file);
+-            long length = is.length();
+-            long remainder = length;
+-            int chunk = buffer.length;
++            final long inputSize = is.length();
+ 
+-            while(remainder > 0) {
+-                int len = (int) Math.min(chunk, remainder);
+-                is.readBytes(buffer, 0, len);
+-                os.writeBytes(buffer, len);
+-                remainder -= len;
+-                if (checkAbort != null)
+-                  // Roughly every 2 MB we will check if
+-                  // it's time to abort
+-                  checkAbort.work(80);
++            final long chunkSize;
++            if (checkAbort != null)
++              // Do it (large) chunks so we can check for
++              // abort after each chunk:
++              chunkSize = 10*1024*1024;
++            else
++              chunkSize = Long.MAX_VALUE;
++
++            long left = inputSize;
++            while (left > 0) {
++              final long inc;
++              if (left > chunkSize)
++                inc = chunkSize;
++              else
++                inc = left;
++              os.copyBytes(is, inc);
++              left -= inc;
++              if (checkAbort != null)
++                checkAbort.work(10000);
+             }
+ 
+-            // Verify that remainder is 0
+-            if (remainder != 0)
+-                throw new IOException(
+-                    "Non-zero remainder length after copying: " + remainder
+-                    + " (id: " + source.file + ", length: " + length
+-                    + ", buffer size: " + chunk + ")");
+-
+             // Verify that the output length diff is equal to original file
+             long endPtr = os.getFilePointer();
+             long diff = endPtr - startPtr;
+-            if (diff != length)
++            if (diff != is.length())
+                 throw new IOException(
+                     "Difference in the output file offsets " + diff
+-                    + " does not match the original file length " + length);
++                    + " does not match the original file length " + is.length());
+ 
+         } finally {
+             if (is != null) is.close();
+Index: src/java/org/apache/lucene/store/BufferedIndexOutput.java
+===================================================================
+--- src/java/org/apache/lucene/store/BufferedIndexOutput.java	(revision 613620)
++++ src/java/org/apache/lucene/store/BufferedIndexOutput.java	(working copy)
+@@ -121,7 +121,8 @@
+    * @see #getFilePointer()
+    */
+   public void seek(long pos) throws IOException {
+-    flush();
++    if (bufferPosition > 0)
++      flush();
+     bufferStart = pos;
+   }
+ 
+Index: src/java/org/apache/lucene/store/FSDirectory.java
+===================================================================
+--- src/java/org/apache/lucene/store/FSDirectory.java	(revision 613620)
++++ src/java/org/apache/lucene/store/FSDirectory.java	(working copy)
+@@ -22,11 +22,13 @@
+ import java.io.FileOutputStream;
+ import java.io.IOException;
+ import java.io.RandomAccessFile;
++import java.nio.channels.FileChannel;
+ import java.security.MessageDigest;
+ import java.security.NoSuchAlgorithmException;
+ import java.util.Hashtable;
+ 
+ import org.apache.lucene.index.IndexFileNameFilter;
++import org.apache.lucene.util.Constants;
+ 
+ // Used only for WRITE_LOCK_NAME in deprecated create=true case:
+ import org.apache.lucene.index.IndexWriter;
+@@ -82,6 +84,20 @@
+     return FSDirectory.disableLocks;
+   }
+ 
++  public final static int COPY_BYTES_BUFFER = 0;
++  public final static int COPY_BYTES_TRANSFER_TO = 1;
++  private int copyBytesMethod;
++
++  public void setCopyBytesMethod(int method) {
++    if (method != COPY_BYTES_BUFFER && method != COPY_BYTES_TRANSFER_TO)
++      throw new IllegalArgumentException("method must be either COPY_BYTES_BUFFER or COPY_BYTES_TRANSFER_TO");
++    copyBytesMethod = method;
++  }
++
++  public int getCopyBytesMethod() {
++    return copyBytesMethod;
++  }
++
+   /**
+    * Directory specified by <code>org.apache.lucene.lockDir</code>
+    * or <code>java.io.tmpdir</code> system property.
+@@ -263,6 +279,14 @@
+ 
+     directory = path;
+ 
++    // On Windows, sometimes FileChannel.transferTo is
++    // extremely slow; so, we default to using buffer.  See
++    // LUCENE-1121:
++    if (Constants.WINDOWS)
++      copyBytesMethod = COPY_BYTES_BUFFER;
++    else
++      copyBytesMethod = COPY_BYTES_TRANSFER_TO;
++
+     boolean doClearLockID = false;
+ 
+     if (lockFactory == null) {
+@@ -432,7 +456,7 @@
+     if (file.exists() && !file.delete())          // delete existing, if any
+       throw new IOException("Cannot overwrite: " + file);
+ 
+-    return new FSIndexOutput(file);
++    return new FSIndexOutput(file, copyBytesMethod);
+   }
+ 
+   // Inherit javadoc
+@@ -525,6 +549,7 @@
+     }
+   
+     private final Descriptor file;
++    private final FileChannel fileChannel;
+     boolean isClone;
+   
+     public FSIndexInput(File path) throws IOException {
+@@ -534,7 +559,12 @@
+     public FSIndexInput(File path, int bufferSize) throws IOException {
+       super(bufferSize);
+       file = new Descriptor(path, "r");
++      fileChannel = file.getChannel();
+     }
++
++    FileChannel getFileChannel() {
++      return fileChannel;
++    }
+   
+     /** IndexInput methods */
+     protected void readInternal(byte[] b, int offset, int len)
+@@ -583,15 +613,23 @@
+   }
+ 
+   protected static class FSIndexOutput extends BufferedIndexOutput {
+-    RandomAccessFile file = null;
+-  
++    private final RandomAccessFile file;
++    private final FileChannel fileChannel;
++    private final int copyBytesMethod;
++
+     // remember if the file is open, so that we don't try to close it
+     // more than once
+     private boolean isOpen;
+ 
+     public FSIndexOutput(File path) throws IOException {
++      this(path, COPY_BYTES_BUFFER);
++    }
++  
++    public FSIndexOutput(File path, int copyBytesMethod) throws IOException {
+       file = new RandomAccessFile(path, "rw");
++      fileChannel = file.getChannel();
+       isOpen = true;
++      this.copyBytesMethod = copyBytesMethod;
+     }
+   
+     /** output methods: */
+@@ -606,6 +644,31 @@
+         isOpen = false;
+       }
+     }
++
++    public void copyBytes(IndexInput input, long numBytes) throws IOException {
++
++      // If we are copying from an FSIndexInput, and, it's a
++      // large copy (bigger than our buffer size), then use
++      // nio.transferTo for faster copy
++      if (copyBytesMethod == COPY_BYTES_TRANSFER_TO && numBytes >= BUFFER_SIZE && input instanceof FSIndexInput) {
++
++        final FileChannel in = ((FSIndexInput) input).getFileChannel();
++
++        final long inputPos = input.getFilePointer();
++        final long outputPos = getFilePointer();
++
++        flush();
++
++        long copied = in.transferTo(inputPos, numBytes, fileChannel);
++        if (copied != numBytes)
++          throw new IOException("failed to copy all bytes: only copied " + copied + " out of " + numBytes);
++
++        seek(outputPos+numBytes);
++        input.seek(inputPos + numBytes);
++        
++      } else
++        super.copyBytes(input, numBytes);
++    }
+   
+     /** Random-access methods */
+     public void seek(long pos) throws IOException {

@@ -1,0 +1,157 @@
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index a440f9567a..b141e4538e 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -169,6 +169,10 @@ Bug Fixes
+   shared with another reader with no CacheHelper (Alan Woodward, Simon Willnauer,
+   Adrien Grand)
+ 
++* LUCENE-8275: Push up #checkPendingDeletes to Directory to ensure IW fails if 
++  the directory has pending deletes files even if the directory is filtered or 
++  a FileSwitchDirectory (Simon Willnauer, Robert Muir)
++
+ Other
+ 
+ * LUCENE-8228: removed obsolete IndexDeletionPolicy clone() requirements from
+diff --git a/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java b/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java
+index d72d856582..9edd490ea3 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java
++++ b/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java
+@@ -53,6 +53,7 @@ import org.apache.lucene.search.Sort;
+ import org.apache.lucene.store.AlreadyClosedException;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.FSDirectory;
++import org.apache.lucene.store.FilterDirectory;
+ import org.apache.lucene.store.FlushInfo;
+ import org.apache.lucene.store.IOContext;
+ import org.apache.lucene.store.Lock;
+@@ -704,7 +705,7 @@ public class IndexWriter implements Closeable, TwoPhaseCommit, Accountable {
+    *           IO error
+    */
+   public IndexWriter(Directory d, IndexWriterConfig conf) throws IOException {
+-    if (d instanceof FSDirectory && ((FSDirectory) d).checkPendingDeletions()) {
++    if (d.checkPendingDeletions()) {
+       throw new IllegalArgumentException("Directory " + d + " still has pending deleted files; cannot initialize IndexWriter");
+     }
+     enableTestPoints = isEnableTestPoints();
+diff --git a/lucene/core/src/java/org/apache/lucene/store/Directory.java b/lucene/core/src/java/org/apache/lucene/store/Directory.java
+index 3f9535b4ce..7597803798 100644
+--- a/lucene/core/src/java/org/apache/lucene/store/Directory.java
++++ b/lucene/core/src/java/org/apache/lucene/store/Directory.java
+@@ -171,4 +171,11 @@ public abstract class Directory implements Closeable {
+    * @throws AlreadyClosedException if this Directory is closed
+    */
+   protected void ensureOpen() throws AlreadyClosedException {}
++
++  /** Tries to delete any pending deleted files, and returns true if
++   *  there are still files that could not be deleted.
++   *  This method is optional and returns <code>false</code> by default. */
++  public boolean checkPendingDeletions() throws IOException {
++    return false;
++  }
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/store/FSDirectory.java b/lucene/core/src/java/org/apache/lucene/store/FSDirectory.java
+index 158a2e2303..7b465dfdc7 100644
+--- a/lucene/core/src/java/org/apache/lucene/store/FSDirectory.java
++++ b/lucene/core/src/java/org/apache/lucene/store/FSDirectory.java
+@@ -246,10 +246,11 @@ public abstract class FSDirectory extends BaseDirectory {
+   @Override
+   public IndexOutput createOutput(String name, IOContext context) throws IOException {
+     ensureOpen();
+-
+-    // If this file was pending delete, we are now bringing it back to life:
+-    pendingDeletes.remove(name);
+     maybeDeletePendingFiles();
++    // If this file was pending delete, we are now bringing it back to life:
++    if (pendingDeletes.remove(name)) {
++      privateDeleteFile(name, true); // try again to delete it - this is best effort
++    }
+     return new FSIndexOutput(name);
+   }
+ 
+@@ -293,9 +294,11 @@ public abstract class FSDirectory extends BaseDirectory {
+     if (pendingDeletes.contains(source)) {
+       throw new NoSuchFileException("file \"" + source + "\" is pending delete and cannot be moved");
+     }
+-    pendingDeletes.remove(dest);
+-    Files.move(directory.resolve(source), directory.resolve(dest), StandardCopyOption.ATOMIC_MOVE);
+     maybeDeletePendingFiles();
++    if (pendingDeletes.remove(dest)) {
++      privateDeleteFile(dest, true); // try again to delete it - this is best effort
++    }
++    Files.move(directory.resolve(source), directory.resolve(dest), StandardCopyOption.ATOMIC_MOVE);
+   }
+ 
+   @Override
+@@ -336,8 +339,7 @@ public abstract class FSDirectory extends BaseDirectory {
+     maybeDeletePendingFiles();
+   }
+ 
+-  /** Tries to delete any pending deleted files, and returns true if
+-   *  there are still files that could not be deleted. */
++  @Override
+   public boolean checkPendingDeletions() throws IOException {
+     deletePendingFiles();
+     return pendingDeletes.isEmpty() == false;
+diff --git a/lucene/core/src/java/org/apache/lucene/store/FileSwitchDirectory.java b/lucene/core/src/java/org/apache/lucene/store/FileSwitchDirectory.java
+index f0c46b1a4e..b2d94521fd 100644
+--- a/lucene/core/src/java/org/apache/lucene/store/FileSwitchDirectory.java
++++ b/lucene/core/src/java/org/apache/lucene/store/FileSwitchDirectory.java
+@@ -202,4 +202,9 @@ public class FileSwitchDirectory extends Directory {
+   public IndexInput openInput(String name, IOContext context) throws IOException {
+     return getDirectory(name).openInput(name, context);
+   }
++
++  @Override
++  public boolean checkPendingDeletions() throws IOException {
++    return primaryDir.checkPendingDeletions() && secondaryDir.checkPendingDeletions();
++  }
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/store/FilterDirectory.java b/lucene/core/src/java/org/apache/lucene/store/FilterDirectory.java
+index 897ce768a8..cc91c9e95f 100644
+--- a/lucene/core/src/java/org/apache/lucene/store/FilterDirectory.java
++++ b/lucene/core/src/java/org/apache/lucene/store/FilterDirectory.java
+@@ -114,4 +114,8 @@ public abstract class FilterDirectory extends Directory {
+     return getClass().getSimpleName() + "(" + in.toString() + ")";
+   }
+ 
++  @Override
++  public boolean checkPendingDeletions() throws IOException {
++    return in.checkPendingDeletions();
++  }
+ }
+diff --git a/lucene/core/src/test/org/apache/lucene/store/TestFilterDirectory.java b/lucene/core/src/test/org/apache/lucene/store/TestFilterDirectory.java
+index 6224140e3c..81b8fad2bb 100644
+--- a/lucene/core/src/test/org/apache/lucene/store/TestFilterDirectory.java
++++ b/lucene/core/src/test/org/apache/lucene/store/TestFilterDirectory.java
+@@ -28,7 +28,7 @@ import org.junit.Test;
+ public class TestFilterDirectory extends BaseDirectoryTestCase {
+ 
+   @Override
+-  protected Directory getDirectory(Path path) throws IOException {
++  protected Directory getDirectory(Path path) {
+     return new FilterDirectory(new RAMDirectory()) {};
+   }
+   
+diff --git a/lucene/replicator/src/java/org/apache/lucene/replicator/nrt/ReplicaNode.java b/lucene/replicator/src/java/org/apache/lucene/replicator/nrt/ReplicaNode.java
+index 291284e033..6366a5a7cc 100644
+--- a/lucene/replicator/src/java/org/apache/lucene/replicator/nrt/ReplicaNode.java
++++ b/lucene/replicator/src/java/org/apache/lucene/replicator/nrt/ReplicaNode.java
+@@ -83,7 +83,7 @@ public abstract class ReplicaNode extends Node {
+   public ReplicaNode(int id, Directory dir, SearcherFactory searcherFactory, PrintStream printStream) throws IOException {
+     super(id, dir, searcherFactory, printStream);
+ 
+-    if (dir instanceof FSDirectory && ((FSDirectory) dir).checkPendingDeletions()) {
++    if (dir.checkPendingDeletions()) {
+       throw new IllegalArgumentException("Directory " + dir + " still has pending deleted files; cannot initialize IndexWriter");
+     }
+ 
+@@ -200,7 +200,7 @@ public abstract class ReplicaNode extends Node {
+         assert deleter.getRefCount(segmentsFileName) == 1;
+         deleter.decRef(Collections.singleton(segmentsFileName));
+ 
+-        if (dir instanceof FSDirectory && ((FSDirectory) dir).checkPendingDeletions()) {
++        if (dir.checkPendingDeletions()) {
+           // If e.g. virus checker blocks us from deleting, we absolutely cannot start this node else there is a definite window during
+           // which if we carsh, we cause corruption:
+           throw new RuntimeException("replica cannot start: existing segments file=" + segmentsFileName + " must be removed in order to start, but the file delete failed");

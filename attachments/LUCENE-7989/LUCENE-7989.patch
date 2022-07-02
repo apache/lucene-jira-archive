@@ -1,0 +1,1093 @@
+diff --git a/lucene/core/src/java/org/apache/lucene/index/BinaryDocValuesWriter.java b/lucene/core/src/java/org/apache/lucene/index/BinaryDocValuesWriter.java
+index 2701a62..20346c8 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/BinaryDocValuesWriter.java
++++ b/lucene/core/src/java/org/apache/lucene/index/BinaryDocValuesWriter.java
+@@ -20,6 +20,7 @@ package org.apache.lucene.index;
+ import java.io.IOException;
+ 
+ import org.apache.lucene.codecs.DocValuesConsumer;
++import org.apache.lucene.codecs.DocValuesProducer;
+ import org.apache.lucene.search.DocIdSetIterator;
+ import org.apache.lucene.search.SortField;
+ import org.apache.lucene.store.DataInput;
+@@ -55,6 +56,7 @@ class BinaryDocValuesWriter extends DocValuesWriter {
+   private long bytesUsed;
+   private int lastDocID = -1;
+   private int maxLength = 0;
++  private PackedLongValues finalLengths;
+ 
+   public BinaryDocValuesWriter(FieldInfo fieldInfo, Counter iwBytesUsed) {
+     this.fieldInfo = fieldInfo;
+@@ -67,6 +69,18 @@ class BinaryDocValuesWriter extends DocValuesWriter {
+     iwBytesUsed.addAndGet(bytesUsed);
+   }
+ 
++  /** Invoked at flush for computed fields. */
++  public BinaryDocValuesWriter(FieldInfo fieldInfo, Counter iwBytesUsed, DocValuesProducer computed) throws IOException {
++    this(fieldInfo, iwBytesUsed);
++
++    // Now compute & record all values:
++    BinaryDocValues values = computed.getBinary(fieldInfo);
++    int docID;
++    while ((docID = values.nextDoc()) != NO_MORE_DOCS) {
++      addValue(docID, values.binaryValue());
++    }
++  }
++
+   public void addValue(int docID, BytesRef value) {
+     if (docID <= lastDocID) {
+       throw new IllegalArgumentException("DocValuesField \"" + fieldInfo.name + "\" appears more than once in this document (only one value is allowed per field)");
+@@ -122,14 +136,25 @@ class BinaryDocValuesWriter extends DocValuesWriter {
+     throw new IllegalArgumentException("It is forbidden to sort on a binary field");
+   }
+ 
++  BinaryDocValues getUnsortedDocValues() {
++    if (finalLengths == null) {
++      bytes.freeze(false);
++      finalLengths = lengths.build();
++    }
++    
++    return new BufferedBinaryDocValues(finalLengths, maxLength, bytes.getDataInput(), docsWithField.iterator());    
++  }
++
+   @Override
+   public void flush(SegmentWriteState state, Sorter.DocMap sortMap, DocValuesConsumer dvConsumer) throws IOException {
+-    bytes.freeze(false);
+-    final PackedLongValues lengths = this.lengths.build();
++    if (finalLengths == null) {
++      bytes.freeze(false);
++      finalLengths = lengths.build();
++    }
+     final SortingLeafReader.CachedBinaryDVs sorted;
+     if (sortMap != null) {
+       sorted = sortDocValues(state.segmentInfo.maxDoc(), sortMap,
+-          new BufferedBinaryDocValues(lengths, maxLength, bytes.getDataInput(), docsWithField.iterator()));
++          new BufferedBinaryDocValues(finalLengths, maxLength, bytes.getDataInput(), docsWithField.iterator()));
+     } else {
+       sorted = null;
+     }
+@@ -141,7 +166,7 @@ class BinaryDocValuesWriter extends DocValuesWriter {
+                                     throw new IllegalArgumentException("wrong fieldInfo");
+                                   }
+                                   if (sorted == null) {
+-                                    return new BufferedBinaryDocValues(lengths, maxLength, bytes.getDataInput(), docsWithField.iterator());
++                                    return new BufferedBinaryDocValues(finalLengths, maxLength, bytes.getDataInput(), docsWithField.iterator());
+                                   } else {
+                                     return new SortingLeafReader.SortingBinaryDocValues(sorted);
+                                   }
+diff --git a/lucene/core/src/java/org/apache/lucene/index/DefaultIndexingChain.java b/lucene/core/src/java/org/apache/lucene/index/DefaultIndexingChain.java
+index fd24105..5052356 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/DefaultIndexingChain.java
++++ b/lucene/core/src/java/org/apache/lucene/index/DefaultIndexingChain.java
+@@ -29,11 +29,15 @@ import java.util.Set;
+ import org.apache.lucene.analysis.TokenStream;
+ import org.apache.lucene.codecs.DocValuesConsumer;
+ import org.apache.lucene.codecs.DocValuesFormat;
++import org.apache.lucene.codecs.DocValuesProducer;
+ import org.apache.lucene.codecs.NormsConsumer;
+ import org.apache.lucene.codecs.NormsFormat;
+ import org.apache.lucene.codecs.PointsFormat;
+ import org.apache.lucene.codecs.PointsWriter;
++import org.apache.lucene.document.BinaryDocValuesField;
+ import org.apache.lucene.document.FieldType;
++import org.apache.lucene.document.NumericDocValuesField;
++import org.apache.lucene.document.SortedDocValuesField;
+ import org.apache.lucene.search.Sort;
+ import org.apache.lucene.search.SortField;
+ import org.apache.lucene.search.similarities.Similarity;
+@@ -87,6 +91,23 @@ final class DefaultIndexingChain extends DocConsumer {
+       termVectorsWriter = new SortingTermVectorsConsumer(docWriter);
+     }
+     termsHash = new FreqProxTermsWriter(docWriter, termVectorsWriter);
++
++    // Create FieldInfo instances up front for computed fields:
++    for (IndexWriterConfig.ComputedDocValuesField field : docWriter.indexWriterConfig.getComputedDocValuesFields()) {
++      switch (field.docValuesType) {
++      case NUMERIC:
++        getOrAddField(field.fieldName, NumericDocValuesField.TYPE, false);      
++        break;
++      case BINARY:
++        getOrAddField(field.fieldName, BinaryDocValuesField.TYPE, false);      
++        break;
++      case SORTED:
++        getOrAddField(field.fieldName, SortedDocValuesField.TYPE, false);      
++        break;
++      default:
++        throw new AssertionError("doc values type " + field.docValuesType + " not handled yet");
++      }
++    }
+   }
+ 
+   private Sorter.DocMap maybeSortSegment(SegmentWriteState state) throws IOException {
+@@ -99,12 +120,9 @@ final class DefaultIndexingChain extends DocConsumer {
+     for (int i = 0; i < indexSort.getSort().length; i++) {
+       SortField sortField = indexSort.getSort()[i];
+       PerField perField = getPerField(sortField.getField());
+-      if (perField != null && perField.docValuesWriter != null &&
+-          finishedDocValues.contains(perField.fieldInfo.name) == false) {
+-          perField.docValuesWriter.finish(state.segmentInfo.maxDoc());
+-          Sorter.DocComparator cmp = perField.docValuesWriter.getDocComparator(state.segmentInfo.maxDoc(), sortField);
+-          comparators.add(cmp);
+-          finishedDocValues.add(perField.fieldInfo.name);
++      if (perField != null && perField.docValuesWriter != null) {
++        maybeFinish(perField.fieldInfo.name, perField.docValuesWriter, state.segmentInfo.maxDoc());
++        comparators.add(perField.docValuesWriter.getDocComparator(state.segmentInfo.maxDoc(), sortField));
+       } else {
+         // safe to ignore, sort field with no values or already seen before
+       }
+@@ -114,12 +132,116 @@ final class DefaultIndexingChain extends DocConsumer {
+     return sorter.sort(state.segmentInfo.maxDoc(), comparators.toArray(new Sorter.DocComparator[comparators.size()]));
+   }
+ 
++  private void maybeFinish(String fieldName, DocValuesWriter writer, int maxDoc) {
++    if (finishedDocValues.contains(fieldName) == false) {
++      writer.finish(maxDoc);
++      finishedDocValues.add(fieldName);
++    }
++  }
++
++  /** Computes doc values fields and inserts new PerField instances. */
++  private final void addComputedDocValuesFields(SegmentWriteState state) throws IOException {
++    Map<String, DocValuesProducer> result = new HashMap<>();
++    DocValuesProducer segment = new DocValuesProducer() {
++        @Override
++        public NumericDocValues getNumeric(FieldInfo fieldInfo) throws IOException {
++          PerField perField = getPerField(fieldInfo.name);
++          if (perField != null && perField.docValuesWriter != null) {
++            maybeFinish(fieldInfo.name, perField.docValuesWriter, state.segmentInfo.maxDoc());
++            return ((NumericDocValuesWriter) perField.docValuesWriter).getUnsortedDocValues();
++          } else {
++            return null;
++          }
++        }
++
++        @Override
++        public BinaryDocValues getBinary(FieldInfo fieldInfo) throws IOException {
++          PerField perField = getPerField(fieldInfo.name);
++          if (perField != null && perField.docValuesWriter != null) {
++            maybeFinish(fieldInfo.name, perField.docValuesWriter, state.segmentInfo.maxDoc());
++            return ((BinaryDocValuesWriter) perField.docValuesWriter).getUnsortedDocValues();
++          } else {
++            return null;
++          }
++        }
++
++        @Override
++        public SortedDocValues getSorted(FieldInfo fieldInfo) throws IOException {
++          PerField perField = getPerField(fieldInfo.name);
++          if (perField != null && perField.docValuesWriter != null) {
++            maybeFinish(fieldInfo.name, perField.docValuesWriter, state.segmentInfo.maxDoc());
++            return ((SortedDocValuesWriter) perField.docValuesWriter).getUnsortedDocValues();
++          } else {
++            return null;
++          }
++        }
++
++        @Override
++        public SortedNumericDocValues getSortedNumeric(FieldInfo fieldInfo) throws IOException {
++          // nocommit implement this
++          throw new UnsupportedOperationException();
++        }
++
++        @Override
++        public SortedSetDocValues getSortedSet(FieldInfo fieldInfo) throws IOException {
++          // nocommit implement this
++          throw new UnsupportedOperationException();
++        }
++
++        @Override
++        public void checkIntegrity() {
++        }
++
++        @Override
++        public void close() {
++        }
++
++        @Override
++        public long ramBytesUsed() {
++          return 0;
++        }
++      };
++    
++    for (IndexWriterConfig.ComputedDocValuesField field : docWriter.indexWriterConfig.getComputedDocValuesFields()) {
++
++      PerField perField = getPerField(field.fieldName);
++
++      // We created these perFields instances up front on init:
++      assert perField != null;
++
++      // make sure our field never had doc values indexed already:
++      if (perField.docValuesWriter != null) {
++        throw new IllegalStateException("field \"" + field.fieldName + "\" cannot be both indexed in documents and computed at flush");
++      }
++      perField.fieldInfo.setDocValuesType(field.docValuesType);
++      
++      switch (field.docValuesType) {
++      case NUMERIC:
++        perField.docValuesWriter = new NumericDocValuesWriter(perField.fieldInfo, bytesUsed, field.computer.compute(state.fieldInfos, segment));
++        break;
++      case BINARY:
++        perField.docValuesWriter = new BinaryDocValuesWriter(perField.fieldInfo, bytesUsed, field.computer.compute(state.fieldInfos, segment));
++        break;
++      case SORTED:
++        perField.docValuesWriter = new SortedDocValuesWriter(perField.fieldInfo, bytesUsed, field.computer.compute(state.fieldInfos, segment));
++        break;
++      default:
++        throw new AssertionError("doc values type " + field.docValuesType + " not handled yet");
++      }
++    }
++  }
++
+   @Override
+   public Sorter.DocMap flush(SegmentWriteState state) throws IOException, AbortingException {
+ 
++    // Insert newly computed fields as normal PerField instances, so the rest of the logic below (writing
++    // DV fields, sorting, etc.) will just work, on indexed and computed fields:
++    addComputedDocValuesFields(state);
++
+     // NOTE: caller (DocumentsWriterPerThread) handles
+     // aborting on any exception from this method
+     Sorter.DocMap sortMap = maybeSortSegment(state);
++    
+     int maxDoc = state.segmentInfo.maxDoc();
+     long t0 = System.nanoTime();
+     writeNorms(state, sortMap);
+@@ -243,6 +365,7 @@ final class DefaultIndexingChain extends DocConsumer {
+ 
+             if (finishedDocValues.contains(perField.fieldInfo.name) == false) {
+               perField.docValuesWriter.finish(maxDoc);
++              finishedDocValues.add(perField.fieldInfo.name);
+             }
+             perField.docValuesWriter.flush(state, sortMap, dvConsumer);
+             perField.docValuesWriter = null;
+diff --git a/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterPerThread.java b/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterPerThread.java
+index 94ffba7..a958752 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterPerThread.java
++++ b/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterPerThread.java
+@@ -157,7 +157,7 @@ class DocumentsWriterPerThread {
+   final Allocator byteBlockAllocator;
+   final IntBlockPool.Allocator intBlockAllocator;
+   private final AtomicLong pendingNumDocs;
+-  private final LiveIndexWriterConfig indexWriterConfig;
++  final LiveIndexWriterConfig indexWriterConfig;
+   private final boolean enableTestPoints;
+   private final IndexWriter indexWriter;
+   
+diff --git a/lucene/core/src/java/org/apache/lucene/index/FieldInfos.java b/lucene/core/src/java/org/apache/lucene/index/FieldInfos.java
+index 890dcca..e0dd23a 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/FieldInfos.java
++++ b/lucene/core/src/java/org/apache/lucene/index/FieldInfos.java
+@@ -357,7 +357,8 @@ public class FieldInfos implements Iterable<FieldInfo> {
+   static final class Builder {
+     private final HashMap<String,FieldInfo> byName = new HashMap<>();
+     final FieldNumbers globalFieldNumbers;
+-
++    private boolean finished;
++    
+     Builder() {
+       this(new FieldNumbers());
+     }
+@@ -371,6 +372,7 @@ public class FieldInfos implements Iterable<FieldInfo> {
+     }
+ 
+     public void add(FieldInfos other) {
++      ensureNotFinished();
+       for(FieldInfo fieldInfo : other){ 
+         add(fieldInfo);
+       }
+@@ -380,6 +382,7 @@ public class FieldInfos implements Iterable<FieldInfo> {
+     public FieldInfo getOrAdd(String name) {
+       FieldInfo fi = fieldInfo(name);
+       if (fi == null) {
++        ensureNotFinished();
+         // This field wasn't yet added to this in-RAM
+         // segment's FieldInfo, so now we get a global
+         // number for this field.  If the field was seen
+@@ -399,6 +402,7 @@ public class FieldInfos implements Iterable<FieldInfo> {
+                                           boolean storeTermVector,
+                                           boolean omitNorms, boolean storePayloads, IndexOptions indexOptions, DocValuesType docValues,
+                                           int dimensionCount, int dimensionNumBytes) {
++      ensureNotFinished();
+       if (docValues == null) {
+         throw new NullPointerException("DocValuesType must not be null");
+       }
+@@ -444,8 +448,15 @@ public class FieldInfos implements Iterable<FieldInfo> {
+     public FieldInfo fieldInfo(String fieldName) {
+       return byName.get(fieldName);
+     }
++
++    private void ensureNotFinished() {
++      if (finished) {
++        throw new IllegalStateException("FieldInfos.Builder was already finished; cannot add new fields");
++      }
++    }
+     
+     FieldInfos finish() {
++      finished = true;
+       return new FieldInfos(byName.values().toArray(new FieldInfo[byName.size()]));
+     }
+   }
+diff --git a/lucene/core/src/java/org/apache/lucene/index/IndexWriterConfig.java b/lucene/core/src/java/org/apache/lucene/index/IndexWriterConfig.java
+index 1377a95..fd4d0d1 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/IndexWriterConfig.java
++++ b/lucene/core/src/java/org/apache/lucene/index/IndexWriterConfig.java
+@@ -18,8 +18,10 @@ package org.apache.lucene.index;
+ 
+ 
+ import java.io.PrintStream;
++import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.EnumSet;
++import java.util.List;
+ import java.util.stream.Collectors;
+ 
+ import org.apache.lucene.analysis.Analyzer;
+@@ -473,11 +475,14 @@ public final class IndexWriterConfig extends LiveIndexWriterConfig {
+     return this;
+   }
+ 
++  public void addComputedDocValuesField(String fieldName, DocValuesType docValuesType, DocValuesFieldComputer computed) {
++    computedDVFields.add(new ComputedDocValuesField(fieldName, docValuesType, computed));
++  }
++
+   @Override
+   public String toString() {
+     StringBuilder sb = new StringBuilder(super.toString());
+     sb.append("writer=").append(writer.get()).append("\n");
+     return sb.toString();
+   }
+-  
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/index/LiveIndexWriterConfig.java b/lucene/core/src/java/org/apache/lucene/index/LiveIndexWriterConfig.java
+index cff1074..9ac20be 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/LiveIndexWriterConfig.java
++++ b/lucene/core/src/java/org/apache/lucene/index/LiveIndexWriterConfig.java
+@@ -17,11 +17,15 @@
+ package org.apache.lucene.index;
+ 
+ 
++import java.io.IOException;
++import java.util.ArrayList;
+ import java.util.Collections;
++import java.util.List;
+ import java.util.Set;
+ 
+ import org.apache.lucene.analysis.Analyzer;
+ import org.apache.lucene.codecs.Codec;
++import org.apache.lucene.codecs.DocValuesProducer;
+ import org.apache.lucene.index.DocumentsWriterPerThread.IndexingChain;
+ import org.apache.lucene.index.IndexWriter.IndexReaderWarmer;
+ import org.apache.lucene.index.IndexWriterConfig.OpenMode;
+@@ -103,6 +107,9 @@ public class LiveIndexWriterConfig {
+   /** The field names involved in the index sort */
+   protected Set<String> indexSortFields = Collections.emptySet();
+ 
++  /** Doc values fields whose values are computed, from other doc values fields, at flush. */
++  protected final List<ComputedDocValuesField> computedDVFields = new ArrayList<>();
++
+   // used by IndexWriterConfig
+   LiveIndexWriterConfig(Analyzer analyzer) {
+     this.analyzer = analyzer;
+@@ -427,6 +434,27 @@ public class LiveIndexWriterConfig {
+     return indexSortFields;
+   }
+ 
++  /** Computes a derived doc values field from current doc values field in a newly flushing segment. */
++  public interface DocValuesFieldComputer {
++    DocValuesProducer compute(FieldInfos fieldInfos, DocValuesProducer flushedSegment) throws IOException;
++  }
++
++  List<ComputedDocValuesField> getComputedDocValuesFields() {
++    return computedDVFields;
++  }
++
++  static final class ComputedDocValuesField {
++    final DocValuesFieldComputer computer;
++    final String fieldName;
++    final DocValuesType docValuesType;
++
++    public ComputedDocValuesField(String fieldName, DocValuesType docValuesType, DocValuesFieldComputer computer) {
++      this.fieldName = fieldName;
++      this.docValuesType = docValuesType;
++      this.computer = computer;
++    }
++  }
++
+   @Override
+   public String toString() {
+     StringBuilder sb = new StringBuilder();
+diff --git a/lucene/core/src/java/org/apache/lucene/index/NumericDocValuesWriter.java b/lucene/core/src/java/org/apache/lucene/index/NumericDocValuesWriter.java
+index 0a58f0d..1e6fb24 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/NumericDocValuesWriter.java
++++ b/lucene/core/src/java/org/apache/lucene/index/NumericDocValuesWriter.java
+@@ -20,6 +20,7 @@ package org.apache.lucene.index;
+ import java.io.IOException;
+ 
+ import org.apache.lucene.codecs.DocValuesConsumer;
++import org.apache.lucene.codecs.DocValuesProducer;
+ import org.apache.lucene.search.DocIdSetIterator;
+ import org.apache.lucene.search.SortField;
+ import org.apache.lucene.util.Counter;
+@@ -50,6 +51,18 @@ class NumericDocValuesWriter extends DocValuesWriter {
+     iwBytesUsed.addAndGet(bytesUsed);
+   }
+ 
++  /** Invoked at flush for computed fields. */
++  public NumericDocValuesWriter(FieldInfo fieldInfo, Counter iwBytesUsed, DocValuesProducer computed) throws IOException {
++    this(fieldInfo, iwBytesUsed);
++
++    // Now compute & record all values:
++    NumericDocValues values = computed.getNumeric(fieldInfo);
++    int docID;
++    while ((docID = values.nextDoc()) != NO_MORE_DOCS) {
++      addValue(docID, values.longValue());
++    }
++  }
++                                                                                                      
+   public void addValue(int docID, long value) {
+     if (docID <= lastDocID) {
+       throw new IllegalArgumentException("DocValuesField \"" + fieldInfo.name + "\" appears more than once in this document (only one value is allowed per field)");
+@@ -75,8 +88,10 @@ class NumericDocValuesWriter extends DocValuesWriter {
+ 
+   @Override
+   Sorter.DocComparator getDocComparator(int maxDoc, SortField sortField) throws IOException {
+-    assert finalValues == null;
+-    finalValues = pending.build();
++    if (finalValues == null) {
++      // nocommit is this safe?
++      finalValues = pending.build();
++    }
+     final BufferedNumericDocValues docValues =
+         new BufferedNumericDocValues(finalValues, docsWithField.iterator());
+     return Sorter.getDocComparator(maxDoc, sortField, () -> null, () -> docValues);
+@@ -97,6 +112,16 @@ class NumericDocValuesWriter extends DocValuesWriter {
+     return new SortingLeafReader.CachedNumericDVs(values, docsWithField);
+   }
+ 
++  NumericDocValues getUnsortedDocValues() {
++    final PackedLongValues values;
++    if (finalValues == null) {
++      // nocommit is this safe?
++      finalValues = pending.build();
++    }
++    
++    return new BufferedNumericDocValues(finalValues, docsWithField.iterator());
++  }
++
+   @Override
+   public void flush(SegmentWriteState state, Sorter.DocMap sortMap, DocValuesConsumer dvConsumer) throws IOException {
+     final PackedLongValues values;
+diff --git a/lucene/core/src/java/org/apache/lucene/index/SortedDocValuesWriter.java b/lucene/core/src/java/org/apache/lucene/index/SortedDocValuesWriter.java
+index be7f488..b339e8f 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/SortedDocValuesWriter.java
++++ b/lucene/core/src/java/org/apache/lucene/index/SortedDocValuesWriter.java
+@@ -20,12 +20,13 @@ import java.io.IOException;
+ import java.util.Arrays;
+ 
+ import org.apache.lucene.codecs.DocValuesConsumer;
++import org.apache.lucene.codecs.DocValuesProducer;
+ import org.apache.lucene.search.DocIdSetIterator;
+ import org.apache.lucene.search.SortField;
+ import org.apache.lucene.util.ByteBlockPool;
+ import org.apache.lucene.util.BytesRef;
+-import org.apache.lucene.util.BytesRefHash;
+ import org.apache.lucene.util.BytesRefHash.DirectBytesStartArray;
++import org.apache.lucene.util.BytesRefHash;
+ import org.apache.lucene.util.Counter;
+ import org.apache.lucene.util.packed.PackedInts;
+ import org.apache.lucene.util.packed.PackedLongValues;
+@@ -62,6 +63,29 @@ class SortedDocValuesWriter extends DocValuesWriter {
+     iwBytesUsed.addAndGet(bytesUsed);
+   }
+ 
++  /** Invoked at flush for computed fields. */
++  public SortedDocValuesWriter(FieldInfo fieldInfo, Counter iwBytesUsed, DocValuesProducer computed) throws IOException {
++    this(fieldInfo, iwBytesUsed);
++
++    // Now compute & record all values:
++    SortedDocValues values = computed.getSorted(fieldInfo);
++
++    // Add all ord -> labels, first:
++    int maxOrd = values.getValueCount();
++    for (int ord=0;ord<maxOrd;ord++) {
++      hash.add(values.lookupOrd(ord));
++    }
++    iwBytesUsed.addAndGet(2 * (long) maxOrd * Integer.BYTES);
++    
++    // Then add all doc ords:
++    int docID;
++    while ((docID = values.nextDoc()) != NO_MORE_DOCS) {
++      docsWithField.add(docID);
++      pending.add(values.ordValue());
++    }
++    updateBytesUsed();
++  }
++
+   public void addValue(int docID, BytesRef value) {
+     if (docID <= lastDocID) {
+       throw new IllegalArgumentException("DocValuesField \"" + fieldInfo.name + "\" appears more than once in this document (only one value is allowed per field)");
+@@ -109,20 +133,27 @@ class SortedDocValuesWriter extends DocValuesWriter {
+   @Override
+   Sorter.DocComparator getDocComparator(int maxDoc, SortField sortField) throws IOException {
+     assert sortField.getType().equals(SortField.Type.STRING);
+-    assert finalSortedValues == null && finalOrdMap == null &&finalOrds == null;
++    
++    freeze();
+     int valueCount = hash.size();
+-    finalSortedValues = hash.sort();
+-    finalOrds = pending.build();
+-    finalOrdMap = new int[valueCount];
+-    for (int ord = 0; ord < valueCount; ord++) {
+-      finalOrdMap[finalSortedValues[ord]] = ord;
+-    }
+     final SortedDocValues docValues =
+         new BufferedSortedDocValues(hash, valueCount, finalOrds, finalSortedValues, finalOrdMap,
+             docsWithField.iterator());
+     return Sorter.getDocComparator(maxDoc, sortField, () -> docValues, () -> null);
+   }
+ 
++  private void freeze() {
++    if (finalOrds == null) {
++      int valueCount = hash.size();
++      finalSortedValues = hash.sort();
++      finalOrds = pending.build();
++      finalOrdMap = new int[valueCount];
++      for (int ord = 0; ord < valueCount; ord++) {
++        finalOrdMap[finalSortedValues[ord]] = ord;
++      }
++    }
++  }
++
+   private int[] sortDocValues(int maxDoc, Sorter.DocMap sortMap, SortedDocValues oldValues) throws IOException {
+     int[] ords = new int[maxDoc];
+     Arrays.fill(ords, -1);
+@@ -134,29 +165,20 @@ class SortedDocValuesWriter extends DocValuesWriter {
+     return ords;
+   }
+ 
++  SortedDocValues getUnsortedDocValues() {
++    freeze();
++    int valueCount = hash.size();
++    return new BufferedSortedDocValues(hash, valueCount, finalOrds, finalSortedValues, finalOrdMap, docsWithField.iterator());
++  }
++
+   @Override
+   public void flush(SegmentWriteState state, Sorter.DocMap sortMap, DocValuesConsumer dvConsumer) throws IOException {
++    freeze();
+     final int valueCount = hash.size();
+-    final PackedLongValues ords;
+-    final int[] sortedValues;
+-    final int[] ordMap;
+-    if (finalOrds == null) {
+-      sortedValues = hash.sort();
+-      ords = pending.build();
+-      ordMap = new int[valueCount];
+-      for (int ord = 0; ord < valueCount; ord++) {
+-        ordMap[sortedValues[ord]] = ord;
+-      }
+-    } else {
+-      sortedValues = finalSortedValues;
+-      ords = finalOrds;
+-      ordMap = finalOrdMap;
+-    }
+-
+     final int[] sorted;
+     if (sortMap != null) {
+       sorted = sortDocValues(state.segmentInfo.maxDoc(), sortMap,
+-          new BufferedSortedDocValues(hash, valueCount, ords, sortedValues, ordMap, docsWithField.iterator()));
++          new BufferedSortedDocValues(hash, valueCount, finalOrds, finalSortedValues, finalOrdMap, docsWithField.iterator()));
+     } else {
+       sorted = null;
+     }
+@@ -168,7 +190,7 @@ class SortedDocValuesWriter extends DocValuesWriter {
+                                     throw new IllegalArgumentException("wrong fieldInfo");
+                                   }
+                                   final SortedDocValues buf =
+-                                      new BufferedSortedDocValues(hash, valueCount, ords, sortedValues, ordMap, docsWithField.iterator());
++                                      new BufferedSortedDocValues(hash, valueCount, finalOrds, finalSortedValues, finalOrdMap, docsWithField.iterator());
+                                   if (sorted == null) {
+                                    return buf;
+                                   }
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestComputedDocValuesFields.java b/lucene/core/src/test/org/apache/lucene/index/TestComputedDocValuesFields.java
+new file mode 100644
+index 0000000..8d478d5
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/index/TestComputedDocValuesFields.java
+@@ -0,0 +1,477 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.index;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++
++import org.apache.lucene.codecs.DocValuesProducer;
++import org.apache.lucene.document.BinaryDocValuesField;
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.Field;
++import org.apache.lucene.document.NumericDocValuesField;
++import org.apache.lucene.document.SortedDocValuesField;
++import org.apache.lucene.document.StoredField;
++import org.apache.lucene.document.StringField;
++import org.apache.lucene.search.Sort;
++import org.apache.lucene.search.SortField;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.BytesRefBuilder;
++import org.apache.lucene.util.IOUtils;
++import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util.TestUtil;
++
++import static org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;
++
++public class TestComputedDocValuesFields extends LuceneTestCase {
++
++  /** Just returns 2X the value of the incoming doc values. */
++  private static class DoubleNumericDocValues extends NumericDocValues {
++                                                                            
++    final NumericDocValues in;
++    
++    public DoubleNumericDocValues(NumericDocValues in) {
++      this.in = in;
++    }
++
++    @Override
++    public int docID() {
++      return in.docID();
++    }
++
++    @Override
++    public int nextDoc() throws IOException {
++      return in.nextDoc();
++    }
++
++    @Override
++    public boolean advanceExact(int target) throws IOException {
++      throw new UnsupportedOperationException();
++    }
++    
++    @Override
++    public int advance(int target) throws IOException {
++      throw new UnsupportedOperationException();
++    }
++
++    @Override
++    public long longValue() throws IOException {
++      return 2 * in.longValue();
++    }
++
++    @Override
++    public long cost() {
++      throw new UnsupportedOperationException();
++    }
++  };
++
++  /** Just returns doubled up binary value from the incoming doc values. */
++  private static class DoubleBinaryDocValues extends BinaryDocValues {
++                                                                            
++    final BinaryDocValues in;
++    final BytesRefBuilder scratch = new BytesRefBuilder();
++    
++    public DoubleBinaryDocValues(BinaryDocValues in) {
++      this.in = in;
++    }
++
++    @Override
++    public int docID() {
++      return in.docID();
++    }
++
++    @Override
++    public int nextDoc() throws IOException {
++      return in.nextDoc();
++    }
++
++    @Override
++    public boolean advanceExact(int target) throws IOException {
++      throw new UnsupportedOperationException();
++    }
++    
++    @Override
++    public int advance(int target) throws IOException {
++      throw new UnsupportedOperationException();
++    }
++
++    @Override
++    public BytesRef binaryValue() throws IOException {
++      BytesRef value = in.binaryValue();
++      scratch.grow(2 * value.length);
++      scratch.clear();
++      scratch.append(value);
++      scratch.append(value);
++      return scratch.get();
++    }
++
++    @Override
++    public long cost() {
++      throw new UnsupportedOperationException();
++    }
++  };
++  
++  public void testBasicNumeric() throws Exception {
++    Directory dir = newDirectory();
++    IndexWriterConfig iwc = newIndexWriterConfig();
++    iwc.addComputedDocValuesField("field2X",
++                                  DocValuesType.NUMERIC,
++                                  new IndexWriterConfig.DocValuesFieldComputer() {
++                                    @Override
++                                    public DocValuesProducer compute(FieldInfos fieldInfos, DocValuesProducer flushedSegment) {
++                                      return new EmptyDocValuesProducer() {
++                                        @Override
++                                        public NumericDocValues getNumeric(FieldInfo fieldInfo) throws IOException {
++                                          assertEquals("field2X", fieldInfo.name);
++                                          return new DoubleNumericDocValues(flushedSegment.getNumeric(fieldInfos.fieldInfo("field")));
++                                        }
++                                      };
++                                    }
++                                  });
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir, iwc);
++    Document doc = new Document();
++    doc.add(new NumericDocValuesField("field", 17));
++    w.addDocument(doc);
++
++    IndexReader r = w.getReader();
++    assertEquals(1, r.maxDoc());
++    NumericDocValues field2 = MultiDocValues.getNumericValues(r, "field2X");
++    assertNotNull(field2);
++    assertEquals(0, field2.nextDoc());
++    assertEquals(34, field2.longValue());
++    IOUtils.close(r, w, dir);
++  }
++
++  public void testBasicBinary() throws Exception {
++    Directory dir = newDirectory();
++    IndexWriterConfig iwc = newIndexWriterConfig();
++    iwc.addComputedDocValuesField("field2X",
++                                  DocValuesType.BINARY,
++                                  new IndexWriterConfig.DocValuesFieldComputer() {
++                                    @Override
++                                    public DocValuesProducer compute(FieldInfos fieldInfos, DocValuesProducer flushedSegment) {
++                                      return new EmptyDocValuesProducer() {
++                                        @Override
++                                        public BinaryDocValues getBinary(FieldInfo fieldInfo) throws IOException {
++                                          assertEquals("field2X", fieldInfo.name);
++                                          return new DoubleBinaryDocValues(flushedSegment.getBinary(fieldInfos.fieldInfo("field")));
++                                        }
++                                      };
++                                    }
++                                  });
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir, iwc);
++    Document doc = new Document();
++    doc.add(new BinaryDocValuesField("field", new BytesRef("fluff")));
++    w.addDocument(doc);
++
++    IndexReader r = w.getReader();
++    assertEquals(1, r.maxDoc());
++    BinaryDocValues field2 = MultiDocValues.getBinaryValues(r, "field2X");
++    assertNotNull(field2);
++    assertEquals(0, field2.nextDoc());
++    assertEquals(new BytesRef("flufffluff"), field2.binaryValue());
++    IOUtils.close(r, w, dir);
++  }
++
++  public void testBasicSorted() throws Exception {
++    Directory dir = newDirectory();
++    IndexWriterConfig iwc = newIndexWriterConfig();
++    iwc.addComputedDocValuesField("field_copy",
++                                  DocValuesType.SORTED,
++                                  new IndexWriterConfig.DocValuesFieldComputer() {
++                                    @Override
++                                    public DocValuesProducer compute(FieldInfos fieldInfos, DocValuesProducer flushedSegment) {
++                                      return new EmptyDocValuesProducer() {
++                                        @Override
++                                        public SortedDocValues getSorted(FieldInfo fieldInfo) throws IOException {
++                                          assertEquals("field_copy", fieldInfo.name);
++                                          return flushedSegment.getSorted(fieldInfos.fieldInfo("field"));
++                                        }
++                                      };
++                                    }
++                                  });
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir, iwc);
++    Document doc = new Document();
++    doc.add(new SortedDocValuesField("field", new BytesRef("fluff")));
++    w.addDocument(doc);
++
++    IndexReader r = w.getReader();
++    assertEquals(1, r.maxDoc());
++    SortedDocValues fieldCopy = MultiDocValues.getSortedValues(r, "field_copy");
++    assertNotNull(fieldCopy);
++    assertEquals(0, fieldCopy.nextDoc());
++    assertEquals(new BytesRef("fluff"), fieldCopy.lookupOrd(fieldCopy.ordValue()));
++    IOUtils.close(r, w, dir);
++  }
++
++  public void testIllegalDoubleUsage() throws Exception {
++    Directory dir = newDirectory();
++    IndexWriterConfig iwc = newIndexWriterConfig();
++    iwc.addComputedDocValuesField("field2X",
++                                  DocValuesType.NUMERIC,
++                                  new IndexWriterConfig.DocValuesFieldComputer() {
++                                    @Override
++                                    public DocValuesProducer compute(FieldInfos fieldInfos, DocValuesProducer flushedSegment) {
++                                      return new EmptyDocValuesProducer() {
++                                        @Override
++                                        public NumericDocValues getNumeric(FieldInfo fieldInfo) throws IOException {
++                                          assertEquals("field2X", fieldInfo.name);
++                                          return new DoubleNumericDocValues(flushedSegment.getNumeric(fieldInfos.fieldInfo("field")));
++                                        }
++                                      };
++                                    }
++                                  });
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir, iwc);
++    Document doc = new Document();
++    doc.add(new NumericDocValuesField("field", 17));
++    doc.add(new NumericDocValuesField("field2X", 30));
++    w.addDocument(doc);
++
++    IllegalStateException ise = expectThrows(IllegalStateException.class, w::getReader);
++    assertEquals("field \"field2X\" cannot be both indexed in documents and computed at flush", ise.getMessage());
++    IOUtils.close(w, dir);
++  }
++
++  private static class MaxFamilySales extends NumericDocValues {
++                                                                            
++    final SortedDocValues families;
++    final NumericDocValues sales;
++    final int[] maxFamilySales;
++    private int salesValue;
++    
++    public MaxFamilySales(SortedDocValues families, NumericDocValues sales, int[] maxFamilySales) {
++      this.families = families;
++      this.sales = sales;
++      this.maxFamilySales = maxFamilySales;
++    }
++
++    @Override
++    public int docID() {
++      return sales.docID();
++    }
++
++    @Override
++    public int nextDoc() throws IOException {
++      int docID = sales.nextDoc();
++      if (docID == NO_MORE_DOCS) {
++        return docID;
++      }
++      if (families.docID() < docID) {
++        families.nextDoc();
++      }
++      assertTrue(families.docID() >= docID);
++      if (families.docID() == docID) {
++        // This product belongs to a family
++        salesValue = maxFamilySales[families.ordValue()];
++      } else {
++        salesValue = (int) sales.longValue();
++      }
++      return docID;
++    }
++
++    @Override
++    public boolean advanceExact(int target) throws IOException {
++      throw new UnsupportedOperationException();
++    }
++    
++    @Override
++    public int advance(int target) throws IOException {
++      throw new UnsupportedOperationException();
++    }
++
++    @Override
++    public long longValue() throws IOException {
++      return salesValue;
++    }
++
++    @Override
++    public long cost() {
++      throw new UnsupportedOperationException();
++    }
++  };
++
++  /** NOTE: the test fails because of fundamental design flaw in this approach: the flushed segments will be sorted
++   *  correctly, but at merge there is no way to sort them correctly because doing so is not possible with
++   *  a simple merge sort. */
++  public void testCoalesceByFamily() throws Exception {
++    Directory dir = newDirectory();
++
++    // How many unique families there are
++    int familyCount = TestUtil.nextInt(random(), 2, 1000);
++    Set<String> familiesSet = new HashSet<>();
++    while (familiesSet.size() != familyCount) {
++      familiesSet.add(TestUtil.randomRealisticUnicodeString(random()));
++    }
++    List<String> families = new ArrayList<>(familiesSet);
++
++    // Chance that a product does not belong in a family
++    double nonFamilyChance = random().nextDouble();
++
++    // Range of sales values
++    int maxSales = TestUtil.nextInt(random(), 1, 1000);
++
++    IndexWriterConfig iwc = newIndexWriterConfig();
++    iwc.addComputedDocValuesField("max_family_sales",
++                                  DocValuesType.NUMERIC,
++                                  new IndexWriterConfig.DocValuesFieldComputer() {
++                                    @Override
++                                    public DocValuesProducer compute(FieldInfos fieldInfos, DocValuesProducer flushedSegment) throws IOException {
++                                      final FieldInfo familyFieldInfo = fieldInfos.fieldInfo("family");
++                                      SortedDocValues families;
++                                      if (familyFieldInfo == null) {
++                                        // This just means all docs in this segment had no family:
++                                        families = DocValues.emptySorted();
++                                      } else {
++                                        families = flushedSegment.getSorted(fieldInfos.fieldInfo("family"));
++                                      }
++                                      NumericDocValues sales = flushedSegment.getNumeric(fieldInfos.fieldInfo("sales"));
++                                      int[] maxFamilySales = new int[families.getValueCount()];
++                                      int docID;
++                                      while ((docID = sales.nextDoc()) != NO_MORE_DOCS) {
++                                        // All docs have a family
++                                        if (families.docID() < docID) {
++                                          families.nextDoc();
++                                        }
++                                        assertTrue(families.docID() >= docID);
++                                        //System.out.println("docID=" + docID + " sales=" + sales.longValue());
++                                        if (families.docID() == docID) {
++                                          int familyOrd = families.ordValue();
++                                          //System.out.println("  familyOrd=" + familyOrd);
++                                          maxFamilySales[familyOrd] = Math.max(maxFamilySales[familyOrd], (int) sales.longValue());
++                                        }
++                                      }
++
++                                      /*
++                                      for (int i=0;i<maxFamilySales.length;i++) {
++                                        System.out.println("maxFamilySales[ord=" + i+ "]=" + maxFamilySales[i]);
++                                      }
++                                      */
++
++                                      return new EmptyDocValuesProducer() {
++                                        @Override
++                                        public NumericDocValues getNumeric(FieldInfo fieldInfo) throws IOException {
++                                          assertEquals("max_family_sales", fieldInfo.name);
++                                          SortedDocValues families;
++                                          if (familyFieldInfo == null) {
++                                            // This just means all docs in this segment had no family:
++                                            families = DocValues.emptySorted();
++                                          } else {
++                                            families = flushedSegment.getSorted(fieldInfos.fieldInfo("family"));
++                                          }
++                                          return new MaxFamilySales(families,
++                                                                    flushedSegment.getNumeric(fieldInfos.fieldInfo("sales")),
++                                                                    maxFamilySales);
++                                        }
++                                      };
++                                    }
++                                  });
++
++    // Sort postings by max_family_sales, descending, then by family for tie breaks:
++    iwc.setIndexSort(new Sort(new SortField[] {new SortField("max_family_sales", SortField.Type.LONG, true),
++                                               new SortField("family", SortField.Type.STRING),
++                                               new SortField("sales", SortField.Type.LONG, true)}));
++                                               
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir, iwc);
++
++    // How many products to index
++    int productCount = atLeast(500);
++
++    String[] familiesByID = new String[productCount];
++    int[] salesByID = new int[productCount];
++    
++    for (int id=0;id<productCount;id++) {
++      Document doc = new Document();
++      doc.add(new StoredField("id", id));
++      if (random().nextDouble() > nonFamilyChance) {
++        String family = families.get(random().nextInt(families.size()));
++        doc.add(new SortedDocValuesField("family", new BytesRef(family)));
++        doc.add(new StoredField("family", family));
++        familiesByID[id] = family;
++      }
++      salesByID[id] = random().nextInt(maxSales);
++      doc.add(new NumericDocValuesField("sales", salesByID[id]));
++      doc.add(new StoredField("sales", salesByID[id]));
++      w.addDocument(doc);
++
++      //System.out.println("id=" + id + " family=" + familiesByID[id] + " sales=" + salesByID[id]);
++    }
++
++    IndexReader r = w.getReader();
++
++    for(LeafReaderContext ctx : r.leaves()) {
++
++      // Confirm all docs are sorted by family's sales, and all docs are coalesced by family:
++      int maxDoc = ctx.reader().maxDoc();
++
++      if (VERBOSE) {
++        System.out.println("LEAF " + ctx + ":");
++        NumericDocValues leafMaxSales = ctx.reader().getNumericDocValues("max_family_sales");
++        for (int docID=0; docID < maxDoc; docID++) {
++          Document doc = ctx.reader().document(docID);
++          System.out.println("  docID=" + docID + " " + doc);
++          if (leafMaxSales.advanceExact(docID)) {
++            System.out.println("    maxFamilySales " + leafMaxSales.longValue());
++          }
++        }
++      }
++      
++      String lastFamily = null;
++      int lastFamilySales = Integer.MAX_VALUE;
++      Set<String> seenFamilies = new HashSet<>();
++      int maxSalesInFamily = Integer.MAX_VALUE;
++      for (int docID=0; docID < maxDoc; docID++) {
++        Document doc = ctx.reader().document(docID);
++        
++        int id = doc.getField("id").numericValue().intValue();
++        String family = familiesByID[id];
++        int salesValue = salesByID[id];
++
++        //System.out.println("docID=" + docID + " family=" + family + " sales=" + salesValue);
++
++        // nocommit also assert w/in same family that sales only decreases
++
++        if (family != null) {
++          if (family.equals(lastFamily) == false) {
++            // Starting a new family
++            //System.out.println("  new family; maxSalesInFamily=" + maxSalesInFamily);
++            
++            // Ensure families really are coalesced
++            assertFalse("family " + family + " appears more than once", seenFamilies.contains(family));
++            assertTrue(maxSalesInFamily <= lastFamilySales);
++            lastFamilySales = maxSalesInFamily;
++            maxSalesInFamily = salesValue;
++          } else {
++            maxSalesInFamily = Math.max(maxSalesInFamily, salesValue);
++          }
++          seenFamilies.add(family);
++        } else {
++          assertTrue(salesValue <= lastFamilySales);
++          lastFamilySales = salesValue;
++          maxSalesInFamily = salesValue;
++        }
++
++        lastFamily = family;
++      }
++    }
++
++    IOUtils.close(r, w, dir);
++  }
++}

@@ -1,0 +1,2487 @@
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index b3d9b1db3b6..a07da96d71f 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -237,6 +237,18 @@ Improvements
+ * LUCENE-9929: Add NorwegianNormalizationFilter, which does the same as ScandinavianNormalizationFilter except
+   it does not fold oo->ø and ao->å. (janhoy, Robert Muir, Adrien Grand)
+ 
++* LUCENE-9981: Operations.getCommonSuffix/Prefix(Automaton) is now much more
++  efficient, from a worst case exponential down to quadratic cost in the
++  number of states + transitions in the Automaton.  These methods no longer
++  use the costly determinize method, removing the risk of
++  TooComplexToDeterminizeException (Robert Muir, Mike McCandless)
++
++* LUCENE-9981: Operations.determinize now throws TooComplexToDeterminizeException
++  based on too much "effort" spent determinizing rather than a precise state
++  count on the resulting returned automaton, to better handle adversarial
++  cases like det(rev(regexp("(.*a){2000}"))) that spend lots of effort but
++  result in smallish eventual returned automata.  (Robert Muir, Mike McCandless)
++
+ Bug fixes
+ 
+ * LUCENE-9686: Fix read past EOF handling in DirectIODirectory. (Zach Chen,
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/hunspell/TrigramAutomaton.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/hunspell/TrigramAutomaton.java
+index effd5968558..dfe994ccf82 100644
+--- a/lucene/analysis/common/src/java/org/apache/lucene/analysis/hunspell/TrigramAutomaton.java
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/hunspell/TrigramAutomaton.java
+@@ -59,7 +59,7 @@ class TrigramAutomaton {
+ 
+     automaton =
+         new CharacterRunAutomaton(
+-            Operations.determinize(builder.finish(), Operations.DEFAULT_MAX_DETERMINIZED_STATES));
++            Operations.determinize(builder.finish(), Operations.DEFAULT_DETERMINIZE_WORK_LIMIT));
+ 
+     state2Score = new int[automaton.getSize()];
+     for (Map.Entry<String, Integer> entry : substringCounts.entrySet()) {
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/miscellaneous/ConcatenateGraphFilter.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/miscellaneous/ConcatenateGraphFilter.java
+index 6c938268336..00b1d049923 100644
+--- a/lucene/analysis/common/src/java/org/apache/lucene/analysis/miscellaneous/ConcatenateGraphFilter.java
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/miscellaneous/ConcatenateGraphFilter.java
+@@ -58,7 +58,7 @@ public final class ConcatenateGraphFilter extends TokenStream {
+   /** Represents the default separator between tokens. */
+   public static final int SEP_LABEL = TokenStreamToAutomaton.POS_SEP;
+ 
+-  public static final int DEFAULT_MAX_GRAPH_EXPANSIONS = Operations.DEFAULT_MAX_DETERMINIZED_STATES;
++  public static final int DEFAULT_MAX_GRAPH_EXPANSIONS = Operations.DEFAULT_DETERMINIZE_WORK_LIMIT;
+   public static final Character DEFAULT_TOKEN_SEPARATOR = SEP_LABEL;
+   public static final boolean DEFAULT_PRESERVE_SEP = true;
+   public static final boolean DEFAULT_PRESERVE_POSITION_INCREMENTS = true;
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/pattern/SimplePatternSplitTokenizer.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/pattern/SimplePatternSplitTokenizer.java
+index c9a7fd672da..bb0facc59e6 100644
+--- a/lucene/analysis/common/src/java/org/apache/lucene/analysis/pattern/SimplePatternSplitTokenizer.java
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/pattern/SimplePatternSplitTokenizer.java
+@@ -63,7 +63,7 @@ public final class SimplePatternSplitTokenizer extends Tokenizer {
+ 
+   /** See {@link RegExp} for the accepted syntax. */
+   public SimplePatternSplitTokenizer(String regexp) {
+-    this(DEFAULT_TOKEN_ATTRIBUTE_FACTORY, regexp, Operations.DEFAULT_MAX_DETERMINIZED_STATES);
++    this(DEFAULT_TOKEN_ATTRIBUTE_FACTORY, regexp, Operations.DEFAULT_DETERMINIZE_WORK_LIMIT);
+   }
+ 
+   /** Runs a pre-built automaton. */
+@@ -73,8 +73,8 @@ public final class SimplePatternSplitTokenizer extends Tokenizer {
+ 
+   /** See {@link RegExp} for the accepted syntax. */
+   public SimplePatternSplitTokenizer(
+-      AttributeFactory factory, String regexp, int maxDeterminizedStates) {
+-    this(factory, new RegExp(regexp).toAutomaton());
++      AttributeFactory factory, String regexp, int determinizeWorkLimit) {
++    this(factory, new RegExp(regexp).toAutomaton(determinizeWorkLimit));
+   }
+ 
+   /** Runs a pre-built automaton. */
+@@ -88,7 +88,7 @@ public final class SimplePatternSplitTokenizer extends Tokenizer {
+       throw new IllegalArgumentException("please determinize the incoming automaton first");
+     }
+ 
+-    runDFA = new CharacterRunAutomaton(dfa, Operations.DEFAULT_MAX_DETERMINIZED_STATES);
++    runDFA = new CharacterRunAutomaton(dfa, Operations.DEFAULT_DETERMINIZE_WORK_LIMIT);
+   }
+ 
+   private void fillToken(int offsetStart) {
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/pattern/SimplePatternSplitTokenizerFactory.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/pattern/SimplePatternSplitTokenizerFactory.java
+index b14a774cabc..7472bba5848 100644
+--- a/lucene/analysis/common/src/java/org/apache/lucene/analysis/pattern/SimplePatternSplitTokenizerFactory.java
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/pattern/SimplePatternSplitTokenizerFactory.java
+@@ -35,8 +35,9 @@ import org.apache.lucene.util.automaton.RegExp;
+  * <ul>
+  *   <li>"pattern" (required) is the regular expression, according to the syntax described at {@link
+  *       RegExp}
+- *   <li>"maxDeterminizedStates" (optional, default 10000) the limit on total state count for the
+- *       determined automaton computed from the regexp
++ *   <li>"determinizeWorkLimit" (optional, default {@link
++ *       Operations#DEFAULT_DETERMINIZE_WORK_LIMIT}) the limit on total effort to determinize the
++ *       automaton computed from the regexp
+  * </ul>
+  *
+  * <p>The pattern matches the characters that should split tokens, like {@code String.split}, and
+@@ -64,16 +65,16 @@ public class SimplePatternSplitTokenizerFactory extends TokenizerFactory {
+ 
+   public static final String PATTERN = "pattern";
+   private final Automaton dfa;
+-  private final int maxDeterminizedStates;
++  private final int determinizeWorkLimit;
+ 
+   /** Creates a new SimpleSplitPatternTokenizerFactory */
+   public SimplePatternSplitTokenizerFactory(Map<String, String> args) {
+     super(args);
+-    maxDeterminizedStates =
+-        getInt(args, "maxDeterminizedStates", Operations.DEFAULT_MAX_DETERMINIZED_STATES);
++    determinizeWorkLimit =
++        getInt(args, "determinizeWorkLimit", Operations.DEFAULT_DETERMINIZE_WORK_LIMIT);
+     dfa =
+         Operations.determinize(
+-            new RegExp(require(args, PATTERN)).toAutomaton(), maxDeterminizedStates);
++            new RegExp(require(args, PATTERN)).toAutomaton(), determinizeWorkLimit);
+     if (args.isEmpty() == false) {
+       throw new IllegalArgumentException("Unknown parameters: " + args);
+     }
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/pattern/SimplePatternTokenizer.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/pattern/SimplePatternTokenizer.java
+index ba441275868..6c364400fc6 100644
+--- a/lucene/analysis/common/src/java/org/apache/lucene/analysis/pattern/SimplePatternTokenizer.java
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/pattern/SimplePatternTokenizer.java
+@@ -74,7 +74,7 @@ public final class SimplePatternTokenizer extends Tokenizer {
+ 
+   /** See {@link RegExp} for the accepted syntax. */
+   public SimplePatternTokenizer(String regexp) {
+-    this(DEFAULT_TOKEN_ATTRIBUTE_FACTORY, regexp, Operations.DEFAULT_MAX_DETERMINIZED_STATES);
++    this(DEFAULT_TOKEN_ATTRIBUTE_FACTORY, regexp, Operations.DEFAULT_DETERMINIZE_WORK_LIMIT);
+   }
+ 
+   /** Runs a pre-built automaton. */
+@@ -83,8 +83,7 @@ public final class SimplePatternTokenizer extends Tokenizer {
+   }
+ 
+   /** See {@link RegExp} for the accepted syntax. */
+-  public SimplePatternTokenizer(
+-      AttributeFactory factory, String regexp, int maxDeterminizedStates) {
++  public SimplePatternTokenizer(AttributeFactory factory, String regexp, int determinizeWorkLimit) {
+     this(factory, new RegExp(regexp).toAutomaton());
+   }
+ 
+@@ -99,7 +98,7 @@ public final class SimplePatternTokenizer extends Tokenizer {
+       throw new IllegalArgumentException("please determinize the incoming automaton first");
+     }
+ 
+-    runDFA = new CharacterRunAutomaton(dfa, Operations.DEFAULT_MAX_DETERMINIZED_STATES);
++    runDFA = new CharacterRunAutomaton(dfa, Operations.DEFAULT_DETERMINIZE_WORK_LIMIT);
+   }
+ 
+   @Override
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/pattern/SimplePatternTokenizerFactory.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/pattern/SimplePatternTokenizerFactory.java
+index 1453d587cbc..ea790345abd 100644
+--- a/lucene/analysis/common/src/java/org/apache/lucene/analysis/pattern/SimplePatternTokenizerFactory.java
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/pattern/SimplePatternTokenizerFactory.java
+@@ -34,8 +34,8 @@ import org.apache.lucene.util.automaton.RegExp;
+  * <ul>
+  *   <li>"pattern" (required) is the regular expression, according to the syntax described at {@link
+  *       RegExp}
+- *   <li>"maxDeterminizedStates" (optional, default 10000) the limit on total state count for the
+- *       determined automaton computed from the regexp
++ *   <li>"determinizeWorkLimit" (optional, default 10000) the limit on total effort spent to
++ *       determinize the automaton computed from the regexp
+  * </ul>
+  *
+  * <p>The pattern matches the characters to include in a token (not the split characters), and the
+@@ -63,16 +63,16 @@ public class SimplePatternTokenizerFactory extends TokenizerFactory {
+ 
+   public static final String PATTERN = "pattern";
+   private final Automaton dfa;
+-  private final int maxDeterminizedStates;
++  private final int determinizeWorkLimit;
+ 
+   /** Creates a new SimplePatternTokenizerFactory */
+   public SimplePatternTokenizerFactory(Map<String, String> args) {
+     super(args);
+-    maxDeterminizedStates =
+-        getInt(args, "maxDeterminizedStates", Operations.DEFAULT_MAX_DETERMINIZED_STATES);
++    determinizeWorkLimit =
++        getInt(args, "determinizeWorkLimit", Operations.DEFAULT_DETERMINIZE_WORK_LIMIT);
+     dfa =
+         Operations.determinize(
+-            new RegExp(require(args, PATTERN)).toAutomaton(), maxDeterminizedStates);
++            new RegExp(require(args, PATTERN)).toAutomaton(), determinizeWorkLimit);
+     if (args.isEmpty() == false) {
+       throw new IllegalArgumentException("Unknown parameters: " + args);
+     }
+diff --git a/lucene/analysis/common/src/test/org/apache/lucene/analysis/core/TestRandomChains.java b/lucene/analysis/common/src/test/org/apache/lucene/analysis/core/TestRandomChains.java
+index 512ae515647..f015b70dee7 100644
+--- a/lucene/analysis/common/src/test/org/apache/lucene/analysis/core/TestRandomChains.java
++++ b/lucene/analysis/common/src/test/org/apache/lucene/analysis/core/TestRandomChains.java
+@@ -616,7 +616,7 @@ public class TestRandomChains extends BaseTokenStreamTestCase {
+               random -> {
+                 return Operations.determinize(
+                     new RegExp(AutomatonTestUtil.randomRegexp(random), RegExp.NONE).toAutomaton(),
+-                    Operations.DEFAULT_MAX_DETERMINIZED_STATES);
++                    Operations.DEFAULT_DETERMINIZE_WORK_LIMIT);
+               });
+           put(
+               PatternTypingFilter.PatternTypingRule[].class,
+diff --git a/lucene/core/src/java/org/apache/lucene/search/AutomatonQuery.java b/lucene/core/src/java/org/apache/lucene/search/AutomatonQuery.java
+index 69b7ed246fe..ef30c0a4817 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/AutomatonQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/AutomatonQuery.java
+@@ -65,7 +65,7 @@ public class AutomatonQuery extends MultiTermQuery implements Accountable {
+    * @param automaton Automaton to run, terms that are accepted are considered a match.
+    */
+   public AutomatonQuery(final Term term, Automaton automaton) {
+-    this(term, automaton, Operations.DEFAULT_MAX_DETERMINIZED_STATES);
++    this(term, automaton, Operations.DEFAULT_DETERMINIZE_WORK_LIMIT);
+   }
+ 
+   /**
+@@ -74,12 +74,12 @@ public class AutomatonQuery extends MultiTermQuery implements Accountable {
+    * @param term Term containing field and possibly some pattern structure. The term text is
+    *     ignored.
+    * @param automaton Automaton to run, terms that are accepted are considered a match.
+-   * @param maxDeterminizedStates maximum number of states in the resulting automata. If the
+-   *     automata would need more than this many states TooComplextToDeterminizeException is thrown.
+-   *     Higher number require more space but can process more complex automata.
++   * @param determinizeWorkLimit maximum effort to spend determinizing the automaton. If the
++   *     automaton would need more than this much effort, TooComplexToDeterminizeException is
++   *     thrown. Higher numbers require more space but can process more complex automata.
+    */
+-  public AutomatonQuery(final Term term, Automaton automaton, int maxDeterminizedStates) {
+-    this(term, automaton, maxDeterminizedStates, false);
++  public AutomatonQuery(final Term term, Automaton automaton, int determinizeWorkLimit) {
++    this(term, automaton, determinizeWorkLimit, false);
+   }
+ 
+   /**
+@@ -88,20 +88,20 @@ public class AutomatonQuery extends MultiTermQuery implements Accountable {
+    * @param term Term containing field and possibly some pattern structure. The term text is
+    *     ignored.
+    * @param automaton Automaton to run, terms that are accepted are considered a match.
+-   * @param maxDeterminizedStates maximum number of states in the resulting automata. If the
+-   *     automata would need more than this many states TooComplextToDeterminizeException is thrown.
+-   *     Higher number require more space but can process more complex automata.
++   * @param determinizeWorkLimit maximum effort to spend determinizing the automaton. If the
++   *     automaton will need more than this much effort, TooComplexToDeterminizeException is thrown.
++   *     Higher numbers require more space but can process more complex automata.
+    * @param isBinary if true, this automaton is already binary and will not go through the
+    *     UTF32ToUTF8 conversion
+    */
+   public AutomatonQuery(
+-      final Term term, Automaton automaton, int maxDeterminizedStates, boolean isBinary) {
++      final Term term, Automaton automaton, int determinizeWorkLimit, boolean isBinary) {
+     super(term.field());
+     this.term = term;
+     this.automaton = automaton;
+     this.automatonIsBinary = isBinary;
+     // TODO: we could take isFinite too, to save a bit of CPU in CompiledAutomaton ctor?:
+-    this.compiled = new CompiledAutomaton(automaton, null, true, maxDeterminizedStates, isBinary);
++    this.compiled = new CompiledAutomaton(automaton, null, true, determinizeWorkLimit, isBinary);
+ 
+     this.ramBytesUsed =
+         BASE_RAM_BYTES + term.ramBytesUsed() + automaton.ramBytesUsed() + compiled.ramBytesUsed();
+diff --git a/lucene/core/src/java/org/apache/lucene/search/PrefixQuery.java b/lucene/core/src/java/org/apache/lucene/search/PrefixQuery.java
+index 4cd60235d4d..9b13d824c7d 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/PrefixQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/PrefixQuery.java
+@@ -30,7 +30,7 @@ public class PrefixQuery extends AutomatonQuery {
+ 
+   /** Constructs a query for terms starting with <code>prefix</code>. */
+   public PrefixQuery(Term prefix) {
+-    // It's OK to pass unlimited maxDeterminizedStates: the automaton is born small and
++    // It's OK to pass unlimited determinizeWorkLimit: the automaton is born small and
+     // determinized:
+     super(prefix, toAutomaton(prefix.bytes()), Integer.MAX_VALUE, true);
+   }
+diff --git a/lucene/core/src/java/org/apache/lucene/search/RegexpQuery.java b/lucene/core/src/java/org/apache/lucene/search/RegexpQuery.java
+index 15d4b8c2970..7e31058bf0b 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/RegexpQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/RegexpQuery.java
+@@ -69,7 +69,7 @@ public class RegexpQuery extends AutomatonQuery {
+    * @param flags optional RegExp features from {@link RegExp}
+    */
+   public RegexpQuery(Term term, int flags) {
+-    this(term, flags, defaultProvider, Operations.DEFAULT_MAX_DETERMINIZED_STATES);
++    this(term, flags, defaultProvider, Operations.DEFAULT_DETERMINIZE_WORK_LIMIT);
+   }
+ 
+   /**
+@@ -77,12 +77,13 @@ public class RegexpQuery extends AutomatonQuery {
+    *
+    * @param term regular expression.
+    * @param flags optional RegExp syntax features from {@link RegExp}
+-   * @param maxDeterminizedStates maximum number of states that compiling the automaton for the
+-   *     regexp can result in. Set higher to allow more complex queries and lower to prevent memory
+-   *     exhaustion.
++   * @param determinizeWorkLimit maximum effort to spend while compiling the automaton from this
++   *     regexp. Set higher to allow more complex queries and lower to prevent memory exhaustion.
++   *     Use {@link Operations#DEFAULT_DETERMINIZE_WORK_LIMIT} as a decent default if you don't
++   *     otherwise know what to specify.
+    */
+-  public RegexpQuery(Term term, int flags, int maxDeterminizedStates) {
+-    this(term, flags, defaultProvider, maxDeterminizedStates);
++  public RegexpQuery(Term term, int flags, int determinizeWorkLimit) {
++    this(term, flags, defaultProvider, determinizeWorkLimit);
+   }
+ 
+   /**
+@@ -93,10 +94,13 @@ public class RegexpQuery extends AutomatonQuery {
+    *     regexp can result in. Set higher to allow more complex queries and lower to prevent memory
+    *     exhaustion.
+    * @param match_flags boolean 'or' of match behavior options such as case insensitivity
+-   * @param maxDeterminizedStates maximum number of states that compiling the
++   * @param determinizeWorkLimit maximum effort to spend while compiling the automaton from this
++   *     regexp. Set higher to allow more complex queries and lower to prevent memory exhaustion.
++   *     Use {@link Operations#DEFAULT_DETERMINIZE_WORK_LIMIT} as a decent default if you don't
++   *     otherwise know what to specify.
+    */
+-  public RegexpQuery(Term term, int syntax_flags, int match_flags, int maxDeterminizedStates) {
+-    this(term, syntax_flags, match_flags, defaultProvider, maxDeterminizedStates);
++  public RegexpQuery(Term term, int syntax_flags, int match_flags, int determinizeWorkLimit) {
++    this(term, syntax_flags, match_flags, defaultProvider, determinizeWorkLimit);
+   }
+ 
+   /**
+@@ -105,13 +109,14 @@ public class RegexpQuery extends AutomatonQuery {
+    * @param term regular expression.
+    * @param syntax_flags optional RegExp features from {@link RegExp}
+    * @param provider custom AutomatonProvider for named automata
+-   * @param maxDeterminizedStates maximum number of states that compiling the automaton for the
+-   *     regexp can result in. Set higher to allow more complex queries and lower to prevent memory
+-   *     exhaustion.
++   * @param determinizeWorkLimit maximum effort to spend while compiling the automaton from this
++   *     regexp. Set higher to allow more complex queries and lower to prevent memory exhaustion.
++   *     Use {@link Operations#DEFAULT_DETERMINIZE_WORK_LIMIT} as a decent default if you don't
++   *     otherwise know what to specify.
+    */
+   public RegexpQuery(
+-      Term term, int syntax_flags, AutomatonProvider provider, int maxDeterminizedStates) {
+-    this(term, syntax_flags, 0, provider, maxDeterminizedStates);
++      Term term, int syntax_flags, AutomatonProvider provider, int determinizeWorkLimit) {
++    this(term, syntax_flags, 0, provider, determinizeWorkLimit);
+   }
+ 
+   /**
+@@ -121,21 +126,22 @@ public class RegexpQuery extends AutomatonQuery {
+    * @param syntax_flags optional RegExp features from {@link RegExp}
+    * @param match_flags boolean 'or' of match behavior options such as case insensitivity
+    * @param provider custom AutomatonProvider for named automata
+-   * @param maxDeterminizedStates maximum number of states that compiling the automaton for the
+-   *     regexp can result in. Set higher to allow more complex queries and lower to prevent memory
+-   *     exhaustion.
++   * @param determinizeWorkLimit maximum effort to spend while compiling the automaton from this
++   *     regexp. Set higher to allow more complex queries and lower to prevent memory exhaustion.
++   *     Use {@link Operations#DEFAULT_DETERMINIZE_WORK_LIMIT} as a decent default if you don't
++   *     otherwise know what to specify.
+    */
+   public RegexpQuery(
+       Term term,
+       int syntax_flags,
+       int match_flags,
+       AutomatonProvider provider,
+-      int maxDeterminizedStates) {
++      int determinizeWorkLimit) {
+     super(
+         term,
+         new RegExp(term.text(), syntax_flags, match_flags)
+-            .toAutomaton(provider, maxDeterminizedStates),
+-        maxDeterminizedStates);
++            .toAutomaton(provider, determinizeWorkLimit),
++        determinizeWorkLimit);
+   }
+ 
+   /** Returns the regexp of this query wrapped in a Term. */
+diff --git a/lucene/core/src/java/org/apache/lucene/search/WildcardQuery.java b/lucene/core/src/java/org/apache/lucene/search/WildcardQuery.java
+index e786ff8044a..19f312e0a79 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/WildcardQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/WildcardQuery.java
+@@ -53,12 +53,13 @@ public class WildcardQuery extends AutomatonQuery {
+   /**
+    * Constructs a query for terms matching <code>term</code>.
+    *
+-   * @param maxDeterminizedStates maximum number of states in the resulting automata. If the
+-   *     automata would need more than this many states TooComplextToDeterminizeException is thrown.
+-   *     Higher number require more space but can process more complex automata.
++   * @param determinizeWorkLimit maximum effort to spend while compiling the automaton from this
++   *     wildcard. Set higher to allow more complex queries and lower to prevent memory exhaustion.
++   *     Use {@link Operations#DEFAULT_DETERMINIZE_WORK_LIMIT} as a decent default if you don't
++   *     otherwise know what to specify.
+    */
+-  public WildcardQuery(Term term, int maxDeterminizedStates) {
+-    super(term, toAutomaton(term), maxDeterminizedStates);
++  public WildcardQuery(Term term, int determinizeWorkLimit) {
++    super(term, toAutomaton(term), determinizeWorkLimit);
+   }
+ 
+   /**
+diff --git a/lucene/core/src/java/org/apache/lucene/util/automaton/ByteRunAutomaton.java b/lucene/core/src/java/org/apache/lucene/util/automaton/ByteRunAutomaton.java
+index 8375fc75503..1c43bbbae60 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/automaton/ByteRunAutomaton.java
++++ b/lucene/core/src/java/org/apache/lucene/util/automaton/ByteRunAutomaton.java
+@@ -21,12 +21,12 @@ public class ByteRunAutomaton extends RunAutomaton {
+ 
+   /** Converts incoming automaton to byte-based (UTF32ToUTF8) first */
+   public ByteRunAutomaton(Automaton a) {
+-    this(a, false, Operations.DEFAULT_MAX_DETERMINIZED_STATES);
++    this(a, false, Operations.DEFAULT_DETERMINIZE_WORK_LIMIT);
+   }
+ 
+   /** expert: if isBinary is true, the input is already byte-based */
+-  public ByteRunAutomaton(Automaton a, boolean isBinary, int maxDeterminizedStates) {
+-    super(isBinary ? a : new UTF32ToUTF8().convert(a), 256, maxDeterminizedStates);
++  public ByteRunAutomaton(Automaton a, boolean isBinary, int determinizeWorkLimit) {
++    super(isBinary ? a : new UTF32ToUTF8().convert(a), 256, determinizeWorkLimit);
+   }
+ 
+   /** Returns true if the given byte array is accepted by this automaton */
+diff --git a/lucene/core/src/java/org/apache/lucene/util/automaton/CharacterRunAutomaton.java b/lucene/core/src/java/org/apache/lucene/util/automaton/CharacterRunAutomaton.java
+index df37500c3ef..f65ccd29ac7 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/automaton/CharacterRunAutomaton.java
++++ b/lucene/core/src/java/org/apache/lucene/util/automaton/CharacterRunAutomaton.java
+@@ -18,21 +18,22 @@ package org.apache.lucene.util.automaton;
+ 
+ /** Automaton representation for matching char[]. */
+ public class CharacterRunAutomaton extends RunAutomaton {
+-  /** Construct with a default number of maxDeterminizedStates. */
++  /** Construct with a default number of determinizeWorkLimit. */
+   public CharacterRunAutomaton(Automaton a) {
+-    this(a, Operations.DEFAULT_MAX_DETERMINIZED_STATES);
++    this(a, Operations.DEFAULT_DETERMINIZE_WORK_LIMIT);
+   }
+ 
+   /**
+-   * Construct specifying maxDeterminizedStates.
++   * Constructor specifying determinizeWorkLimit.
+    *
+    * @param a Automaton to match
+-   * @param maxDeterminizedStates maximum number of states that the automaton can have once
+-   *     determinized. If more states are required to determinize it then a
+-   *     TooComplexToDeterminizeException is thrown.
++   * @param determinizeWorkLimit maximum effort to spend determinizing the automataon. If more
++   *     effort is required then a TooComplexToDeterminizeException is thrown. Use {@link
++   *     Operations#DEFAULT_DETERMINIZE_WORK_LIMIT} as a decent default if you don't otherwise know
++   *     what to specify.
+    */
+-  public CharacterRunAutomaton(Automaton a, int maxDeterminizedStates) {
+-    super(a, Character.MAX_CODE_POINT + 1, maxDeterminizedStates);
++  public CharacterRunAutomaton(Automaton a, int determinizeWorkLimit) {
++    super(a, Character.MAX_CODE_POINT + 1, determinizeWorkLimit);
+   }
+ 
+   /** Returns true if the given string is accepted by this automaton. */
+diff --git a/lucene/core/src/java/org/apache/lucene/util/automaton/CompiledAutomaton.java b/lucene/core/src/java/org/apache/lucene/util/automaton/CompiledAutomaton.java
+index dbe24de6ce9..f2ec26d807a 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/automaton/CompiledAutomaton.java
++++ b/lucene/core/src/java/org/apache/lucene/util/automaton/CompiledAutomaton.java
+@@ -133,21 +133,21 @@ public class CompiledAutomaton implements Accountable {
+    * is one the cases in {@link CompiledAutomaton.AUTOMATON_TYPE}.
+    */
+   public CompiledAutomaton(Automaton automaton, Boolean finite, boolean simplify) {
+-    this(automaton, finite, simplify, Operations.DEFAULT_MAX_DETERMINIZED_STATES, false);
++    this(automaton, finite, simplify, Operations.DEFAULT_DETERMINIZE_WORK_LIMIT, false);
+   }
+ 
+   /**
+    * Create this. If finite is null, we use {@link Operations#isFinite} to determine whether it is
+    * finite. If simplify is true, we run possibly expensive operations to determine if the automaton
+    * is one the cases in {@link CompiledAutomaton.AUTOMATON_TYPE}. If simplify requires
+-   * determinizing the automaton then only maxDeterminizedStates will be created. Any more than that
+-   * will cause a TooComplexToDeterminizeException.
++   * determinizing the automaton then at most determinizeWorkLimit effort will be spent. Any more
++   * than that will cause a TooComplexToDeterminizeException.
+    */
+   public CompiledAutomaton(
+       Automaton automaton,
+       Boolean finite,
+       boolean simplify,
+-      int maxDeterminizedStates,
++      int determinizeWorkLimit,
+       boolean isBinary) {
+     if (automaton.getNumStates() == 0) {
+       automaton = new Automaton();
+@@ -193,7 +193,7 @@ public class CompiledAutomaton implements Accountable {
+         return;
+       }
+ 
+-      automaton = Operations.determinize(automaton, maxDeterminizedStates);
++      automaton = Operations.determinize(automaton, determinizeWorkLimit);
+ 
+       IntsRef singleton = Operations.getSingleton(automaton);
+ 
+@@ -237,14 +237,12 @@ public class CompiledAutomaton implements Accountable {
+       binary = new UTF32ToUTF8().convert(automaton);
+     }
+ 
+-    if (this.finite) {
++    // compute a common suffix for infinite DFAs, this is an optimization for "leading wildcard"
++    // so don't burn cycles on it if the DFA is finite, or largeish
++    if (this.finite || automaton.getNumStates() + automaton.getNumTransitions() > 1000) {
+       commonSuffixRef = null;
+     } else {
+-      // NOTE: this is a very costly operation!  We should test if it's really warranted in
+-      // practice... we could do a fast match
+-      // by looking for a sink state (which means it has no common suffix).  Or maybe we shouldn't
+-      // do it when simplify is false?:
+-      BytesRef suffix = Operations.getCommonSuffixBytesRef(binary, maxDeterminizedStates);
++      BytesRef suffix = Operations.getCommonSuffixBytesRef(binary);
+       if (suffix.length == 0) {
+         commonSuffixRef = null;
+       } else {
+@@ -253,7 +251,7 @@ public class CompiledAutomaton implements Accountable {
+     }
+ 
+     // This will determinize the binary automaton for us:
+-    runAutomaton = new ByteRunAutomaton(binary, true, maxDeterminizedStates);
++    runAutomaton = new ByteRunAutomaton(binary, true, determinizeWorkLimit);
+ 
+     this.automaton = runAutomaton.automaton;
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/util/automaton/MinimizationOperations.java b/lucene/core/src/java/org/apache/lucene/util/automaton/MinimizationOperations.java
+index 24ceb4760f8..ffd6edd44e1 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/automaton/MinimizationOperations.java
++++ b/lucene/core/src/java/org/apache/lucene/util/automaton/MinimizationOperations.java
+@@ -47,15 +47,17 @@ public final class MinimizationOperations {
+    * Minimizes (and determinizes if not already deterministic) the given automaton using Hopcroft's
+    * algorithm.
+    *
+-   * @param maxDeterminizedStates maximum number of states determinizing the automaton can result
+-   *     in. Set higher to allow more complex queries and lower to prevent memory exhaustion.
++   * @param determinizeWorkLimit maximum effort to spend determinizing the automaton. Set higher to
++   *     allow more complex queries and lower to prevent memory exhaustion. Use {@link
++   *     Operations#DEFAULT_DETERMINIZE_WORK_LIMIT} as a decent default if you don't otherwise know
++   *     what to specify.
+    */
+-  public static Automaton minimize(Automaton a, int maxDeterminizedStates) {
++  public static Automaton minimize(Automaton a, int determinizeWorkLimit) {
+     if (a.getNumStates() == 0 || (a.isAccept(0) == false && a.getNumTransitions(0) == 0)) {
+       // Fastmatch for common case
+       return new Automaton();
+     }
+-    a = Operations.determinize(a, maxDeterminizedStates);
++    a = Operations.determinize(a, determinizeWorkLimit);
+     // a.writeDot("adet");
+     if (a.getNumTransitions(0) == 1) {
+       Transition t = new Transition();
+diff --git a/lucene/core/src/java/org/apache/lucene/util/automaton/Operations.java b/lucene/core/src/java/org/apache/lucene/util/automaton/Operations.java
+index ad080aff6b8..58faa1afee6 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/automaton/Operations.java
++++ b/lucene/core/src/java/org/apache/lucene/util/automaton/Operations.java
+@@ -39,9 +39,11 @@ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
++import org.apache.lucene.search.DocIdSetIterator;
+ import org.apache.lucene.util.ArrayUtil;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.BytesRefBuilder;
++import org.apache.lucene.util.FixedBitSet;
+ import org.apache.lucene.util.IntsRef;
+ import org.apache.lucene.util.IntsRefBuilder;
+ import org.apache.lucene.util.RamUsageEstimator;
+@@ -52,8 +54,11 @@ import org.apache.lucene.util.RamUsageEstimator;
+  * @lucene.experimental
+  */
+ public final class Operations {
+-  /** Default maximum number of states that {@link Operations#determinize} should create. */
+-  public static final int DEFAULT_MAX_DETERMINIZED_STATES = 10000;
++  /**
++   * Default maximum effort that {@link Operations#determinize} should spend before giving up and
++   * throwing {@link TooComplexToDeterminizeException}.
++   */
++  public static final int DEFAULT_DETERMINIZE_WORK_LIMIT = 10000;
+ 
+   /** Maximum level of recursion allowed in recursive operations. */
+   public static final int MAX_RECURSION_LEVEL = 1000;
+@@ -279,11 +284,12 @@ public final class Operations {
+    *
+    * <p>Complexity: linear in number of states if already deterministic and exponential otherwise.
+    *
+-   * @param maxDeterminizedStates maximum number of states determinizing the automaton can result
+-   *     in. Set higher to allow more complex queries and lower to prevent memory exhaustion.
++   * @param determinizeWorkLimit maximum effort to spend determinizing the automaton. Set higher to
++   *     allow more complex queries and lower to prevent memory exhaustion. {@link
++   *     #DEFAULT_DETERMINIZE_WORK_LIMIT} is a good starting default.
+    */
+-  public static Automaton complement(Automaton a, int maxDeterminizedStates) {
+-    a = totalize(determinize(a, maxDeterminizedStates));
++  public static Automaton complement(Automaton a, int determinizeWorkLimit) {
++    a = totalize(determinize(a, determinizeWorkLimit));
+     int numStates = a.getNumStates();
+     for (int p = 0; p < numStates; p++) {
+       a.setAccept(p, !a.isAccept(p));
+@@ -298,15 +304,21 @@ public final class Operations {
+    *
+    * <p>Complexity: quadratic in number of states if a2 already deterministic and exponential in
+    * number of a2's states otherwise.
++   *
++   * @param a1 the initial automaton
++   * @param a2 the automaton to subtract
++   * @param determinizeWorkLimit maximum effort to spend determinizing the automaton. Set higher to
++   *     allow more complex queries and lower to prevent memory exhaustion. {@link
++   *     #DEFAULT_DETERMINIZE_WORK_LIMIT} is a good starting default.
+    */
+-  public static Automaton minus(Automaton a1, Automaton a2, int maxDeterminizedStates) {
++  public static Automaton minus(Automaton a1, Automaton a2, int determinizeWorkLimit) {
+     if (Operations.isEmpty(a1) || a1 == a2) {
+       return Automata.makeEmpty();
+     }
+     if (Operations.isEmpty(a2)) {
+       return a1;
+     }
+-    return intersection(a1, complement(a2, maxDeterminizedStates));
++    return intersection(a1, complement(a2, determinizeWorkLimit));
+   }
+ 
+   /**
+@@ -653,13 +665,15 @@ public final class Operations {
+    *
+    * <p>Worst case complexity: exponential in number of states.
+    *
+-   * @param maxDeterminizedStates Maximum number of states created when determinizing. Higher
+-   *     numbers allow this operation to consume more memory but allow more complex automatons. Use
+-   *     DEFAULT_MAX_DETERMINIZED_STATES as a decent default if you don't know how many to allow.
+-   * @throws TooComplexToDeterminizeException if determinizing a creates an automaton with more than
+-   *     maxDeterminizedStates
++   * @param workLimit Maximum amount of "work" that the powerset construction will spend before
++   *     throwing {@link TooComplexToDeterminizeException}. Higher numbers allow this operation to
++   *     consume more memory and CPU but allow more complex automatons. Use {@link
++   *     #DEFAULT_DETERMINIZE_WORK_LIMIT} as a decent default if you don't otherwise know what to
++   *     specify.
++   * @throws TooComplexToDeterminizeException if determinizing requires more than {@code workLimit}
++   *     "effort"
+    */
+-  public static Automaton determinize(Automaton a, int maxDeterminizedStates) {
++  public static Automaton determinize(Automaton a, int workLimit) {
+     if (a.isDeterministic()) {
+       // Already determinized
+       return a;
+@@ -697,9 +711,26 @@ public final class Operations {
+ 
+     Transition t = new Transition();
+ 
++    long effortSpent = 0;
++
++    // LUCENE-9981: approximate conversion from what used to be a limit on number of states, to
++    // maximum "effort":
++    long effortLimit = workLimit * (long) 10;
++
+     while (worklist.size() > 0) {
++      // TODO (LUCENE-9983): these int sets really do not need to be sorted, and we are paying
++      // a high (unecessary) price for that!  really we just need a low-overhead Map<int,int>
++      // that implements equals/hash based only on the keys (ignores the values).  fixing this
++      // might be a bigspeedup for determinizing complex automata
+       FrozenIntSet s = worklist.removeFirst();
+-      // System.out.println("det: pop set=" + s);
++
++      // LUCENE-9981: we more carefully aggregate the net work this automaton is costing us, instead
++      // of (overly simplistically) counting number
++      // of determinized states:
++      effortSpent += s.values.length;
++      if (effortSpent >= effortLimit) {
++        throw new TooComplexToDeterminizeException(a, workLimit);
++      }
+ 
+       // Collate all outgoing transitions by min/1+max:
+       for (int i = 0; i < s.values.length; i++) {
+@@ -736,9 +767,6 @@ public final class Operations {
+           Integer q = newstate.get(statesSet);
+           if (q == null) {
+             q = b.createState();
+-            if (q >= maxDeterminizedStates) {
+-              throw new TooComplexToDeterminizeException(a, maxDeterminizedStates);
+-            }
+             final FrozenIntSet p = statesSet.freeze(q);
+             // System.out.println("  make new state=" + q + " -> " + p + " accCount=" + accCount);
+             worklist.add(p);
+@@ -1050,62 +1078,86 @@ public final class Operations {
+ 
+   /**
+    * Returns the longest string that is a prefix of all accepted strings and visits each state at
+-   * most once. The automaton must be deterministic.
++   * most once. The automaton must not have dead states. If this automaton has already been
++   * converted to UTF-8 (e.g. using {@link UTF32ToUTF8}) then you should use {@link
++   * #getCommonPrefixBytesRef} instead.
+    *
++   * @throws IllegalArgumentException if the automaton has dead states reachable from the initial
++   *     state.
+    * @return common prefix, which can be an empty (length 0) String (never null)
+    */
+   public static String getCommonPrefix(Automaton a) {
+-    if (a.isDeterministic() == false) {
+-      throw new IllegalArgumentException("input automaton must be deterministic");
+-    }
+-    StringBuilder b = new StringBuilder();
+-    HashSet<Integer> visited = new HashSet<>();
+-    int s = 0;
+-    boolean done;
+-    Transition t = new Transition();
+-    do {
+-      done = true;
+-      visited.add(s);
+-      if (a.isAccept(s) == false && a.getNumTransitions(s) == 1) {
+-        a.getTransition(s, 0, t);
+-        if (t.min == t.max && !visited.contains(t.dest)) {
+-          b.appendCodePoint(t.min);
+-          s = t.dest;
+-          done = false;
++    if (hasDeadStatesFromInitial(a)) {
++      throw new IllegalArgumentException("input automaton has dead states");
++    }
++    if (isEmpty(a)) {
++      return "";
++    }
++    StringBuilder builder = new StringBuilder();
++    Transition scratch = new Transition();
++    FixedBitSet visited = new FixedBitSet(a.getNumStates());
++    FixedBitSet current = new FixedBitSet(a.getNumStates());
++    FixedBitSet next = new FixedBitSet(a.getNumStates());
++    current.set(0); // start with initial state
++    algorithm:
++    while (true) {
++      int label = -1;
++      // do a pass, stepping all current paths forward once
++      for (int state = current.nextSetBit(0);
++          state != DocIdSetIterator.NO_MORE_DOCS;
++          state =
++              state + 1 >= current.length()
++                  ? DocIdSetIterator.NO_MORE_DOCS
++                  : current.nextSetBit(state + 1)) {
++        visited.set(state);
++        // if it is an accept state, we are done
++        if (a.isAccept(state)) {
++          break algorithm;
++        }
++        for (int transition = 0; transition < a.getNumTransitions(state); transition++) {
++          a.getTransition(state, transition, scratch);
++          if (label == -1) {
++            label = scratch.min;
++          }
++          // either a range of labels, or label that doesn't match all the other paths this round
++          if (scratch.min != scratch.max || scratch.min != label) {
++            break algorithm;
++          }
++          // mark target state for next iteration
++          next.set(scratch.dest);
+         }
+       }
+-    } while (!done);
+ 
+-    return b.toString();
++      assert label != -1 : "we should not get here since we checked no dead-end states up front!?";
++
++      // add the label to the prefix
++      builder.appendCodePoint(label);
++      // swap "current" with "next", clear "next"
++      FixedBitSet tmp = current;
++      current = next;
++      next = tmp;
++      next.clear(0, next.length());
++    }
++    return builder.toString();
+   }
+ 
+-  // TODO: this currently requites a determinized machine,
+-  // but it need not -- we can speed it up by walking the
+-  // NFA instead.  it'd still be fail fast.
+   /**
+    * Returns the longest BytesRef that is a prefix of all accepted strings and visits each state at
+-   * most once. The automaton must be deterministic.
++   * most once.
+    *
+-   * @return common prefix, which can be an empty (length 0) BytesRef (never null)
++   * @return common prefix, which can be an empty (length 0) BytesRef (never null), and might
++   *     possibly include a UTF-8 fragment of a full Unicode character
+    */
+   public static BytesRef getCommonPrefixBytesRef(Automaton a) {
++    String prefix = getCommonPrefix(a);
+     BytesRefBuilder builder = new BytesRefBuilder();
+-    HashSet<Integer> visited = new HashSet<>();
+-    int s = 0;
+-    boolean done;
+-    Transition t = new Transition();
+-    do {
+-      done = true;
+-      visited.add(s);
+-      if (a.isAccept(s) == false && a.getNumTransitions(s) == 1) {
+-        a.getTransition(s, 0, t);
+-        if (t.min == t.max && !visited.contains(t.dest)) {
+-          builder.append((byte) t.min);
+-          s = t.dest;
+-          done = false;
+-        }
++    for (int i = 0; i < prefix.length(); i++) {
++      char ch = prefix.charAt(i);
++      if (ch > 255) {
++        throw new IllegalStateException("automaton is not binary");
+       }
+-    } while (!done);
++      builder.append((byte) ch);
++    }
+ 
+     return builder.get();
+   }
+@@ -1144,15 +1196,13 @@ public final class Operations {
+ 
+   /**
+    * Returns the longest BytesRef that is a suffix of all accepted strings. Worst case complexity:
+-   * exponential in number of states (this calls determinize).
++   * quadratic with number of states+transitions.
+    *
+-   * @param maxDeterminizedStates maximum number of states determinizing the automaton can result
+-   *     in. Set higher to allow more complex queries and lower to prevent memory exhaustion.
+    * @return common suffix, which can be an empty (length 0) BytesRef (never null)
+    */
+-  public static BytesRef getCommonSuffixBytesRef(Automaton a, int maxDeterminizedStates) {
++  public static BytesRef getCommonSuffixBytesRef(Automaton a) {
+     // reverse the language of the automaton, then reverse its common prefix.
+-    Automaton r = Operations.determinize(reverse(a), maxDeterminizedStates);
++    Automaton r = removeDeadStates(reverse(a));
+     BytesRef ref = getCommonPrefixBytesRef(r);
+     reverseBytes(ref);
+     return ref;
+diff --git a/lucene/core/src/java/org/apache/lucene/util/automaton/RegExp.java b/lucene/core/src/java/org/apache/lucene/util/automaton/RegExp.java
+index e62a998e422..ecd59fdb231 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/automaton/RegExp.java
++++ b/lucene/core/src/java/org/apache/lucene/util/automaton/RegExp.java
+@@ -556,24 +556,26 @@ public class RegExp {
+    * toAutomaton(null)</code> (empty automaton map).
+    */
+   public Automaton toAutomaton() {
+-    return toAutomaton(null, null, Operations.DEFAULT_MAX_DETERMINIZED_STATES);
++    return toAutomaton(null, null, Operations.DEFAULT_DETERMINIZE_WORK_LIMIT);
+   }
+ 
+   /**
+    * Constructs new <code>Automaton</code> from this <code>RegExp</code>. The constructed automaton
+    * is minimal and deterministic and has no transitions to dead states.
+    *
+-   * @param maxDeterminizedStates maximum number of states in the resulting automata. If the
+-   *     automata would need more than this many states TooComplextToDeterminizeException is thrown.
+-   *     Higher number require more space but can process more complex regexes.
++   * @param determinizeWorkLimit maximum effort to spend while determinizing the automata. If
++   *     determinizing the automata would require more than this effort,
++   *     TooComplexToDeterminizeException is thrown. Higher numbers require more space but can
++   *     process more complex regexes. Use {@link Operations#DEFAULT_DETERMINIZE_WORK_LIMIT} as a
++   *     decent default if you don't otherwise know what to specify.
+    * @exception IllegalArgumentException if this regular expression uses a named identifier that is
+    *     not available from the automaton provider
+-   * @exception TooComplexToDeterminizeException if determinizing this regexp requires more than
+-   *     maxDeterminizedStates states
++   * @exception TooComplexToDeterminizeException if determinizing this regexp requires more effort
++   *     than determinizeWorkLimit states
+    */
+-  public Automaton toAutomaton(int maxDeterminizedStates)
++  public Automaton toAutomaton(int determinizeWorkLimit)
+       throws IllegalArgumentException, TooComplexToDeterminizeException {
+-    return toAutomaton(null, null, maxDeterminizedStates);
++    return toAutomaton(null, null, determinizeWorkLimit);
+   }
+ 
+   /**
+@@ -581,17 +583,19 @@ public class RegExp {
+    * is minimal and deterministic and has no transitions to dead states.
+    *
+    * @param automaton_provider provider of automata for named identifiers
+-   * @param maxDeterminizedStates maximum number of states in the resulting automata. If the
+-   *     automata would need more than this many states TooComplextToDeterminizeException is thrown.
+-   *     Higher number require more space but can process more complex regexes.
++   * @param determinizeWorkLimit maximum effort to spend while determinizing the automata. If
++   *     determinizing the automata would require more than this effort,
++   *     TooComplexToDeterminizeException is thrown. Higher numbers require more space but can
++   *     process more complex regexes. Use {@link Operations#DEFAULT_DETERMINIZE_WORK_LIMIT} as a
++   *     decent default if you don't otherwise know what to specify.
+    * @exception IllegalArgumentException if this regular expression uses a named identifier that is
+    *     not available from the automaton provider
+-   * @exception TooComplexToDeterminizeException if determinizing this regexp requires more than
+-   *     maxDeterminizedStates states
++   * @exception TooComplexToDeterminizeException if determinizing this regexp requires more effort
++   *     than determinizeWorkLimit states
+    */
+-  public Automaton toAutomaton(AutomatonProvider automaton_provider, int maxDeterminizedStates)
++  public Automaton toAutomaton(AutomatonProvider automaton_provider, int determinizeWorkLimit)
+       throws IllegalArgumentException, TooComplexToDeterminizeException {
+-    return toAutomaton(null, automaton_provider, maxDeterminizedStates);
++    return toAutomaton(null, automaton_provider, determinizeWorkLimit);
+   }
+ 
+   /**
+@@ -599,26 +603,27 @@ public class RegExp {
+    * is minimal and deterministic and has no transitions to dead states.
+    *
+    * @param automata a map from automaton identifiers to automata (of type <code>Automaton</code>).
+-   * @param maxDeterminizedStates maximum number of states in the resulting automata. If the
+-   *     automata would need more than this many states TooComplexToDeterminizeException is thrown.
+-   *     Higher number require more space but can process more complex regexes.
++   * @param determinizeWorkLimit maximum effort to spend while determinizing the automata. If
++   *     determinizing the automata would require more than this effort,
++   *     TooComplexToDeterminizeException is thrown. Higher numbers require more space but can
++   *     process more complex regexes.
+    * @exception IllegalArgumentException if this regular expression uses a named identifier that
+    *     does not occur in the automaton map
+-   * @exception TooComplexToDeterminizeException if determinizing this regexp requires more than
+-   *     maxDeterminizedStates states
++   * @exception TooComplexToDeterminizeException if determinizing this regexp requires more effort
++   *     than determinizeWorkLimit states
+    */
+-  public Automaton toAutomaton(Map<String, Automaton> automata, int maxDeterminizedStates)
++  public Automaton toAutomaton(Map<String, Automaton> automata, int determinizeWorkLimit)
+       throws IllegalArgumentException, TooComplexToDeterminizeException {
+-    return toAutomaton(automata, null, maxDeterminizedStates);
++    return toAutomaton(automata, null, determinizeWorkLimit);
+   }
+ 
+   private Automaton toAutomaton(
+       Map<String, Automaton> automata,
+       AutomatonProvider automaton_provider,
+-      int maxDeterminizedStates)
++      int determinizeWorkLimit)
+       throws IllegalArgumentException, TooComplexToDeterminizeException {
+     try {
+-      return toAutomatonInternal(automata, automaton_provider, maxDeterminizedStates);
++      return toAutomatonInternal(automata, automaton_provider, determinizeWorkLimit);
+     } catch (TooComplexToDeterminizeException e) {
+       throw new TooComplexToDeterminizeException(this, e);
+     }
+@@ -627,23 +632,23 @@ public class RegExp {
+   private Automaton toAutomatonInternal(
+       Map<String, Automaton> automata,
+       AutomatonProvider automaton_provider,
+-      int maxDeterminizedStates)
++      int determinizeWorkLimit)
+       throws IllegalArgumentException {
+     List<Automaton> list;
+     Automaton a = null;
+     switch (kind) {
+       case REGEXP_PRE_CLASS:
+         RegExp expanded = expandPredefined();
+-        a = expanded.toAutomatonInternal(automata, automaton_provider, maxDeterminizedStates);
++        a = expanded.toAutomatonInternal(automata, automaton_provider, determinizeWorkLimit);
+         break;
+       case REGEXP_UNION:
+         list = new ArrayList<>();
+         findLeaves(
+-            exp1, Kind.REGEXP_UNION, list, automata, automaton_provider, maxDeterminizedStates);
++            exp1, Kind.REGEXP_UNION, list, automata, automaton_provider, determinizeWorkLimit);
+         findLeaves(
+-            exp2, Kind.REGEXP_UNION, list, automata, automaton_provider, maxDeterminizedStates);
++            exp2, Kind.REGEXP_UNION, list, automata, automaton_provider, determinizeWorkLimit);
+         a = Operations.union(list);
+-        a = MinimizationOperations.minimize(a, maxDeterminizedStates);
++        a = MinimizationOperations.minimize(a, determinizeWorkLimit);
+         break;
+       case REGEXP_CONCATENATION:
+         list = new ArrayList<>();
+@@ -653,49 +658,49 @@ public class RegExp {
+             list,
+             automata,
+             automaton_provider,
+-            maxDeterminizedStates);
++            determinizeWorkLimit);
+         findLeaves(
+             exp2,
+             Kind.REGEXP_CONCATENATION,
+             list,
+             automata,
+             automaton_provider,
+-            maxDeterminizedStates);
++            determinizeWorkLimit);
+         a = Operations.concatenate(list);
+-        a = MinimizationOperations.minimize(a, maxDeterminizedStates);
++        a = MinimizationOperations.minimize(a, determinizeWorkLimit);
+         break;
+       case REGEXP_INTERSECTION:
+         a =
+             Operations.intersection(
+-                exp1.toAutomatonInternal(automata, automaton_provider, maxDeterminizedStates),
+-                exp2.toAutomatonInternal(automata, automaton_provider, maxDeterminizedStates));
+-        a = MinimizationOperations.minimize(a, maxDeterminizedStates);
++                exp1.toAutomatonInternal(automata, automaton_provider, determinizeWorkLimit),
++                exp2.toAutomatonInternal(automata, automaton_provider, determinizeWorkLimit));
++        a = MinimizationOperations.minimize(a, determinizeWorkLimit);
+         break;
+       case REGEXP_OPTIONAL:
+         a =
+             Operations.optional(
+-                exp1.toAutomatonInternal(automata, automaton_provider, maxDeterminizedStates));
+-        a = MinimizationOperations.minimize(a, maxDeterminizedStates);
++                exp1.toAutomatonInternal(automata, automaton_provider, determinizeWorkLimit));
++        a = MinimizationOperations.minimize(a, determinizeWorkLimit);
+         break;
+       case REGEXP_REPEAT:
+         a =
+             Operations.repeat(
+-                exp1.toAutomatonInternal(automata, automaton_provider, maxDeterminizedStates));
+-        a = MinimizationOperations.minimize(a, maxDeterminizedStates);
++                exp1.toAutomatonInternal(automata, automaton_provider, determinizeWorkLimit));
++        a = MinimizationOperations.minimize(a, determinizeWorkLimit);
+         break;
+       case REGEXP_REPEAT_MIN:
+-        a = exp1.toAutomatonInternal(automata, automaton_provider, maxDeterminizedStates);
++        a = exp1.toAutomatonInternal(automata, automaton_provider, determinizeWorkLimit);
+         int minNumStates = (a.getNumStates() - 1) * min;
+-        if (minNumStates > maxDeterminizedStates) {
++        if (minNumStates > determinizeWorkLimit) {
+           throw new TooComplexToDeterminizeException(a, minNumStates);
+         }
+         a = Operations.repeat(a, min);
+-        a = MinimizationOperations.minimize(a, maxDeterminizedStates);
++        a = MinimizationOperations.minimize(a, determinizeWorkLimit);
+         break;
+       case REGEXP_REPEAT_MINMAX:
+-        a = exp1.toAutomatonInternal(automata, automaton_provider, maxDeterminizedStates);
++        a = exp1.toAutomatonInternal(automata, automaton_provider, determinizeWorkLimit);
+         int minMaxNumStates = (a.getNumStates() - 1) * max;
+-        if (minMaxNumStates > maxDeterminizedStates) {
++        if (minMaxNumStates > determinizeWorkLimit) {
+           throw new TooComplexToDeterminizeException(a, minMaxNumStates);
+         }
+         a = Operations.repeat(a, min, max);
+@@ -703,13 +708,13 @@ public class RegExp {
+       case REGEXP_COMPLEMENT:
+         a =
+             Operations.complement(
+-                exp1.toAutomatonInternal(automata, automaton_provider, maxDeterminizedStates),
+-                maxDeterminizedStates);
+-        a = MinimizationOperations.minimize(a, maxDeterminizedStates);
++                exp1.toAutomatonInternal(automata, automaton_provider, determinizeWorkLimit),
++                determinizeWorkLimit);
++        a = MinimizationOperations.minimize(a, determinizeWorkLimit);
+         break;
+       case REGEXP_CHAR:
+         if (check(ASCII_CASE_INSENSITIVE)) {
+-          a = toCaseInsensitiveChar(c, maxDeterminizedStates);
++          a = toCaseInsensitiveChar(c, determinizeWorkLimit);
+         } else {
+           a = Automata.makeChar(c);
+         }
+@@ -725,7 +730,7 @@ public class RegExp {
+         break;
+       case REGEXP_STRING:
+         if (check(ASCII_CASE_INSENSITIVE)) {
+-          a = toCaseInsensitiveString(maxDeterminizedStates);
++          a = toCaseInsensitiveString(determinizeWorkLimit);
+         } else {
+           a = Automata.makeString(s);
+         }
+@@ -757,7 +762,7 @@ public class RegExp {
+     return a;
+   }
+ 
+-  private Automaton toCaseInsensitiveChar(int codepoint, int maxDeterminizedStates) {
++  private Automaton toCaseInsensitiveChar(int codepoint, int determinizeWorkLimit) {
+     Automaton case1 = Automata.makeChar(codepoint);
+     // For now we only work with ASCII characters
+     if (codepoint > 128) {
+@@ -770,22 +775,22 @@ public class RegExp {
+     Automaton result;
+     if (altCase != codepoint) {
+       result = Operations.union(case1, Automata.makeChar(altCase));
+-      result = MinimizationOperations.minimize(result, maxDeterminizedStates);
++      result = MinimizationOperations.minimize(result, determinizeWorkLimit);
+     } else {
+       result = case1;
+     }
+     return result;
+   }
+ 
+-  private Automaton toCaseInsensitiveString(int maxDeterminizedStates) {
++  private Automaton toCaseInsensitiveString(int determinizeWorkLimit) {
+     List<Automaton> list = new ArrayList<>();
+ 
+     Iterator<Integer> iter = s.codePoints().iterator();
+     while (iter.hasNext()) {
+-      list.add(toCaseInsensitiveChar(iter.next(), maxDeterminizedStates));
++      list.add(toCaseInsensitiveChar(iter.next(), determinizeWorkLimit));
+     }
+     Automaton a = Operations.concatenate(list);
+-    a = MinimizationOperations.minimize(a, maxDeterminizedStates);
++    a = MinimizationOperations.minimize(a, determinizeWorkLimit);
+     return a;
+   }
+ 
+@@ -795,12 +800,12 @@ public class RegExp {
+       List<Automaton> list,
+       Map<String, Automaton> automata,
+       AutomatonProvider automaton_provider,
+-      int maxDeterminizedStates) {
++      int determinizeWorkLimit) {
+     if (exp.kind == kind) {
+-      findLeaves(exp.exp1, kind, list, automata, automaton_provider, maxDeterminizedStates);
+-      findLeaves(exp.exp2, kind, list, automata, automaton_provider, maxDeterminizedStates);
++      findLeaves(exp.exp1, kind, list, automata, automaton_provider, determinizeWorkLimit);
++      findLeaves(exp.exp2, kind, list, automata, automaton_provider, determinizeWorkLimit);
+     } else {
+-      list.add(exp.toAutomatonInternal(automata, automaton_provider, maxDeterminizedStates));
++      list.add(exp.toAutomatonInternal(automata, automaton_provider, determinizeWorkLimit));
+     }
+   }
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/util/automaton/RunAutomaton.java b/lucene/core/src/java/org/apache/lucene/util/automaton/RunAutomaton.java
+index cfcff2e9c14..d4b2a2ec41e 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/automaton/RunAutomaton.java
++++ b/lucene/core/src/java/org/apache/lucene/util/automaton/RunAutomaton.java
+@@ -58,18 +58,18 @@ public abstract class RunAutomaton implements Accountable {
+    * @param a an automaton
+    */
+   protected RunAutomaton(Automaton a, int alphabetSize) {
+-    this(a, alphabetSize, Operations.DEFAULT_MAX_DETERMINIZED_STATES);
++    this(a, alphabetSize, Operations.DEFAULT_DETERMINIZE_WORK_LIMIT);
+   }
+ 
+   /**
+    * Constructs a new <code>RunAutomaton</code> from a deterministic <code>Automaton</code>.
+    *
+    * @param a an automaton
+-   * @param maxDeterminizedStates maximum number of states that can be created while determinizing a
++   * @param determinizeWorkLimit maximum effort to spend while determinizing
+    */
+-  protected RunAutomaton(Automaton a, int alphabetSize, int maxDeterminizedStates) {
++  protected RunAutomaton(Automaton a, int alphabetSize, int determinizeWorkLimit) {
+     this.alphabetSize = alphabetSize;
+-    a = Operations.determinize(a, maxDeterminizedStates);
++    a = Operations.determinize(a, determinizeWorkLimit);
+     this.automaton = a;
+     points = a.getStartPoints();
+     size = Math.max(1, a.getNumStates());
+diff --git a/lucene/core/src/java/org/apache/lucene/util/automaton/TooComplexToDeterminizeException.java b/lucene/core/src/java/org/apache/lucene/util/automaton/TooComplexToDeterminizeException.java
+index 0198be06f71..0a3da3c01e9 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/automaton/TooComplexToDeterminizeException.java
++++ b/lucene/core/src/java/org/apache/lucene/util/automaton/TooComplexToDeterminizeException.java
+@@ -16,42 +16,39 @@
+  */
+ package org.apache.lucene.util.automaton;
+ 
+-/**
+- * This exception is thrown when determinizing an automaton would result in one which has too many
+- * states.
+- */
++/** This exception is thrown when determinizing an automaton would require too much work. */
+ public class TooComplexToDeterminizeException extends RuntimeException {
+   private final transient Automaton automaton;
+   private final transient RegExp regExp;
+-  private final transient int maxDeterminizedStates;
++  private final transient int determinizeWorkLimit;
+ 
+   /** Use this constructor when the RegExp failed to convert to an automaton. */
+   public TooComplexToDeterminizeException(RegExp regExp, TooComplexToDeterminizeException cause) {
+     super(
+         "Determinizing "
+             + regExp.getOriginalString()
+-            + " would result in more than "
+-            + cause.maxDeterminizedStates
+-            + " states.",
++            + " would require more than "
++            + cause.determinizeWorkLimit
++            + " effort.",
+         cause);
+     this.regExp = regExp;
+     this.automaton = cause.automaton;
+-    this.maxDeterminizedStates = cause.maxDeterminizedStates;
++    this.determinizeWorkLimit = cause.determinizeWorkLimit;
+   }
+ 
+   /** Use this constructor when the automaton failed to determinize. */
+-  public TooComplexToDeterminizeException(Automaton automaton, int maxDeterminizedStates) {
++  public TooComplexToDeterminizeException(Automaton automaton, int determinizeWorkLimit) {
+     super(
+         "Determinizing automaton with "
+             + automaton.getNumStates()
+             + " states and "
+             + automaton.getNumTransitions()
+-            + " transitions would result in more than "
+-            + maxDeterminizedStates
+-            + " states.");
++            + " transitions would require more than "
++            + determinizeWorkLimit
++            + " effort.");
+     this.automaton = automaton;
+     this.regExp = null;
+-    this.maxDeterminizedStates = maxDeterminizedStates;
++    this.determinizeWorkLimit = determinizeWorkLimit;
+   }
+ 
+   /** Returns the automaton that caused this exception, if any. */
+@@ -64,8 +61,8 @@ public class TooComplexToDeterminizeException extends RuntimeException {
+     return regExp;
+   }
+ 
+-  /** Get the maximum number of allowed determinized states. */
+-  public int getMaxDeterminizedStates() {
+-    return maxDeterminizedStates;
++  /** Get the maximum allowed determinize effort. */
++  public int getDeterminizeWorkLimit() {
++    return determinizeWorkLimit;
+   }
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/util/graph/GraphTokenStreamFiniteStrings.java b/lucene/core/src/java/org/apache/lucene/util/graph/GraphTokenStreamFiniteStrings.java
+index dcaec93b498..6711dfb6230 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/graph/GraphTokenStreamFiniteStrings.java
++++ b/lucene/core/src/java/org/apache/lucene/util/graph/GraphTokenStreamFiniteStrings.java
+@@ -17,7 +17,7 @@
+ 
+ package org.apache.lucene.util.graph;
+ 
+-import static org.apache.lucene.util.automaton.Operations.DEFAULT_MAX_DETERMINIZED_STATES;
++import static org.apache.lucene.util.automaton.Operations.DEFAULT_DETERMINIZE_WORK_LIMIT;
+ 
+ import java.io.IOException;
+ import java.util.ArrayList;
+@@ -80,7 +80,7 @@ public final class GraphTokenStreamFiniteStrings {
+   public GraphTokenStreamFiniteStrings(TokenStream in) throws IOException {
+     Automaton aut = build(in);
+     this.det =
+-        Operations.removeDeadStates(Operations.determinize(aut, DEFAULT_MAX_DETERMINIZED_STATES));
++        Operations.removeDeadStates(Operations.determinize(aut, DEFAULT_DETERMINIZE_WORK_LIMIT));
+   }
+ 
+   /**
+diff --git a/lucene/core/src/test/org/apache/lucene/analysis/TestGraphTokenizers.java b/lucene/core/src/test/org/apache/lucene/analysis/TestGraphTokenizers.java
+index 42bc3707a54..989759d9038 100644
+--- a/lucene/core/src/test/org/apache/lucene/analysis/TestGraphTokenizers.java
++++ b/lucene/core/src/test/org/apache/lucene/analysis/TestGraphTokenizers.java
+@@ -16,7 +16,7 @@
+  */
+ package org.apache.lucene.analysis;
+ 
+-import static org.apache.lucene.util.automaton.Operations.DEFAULT_MAX_DETERMINIZED_STATES;
++import static org.apache.lucene.util.automaton.Operations.DEFAULT_DETERMINIZE_WORK_LIMIT;
+ 
+ import java.io.IOException;
+ import java.io.PrintWriter;
+@@ -615,10 +615,9 @@ public class TestGraphTokenizers extends BaseTokenStreamTestCase {
+   private void assertSameLanguage(Automaton expected, Automaton actual) {
+     Automaton expectedDet =
+         Operations.determinize(
+-            Operations.removeDeadStates(expected), DEFAULT_MAX_DETERMINIZED_STATES);
++            Operations.removeDeadStates(expected), DEFAULT_DETERMINIZE_WORK_LIMIT);
+     Automaton actualDet =
+-        Operations.determinize(
+-            Operations.removeDeadStates(actual), DEFAULT_MAX_DETERMINIZED_STATES);
++        Operations.determinize(Operations.removeDeadStates(actual), DEFAULT_DETERMINIZE_WORK_LIMIT);
+     if (Operations.sameLanguage(expectedDet, actualDet) == false) {
+       Set<String> expectedPaths = toPathStrings(expectedDet);
+       Set<String> actualPaths = toPathStrings(actualDet);
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestTermsEnum2.java b/lucene/core/src/test/org/apache/lucene/index/TestTermsEnum2.java
+index 5c4e990e284..97fc663298f 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestTermsEnum2.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestTermsEnum2.java
+@@ -16,7 +16,7 @@
+  */
+ package org.apache.lucene.index;
+ 
+-import static org.apache.lucene.util.automaton.Operations.DEFAULT_MAX_DETERMINIZED_STATES;
++import static org.apache.lucene.util.automaton.Operations.DEFAULT_DETERMINIZE_WORK_LIMIT;
+ 
+ import java.util.ArrayList;
+ import java.util.Collections;
+@@ -91,7 +91,7 @@ public class TestTermsEnum2 extends LuceneTestCase {
+       String reg = AutomatonTestUtil.randomRegexp(random());
+       Automaton automaton =
+           Operations.determinize(
+-              new RegExp(reg, RegExp.NONE).toAutomaton(), DEFAULT_MAX_DETERMINIZED_STATES);
++              new RegExp(reg, RegExp.NONE).toAutomaton(), DEFAULT_DETERMINIZE_WORK_LIMIT);
+       final List<BytesRef> matchedTerms = new ArrayList<>();
+       for (BytesRef t : terms) {
+         if (Operations.run(automaton, t.utf8ToString())) {
+@@ -119,7 +119,7 @@ public class TestTermsEnum2 extends LuceneTestCase {
+       String reg = AutomatonTestUtil.randomRegexp(random());
+       Automaton automaton =
+           Operations.determinize(
+-              new RegExp(reg, RegExp.NONE).toAutomaton(), DEFAULT_MAX_DETERMINIZED_STATES);
++              new RegExp(reg, RegExp.NONE).toAutomaton(), DEFAULT_DETERMINIZE_WORK_LIMIT);
+       TermsEnum te = MultiTerms.getTerms(reader, "field").iterator();
+       ArrayList<BytesRef> unsortedTerms = new ArrayList<>(terms);
+       Collections.shuffle(unsortedTerms, random());
+@@ -169,14 +169,14 @@ public class TestTermsEnum2 extends LuceneTestCase {
+       TermsEnum te = MultiTerms.getTerms(reader, "field").intersect(ca, null);
+       Automaton expected =
+           Operations.determinize(
+-              Operations.intersection(termsAutomaton, automaton), DEFAULT_MAX_DETERMINIZED_STATES);
++              Operations.intersection(termsAutomaton, automaton), DEFAULT_DETERMINIZE_WORK_LIMIT);
+       TreeSet<BytesRef> found = new TreeSet<>();
+       while (te.next() != null) {
+         found.add(BytesRef.deepCopyOf(te.term()));
+       }
+ 
+       Automaton actual =
+-          Operations.determinize(Automata.makeStringUnion(found), DEFAULT_MAX_DETERMINIZED_STATES);
++          Operations.determinize(Automata.makeStringUnion(found), DEFAULT_DETERMINIZE_WORK_LIMIT);
+       assertTrue(Operations.sameLanguage(expected, actual));
+     }
+   }
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestAutomatonQuery.java b/lucene/core/src/test/org/apache/lucene/search/TestAutomatonQuery.java
+index 4b937bb0e95..393ce928a31 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestAutomatonQuery.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestAutomatonQuery.java
+@@ -16,7 +16,7 @@
+  */
+ package org.apache.lucene.search;
+ 
+-import static org.apache.lucene.util.automaton.Operations.DEFAULT_MAX_DETERMINIZED_STATES;
++import static org.apache.lucene.util.automaton.Operations.DEFAULT_DETERMINIZE_WORK_LIMIT;
+ 
+ import java.io.IOException;
+ import java.util.ArrayList;
+@@ -121,7 +121,7 @@ public class TestAutomatonQuery extends LuceneTestCase {
+         Operations.minus(
+             Automata.makeCharRange('a', 'b'),
+             Automata.makeChar('a'),
+-            DEFAULT_MAX_DETERMINIZED_STATES));
++            DEFAULT_DETERMINIZE_WORK_LIMIT));
+   }
+ 
+   /** Test that a nondeterministic automaton works correctly. (It should will be determinized) */
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestFuzzyQuery.java b/lucene/core/src/test/org/apache/lucene/search/TestFuzzyQuery.java
+index 3bc14e795cd..9b599556707 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestFuzzyQuery.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestFuzzyQuery.java
+@@ -578,7 +578,7 @@ public class TestFuzzyQuery extends LuceneTestCase {
+ 
+   public void testErrorMessage() {
+     // 45 states per vector from Lev2TParametricDescription
+-    final int length = (Operations.DEFAULT_MAX_DETERMINIZED_STATES / 45) + 10;
++    final int length = (Operations.DEFAULT_DETERMINIZE_WORK_LIMIT / 5) + 10;
+     final String value = randomRealisticMultiByteUnicode(length);
+ 
+     FuzzyTermsEnum.FuzzyTermsException expected =
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestRegexpQuery.java b/lucene/core/src/test/org/apache/lucene/search/TestRegexpQuery.java
+index cc5053db043..bd86bae92d2 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestRegexpQuery.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestRegexpQuery.java
+@@ -16,7 +16,7 @@
+  */
+ package org.apache.lucene.search;
+ 
+-import static org.apache.lucene.util.automaton.Operations.DEFAULT_MAX_DETERMINIZED_STATES;
++import static org.apache.lucene.util.automaton.Operations.DEFAULT_DETERMINIZE_WORK_LIMIT;
+ 
+ import java.io.IOException;
+ import java.util.Arrays;
+@@ -32,6 +32,7 @@ import org.apache.lucene.util.automaton.Automaton;
+ import org.apache.lucene.util.automaton.AutomatonProvider;
+ import org.apache.lucene.util.automaton.Operations;
+ import org.apache.lucene.util.automaton.RegExp;
++import org.apache.lucene.util.automaton.TooComplexToDeterminizeException;
+ 
+ /** Some simple regex tests, mostly converted from contrib's TestRegexQuery. */
+ public class TestRegexpQuery extends LuceneTestCase {
+@@ -79,7 +80,7 @@ public class TestRegexpQuery extends LuceneTestCase {
+             newTerm(regex),
+             RegExp.ALL,
+             RegExp.ASCII_CASE_INSENSITIVE,
+-            Operations.DEFAULT_MAX_DETERMINIZED_STATES);
++            Operations.DEFAULT_DETERMINIZE_WORK_LIMIT);
+     return searcher.count(query);
+   }
+ 
+@@ -166,7 +167,7 @@ public class TestRegexpQuery extends LuceneTestCase {
+         };
+     RegexpQuery query =
+         new RegexpQuery(
+-            newTerm("<quickBrown>"), RegExp.ALL, myProvider, DEFAULT_MAX_DETERMINIZED_STATES);
++            newTerm("<quickBrown>"), RegExp.ALL, myProvider, DEFAULT_DETERMINIZE_WORK_LIMIT);
+     assertEquals(1, searcher.search(query, 5).totalHits.value);
+   }
+ 
+@@ -178,4 +179,13 @@ public class TestRegexpQuery extends LuceneTestCase {
+   public void testBacktracking() throws IOException {
+     assertEquals(1, regexQueryNrHits("4934[314]"));
+   }
++
++  /** Test worst-case for getCommonSuffix optimization */
++  public void testSlowCommonSuffix() throws Exception {
++    expectThrows(
++        TooComplexToDeterminizeException.class,
++        () -> {
++          new RegexpQuery(new Term("stringvalue", "(.*a){2000}"));
++        });
++  }
+ }
+diff --git a/lucene/core/src/test/org/apache/lucene/util/automaton/TestAutomaton.java b/lucene/core/src/test/org/apache/lucene/util/automaton/TestAutomaton.java
+index cc827f43a05..211e93b990c 100644
+--- a/lucene/core/src/test/org/apache/lucene/util/automaton/TestAutomaton.java
++++ b/lucene/core/src/test/org/apache/lucene/util/automaton/TestAutomaton.java
+@@ -16,7 +16,7 @@
+  */
+ package org.apache.lucene.util.automaton;
+ 
+-import static org.apache.lucene.util.automaton.Operations.DEFAULT_MAX_DETERMINIZED_STATES;
++import static org.apache.lucene.util.automaton.Operations.DEFAULT_DETERMINIZE_WORK_LIMIT;
+ 
+ import java.util.ArrayList;
+ import java.util.Arrays;
+@@ -89,11 +89,121 @@ public class TestAutomaton extends LuceneTestCase {
+     assertTrue(Operations.sameLanguage(a1, a2));
+   }
+ 
+-  public void testCommonPrefix() throws Exception {
++  public void testCommonPrefixString() throws Exception {
+     Automaton a = Operations.concatenate(Automata.makeString("foobar"), Automata.makeAnyString());
+     assertEquals("foobar", Operations.getCommonPrefix(a));
+   }
+ 
++  public void testCommonPrefixEmpty() throws Exception {
++    assertEquals("", Operations.getCommonPrefix(Automata.makeEmpty()));
++  }
++
++  public void testCommonPrefixEmptyString() throws Exception {
++    assertEquals("", Operations.getCommonPrefix(Automata.makeEmptyString()));
++  }
++
++  public void testCommonPrefixAny() throws Exception {
++    assertEquals("", Operations.getCommonPrefix(Automata.makeAnyString()));
++  }
++
++  public void testCommonPrefixRange() throws Exception {
++    assertEquals("", Operations.getCommonPrefix(Automata.makeCharRange('a', 'b')));
++  }
++
++  public void testAlternatives() throws Exception {
++    Automaton a = Automata.makeChar('a');
++    Automaton c = Automata.makeChar('c');
++    assertEquals("", Operations.getCommonPrefix(Operations.union(a, c)));
++  }
++
++  public void testCommonPrefixLeadingWildcard() throws Exception {
++    Automaton a = Operations.concatenate(Automata.makeAnyChar(), Automata.makeString("boo"));
++    assertEquals("", Operations.getCommonPrefix(a));
++  }
++
++  public void testCommonPrefixTrailingWildcard() throws Exception {
++    Automaton a = Operations.concatenate(Automata.makeString("boo"), Automata.makeAnyChar());
++    assertEquals("boo", Operations.getCommonPrefix(a));
++  }
++
++  public void testCommonPrefixLeadingKleenStar() throws Exception {
++    Automaton a = Operations.concatenate(Automata.makeAnyString(), Automata.makeString("boo"));
++    assertEquals("", Operations.getCommonPrefix(a));
++  }
++
++  public void testCommonPrefixTrailingKleenStar() throws Exception {
++    Automaton a = Operations.concatenate(Automata.makeString("boo"), Automata.makeAnyString());
++    assertEquals("boo", Operations.getCommonPrefix(a));
++  }
++
++  public void testCommonPrefixDeadStates() throws Exception {
++    Automaton a = Operations.concatenate(Automata.makeAnyString(), Automata.makeString("boo"));
++    // reverse it twice, to create some dead states
++    // TODO: is it possible to fix reverse() to not create dead states?!
++    Automaton withDeadStates = Operations.reverse(Operations.reverse(a));
++    IllegalArgumentException expected =
++        expectThrows(
++            IllegalArgumentException.class,
++            () -> {
++              Operations.getCommonPrefix(withDeadStates);
++            });
++    assertEquals("input automaton has dead states", expected.getMessage());
++  }
++
++  public void testCommonPrefixRemoveDeadStates() throws Exception {
++    Automaton a = Operations.concatenate(Automata.makeAnyString(), Automata.makeString("boo"));
++    // reverse it twice, to create some dead states
++    // TODO: is it possible to fix reverse() to not create dead states?!
++    Automaton withDeadStates = Operations.reverse(Operations.reverse(a));
++    // now remove the deadstates
++    Automaton withoutDeadStates = Operations.removeDeadStates(withDeadStates);
++    assertEquals("", Operations.getCommonPrefix(withoutDeadStates));
++  }
++
++  public void testCommonPrefixOptional() throws Exception {
++    Automaton a = new Automaton();
++    int init = a.createState();
++    int fini = a.createState();
++    a.setAccept(init, true);
++    a.setAccept(fini, true);
++    a.addTransition(init, fini, 'm');
++    a.addTransition(fini, fini, 'm');
++    a.finishState();
++    assertEquals("", Operations.getCommonPrefix(a));
++  }
++
++  public void testCommonPrefixNFA() throws Exception {
++    Automaton a = new Automaton();
++    int init = a.createState();
++    int medial = a.createState();
++    int fini = a.createState();
++    a.setAccept(fini, true);
++    a.addTransition(init, medial, 'm');
++    a.addTransition(init, fini, 'm');
++    a.addTransition(medial, fini, 'o');
++    a.finishState();
++    assertEquals("m", Operations.getCommonPrefix(a));
++  }
++
++  public void testCommonPrefixNFAInfinite() throws Exception {
++    Automaton a = new Automaton();
++    int init = a.createState();
++    int medial = a.createState();
++    int fini = a.createState();
++    a.setAccept(fini, true);
++    a.addTransition(init, medial, 'm');
++    a.addTransition(init, fini, 'm');
++    a.addTransition(medial, fini, 'm');
++    a.addTransition(fini, fini, 'm');
++    a.finishState();
++    assertEquals("m", Operations.getCommonPrefix(a));
++  }
++
++  public void testCommonPrefixUnicode() throws Exception {
++    Automaton a = Operations.concatenate(Automata.makeString("boo😂😂😂"), Automata.makeAnyChar());
++    assertEquals("boo😂😂😂", Operations.getCommonPrefix(a));
++  }
++
+   public void testConcatenate1() throws Exception {
+     Automaton a = Operations.concatenate(Automata.makeString("m"), Automata.makeAnyString());
+     assertTrue(Operations.run(a, "m"));
+@@ -109,7 +219,7 @@ public class TestAutomaton extends LuceneTestCase {
+                 Automata.makeAnyString(),
+                 Automata.makeString("n"),
+                 Automata.makeAnyString()));
+-    a = Operations.determinize(a, DEFAULT_MAX_DETERMINIZED_STATES);
++    a = Operations.determinize(a, DEFAULT_DETERMINIZE_WORK_LIMIT);
+     assertTrue(Operations.run(a, "mn"));
+     assertTrue(Operations.run(a, "mone"));
+     assertFalse(Operations.run(a, "m"));
+@@ -120,7 +230,7 @@ public class TestAutomaton extends LuceneTestCase {
+     Automaton a =
+         Operations.union(
+             Arrays.asList(Automata.makeString("foobar"), Automata.makeString("barbaz")));
+-    a = Operations.determinize(a, DEFAULT_MAX_DETERMINIZED_STATES);
++    a = Operations.determinize(a, DEFAULT_DETERMINIZE_WORK_LIMIT);
+     assertTrue(Operations.run(a, "foobar"));
+     assertTrue(Operations.run(a, "barbaz"));
+ 
+@@ -134,7 +244,7 @@ public class TestAutomaton extends LuceneTestCase {
+                 Automata.makeString("foobar"),
+                 Automata.makeString(""),
+                 Automata.makeString("barbaz")));
+-    a = Operations.determinize(a, DEFAULT_MAX_DETERMINIZED_STATES);
++    a = Operations.determinize(a, DEFAULT_DETERMINIZE_WORK_LIMIT);
+     assertTrue(Operations.run(a, "foobar"));
+     assertTrue(Operations.run(a, "barbaz"));
+     assertTrue(Operations.run(a, ""));
+@@ -144,7 +254,7 @@ public class TestAutomaton extends LuceneTestCase {
+ 
+   public void testMinimizeSimple() throws Exception {
+     Automaton a = Automata.makeString("foobar");
+-    Automaton aMin = MinimizationOperations.minimize(a, DEFAULT_MAX_DETERMINIZED_STATES);
++    Automaton aMin = MinimizationOperations.minimize(a, DEFAULT_DETERMINIZE_WORK_LIMIT);
+ 
+     assertTrue(Operations.sameLanguage(a, aMin));
+   }
+@@ -153,17 +263,17 @@ public class TestAutomaton extends LuceneTestCase {
+     Automaton a =
+         Operations.union(
+             Arrays.asList(Automata.makeString("foobar"), Automata.makeString("boobar")));
+-    Automaton aMin = MinimizationOperations.minimize(a, DEFAULT_MAX_DETERMINIZED_STATES);
++    Automaton aMin = MinimizationOperations.minimize(a, DEFAULT_DETERMINIZE_WORK_LIMIT);
+     assertTrue(
+         Operations.sameLanguage(
+-            Operations.determinize(Operations.removeDeadStates(a), DEFAULT_MAX_DETERMINIZED_STATES),
++            Operations.determinize(Operations.removeDeadStates(a), DEFAULT_DETERMINIZE_WORK_LIMIT),
+             aMin));
+   }
+ 
+   public void testReverse() throws Exception {
+     Automaton a = Automata.makeString("foobar");
+     Automaton ra = Operations.reverse(a);
+-    Automaton a2 = Operations.determinize(Operations.reverse(ra), DEFAULT_MAX_DETERMINIZED_STATES);
++    Automaton a2 = Operations.determinize(Operations.reverse(ra), DEFAULT_DETERMINIZE_WORK_LIMIT);
+ 
+     assertTrue(Operations.sameLanguage(a, a2));
+   }
+@@ -171,7 +281,7 @@ public class TestAutomaton extends LuceneTestCase {
+   public void testOptional() throws Exception {
+     Automaton a = Automata.makeString("foobar");
+     Automaton a2 = Operations.optional(a);
+-    a2 = Operations.determinize(a2, DEFAULT_MAX_DETERMINIZED_STATES);
++    a2 = Operations.determinize(a2, DEFAULT_DETERMINIZE_WORK_LIMIT);
+ 
+     assertTrue(Operations.run(a, "foobar"));
+     assertFalse(Operations.run(a, ""));
+@@ -181,7 +291,7 @@ public class TestAutomaton extends LuceneTestCase {
+ 
+   public void testRepeatAny() throws Exception {
+     Automaton a = Automata.makeString("zee");
+-    Automaton a2 = Operations.determinize(Operations.repeat(a), DEFAULT_MAX_DETERMINIZED_STATES);
++    Automaton a2 = Operations.determinize(Operations.repeat(a), DEFAULT_DETERMINIZE_WORK_LIMIT);
+     assertTrue(Operations.run(a2, ""));
+     assertTrue(Operations.run(a2, "zee"));
+     assertTrue(Operations.run(a2, "zeezee"));
+@@ -190,7 +300,7 @@ public class TestAutomaton extends LuceneTestCase {
+ 
+   public void testRepeatMin() throws Exception {
+     Automaton a = Automata.makeString("zee");
+-    Automaton a2 = Operations.determinize(Operations.repeat(a, 2), DEFAULT_MAX_DETERMINIZED_STATES);
++    Automaton a2 = Operations.determinize(Operations.repeat(a, 2), DEFAULT_DETERMINIZE_WORK_LIMIT);
+     assertFalse(Operations.run(a2, ""));
+     assertFalse(Operations.run(a2, "zee"));
+     assertTrue(Operations.run(a2, "zeezee"));
+@@ -200,7 +310,7 @@ public class TestAutomaton extends LuceneTestCase {
+   public void testRepeatMinMax1() throws Exception {
+     Automaton a = Automata.makeString("zee");
+     Automaton a2 =
+-        Operations.determinize(Operations.repeat(a, 0, 2), DEFAULT_MAX_DETERMINIZED_STATES);
++        Operations.determinize(Operations.repeat(a, 0, 2), DEFAULT_DETERMINIZE_WORK_LIMIT);
+     assertTrue(Operations.run(a2, ""));
+     assertTrue(Operations.run(a2, "zee"));
+     assertTrue(Operations.run(a2, "zeezee"));
+@@ -210,7 +320,7 @@ public class TestAutomaton extends LuceneTestCase {
+   public void testRepeatMinMax2() throws Exception {
+     Automaton a = Automata.makeString("zee");
+     Automaton a2 =
+-        Operations.determinize(Operations.repeat(a, 2, 4), DEFAULT_MAX_DETERMINIZED_STATES);
++        Operations.determinize(Operations.repeat(a, 2, 4), DEFAULT_DETERMINIZE_WORK_LIMIT);
+     assertFalse(Operations.run(a2, ""));
+     assertFalse(Operations.run(a2, "zee"));
+     assertTrue(Operations.run(a2, "zeezee"));
+@@ -223,8 +333,8 @@ public class TestAutomaton extends LuceneTestCase {
+     Automaton a = Automata.makeString("zee");
+     Automaton a2 =
+         Operations.determinize(
+-            Operations.complement(a, DEFAULT_MAX_DETERMINIZED_STATES),
+-            DEFAULT_MAX_DETERMINIZED_STATES);
++            Operations.complement(a, DEFAULT_DETERMINIZE_WORK_LIMIT),
++            DEFAULT_DETERMINIZE_WORK_LIMIT);
+     assertTrue(Operations.run(a2, ""));
+     assertFalse(Operations.run(a2, "zee"));
+     assertTrue(Operations.run(a2, "zeezee"));
+@@ -234,7 +344,7 @@ public class TestAutomaton extends LuceneTestCase {
+   public void testInterval() throws Exception {
+     Automaton a =
+         Operations.determinize(
+-            Automata.makeDecimalInterval(17, 100, 3), DEFAULT_MAX_DETERMINIZED_STATES);
++            Automata.makeDecimalInterval(17, 100, 3), DEFAULT_DETERMINIZE_WORK_LIMIT);
+     assertFalse(Operations.run(a, ""));
+     assertTrue(Operations.run(a, "017"));
+     assertTrue(Operations.run(a, "100"));
+@@ -250,7 +360,37 @@ public class TestAutomaton extends LuceneTestCase {
+     a.addTransition(init, fini, 'm');
+     a.addTransition(fini, fini, 'm');
+     a.finishState();
+-    assertEquals(0, Operations.getCommonSuffixBytesRef(a, DEFAULT_MAX_DETERMINIZED_STATES).length);
++    assertEquals(0, Operations.getCommonSuffixBytesRef(a).length);
++  }
++
++  public void testCommonSuffixEmpty() throws Exception {
++    assertEquals(new BytesRef(), Operations.getCommonSuffixBytesRef(Automata.makeEmpty()));
++  }
++
++  public void testCommonSuffixEmptyString() throws Exception {
++    assertEquals(new BytesRef(), Operations.getCommonSuffixBytesRef(Automata.makeEmptyString()));
++  }
++
++  public void testCommonSuffixTrailingWildcard() throws Exception {
++    Automaton a = Operations.concatenate(Automata.makeString("boo"), Automata.makeAnyChar());
++    assertEquals(new BytesRef(), Operations.getCommonSuffixBytesRef(a));
++  }
++
++  public void testCommonSuffixLeadingKleenStar() throws Exception {
++    Automaton a = Operations.concatenate(Automata.makeAnyString(), Automata.makeString("boo"));
++    assertEquals(new BytesRef("boo"), Operations.getCommonSuffixBytesRef(a));
++  }
++
++  public void testCommonSuffixTrailingKleenStar() throws Exception {
++    Automaton a = Operations.concatenate(Automata.makeString("boo"), Automata.makeAnyString());
++    assertEquals(new BytesRef(), Operations.getCommonSuffixBytesRef(a));
++  }
++
++  public void testCommonSuffixUnicode() throws Exception {
++    Automaton a =
++        Operations.concatenate(Automata.makeAnyString(), Automata.makeString("boo😂😂😂"));
++    Automaton binary = new UTF32ToUTF8().convert(a);
++    assertEquals(new BytesRef("boo😂😂😂"), Operations.getCommonSuffixBytesRef(binary));
+   }
+ 
+   public void testReverseRandom1() throws Exception {
+@@ -303,7 +443,7 @@ public class TestAutomaton extends LuceneTestCase {
+   }
+ 
+   public void testAnyStringEmptyString() throws Exception {
+-    Automaton a = Operations.determinize(Automata.makeAnyString(), DEFAULT_MAX_DETERMINIZED_STATES);
++    Automaton a = Operations.determinize(Automata.makeAnyString(), DEFAULT_DETERMINIZE_WORK_LIMIT);
+     assertTrue(Operations.run(a, ""));
+   }
+ 
+@@ -382,7 +522,7 @@ public class TestAutomaton extends LuceneTestCase {
+     assertFalse(Operations.isTotal(a));
+     a.setAccept(init, true);
+     assertTrue(
+-        Operations.isTotal(MinimizationOperations.minimize(a, DEFAULT_MAX_DETERMINIZED_STATES)));
++        Operations.isTotal(MinimizationOperations.minimize(a, DEFAULT_DETERMINIZE_WORK_LIMIT)));
+   }
+ 
+   public void testMinimizeEmpty() throws Exception {
+@@ -391,7 +531,7 @@ public class TestAutomaton extends LuceneTestCase {
+     int fini = a.createState();
+     a.addTransition(init, fini, 'a');
+     a.finishState();
+-    a = MinimizationOperations.minimize(a, DEFAULT_MAX_DETERMINIZED_STATES);
++    a = MinimizationOperations.minimize(a, DEFAULT_DETERMINIZE_WORK_LIMIT);
+     assertEquals(0, a.getNumStates());
+   }
+ 
+@@ -401,16 +541,16 @@ public class TestAutomaton extends LuceneTestCase {
+     Automaton a3 = Automata.makeString("beebar");
+     Automaton a = Operations.union(Arrays.asList(a1, a2, a3));
+     if (random().nextBoolean()) {
+-      a = Operations.determinize(a, DEFAULT_MAX_DETERMINIZED_STATES);
++      a = Operations.determinize(a, DEFAULT_DETERMINIZE_WORK_LIMIT);
+     } else if (random().nextBoolean()) {
+-      a = MinimizationOperations.minimize(a, DEFAULT_MAX_DETERMINIZED_STATES);
++      a = MinimizationOperations.minimize(a, DEFAULT_DETERMINIZE_WORK_LIMIT);
+     }
+     assertMatches(a, "foobar", "beebar", "boobar");
+ 
+     Automaton a4 =
+         Operations.determinize(
+-            Operations.minus(a, a2, DEFAULT_MAX_DETERMINIZED_STATES),
+-            DEFAULT_MAX_DETERMINIZED_STATES);
++            Operations.minus(a, a2, DEFAULT_DETERMINIZE_WORK_LIMIT),
++            DEFAULT_DETERMINIZE_WORK_LIMIT);
+ 
+     assertTrue(Operations.run(a4, "foobar"));
+     assertFalse(Operations.run(a4, "boobar"));
+@@ -419,8 +559,8 @@ public class TestAutomaton extends LuceneTestCase {
+ 
+     a4 =
+         Operations.determinize(
+-            Operations.minus(a4, a1, DEFAULT_MAX_DETERMINIZED_STATES),
+-            DEFAULT_MAX_DETERMINIZED_STATES);
++            Operations.minus(a4, a1, DEFAULT_DETERMINIZE_WORK_LIMIT),
++            DEFAULT_DETERMINIZE_WORK_LIMIT);
+     assertFalse(Operations.run(a4, "foobar"));
+     assertFalse(Operations.run(a4, "boobar"));
+     assertTrue(Operations.run(a4, "beebar"));
+@@ -428,8 +568,8 @@ public class TestAutomaton extends LuceneTestCase {
+ 
+     a4 =
+         Operations.determinize(
+-            Operations.minus(a4, a3, DEFAULT_MAX_DETERMINIZED_STATES),
+-            DEFAULT_MAX_DETERMINIZED_STATES);
++            Operations.minus(a4, a3, DEFAULT_DETERMINIZE_WORK_LIMIT),
++            DEFAULT_DETERMINIZE_WORK_LIMIT);
+     assertFalse(Operations.run(a4, "foobar"));
+     assertFalse(Operations.run(a4, "boobar"));
+     assertFalse(Operations.run(a4, "beebar"));
+@@ -438,7 +578,7 @@ public class TestAutomaton extends LuceneTestCase {
+ 
+   public void testOneInterval() throws Exception {
+     Automaton a = Automata.makeDecimalInterval(999, 1032, 0);
+-    a = Operations.determinize(a, DEFAULT_MAX_DETERMINIZED_STATES);
++    a = Operations.determinize(a, DEFAULT_DETERMINIZE_WORK_LIMIT);
+     assertTrue(Operations.run(a, "0999"));
+     assertTrue(Operations.run(a, "00999"));
+     assertTrue(Operations.run(a, "000999"));
+@@ -446,7 +586,7 @@ public class TestAutomaton extends LuceneTestCase {
+ 
+   public void testAnotherInterval() throws Exception {
+     Automaton a = Automata.makeDecimalInterval(1, 2, 0);
+-    a = Operations.determinize(a, DEFAULT_MAX_DETERMINIZED_STATES);
++    a = Operations.determinize(a, DEFAULT_DETERMINIZE_WORK_LIMIT);
+     assertTrue(Operations.run(a, "01"));
+   }
+ 
+@@ -470,9 +610,9 @@ public class TestAutomaton extends LuceneTestCase {
+ 
+       Automaton a =
+           Operations.determinize(
+-              Automata.makeDecimalInterval(min, max, digits), DEFAULT_MAX_DETERMINIZED_STATES);
++              Automata.makeDecimalInterval(min, max, digits), DEFAULT_DETERMINIZE_WORK_LIMIT);
+       if (random().nextBoolean()) {
+-        a = MinimizationOperations.minimize(a, DEFAULT_MAX_DETERMINIZED_STATES);
++        a = MinimizationOperations.minimize(a, DEFAULT_DETERMINIZE_WORK_LIMIT);
+       }
+       String mins = Integer.toString(min);
+       String maxs = Integer.toString(max);
+@@ -514,8 +654,7 @@ public class TestAutomaton extends LuceneTestCase {
+ 
+     assertEquals(
+         expected,
+-        TestOperations.getFiniteStrings(
+-            Operations.determinize(a, DEFAULT_MAX_DETERMINIZED_STATES)));
++        TestOperations.getFiniteStrings(Operations.determinize(a, DEFAULT_DETERMINIZE_WORK_LIMIT)));
+   }
+ 
+   public void testConcatenatePreservesDet() throws Exception {
+@@ -610,7 +749,7 @@ public class TestAutomaton extends LuceneTestCase {
+           if (VERBOSE) {
+             System.out.println("  randomNoOp: minimize");
+           }
+-          return MinimizationOperations.minimize(a, DEFAULT_MAX_DETERMINIZED_STATES);
++          return MinimizationOperations.minimize(a, DEFAULT_DETERMINIZE_WORK_LIMIT);
+         } else {
+           if (VERBOSE) {
+             System.out.println(
+@@ -767,7 +906,7 @@ public class TestAutomaton extends LuceneTestCase {
+               System.out.println("  op=minimize");
+             }
+             // minimize
+-            a = MinimizationOperations.minimize(a, DEFAULT_MAX_DETERMINIZED_STATES);
++            a = MinimizationOperations.minimize(a, DEFAULT_DETERMINIZE_WORK_LIMIT);
+           } else if (VERBOSE) {
+             System.out.println("  skip op=minimize: too many states (" + a.getNumStates() + ")");
+           }
+@@ -865,7 +1004,7 @@ public class TestAutomaton extends LuceneTestCase {
+               }
+             }
+             Automaton a2 = randomNoOp(Operations.union(as));
+-            a = Operations.minus(a, a2, DEFAULT_MAX_DETERMINIZED_STATES);
++            a = Operations.minus(a, a2, DEFAULT_DETERMINIZE_WORK_LIMIT);
+           }
+           break;
+ 
+@@ -902,9 +1041,9 @@ public class TestAutomaton extends LuceneTestCase {
+ 
+             Automaton a2 = Operations.union(as);
+             if (random().nextBoolean()) {
+-              a2 = Operations.determinize(a2, DEFAULT_MAX_DETERMINIZED_STATES);
++              a2 = Operations.determinize(a2, DEFAULT_DETERMINIZE_WORK_LIMIT);
+             } else if (random().nextBoolean()) {
+-              a2 = MinimizationOperations.minimize(a2, DEFAULT_MAX_DETERMINIZED_STATES);
++              a2 = MinimizationOperations.minimize(a2, DEFAULT_DETERMINIZE_WORK_LIMIT);
+             }
+             a = Operations.intersection(a, a2);
+ 
+@@ -980,7 +1119,7 @@ public class TestAutomaton extends LuceneTestCase {
+           if (VERBOSE) {
+             System.out.println("  op=remove the empty string");
+           }
+-          a = Operations.minus(a, Automata.makeEmptyString(), DEFAULT_MAX_DETERMINIZED_STATES);
++          a = Operations.minus(a, Automata.makeEmptyString(), DEFAULT_DETERMINIZE_WORK_LIMIT);
+           terms.remove(new BytesRef());
+           break;
+ 
+@@ -1100,7 +1239,7 @@ public class TestAutomaton extends LuceneTestCase {
+       assertTrue(Operations.isFinite(a));
+       assertFalse(Operations.isTotal(a));
+ 
+-      Automaton detA = Operations.determinize(a, DEFAULT_MAX_DETERMINIZED_STATES);
++      Automaton detA = Operations.determinize(a, DEFAULT_DETERMINIZE_WORK_LIMIT);
+ 
+       // Make sure all terms are accepted:
+       IntsRefBuilder scratch = new IntsRefBuilder();
+@@ -1513,4 +1652,23 @@ public class TestAutomaton extends LuceneTestCase {
+     a.finishState();
+     assertNull(Operations.getSingleton(a));
+   }
++
++  // LUCENE-9981
++  public void testDeterminizeTooMuchEffort() {
++    // make sure determinize properly aborts, relatively quickly, for this regexp:
++    expectThrows(
++        TooComplexToDeterminizeException.class,
++        () -> {
++          Automaton a = new RegExp("(.*a){2000}").toAutomaton();
++          Operations.determinize(a, Operations.DEFAULT_DETERMINIZE_WORK_LIMIT);
++        });
++    // ... and for its reversed form too:
++    expectThrows(
++        TooComplexToDeterminizeException.class,
++        () -> {
++          Automaton a = new RegExp("(.*a){2000}").toAutomaton();
++          a = Operations.reverse(a);
++          Operations.determinize(a, Operations.DEFAULT_DETERMINIZE_WORK_LIMIT);
++        });
++  }
+ }
+diff --git a/lucene/core/src/test/org/apache/lucene/util/automaton/TestCompiledAutomaton.java b/lucene/core/src/test/org/apache/lucene/util/automaton/TestCompiledAutomaton.java
+index 1e2a782ba95..0e3e06a1b78 100644
+--- a/lucene/core/src/test/org/apache/lucene/util/automaton/TestCompiledAutomaton.java
++++ b/lucene/core/src/test/org/apache/lucene/util/automaton/TestCompiledAutomaton.java
+@@ -29,14 +29,14 @@ import org.apache.lucene.util.TestUtil;
+ 
+ public class TestCompiledAutomaton extends LuceneTestCase {
+ 
+-  private CompiledAutomaton build(int maxDeterminizedStates, String... strings) {
++  private CompiledAutomaton build(int determinizeWorkLimit, String... strings) {
+     final List<BytesRef> terms = new ArrayList<>();
+     for (String s : strings) {
+       terms.add(new BytesRef(s));
+     }
+     Collections.sort(terms);
+     final Automaton a = DaciukMihovAutomatonBuilder.build(terms);
+-    return new CompiledAutomaton(a, true, false, maxDeterminizedStates, false);
++    return new CompiledAutomaton(a, true, false, determinizeWorkLimit, false);
+   }
+ 
+   private void testFloor(CompiledAutomaton c, String input, String expected) {
+@@ -53,8 +53,8 @@ public class TestCompiledAutomaton extends LuceneTestCase {
+     }
+   }
+ 
+-  private void testTerms(int maxDeterminizedStates, String[] terms) throws Exception {
+-    final CompiledAutomaton c = build(maxDeterminizedStates, terms);
++  private void testTerms(int determinizeWorkLimit, String[] terms) throws Exception {
++    final CompiledAutomaton c = build(determinizeWorkLimit, terms);
+     final BytesRef[] termBytes = new BytesRef[terms.length];
+     for (int idx = 0; idx < terms.length; idx++) {
+       termBytes[idx] = new BytesRef(terms[idx]);
+@@ -110,7 +110,7 @@ public class TestCompiledAutomaton extends LuceneTestCase {
+   }
+ 
+   public void testBasic() throws Exception {
+-    CompiledAutomaton c = build(Operations.DEFAULT_MAX_DETERMINIZED_STATES, "fob", "foo", "goo");
++    CompiledAutomaton c = build(Operations.DEFAULT_DETERMINIZE_WORK_LIMIT, "fob", "foo", "goo");
+     testFloor(c, "goo", "goo");
+     testFloor(c, "ga", "foo");
+     testFloor(c, "g", "foo");
+diff --git a/lucene/core/src/test/org/apache/lucene/util/automaton/TestDeterminism.java b/lucene/core/src/test/org/apache/lucene/util/automaton/TestDeterminism.java
+index e3c3de6bab7..b3a42380349 100644
+--- a/lucene/core/src/test/org/apache/lucene/util/automaton/TestDeterminism.java
++++ b/lucene/core/src/test/org/apache/lucene/util/automaton/TestDeterminism.java
+@@ -16,7 +16,7 @@
+  */
+ package org.apache.lucene.util.automaton;
+ 
+-import static org.apache.lucene.util.automaton.Operations.DEFAULT_MAX_DETERMINIZED_STATES;
++import static org.apache.lucene.util.automaton.Operations.DEFAULT_DETERMINIZE_WORK_LIMIT;
+ 
+ import org.apache.lucene.util.LuceneTestCase;
+ 
+@@ -45,30 +45,30 @@ public class TestDeterminism extends LuceneTestCase {
+   }
+ 
+   private static void assertAutomaton(Automaton a) {
+-    a = Operations.determinize(Operations.removeDeadStates(a), DEFAULT_MAX_DETERMINIZED_STATES);
++    a = Operations.determinize(Operations.removeDeadStates(a), DEFAULT_DETERMINIZE_WORK_LIMIT);
+ 
+     // complement(complement(a)) = a
+     Automaton equivalent =
+         Operations.complement(
+-            Operations.complement(a, DEFAULT_MAX_DETERMINIZED_STATES),
+-            DEFAULT_MAX_DETERMINIZED_STATES);
++            Operations.complement(a, DEFAULT_DETERMINIZE_WORK_LIMIT),
++            DEFAULT_DETERMINIZE_WORK_LIMIT);
+     assertTrue(Operations.sameLanguage(a, equivalent));
+ 
+     // a union a = a
+     equivalent =
+         Operations.determinize(
+-            Operations.removeDeadStates(Operations.union(a, a)), DEFAULT_MAX_DETERMINIZED_STATES);
++            Operations.removeDeadStates(Operations.union(a, a)), DEFAULT_DETERMINIZE_WORK_LIMIT);
+     assertTrue(Operations.sameLanguage(a, equivalent));
+ 
+     // a intersect a = a
+     equivalent =
+         Operations.determinize(
+             Operations.removeDeadStates(Operations.intersection(a, a)),
+-            DEFAULT_MAX_DETERMINIZED_STATES);
++            DEFAULT_DETERMINIZE_WORK_LIMIT);
+     assertTrue(Operations.sameLanguage(a, equivalent));
+ 
+     // a minus a = empty
+-    Automaton empty = Operations.minus(a, a, DEFAULT_MAX_DETERMINIZED_STATES);
++    Automaton empty = Operations.minus(a, a, DEFAULT_DETERMINIZE_WORK_LIMIT);
+     assertTrue(Operations.isEmpty(empty));
+ 
+     // as long as don't accept the empty string
+@@ -78,7 +78,7 @@ public class TestDeterminism extends LuceneTestCase {
+       Automaton optional = Operations.optional(a);
+       // System.out.println("optional " + optional);
+       equivalent =
+-          Operations.minus(optional, Automata.makeEmptyString(), DEFAULT_MAX_DETERMINIZED_STATES);
++          Operations.minus(optional, Automata.makeEmptyString(), DEFAULT_DETERMINIZE_WORK_LIMIT);
+       // System.out.println("equiv " + equivalent);
+       assertTrue(Operations.sameLanguage(a, equivalent));
+     }
+diff --git a/lucene/core/src/test/org/apache/lucene/util/automaton/TestFiniteStringsIterator.java b/lucene/core/src/test/org/apache/lucene/util/automaton/TestFiniteStringsIterator.java
+index a86932ff6e8..8a1f4b59610 100644
+--- a/lucene/core/src/test/org/apache/lucene/util/automaton/TestFiniteStringsIterator.java
++++ b/lucene/core/src/test/org/apache/lucene/util/automaton/TestFiniteStringsIterator.java
+@@ -16,7 +16,7 @@
+  */
+ package org.apache.lucene.util.automaton;
+ 
+-import static org.apache.lucene.util.automaton.Operations.DEFAULT_MAX_DETERMINIZED_STATES;
++import static org.apache.lucene.util.automaton.Operations.DEFAULT_DETERMINIZE_WORK_LIMIT;
+ 
+ import java.util.ArrayList;
+ import java.util.Collections;
+@@ -96,7 +96,7 @@ public class TestFiniteStringsIterator extends LuceneTestCase {
+   /** Basic test for getFiniteStrings */
+   public void testFiniteStringsBasic() {
+     Automaton a = Operations.union(Automata.makeString("dog"), Automata.makeString("duck"));
+-    a = MinimizationOperations.minimize(a, DEFAULT_MAX_DETERMINIZED_STATES);
++    a = MinimizationOperations.minimize(a, DEFAULT_DETERMINIZE_WORK_LIMIT);
+     FiniteStringsIterator iterator = new FiniteStringsIterator(a);
+     List<IntsRef> actual = getFiniteStrings(iterator);
+     assertFiniteStringsRecursive(a, actual);
+@@ -149,7 +149,7 @@ public class TestFiniteStringsIterator extends LuceneTestCase {
+ 
+   public void testShortAccept() {
+     Automaton a = Operations.union(Automata.makeString("x"), Automata.makeString("xy"));
+-    a = MinimizationOperations.minimize(a, DEFAULT_MAX_DETERMINIZED_STATES);
++    a = MinimizationOperations.minimize(a, DEFAULT_DETERMINIZE_WORK_LIMIT);
+     FiniteStringsIterator iterator = new FiniteStringsIterator(a);
+     List<IntsRef> actual = getFiniteStrings(iterator);
+     assertEquals(2, actual.size());
+diff --git a/lucene/core/src/test/org/apache/lucene/util/automaton/TestLevenshteinAutomata.java b/lucene/core/src/test/org/apache/lucene/util/automaton/TestLevenshteinAutomata.java
+index e18794bad54..f8b7b463ccf 100644
+--- a/lucene/core/src/test/org/apache/lucene/util/automaton/TestLevenshteinAutomata.java
++++ b/lucene/core/src/test/org/apache/lucene/util/automaton/TestLevenshteinAutomata.java
+@@ -16,7 +16,7 @@
+  */
+ package org.apache.lucene.util.automaton;
+ 
+-import static org.apache.lucene.util.automaton.Operations.DEFAULT_MAX_DETERMINIZED_STATES;
++import static org.apache.lucene.util.automaton.Operations.DEFAULT_DETERMINIZE_WORK_LIMIT;
+ 
+ import java.util.ArrayList;
+ import java.util.List;
+@@ -133,11 +133,11 @@ public class TestLevenshteinAutomata extends LuceneTestCase {
+   private Automaton naiveLev1(String s) {
+     Automaton a = Automata.makeString(s);
+     a = Operations.union(a, insertionsOf(s));
+-    a = MinimizationOperations.minimize(a, DEFAULT_MAX_DETERMINIZED_STATES);
++    a = MinimizationOperations.minimize(a, DEFAULT_DETERMINIZE_WORK_LIMIT);
+     a = Operations.union(a, deletionsOf(s));
+-    a = MinimizationOperations.minimize(a, DEFAULT_MAX_DETERMINIZED_STATES);
++    a = MinimizationOperations.minimize(a, DEFAULT_DETERMINIZE_WORK_LIMIT);
+     a = Operations.union(a, substitutionsOf(s));
+-    a = MinimizationOperations.minimize(a, DEFAULT_MAX_DETERMINIZED_STATES);
++    a = MinimizationOperations.minimize(a, DEFAULT_DETERMINIZE_WORK_LIMIT);
+ 
+     return a;
+   }
+@@ -149,7 +149,7 @@ public class TestLevenshteinAutomata extends LuceneTestCase {
+   private Automaton naiveLev1T(String s) {
+     Automaton a = naiveLev1(s);
+     a = Operations.union(a, transpositionsOf(s));
+-    a = MinimizationOperations.minimize(a, DEFAULT_MAX_DETERMINIZED_STATES);
++    a = MinimizationOperations.minimize(a, DEFAULT_DETERMINIZE_WORK_LIMIT);
+     return a;
+   }
+ 
+@@ -165,7 +165,7 @@ public class TestLevenshteinAutomata extends LuceneTestCase {
+     }
+ 
+     Automaton a = Operations.union(list);
+-    a = MinimizationOperations.minimize(a, DEFAULT_MAX_DETERMINIZED_STATES);
++    a = MinimizationOperations.minimize(a, DEFAULT_DETERMINIZE_WORK_LIMIT);
+     return a;
+   }
+ 
+@@ -180,7 +180,7 @@ public class TestLevenshteinAutomata extends LuceneTestCase {
+     }
+ 
+     Automaton a = Operations.union(list);
+-    a = MinimizationOperations.minimize(a, DEFAULT_MAX_DETERMINIZED_STATES);
++    a = MinimizationOperations.minimize(a, DEFAULT_DETERMINIZE_WORK_LIMIT);
+     return a;
+   }
+ 
+@@ -198,7 +198,7 @@ public class TestLevenshteinAutomata extends LuceneTestCase {
+     }
+ 
+     Automaton a = Operations.union(list);
+-    a = MinimizationOperations.minimize(a, DEFAULT_MAX_DETERMINIZED_STATES);
++    a = MinimizationOperations.minimize(a, DEFAULT_DETERMINIZE_WORK_LIMIT);
+     return a;
+   }
+ 
+@@ -222,7 +222,7 @@ public class TestLevenshteinAutomata extends LuceneTestCase {
+       }
+     }
+     Automaton a = Operations.union(list);
+-    a = MinimizationOperations.minimize(a, DEFAULT_MAX_DETERMINIZED_STATES);
++    a = MinimizationOperations.minimize(a, DEFAULT_DETERMINIZE_WORK_LIMIT);
+     return a;
+   }
+ 
+diff --git a/lucene/core/src/test/org/apache/lucene/util/automaton/TestOperations.java b/lucene/core/src/test/org/apache/lucene/util/automaton/TestOperations.java
+index b2bb288f236..f561275dc7a 100644
+--- a/lucene/core/src/test/org/apache/lucene/util/automaton/TestOperations.java
++++ b/lucene/core/src/test/org/apache/lucene/util/automaton/TestOperations.java
+@@ -16,7 +16,7 @@
+  */
+ package org.apache.lucene.util.automaton;
+ 
+-import static org.apache.lucene.util.automaton.Operations.DEFAULT_MAX_DETERMINIZED_STATES;
++import static org.apache.lucene.util.automaton.Operations.DEFAULT_DETERMINIZE_WORK_LIMIT;
+ 
+ import com.carrotsearch.randomizedtesting.generators.RandomNumbers;
+ import java.util.*;
+@@ -49,7 +49,7 @@ public class TestOperations extends LuceneTestCase {
+       eachIndividual[i++] = Automata.makeString(bref.utf8ToString());
+     }
+     return Operations.determinize(
+-        Operations.union(Arrays.asList(eachIndividual)), DEFAULT_MAX_DETERMINIZED_STATES);
++        Operations.union(Arrays.asList(eachIndividual)), DEFAULT_DETERMINIZE_WORK_LIMIT);
+   }
+ 
+   /** Test concatenation with empty language returns empty */
+@@ -86,7 +86,7 @@ public class TestOperations extends LuceneTestCase {
+ 
+       final RegExp re = new RegExp(AutomatonTestUtil.randomRegexp(random()), RegExp.NONE);
+       // System.out.println("TEST i=" + i + " re=" + re);
+-      final Automaton a = Operations.determinize(re.toAutomaton(), DEFAULT_MAX_DETERMINIZED_STATES);
++      final Automaton a = Operations.determinize(re.toAutomaton(), DEFAULT_DETERMINIZE_WORK_LIMIT);
+       assertFalse(Operations.isEmpty(a));
+ 
+       final AutomatonTestUtil.RandomAcceptedStrings rx =
+diff --git a/lucene/queryparser/src/java/org/apache/lucene/queryparser/classic/QueryParserBase.java b/lucene/queryparser/src/java/org/apache/lucene/queryparser/classic/QueryParserBase.java
+index 632f3430b3e..82e9eac844a 100644
+--- a/lucene/queryparser/src/java/org/apache/lucene/queryparser/classic/QueryParserBase.java
++++ b/lucene/queryparser/src/java/org/apache/lucene/queryparser/classic/QueryParserBase.java
+@@ -16,7 +16,7 @@
+  */
+ package org.apache.lucene.queryparser.classic;
+ 
+-import static org.apache.lucene.util.automaton.Operations.DEFAULT_MAX_DETERMINIZED_STATES;
++import static org.apache.lucene.util.automaton.Operations.DEFAULT_DETERMINIZE_WORK_LIMIT;
+ 
+ import java.io.StringReader;
+ import java.text.DateFormat;
+@@ -79,7 +79,7 @@ public abstract class QueryParserBase extends QueryBuilder
+   Map<String, DateTools.Resolution> fieldToDateResolution = null;
+ 
+   boolean autoGeneratePhraseQueries;
+-  int maxDeterminizedStates = DEFAULT_MAX_DETERMINIZED_STATES;
++  int determinizeWorkLimit = DEFAULT_DETERMINIZE_WORK_LIMIT;
+ 
+   // So the generated QueryParser(CharStream) won't error out
+   protected QueryParserBase() {
+@@ -328,20 +328,19 @@ public abstract class QueryParserBase extends QueryBuilder
+   }
+ 
+   /**
+-   * @param maxDeterminizedStates the maximum number of states that determinizing a regexp query can
+-   *     result in. If the query results in any more states a TooComplexToDeterminizeException is
+-   *     thrown.
++   * @param determinizeWorkLimit the maximum effort that determinizing a regexp query can spend. If
++   *     the query requires more effort, a TooComplexToDeterminizeException is thrown.
+    */
+-  public void setMaxDeterminizedStates(int maxDeterminizedStates) {
+-    this.maxDeterminizedStates = maxDeterminizedStates;
++  public void setDeterminizeWorkLimit(int determinizeWorkLimit) {
++    this.determinizeWorkLimit = determinizeWorkLimit;
+   }
+ 
+   /**
+-   * @return the maximum number of states that determinizing a regexp query can result in. If the
+-   *     query results in any more states a TooComplexToDeterminizeException is thrown.
++   * @return the maximum effort that determinizing a regexp query can spend. If the query requires
++   *     more effort, a TooComplexToDeterminizeException is thrown.
+    */
+-  public int getMaxDeterminizedStates() {
+-    return maxDeterminizedStates;
++  public int getDeterminizeWorkLimit() {
++    return determinizeWorkLimit;
+   }
+ 
+   protected void addClause(List<BooleanClause> clauses, int conj, int mods, Query q) {
+@@ -554,7 +553,7 @@ public abstract class QueryParserBase extends QueryBuilder
+    * @return new RegexpQuery instance
+    */
+   protected Query newRegexpQuery(Term regexp) {
+-    RegexpQuery query = new RegexpQuery(regexp, RegExp.ALL, maxDeterminizedStates);
++    RegexpQuery query = new RegexpQuery(regexp, RegExp.ALL, determinizeWorkLimit);
+     query.setRewriteMethod(multiTermRewriteMethod);
+     return query;
+   }
+@@ -625,7 +624,7 @@ public abstract class QueryParserBase extends QueryBuilder
+    * @return new WildcardQuery instance
+    */
+   protected Query newWildcardQuery(Term t) {
+-    WildcardQuery query = new WildcardQuery(t, maxDeterminizedStates);
++    WildcardQuery query = new WildcardQuery(t, determinizeWorkLimit);
+     query.setRewriteMethod(multiTermRewriteMethod);
+     return query;
+   }
+diff --git a/lucene/queryparser/src/test/org/apache/lucene/queryparser/classic/TestQueryParser.java b/lucene/queryparser/src/test/org/apache/lucene/queryparser/classic/TestQueryParser.java
+index de84383d311..54ba7083a49 100644
+--- a/lucene/queryparser/src/test/org/apache/lucene/queryparser/classic/TestQueryParser.java
++++ b/lucene/queryparser/src/test/org/apache/lucene/queryparser/classic/TestQueryParser.java
+@@ -502,10 +502,10 @@ public class TestQueryParser extends QueryParserTestBase {
+     assertEquals(expected, qp.parse("\"中国\"~3^2"));
+   }
+ 
+-  /** LUCENE-6677: make sure wildcard query respects maxDeterminizedStates. */
+-  public void testWildcardMaxDeterminizedStates() throws Exception {
++  /** LUCENE-6677: make sure wildcard query respects determinizeWorkLimit. */
++  public void testWildcardDeterminizeWorkLimit() throws Exception {
+     QueryParser qp = new QueryParser(FIELD, new MockAnalyzer(random()));
+-    qp.setMaxDeterminizedStates(10);
++    qp.setDeterminizeWorkLimit(1);
+     expectThrows(
+         TooComplexToDeterminizeException.class,
+         () -> {
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/sandbox/search/TermAutomatonQuery.java b/lucene/sandbox/src/java/org/apache/lucene/sandbox/search/TermAutomatonQuery.java
+index 7f8ca4c7651..42aad127841 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/sandbox/search/TermAutomatonQuery.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/sandbox/search/TermAutomatonQuery.java
+@@ -16,7 +16,7 @@
+  */
+ package org.apache.lucene.sandbox.search;
+ 
+-import static org.apache.lucene.util.automaton.Operations.DEFAULT_MAX_DETERMINIZED_STATES;
++import static org.apache.lucene.util.automaton.Operations.DEFAULT_DETERMINIZE_WORK_LIMIT;
+ 
+ import java.io.IOException;
+ import java.util.ArrayList;
+@@ -125,17 +125,18 @@ public class TermAutomatonQuery extends Query implements Accountable {
+ 
+   /** Call this once you are done adding states/transitions. */
+   public void finish() {
+-    finish(DEFAULT_MAX_DETERMINIZED_STATES);
++    finish(DEFAULT_DETERMINIZE_WORK_LIMIT);
+   }
+ 
+   /**
+    * Call this once you are done adding states/transitions.
+    *
+-   * @param maxDeterminizedStates Maximum number of states created when determinizing the automaton.
+-   *     Higher numbers allow this operation to consume more memory but allow more complex
+-   *     automatons.
++   * @param determinizeWorkLimit Maximum effort to spend determinizing the automaton. Higher numbers
++   *     allow this operation to consume more memory but allow more complex automatons. Use {@link
++   *     Operations#DEFAULT_DETERMINIZE_WORK_LIMIT} as a decent default if you don't otherwise know
++   *     what to specify.
+    */
+-  public void finish(int maxDeterminizedStates) {
++  public void finish(int determinizeWorkLimit) {
+     Automaton automaton = builder.finish();
+ 
+     // System.out.println("before det:\n" + automaton.toDot());
+@@ -199,7 +200,7 @@ public class TermAutomatonQuery extends Query implements Accountable {
+       automaton = newAutomaton;
+     }
+ 
+-    det = Operations.removeDeadStates(Operations.determinize(automaton, maxDeterminizedStates));
++    det = Operations.removeDeadStates(Operations.determinize(automaton, determinizeWorkLimit));
+ 
+     if (det.isAccept(0)) {
+       throw new IllegalStateException("cannot accept the empty string");
+diff --git a/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/AnalyzingSuggester.java b/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/AnalyzingSuggester.java
+index 8186fe36daa..011c48a8553 100644
+--- a/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/AnalyzingSuggester.java
++++ b/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/AnalyzingSuggester.java
+@@ -16,7 +16,7 @@
+  */
+ package org.apache.lucene.search.suggest.analyzing;
+ 
+-import static org.apache.lucene.util.automaton.Operations.DEFAULT_MAX_DETERMINIZED_STATES;
++import static org.apache.lucene.util.automaton.Operations.DEFAULT_DETERMINIZE_WORK_LIMIT;
+ 
+ import java.io.IOException;
+ import java.util.ArrayList;
+@@ -897,7 +897,7 @@ public class AnalyzingSuggester extends Lookup {
+ 
+     // TODO: we can optimize this somewhat by determinizing
+     // while we convert
+-    automaton = Operations.determinize(automaton, DEFAULT_MAX_DETERMINIZED_STATES);
++    automaton = Operations.determinize(automaton, DEFAULT_DETERMINIZE_WORK_LIMIT);
+     return automaton;
+   }
+ 
+diff --git a/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/FuzzySuggester.java b/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/FuzzySuggester.java
+index 6c17ed0de73..92c6777a02d 100644
+--- a/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/FuzzySuggester.java
++++ b/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/FuzzySuggester.java
+@@ -16,7 +16,7 @@
+  */
+ package org.apache.lucene.search.suggest.analyzing;
+ 
+-import static org.apache.lucene.util.automaton.Operations.DEFAULT_MAX_DETERMINIZED_STATES;
++import static org.apache.lucene.util.automaton.Operations.DEFAULT_DETERMINIZE_WORK_LIMIT;
+ 
+ import java.io.IOException;
+ import java.util.ArrayList;
+@@ -224,7 +224,7 @@ public final class FuzzySuggester extends AnalyzingSuggester {
+   protected Automaton convertAutomaton(Automaton a) {
+     if (unicodeAware) {
+       Automaton utf8automaton = new UTF32ToUTF8().convert(a);
+-      utf8automaton = Operations.determinize(utf8automaton, DEFAULT_MAX_DETERMINIZED_STATES);
++      utf8automaton = Operations.determinize(utf8automaton, DEFAULT_DETERMINIZE_WORK_LIMIT);
+       return utf8automaton;
+     } else {
+       return a;
+@@ -273,7 +273,7 @@ public final class FuzzySuggester extends AnalyzingSuggester {
+       Automaton a = Operations.union(subs);
+       // TODO: we could call toLevenshteinAutomata() before det?
+       // this only happens if you have multiple paths anyway (e.g. synonyms)
+-      return Operations.determinize(a, DEFAULT_MAX_DETERMINIZED_STATES);
++      return Operations.determinize(a, DEFAULT_DETERMINIZE_WORK_LIMIT);
+     }
+   }
+ }
+diff --git a/lucene/suggest/src/java/org/apache/lucene/search/suggest/document/ContextQuery.java b/lucene/suggest/src/java/org/apache/lucene/search/suggest/document/ContextQuery.java
+index c2b41a31ce1..d8d17af7ca0 100644
+--- a/lucene/suggest/src/java/org/apache/lucene/search/suggest/document/ContextQuery.java
++++ b/lucene/suggest/src/java/org/apache/lucene/search/suggest/document/ContextQuery.java
+@@ -195,7 +195,7 @@ public class ContextQuery extends CompletionQuery implements Accountable {
+     Automaton contextsAutomaton =
+         Operations.concatenate(toContextAutomaton(contexts, matchAllContexts), prefixAutomaton);
+     contextsAutomaton =
+-        Operations.determinize(contextsAutomaton, Operations.DEFAULT_MAX_DETERMINIZED_STATES);
++        Operations.determinize(contextsAutomaton, Operations.DEFAULT_DETERMINIZE_WORK_LIMIT);
+ 
+     final Map<IntsRef, Float> contextMap = new HashMap<>(contexts.size());
+     final TreeSet<Integer> contextLengths = new TreeSet<>();
+diff --git a/lucene/suggest/src/java/org/apache/lucene/search/suggest/document/FuzzyCompletionQuery.java b/lucene/suggest/src/java/org/apache/lucene/search/suggest/document/FuzzyCompletionQuery.java
+index 16bbd616ed8..a5cf50e14ae 100644
+--- a/lucene/suggest/src/java/org/apache/lucene/search/suggest/document/FuzzyCompletionQuery.java
++++ b/lucene/suggest/src/java/org/apache/lucene/search/suggest/document/FuzzyCompletionQuery.java
+@@ -77,7 +77,7 @@ public class FuzzyCompletionQuery extends PrefixCompletionQuery {
+   private final int nonFuzzyPrefix;
+   private final int minFuzzyLength;
+   private final boolean unicodeAware;
+-  private final int maxDeterminizedStates;
++  private final int determinizeWorkLimit;
+ 
+   /**
+    * Calls {@link FuzzyCompletionQuery#FuzzyCompletionQuery(Analyzer, Term, BitsProducer)} with no
+@@ -91,9 +91,9 @@ public class FuzzyCompletionQuery extends PrefixCompletionQuery {
+    * Calls {@link FuzzyCompletionQuery#FuzzyCompletionQuery(Analyzer, Term, BitsProducer, int,
+    * boolean, int, int, boolean, int)} with defaults for <code>maxEdits</code>, <code>transpositions
+    * </code>, <code>nonFuzzyPrefix</code>, <code>minFuzzyLength</code>, <code>unicodeAware</code>
+-   * and <code>maxDeterminizedStates</code> See {@link #DEFAULT_MAX_EDITS}, {@link
++   * and <code>determinizeWorkLimit</code> See {@link #DEFAULT_MAX_EDITS}, {@link
+    * #DEFAULT_TRANSPOSITIONS}, {@link #DEFAULT_NON_FUZZY_PREFIX}, {@link #DEFAULT_MIN_FUZZY_LENGTH},
+-   * {@link #DEFAULT_UNICODE_AWARE} and {@link Operations#DEFAULT_MAX_DETERMINIZED_STATES} for
++   * {@link #DEFAULT_UNICODE_AWARE} and {@link Operations#DEFAULT_DETERMINIZE_WORK_LIMIT} for
+    * defaults
+    */
+   public FuzzyCompletionQuery(Analyzer analyzer, Term term, BitsProducer filter) {
+@@ -106,7 +106,7 @@ public class FuzzyCompletionQuery extends PrefixCompletionQuery {
+         DEFAULT_NON_FUZZY_PREFIX,
+         DEFAULT_MIN_FUZZY_LENGTH,
+         DEFAULT_UNICODE_AWARE,
+-        Operations.DEFAULT_MAX_DETERMINIZED_STATES);
++        Operations.DEFAULT_DETERMINIZE_WORK_LIMIT);
+   }
+ 
+   /**
+@@ -121,7 +121,8 @@ public class FuzzyCompletionQuery extends PrefixCompletionQuery {
+    * @param nonFuzzyPrefix prefix length where edits are not allowed
+    * @param minFuzzyLength minimum prefix length before any edits are allowed
+    * @param unicodeAware treat prefix as unicode rather than bytes
+-   * @param maxDeterminizedStates maximum automaton states allowed for {@link LevenshteinAutomata}
++   * @param determinizeWorkLimit maximum effort allowed to determinize the {@link
++   *     LevenshteinAutomata}
+    */
+   public FuzzyCompletionQuery(
+       Analyzer analyzer,
+@@ -132,14 +133,14 @@ public class FuzzyCompletionQuery extends PrefixCompletionQuery {
+       int nonFuzzyPrefix,
+       int minFuzzyLength,
+       boolean unicodeAware,
+-      int maxDeterminizedStates) {
++      int determinizeWorkLimit) {
+     super(analyzer, term, filter);
+     this.maxEdits = maxEdits;
+     this.transpositions = transpositions;
+     this.nonFuzzyPrefix = nonFuzzyPrefix;
+     this.minFuzzyLength = minFuzzyLength;
+     this.unicodeAware = unicodeAware;
+-    this.maxDeterminizedStates = maxDeterminizedStates;
++    this.determinizeWorkLimit = determinizeWorkLimit;
+   }
+ 
+   @Override
+@@ -154,7 +155,7 @@ public class FuzzyCompletionQuery extends PrefixCompletionQuery {
+     Automaton automaton = toLevenshteinAutomata(originalAutomata, refs);
+     if (unicodeAware) {
+       Automaton utf8automaton = new UTF32ToUTF8().convert(automaton);
+-      utf8automaton = Operations.determinize(utf8automaton, maxDeterminizedStates);
++      utf8automaton = Operations.determinize(utf8automaton, determinizeWorkLimit);
+       automaton = utf8automaton;
+     }
+     // TODO Accumulating all refs is bad, because the resulting set may be very big.
+@@ -199,7 +200,7 @@ public class FuzzyCompletionQuery extends PrefixCompletionQuery {
+       Automaton a = Operations.union(subs);
+       // TODO: we could call toLevenshteinAutomata() before det?
+       // this only happens if you have multiple paths anyway (e.g. synonyms)
+-      return Operations.determinize(a, maxDeterminizedStates);
++      return Operations.determinize(a, determinizeWorkLimit);
+     }
+   }
+ 
+@@ -228,9 +229,9 @@ public class FuzzyCompletionQuery extends PrefixCompletionQuery {
+     return unicodeAware;
+   }
+ 
+-  /** Get the maximum number of determinized states permitted */
+-  public int getMaxDeterminizedStates() {
+-    return maxDeterminizedStates;
++  /** Get the maximum effort to use determinizing */
++  public int getDeterminizeWorkLimit() {
++    return determinizeWorkLimit;
+   }
+ 
+   @Override
+diff --git a/lucene/suggest/src/java/org/apache/lucene/search/suggest/document/RegexCompletionQuery.java b/lucene/suggest/src/java/org/apache/lucene/search/suggest/document/RegexCompletionQuery.java
+index c18e89b25c4..fe061da7597 100644
+--- a/lucene/suggest/src/java/org/apache/lucene/search/suggest/document/RegexCompletionQuery.java
++++ b/lucene/suggest/src/java/org/apache/lucene/search/suggest/document/RegexCompletionQuery.java
+@@ -45,7 +45,7 @@ import org.apache.lucene.util.automaton.RegExp;
+ public class RegexCompletionQuery extends CompletionQuery {
+ 
+   private final int flags;
+-  private final int maxDeterminizedStates;
++  private final int determinizeWorkLimit;
+ 
+   /** Calls {@link RegexCompletionQuery#RegexCompletionQuery(Term, BitsProducer)} with no filter */
+   public RegexCompletionQuery(Term term) {
+@@ -54,18 +54,18 @@ public class RegexCompletionQuery extends CompletionQuery {
+ 
+   /**
+    * Calls {@link RegexCompletionQuery#RegexCompletionQuery(Term, int, int, BitsProducer)} enabling
+-   * all optional regex syntax and <code>maxDeterminizedStates</code> of {@value
+-   * Operations#DEFAULT_MAX_DETERMINIZED_STATES}
++   * all optional regex syntax and <code>determinizeWorkLimit</code> of {@value
++   * Operations#DEFAULT_DETERMINIZE_WORK_LIMIT}
+    */
+   public RegexCompletionQuery(Term term, BitsProducer filter) {
+-    this(term, RegExp.ALL, Operations.DEFAULT_MAX_DETERMINIZED_STATES, filter);
++    this(term, RegExp.ALL, Operations.DEFAULT_DETERMINIZE_WORK_LIMIT, filter);
+   }
+   /**
+    * Calls {@link RegexCompletionQuery#RegexCompletionQuery(Term, int, int, BitsProducer)} with no
+    * filter
+    */
+-  public RegexCompletionQuery(Term term, int flags, int maxDeterminizedStates) {
+-    this(term, flags, maxDeterminizedStates, null);
++  public RegexCompletionQuery(Term term, int flags, int determinizeWorkLimit) {
++    this(term, flags, determinizeWorkLimit, null);
+   }
+ 
+   /**
+@@ -74,14 +74,13 @@ public class RegexCompletionQuery extends CompletionQuery {
+    * @param term query is run against {@link Term#field()} and {@link Term#text()} is interpreted as
+    *     a regular expression
+    * @param flags used as syntax_flag in {@link RegExp#RegExp(String, int)}
+-   * @param maxDeterminizedStates used in {@link RegExp#toAutomaton(int)}
++   * @param determinizeWorkLimit used in {@link RegExp#toAutomaton(int)}
+    * @param filter used to query on a sub set of documents
+    */
+-  public RegexCompletionQuery(
+-      Term term, int flags, int maxDeterminizedStates, BitsProducer filter) {
++  public RegexCompletionQuery(Term term, int flags, int determinizeWorkLimit, BitsProducer filter) {
+     super(term, filter);
+     this.flags = flags;
+-    this.maxDeterminizedStates = maxDeterminizedStates;
++    this.determinizeWorkLimit = determinizeWorkLimit;
+   }
+ 
+   @Override
+@@ -92,7 +91,7 @@ public class RegexCompletionQuery extends CompletionQuery {
+     Automaton automaton =
+         getTerm().text().isEmpty()
+             ? Automata.makeEmpty()
+-            : new RegExp(getTerm().text(), flags).toAutomaton(maxDeterminizedStates);
++            : new RegExp(getTerm().text(), flags).toAutomaton(determinizeWorkLimit);
+     return new CompletionWeight(this, automaton);
+   }
+ 
+@@ -101,9 +100,9 @@ public class RegexCompletionQuery extends CompletionQuery {
+     return flags;
+   }
+ 
+-  /** Get the maximum number of states permitted in the determinized automaton */
+-  public int getMaxDeterminizedStates() {
+-    return maxDeterminizedStates;
++  /** Get the maximum effort permitted to determinize the automaton */
++  public int getDeterminizeWorkLimit() {
++    return determinizeWorkLimit;
+   }
+ 
+   @Override
+diff --git a/lucene/test-framework/src/test/org/apache/lucene/analysis/TestMockAnalyzer.java b/lucene/test-framework/src/test/org/apache/lucene/analysis/TestMockAnalyzer.java
+index c3fccc5514d..69a7829e876 100644
+--- a/lucene/test-framework/src/test/org/apache/lucene/analysis/TestMockAnalyzer.java
++++ b/lucene/test-framework/src/test/org/apache/lucene/analysis/TestMockAnalyzer.java
+@@ -16,7 +16,7 @@
+  */
+ package org.apache.lucene.analysis;
+ 
+-import static org.apache.lucene.util.automaton.Operations.DEFAULT_MAX_DETERMINIZED_STATES;
++import static org.apache.lucene.util.automaton.Operations.DEFAULT_DETERMINIZE_WORK_LIMIT;
+ 
+ import java.io.Reader;
+ import java.io.StringReader;
+@@ -155,7 +155,7 @@ public class TestMockAnalyzer extends BaseTokenStreamTestCase {
+             Operations.complement(
+                 Operations.union(
+                     Arrays.asList(Automata.makeString("foo"), Automata.makeString("bar"))),
+-                DEFAULT_MAX_DETERMINIZED_STATES));
++                DEFAULT_DETERMINIZE_WORK_LIMIT));
+     Analyzer a = new MockAnalyzer(random(), MockTokenizer.SIMPLE, true, keepWords);
+     assertAnalyzesTo(
+         a,

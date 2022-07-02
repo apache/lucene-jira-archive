@@ -1,0 +1,2822 @@
+Index: lucene/src/test/org/apache/lucene/index/TestIndexWriter.java
+===================================================================
+--- lucene/src/test/org/apache/lucene/index/TestIndexWriter.java	(revision 1070267)
++++ lucene/src/test/org/apache/lucene/index/TestIndexWriter.java	(working copy)
+@@ -2884,7 +2884,10 @@
+     Document doc = new Document();
+     Field f = newField(random, "field", "two", Field.Store.NO, Field.Index.ANALYZED);
+     doc.add(f);
+-    final int NUM_GAPS = 100;
++    // THIS TEST DEPENDS ON THE FACT YOU WILL JUMP! (e.g. if you set a massive skip interval,
++    // don't impl skipping at all (like the SimpleText hack), or do something else interesting,
++    // it fails!)
++    final int NUM_GAPS = 200;
+     for(int i=0;i<NUM_GAPS;i++) {
+       f.setValue("one");
+       w.addDocument(doc);
+Index: lucene/src/java/org/apache/lucene/index/codecs/fixed/FixedSkipListWriter.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/index/codecs/fixed/FixedSkipListWriter.java	(revision 0)
++++ lucene/src/java/org/apache/lucene/index/codecs/fixed/FixedSkipListWriter.java	(revision 0)
+@@ -0,0 +1,183 @@
++package org.apache.lucene.index.codecs.fixed;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.Arrays;
++
++import org.apache.lucene.store.IndexOutput;
++import org.apache.lucene.index.codecs.MultiLevelSkipListWriter;
++import org.apache.lucene.index.codecs.sep.IntIndexOutput;
++
++// TODO: -- skip data should somehow be more local to the
++// particular stream (doc, freq, pos, payload)
++
++/**
++ * Implements the skip list writer for the default posting list format
++ * that stores positions and payloads.
++ *
++ * @lucene.experimental
++ */
++class FixedSkipListWriter extends MultiLevelSkipListWriter {
++  private int[] lastSkipDoc;
++  private int[] lastSkipPayloadLength;
++  private long[] lastSkipPayloadPointer;
++
++  private IntIndexOutput.Index[] docIndex;
++  private IntIndexOutput.Index[] posIndex;
++  
++  // TODO: -- private again
++  IntIndexOutput posOutput;
++  // TODO: -- private again
++  IndexOutput payloadOutput;
++
++  private int curDoc;
++  private boolean curStorePayloads;
++  private int curPayloadLength;
++  private long curPayloadPointer;
++  
++  FixedSkipListWriter(int skipInterval, int numberOfSkipLevels, int docCount,
++                    IntIndexOutput docOutput,
++                    IntIndexOutput posOutput,
++                    IndexOutput payloadOutput)
++    throws IOException {
++    super(skipInterval, numberOfSkipLevels, docCount);
++
++    this.posOutput = posOutput;
++    this.payloadOutput = payloadOutput;
++    
++    lastSkipDoc = new int[numberOfSkipLevels];
++    lastSkipPayloadLength = new int[numberOfSkipLevels];
++    // TODO: -- also cutover normal IndexOutput to use getIndex()?
++    lastSkipPayloadPointer = new long[numberOfSkipLevels];
++
++    docIndex = new IntIndexOutput.Index[numberOfSkipLevels];
++    posIndex = new IntIndexOutput.Index[numberOfSkipLevels];
++
++    for(int i=0;i<numberOfSkipLevels;i++) {
++      docIndex[i] = docOutput.index();
++      if (posOutput != null) {
++        posIndex[i] = posOutput.index();
++      }
++    }
++  }
++
++  boolean omitTF;
++
++  void setOmitTF(boolean v) {
++    omitTF = v;
++  }
++
++  void setPosOutput(IntIndexOutput posOutput) throws IOException {
++    this.posOutput = posOutput;
++    for(int i=0;i<numberOfSkipLevels;i++) {
++      posIndex[i] = posOutput.index();
++    }
++  }
++
++  void setPayloadOutput(IndexOutput payloadOutput) {
++    this.payloadOutput = payloadOutput;
++  }
++
++  /**
++   * Sets the values for the current skip data. 
++   */
++  // Called @ every index interval (every 128th (by default)
++  // doc)
++  void setSkipData(int doc, boolean storePayloads, int payloadLength) {
++    this.curDoc = doc;
++    this.curStorePayloads = storePayloads;
++    this.curPayloadLength = payloadLength;
++    if (payloadOutput != null) {
++      this.curPayloadPointer = payloadOutput.getFilePointer();
++    }
++  }
++
++  // Called @ start of new term
++  protected void resetSkip(IntIndexOutput.Index topDocIndex, IntIndexOutput.Index topPosIndex)
++    throws IOException {
++    super.resetSkip();
++
++    Arrays.fill(lastSkipDoc, 0);
++    Arrays.fill(lastSkipPayloadLength, -1);  // we don't have to write the first length in the skip list
++    for(int i=0;i<numberOfSkipLevels;i++) {
++      docIndex[i].set(topDocIndex);
++      if (posOutput != null) {
++        posIndex[i].set(topPosIndex);
++      }
++    }
++    if (payloadOutput != null) {
++      Arrays.fill(lastSkipPayloadPointer, payloadOutput.getFilePointer());
++    }
++  }
++  
++  @Override
++  protected void writeSkipData(int level, IndexOutput skipBuffer) throws IOException {
++    // To efficiently store payloads in the posting lists we do not store the length of
++    // every payload. Instead we omit the length for a payload if the previous payload had
++    // the same length.
++    // However, in order to support skipping the payload length at every skip point must be known.
++    // So we use the same length encoding that we use for the posting lists for the skip data as well:
++    // Case 1: current field does not store payloads
++    //           SkipDatum                 --> DocSkip, FreqSkip, ProxSkip
++    //           DocSkip,FreqSkip,ProxSkip --> VInt
++    //           DocSkip records the document number before every SkipInterval th  document in TermFreqs. 
++    //           Document numbers are represented as differences from the previous value in the sequence.
++    // Case 2: current field stores payloads
++    //           SkipDatum                 --> DocSkip, PayloadLength?, FreqSkip,ProxSkip
++    //           DocSkip,FreqSkip,ProxSkip --> VInt
++    //           PayloadLength             --> VInt    
++    //         In this case DocSkip/2 is the difference between
++    //         the current and the previous value. If DocSkip
++    //         is odd, then a PayloadLength encoded as VInt follows,
++    //         if DocSkip is even, then it is assumed that the
++    //         current payload length equals the length at the previous
++    //         skip point
++
++    assert !omitTF || !curStorePayloads;
++
++    if (curStorePayloads) {
++      int delta = curDoc - lastSkipDoc[level];
++      if (curPayloadLength == lastSkipPayloadLength[level]) {
++        // the current payload length equals the length at the previous skip point,
++        // so we don't store the length again
++        skipBuffer.writeVInt(delta << 1);
++      } else {
++        // the payload length is different from the previous one. We shift the DocSkip, 
++        // set the lowest bit and store the current payload length as VInt.
++        skipBuffer.writeVInt(delta << 1 | 1);
++        skipBuffer.writeVInt(curPayloadLength);
++        lastSkipPayloadLength[level] = curPayloadLength;
++      }
++    } else {
++      // current field does not store payloads
++      skipBuffer.writeVInt(curDoc - lastSkipDoc[level]);
++    }
++
++    docIndex[level].mark();
++    docIndex[level].write(skipBuffer, false);
++    if (!omitTF) {
++      posIndex[level].mark();
++      posIndex[level].write(skipBuffer, false);
++      skipBuffer.writeVInt((int) (curPayloadPointer - lastSkipPayloadPointer[level]));
++    }
++
++    lastSkipDoc[level] = curDoc;
++    lastSkipPayloadPointer[level] = curPayloadPointer;
++  }
++}
+
+Property changes on: lucene\src\java\org\apache\lucene\index\codecs\fixed\FixedSkipListWriter.java
+___________________________________________________________________
+Added: svn:eol-style
+   + native
+
+Index: lucene/src/java/org/apache/lucene/index/codecs/fixed/InterleavedIntBlockIndexOutput.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/index/codecs/fixed/InterleavedIntBlockIndexOutput.java	(revision 0)
++++ lucene/src/java/org/apache/lucene/index/codecs/fixed/InterleavedIntBlockIndexOutput.java	(revision 0)
+@@ -0,0 +1,80 @@
++package org.apache.lucene.index.codecs.fixed;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++
++import org.apache.lucene.index.codecs.intblock.FixedIntBlockIndexOutput;
++import org.apache.lucene.index.codecs.sep.IntIndexOutput;
++
++public class InterleavedIntBlockIndexOutput extends IntIndexOutput {
++  private final FixedIntBlockIndexOutput a;
++  private final FixedIntBlockIndexOutput b;
++  private final int buffer[];
++  private int bufferIdx;
++  private boolean isB;
++  
++  public InterleavedIntBlockIndexOutput(FixedIntBlockIndexOutput a, FixedIntBlockIndexOutput b) {
++    if (a.blockSize != b.blockSize) {
++      throw new IllegalArgumentException("interleaved blocks must have the same block size");
++    }
++    this.a = a;
++    this.b = b;
++    this.buffer = new int[a.blockSize];
++  }
++  
++  @Override
++  public void write(int v) throws IOException {
++    if (isB) {
++      buffer[bufferIdx++] = v;
++      if (bufferIdx == buffer.length) {
++        flushFreqs();
++      }
++    } else {
++      a.write(v);
++    }
++    isB = !isB;
++  }
++
++  private void flushFreqs() throws IOException {
++    for (int i = 0; i < bufferIdx; i++) {
++      b.write(buffer[i]);
++    }
++    bufferIdx = 0;
++  }
++
++  @Override
++  public Index index() throws IOException {
++    return a.index();
++  }
++
++  public void flush() throws IOException {
++    a.flush();
++    flushFreqs();
++    b.flush();
++  }
++  
++  @Override
++  public void close() throws IOException {
++    try {
++      flush();
++    } finally {
++      b.close();
++    }
++  }
++}
+
+Property changes on: lucene\src\java\org\apache\lucene\index\codecs\fixed\InterleavedIntBlockIndexOutput.java
+___________________________________________________________________
+Added: svn:eol-style
+   + native
+
+Index: lucene/src/java/org/apache/lucene/index/codecs/fixed/FixedSkipListReader.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/index/codecs/fixed/FixedSkipListReader.java	(revision 0)
++++ lucene/src/java/org/apache/lucene/index/codecs/fixed/FixedSkipListReader.java	(revision 0)
+@@ -0,0 +1,175 @@
++package org.apache.lucene.index.codecs.fixed;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.Arrays;
++
++import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.index.codecs.MultiLevelSkipListReader;
++import org.apache.lucene.index.codecs.sep.IntIndexInput;
++
++/**
++ * Implements the skip list reader for the default posting list format
++ * that stores positions and payloads.
++ *
++ * @lucene.experimental
++ */
++
++// TODO: rewrite this as recursive classes?
++class FixedSkipListReader extends MultiLevelSkipListReader {
++  private boolean currentFieldStoresPayloads;
++  private IntIndexInput.Index docIndex[];
++  private IntIndexInput.Index posIndex[];
++  private long payloadPointer[];
++  private int payloadLength[];
++
++  private final IntIndexInput.Index lastDocIndex;
++  // TODO: -- make private again
++  final IntIndexInput.Index lastPosIndex;
++  
++  private long lastPayloadPointer;
++  private int lastPayloadLength;
++                           
++  FixedSkipListReader(IndexInput skipStream,
++                    IntIndexInput docIn,
++                    IntIndexInput posIn,
++                    int maxSkipLevels,
++                    int skipInterval)
++    throws IOException {
++    super(skipStream, maxSkipLevels, skipInterval);
++    docIndex = new IntIndexInput.Index[maxSkipLevels];
++    if (posIn != null) {
++      posIndex = new IntIndexInput.Index[maxNumberOfSkipLevels];
++    }
++    for(int i=0;i<maxSkipLevels;i++) {
++      docIndex[i] = docIn.index();
++      if (posIn != null) {
++        posIndex[i] = posIn.index();
++      }
++    }
++    payloadPointer = new long[maxSkipLevels];
++    payloadLength = new int[maxSkipLevels];
++
++    lastDocIndex = docIn.index();
++    if (posIn != null) {
++      lastPosIndex = posIn.index();
++    } else {
++      lastPosIndex = null;
++    }
++  }
++  
++  boolean omitTF;
++
++  void setOmitTF(boolean v) {
++    omitTF = v;
++  }
++
++  void init(long skipPointer,
++            IntIndexInput.Index docBaseIndex,
++            IntIndexInput.Index posBaseIndex,
++            long payloadBasePointer,
++            int df,
++            boolean storesPayloads) {
++
++    super.init(skipPointer, df);
++    this.currentFieldStoresPayloads = storesPayloads;
++
++    lastPayloadPointer = payloadBasePointer;
++
++    for(int i=0;i<maxNumberOfSkipLevels;i++) {
++      docIndex[i].set(docBaseIndex);
++      if (posBaseIndex != null) {
++        posIndex[i].set(posBaseIndex);
++      }
++    }
++    Arrays.fill(payloadPointer, payloadBasePointer);
++    Arrays.fill(payloadLength, 0);
++  }
++
++  long getPayloadPointer() {
++    return lastPayloadPointer;
++  }
++  
++  /** Returns the payload length of the payload stored just before 
++   * the doc to which the last call of {@link MultiLevelSkipListReader#skipTo(int)} 
++   * has skipped.  */
++  int getPayloadLength() {
++    return lastPayloadLength;
++  }
++  
++  @Override
++  protected void seekChild(int level) throws IOException {
++    super.seekChild(level);
++    payloadPointer[level] = lastPayloadPointer;
++    payloadLength[level] = lastPayloadLength;
++  }
++  
++  @Override
++  protected void setLastSkipData(int level) {
++    super.setLastSkipData(level);
++
++    lastPayloadPointer = payloadPointer[level];
++    lastPayloadLength = payloadLength[level];
++    lastDocIndex.set(docIndex[level]);
++    if (lastPosIndex != null) {
++      lastPosIndex.set(posIndex[level]);
++    }
++
++    if (level > 0) {
++      docIndex[level-1].set(docIndex[level]);
++      if (posIndex != null) {
++        posIndex[level-1].set(posIndex[level]);
++      }
++    }
++  }
++
++  IntIndexInput.Index getPosIndex() {
++    return lastPosIndex;
++  }
++
++  IntIndexInput.Index getDocIndex() {
++    return lastDocIndex;
++  }
++
++  @Override
++  protected int readSkipData(int level, IndexInput skipStream) throws IOException {
++    int delta;
++    if (currentFieldStoresPayloads) {
++      // the current field stores payloads.
++      // if the doc delta is odd then we have
++      // to read the current payload length
++      // because it differs from the length of the
++      // previous payload
++      delta = skipStream.readVInt();
++      if ((delta & 1) != 0) {
++        payloadLength[level] = skipStream.readVInt();
++      }
++      delta >>>= 1;
++    } else {
++      delta = skipStream.readVInt();
++    }
++    docIndex[level].read(skipStream, false);
++    if (!omitTF) {
++      posIndex[level].read(skipStream, false);
++      payloadPointer[level] += skipStream.readVInt();
++    }
++    
++    return delta;
++  }
++}
+
+Property changes on: lucene\src\java\org\apache\lucene\index\codecs\fixed\FixedSkipListReader.java
+___________________________________________________________________
+Added: svn:eol-style
+   + native
+
+Index: lucene/src/java/org/apache/lucene/index/codecs/fixed/FixedPostingsWriterImpl.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/index/codecs/fixed/FixedPostingsWriterImpl.java	(revision 0)
++++ lucene/src/java/org/apache/lucene/index/codecs/fixed/FixedPostingsWriterImpl.java	(revision 0)
+@@ -0,0 +1,344 @@
++package org.apache.lucene.index.codecs.fixed;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.Set;
++
++import org.apache.lucene.index.CorruptIndexException;
++import org.apache.lucene.index.DocsEnum;
++import org.apache.lucene.index.FieldInfo;
++import org.apache.lucene.index.IndexFileNames;
++import org.apache.lucene.index.SegmentWriteState;
++import org.apache.lucene.index.codecs.PostingsWriterBase;
++import org.apache.lucene.index.codecs.TermStats;
++import org.apache.lucene.index.codecs.intblock.FixedIntBlockIndexOutput;
++import org.apache.lucene.index.codecs.sep.IntIndexOutput;
++import org.apache.lucene.store.IndexOutput;
++import org.apache.lucene.store.RAMOutputStream;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.CodecUtil;
++
++/** Writes frq to .frq, docs to .doc, pos to .pos, payloads
++ *  to .pyl, skip data to .skp
++ *
++ * @lucene.experimental */
++public final class FixedPostingsWriterImpl extends PostingsWriterBase {
++  final static String CODEC = "FixedDocFreqSkip";
++
++  final static String DOC_EXTENSION = "doc";
++  final static String SKIP_EXTENSION = "skp";
++  final static String POS_EXTENSION = "pos";
++  final static String PAYLOAD_EXTENSION = "pyl";
++
++  // Increment version to change it:
++  final static int VERSION_START = 0;
++  final static int VERSION_CURRENT = VERSION_START;
++
++  final FixedIntBlockIndexOutput posOut;
++  final IntIndexOutput.Index posIndex;
++
++  IntIndexOutput docOut; // pointer to either docio or docfreqio
++  final InterleavedIntBlockIndexOutput docfreqio; // for !omitTF fields, doc+freq stream
++  final FixedIntBlockIndexOutput docio; // for omitTF fields, the underlying doc-only stream
++  final IntIndexOutput.Index docIndex;
++
++  final IndexOutput payloadOut;
++
++  final IndexOutput skipOut;
++  IndexOutput termsOut;
++
++  final FixedSkipListWriter skipListWriter;
++  /** Expert: The fraction of TermDocs entries stored in skip tables,
++   * used to accelerate {@link DocsEnum#advance(int)}.  Larger values result in
++   * smaller indexes, greater acceleration, but fewer accelerable cases, while
++   * smaller values result in bigger indexes, less acceleration and more
++   * accelerable cases. More detailed experiments would be useful here. */
++  final int skipInterval;
++  
++  /**
++   * Expert: minimum docFreq to write any skip data at all
++   */
++  final int skipMinimum;
++
++  /** Expert: The maximum number of skip levels. Smaller values result in 
++   * slightly smaller indexes, but slower skipping in big posting lists.
++   */
++  final int maxSkipLevels = 10;
++
++  final int totalNumDocs;
++
++  boolean storePayloads;
++  boolean omitTF;
++
++  long lastSkipFP;
++
++  FieldInfo fieldInfo;
++
++  int lastPayloadLength;
++  int lastPosition;
++  long payloadStart;
++  long lastPayloadStart;
++  int lastDocID;
++  int df;
++  private int pendingTermCount;
++
++  // Holds pending byte[] blob for the current terms block
++  private final RAMOutputStream indexBytesWriter = new RAMOutputStream();
++
++  public FixedPostingsWriterImpl(SegmentWriteState state, FixedIntStreamFactory factory) throws IOException {
++    super();
++
++    final String docFileName = IndexFileNames.segmentFileName(state.segmentName, state.codecId, DOC_EXTENSION);
++    IndexOutput stream = state.directory.createOutput(docFileName);
++    docio = factory.createOutput(stream, docFileName, false);
++    skipMinimum = skipInterval = docio.blockSize;
++    if (state.fieldInfos.hasProx()) {
++      FixedIntBlockIndexOutput freqio = factory.createOutput(stream, docFileName, true); 
++      docOut = docfreqio = new InterleavedIntBlockIndexOutput(docio, freqio);
++
++      final String posFileName = IndexFileNames.segmentFileName(state.segmentName, state.codecId, POS_EXTENSION);
++      posOut = factory.createOutput(state.directory, posFileName);
++      posIndex = posOut.index();
++      
++      assert posOut.blockSize == docio.blockSize;
++
++      // TODO: -- only if at least one field stores payloads?
++      final String payloadFileName = IndexFileNames.segmentFileName(state.segmentName, state.codecId, PAYLOAD_EXTENSION);
++      payloadOut = state.directory.createOutput(payloadFileName);
++
++    } else {
++      docOut = docio; // docOut is just a pure doc stream only
++      docfreqio = null;
++      posOut = null;
++      posIndex = null;
++      payloadOut = null;
++    }
++
++    docIndex = docOut.index();
++    final String skipFileName = IndexFileNames.segmentFileName(state.segmentName, state.codecId, SKIP_EXTENSION);
++    skipOut = state.directory.createOutput(skipFileName);
++
++    totalNumDocs = state.numDocs;
++
++    skipListWriter = new FixedSkipListWriter(skipInterval,
++                                           maxSkipLevels,
++                                           state.numDocs,
++                                           docOut,
++                                           posOut, payloadOut);
++  }
++
++  @Override
++  public void start(IndexOutput termsOut) throws IOException {
++    this.termsOut = termsOut;
++    CodecUtil.writeHeader(termsOut, CODEC, VERSION_CURRENT);
++    // TODO: -- just ask skipper to "start" here
++    termsOut.writeInt(skipInterval);                // write skipInterval
++    termsOut.writeInt(maxSkipLevels);               // write maxSkipLevels
++    termsOut.writeInt(skipMinimum);                 // write skipMinimum
++  }
++
++  @Override
++  public void startTerm() throws IOException {
++    docIndex.mark();
++    if (!omitTF) {
++      posIndex.mark();
++      payloadStart = payloadOut.getFilePointer();
++      lastPayloadLength = -1;
++    }
++    skipListWriter.resetSkip(docIndex, posIndex);
++  }
++
++  // Currently, this instance is re-used across fields, so
++  // our parent calls setField whenever the field changes
++  @Override
++  public void setField(FieldInfo fieldInfo) {
++    this.fieldInfo = fieldInfo;
++    
++    // omitTF's differ, we must flush any buffered docs/freqs
++    // nocommit: ugly!
++    if (omitTF != fieldInfo.omitTermFreqAndPositions) {
++      try {
++        if (docOut instanceof InterleavedIntBlockIndexOutput) {
++          ((InterleavedIntBlockIndexOutput) docOut).flush();
++        } else {
++          ((FixedIntBlockIndexOutput) docOut).flush();
++        }
++      } catch (IOException e) { throw new RuntimeException(e); }
++    }
++    
++    omitTF = fieldInfo.omitTermFreqAndPositions;
++    docOut = omitTF ? docio : docfreqio;
++    skipListWriter.setOmitTF(omitTF);
++    storePayloads = !omitTF && fieldInfo.storePayloads;
++  }
++
++  /** Adds a new doc in this term.  If this returns null
++   *  then we just skip consuming positions/payloads. */
++  @Override
++  public void startDoc(int docID, int termDocFreq) throws IOException {
++
++    final int delta = docID - lastDocID;
++    //System.out.println("SepW startDoc: write doc=" + docID + " delta=" + delta);
++
++    if (docID < 0 || (df > 0 && delta <= 0)) {
++      throw new CorruptIndexException("docs out of order (" + docID + " <= " + lastDocID + " )");
++    }
++
++    if ((++df % skipInterval) == 0) {
++      // TODO: -- awkward we have to make these two
++      // separate calls to skipper
++      //System.out.println("    buffer skip lastDocID=" + lastDocID);
++      skipListWriter.setSkipData(lastDocID, storePayloads, lastPayloadLength);
++      skipListWriter.bufferSkip(df);
++    }
++
++    lastDocID = docID;
++    //System.out.println("sepw: write docID=" + docID);
++    docOut.write(delta);
++    if (!omitTF) {
++      //System.out.println("    sepw startDoc: write freq=" + termDocFreq);
++      // NOCOMMIT buffer freq?
++      docOut.write(termDocFreq);
++    }
++  }
++
++  @Override
++  public void flushTermsBlock() throws IOException {
++    //System.out.println("SepW.flushTermsBlock: pendingTermCount=" + pendingTermCount + " bytesUsed=" + indexBytesWriter.getFilePointer());
++    termsOut.writeVLong((int) indexBytesWriter.getFilePointer());
++    indexBytesWriter.writeTo(termsOut);
++    indexBytesWriter.reset();
++    pendingTermCount = 0;
++  }
++
++  /** Add a new position & payload */
++  @Override
++  public void addPosition(int position, BytesRef payload) throws IOException {
++    assert !omitTF;
++
++    final int delta = position - lastPosition;
++    assert delta > 0 || position == 0: "position=" + position + " lastPosition=" + lastPosition;            // not quite right (if pos=0 is repeated twice we don't catch it)
++    lastPosition = position;
++
++    if (storePayloads) {
++      final int payloadLength = payload == null ? 0 : payload.length;
++      if (payloadLength != lastPayloadLength) {
++        lastPayloadLength = payloadLength;
++        // TODO: explore whether we get better compression
++        // by not storing payloadLength into prox stream?
++        posOut.write((delta<<1)|1);
++        posOut.write(payloadLength);
++      } else {
++        posOut.write(delta << 1);
++      }
++
++      if (payloadLength > 0) {
++        payloadOut.writeBytes(payload.bytes, payload.offset, payloadLength);
++      }
++    } else {
++      posOut.write(delta);
++    }
++
++    lastPosition = position;
++  }
++
++  /** Called when we are done adding positions & payloads */
++  @Override
++  public void finishDoc() {       
++    lastPosition = 0;
++  }
++
++  /** Called when we are done adding docs to this term */
++  @Override
++  public void finishTerm(TermStats stats) throws IOException {
++    // TODO: -- wasteful we are counting this in two places?
++    assert stats.docFreq > 0;
++    assert stats.docFreq == df;
++
++    final boolean isFirstTerm = pendingTermCount == 0;  
++    //System.out.println("SepW.finishTerm: isFirstTerm=" + isFirstTerm);
++
++    docIndex.write(indexBytesWriter, isFirstTerm);
++    //System.out.println("  docIndex=" + docIndex);
++
++    if (!omitTF) {
++      posIndex.write(indexBytesWriter, isFirstTerm);
++      //System.out.println("  posIndex=" + posIndex);
++      if (storePayloads) {
++        if (isFirstTerm) {
++          indexBytesWriter.writeVLong(payloadStart);
++        } else {
++          indexBytesWriter.writeVLong(payloadStart - lastPayloadStart);
++        }
++        lastPayloadStart = payloadStart;
++        //System.out.println("  payloadFP=" + payloadStart);
++      }
++    }
++
++    if (df >= skipMinimum) {
++      //System.out.println("  skipFP=" + skipStart);
++      final long skipFP = skipOut.getFilePointer();
++      skipListWriter.writeSkip(skipOut);
++      //System.out.println("   writeSkip @ " + indexBytesWriter.getFilePointer());
++      if (isFirstTerm) {
++        indexBytesWriter.writeVLong(skipFP);
++      } else {
++        indexBytesWriter.writeVLong(skipFP - lastSkipFP);
++      }
++      lastSkipFP = skipFP;
++    } else if (isFirstTerm) {
++      // TODO: this is somewhat wasteful; eg if no terms in
++      // this block will use skip data, we don't need to
++      // write this:
++      final long skipFP = skipOut.getFilePointer();
++      indexBytesWriter.writeVLong(skipFP);
++      lastSkipFP = skipFP;
++    }
++
++    lastDocID = 0;
++    df = 0;
++    pendingTermCount++;
++  }
++
++  @Override
++  public void close() throws IOException {
++    try {
++      docOut.close();
++    } finally {
++      try {
++        skipOut.close();
++      } finally {
++        if (posOut != null) {
++          try {
++            posOut.close();
++          } finally {
++            payloadOut.close();
++          }
++        }
++      }
++    }
++  }
++
++  public static void getExtensions(Set<String> extensions) {
++    extensions.add(DOC_EXTENSION);
++    extensions.add(SKIP_EXTENSION);
++    extensions.add(POS_EXTENSION);
++    extensions.add(PAYLOAD_EXTENSION);
++  }
++}
+
+Property changes on: lucene\src\java\org\apache\lucene\index\codecs\fixed\FixedPostingsWriterImpl.java
+___________________________________________________________________
+Added: svn:eol-style
+   + native
+
+Index: lucene/src/java/org/apache/lucene/index/codecs/fixed/FixedPostingsReaderImpl.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/index/codecs/fixed/FixedPostingsReaderImpl.java	(revision 0)
++++ lucene/src/java/org/apache/lucene/index/codecs/fixed/FixedPostingsReaderImpl.java	(revision 0)
+@@ -0,0 +1,1596 @@
++package org.apache.lucene.index.codecs.fixed;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.Collection;
++
++import org.apache.lucene.index.DocsAndPositionsEnum;
++import org.apache.lucene.index.DocsEnum;
++import org.apache.lucene.index.BulkPostingsEnum;
++import org.apache.lucene.index.FieldInfo;
++import org.apache.lucene.index.IndexFileNames;
++import org.apache.lucene.index.SegmentInfo;
++import org.apache.lucene.index.TermState;
++import org.apache.lucene.index.codecs.BlockTermState;
++import org.apache.lucene.index.codecs.PostingsReaderBase;
++import org.apache.lucene.index.codecs.intblock.FixedIntBlockIndexInput;
++import org.apache.lucene.index.codecs.sep.IntIndexInput;
++import org.apache.lucene.store.ByteArrayDataInput;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.util.ArrayUtil;
++import org.apache.lucene.util.Bits;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.CodecUtil;
++
++/** Concrete class that reads the current doc/freq/skip
++ *  postings format.    
++ *
++ * @lucene.experimental
++ */
++
++// TODO: -- should we switch "hasProx" higher up?  and
++// create two separate docs readers, one that also reads
++// prox and one that doesn't?
++
++public class FixedPostingsReaderImpl extends PostingsReaderBase {
++
++  final FixedIntBlockIndexInput freqIn;
++  final FixedIntBlockIndexInput docIn;
++  final FixedIntBlockIndexInput posIn;
++  final IndexInput payloadIn;
++  final IndexInput skipIn;
++  final int blocksize;
++
++  int skipInterval;
++  int maxSkipLevels;
++  int skipMinimum;
++
++  public FixedPostingsReaderImpl(Directory dir, SegmentInfo segmentInfo, int readBufferSize, FixedIntStreamFactory intFactory, String codecId) throws IOException {
++
++    boolean success = false;
++    try {
++
++      final String docFileName = IndexFileNames.segmentFileName(segmentInfo.name, codecId, FixedPostingsWriterImpl.DOC_EXTENSION);
++      final IndexInput docsAndFreqsIn = dir.openInput(docFileName, readBufferSize);
++      
++      docIn = intFactory.openInput(docsAndFreqsIn, docFileName, false);
++      blocksize = docIn.blockSize;
++      skipIn = dir.openInput(IndexFileNames.segmentFileName(segmentInfo.name, codecId, FixedPostingsWriterImpl.SKIP_EXTENSION), readBufferSize);
++
++      if (segmentInfo.getHasProx()) {
++        freqIn = intFactory.openInput(docsAndFreqsIn, docFileName, true);
++        posIn = intFactory.openInput(dir, IndexFileNames.segmentFileName(segmentInfo.name, codecId, FixedPostingsWriterImpl.POS_EXTENSION), readBufferSize);
++        payloadIn = dir.openInput(IndexFileNames.segmentFileName(segmentInfo.name, codecId, FixedPostingsWriterImpl.PAYLOAD_EXTENSION), readBufferSize);
++      } else {
++        posIn = null;
++        payloadIn = null;
++        freqIn = null;
++      }
++      success = true;
++    } finally {
++      if (!success) {
++        close();
++      }
++    }
++  }
++
++  public static void files(SegmentInfo segmentInfo, String codecId, Collection<String> files) {
++    files.add(IndexFileNames.segmentFileName(segmentInfo.name, codecId, FixedPostingsWriterImpl.DOC_EXTENSION));
++    files.add(IndexFileNames.segmentFileName(segmentInfo.name, codecId, FixedPostingsWriterImpl.SKIP_EXTENSION));
++
++    if (segmentInfo.getHasProx()) {
++      files.add(IndexFileNames.segmentFileName(segmentInfo.name, codecId, FixedPostingsWriterImpl.POS_EXTENSION));
++      files.add(IndexFileNames.segmentFileName(segmentInfo.name, codecId, FixedPostingsWriterImpl.PAYLOAD_EXTENSION));
++    }
++  }
++
++  @Override
++  public void init(IndexInput termsIn) throws IOException {
++    // Make sure we are talking to the matching past writer
++    CodecUtil.checkHeader(termsIn, FixedPostingsWriterImpl.CODEC,
++      FixedPostingsWriterImpl.VERSION_START, FixedPostingsWriterImpl.VERSION_START);
++    skipInterval = termsIn.readInt();
++    maxSkipLevels = termsIn.readInt();
++    skipMinimum = termsIn.readInt();
++  }
++
++  @Override
++  public void close() throws IOException {
++    try {
++      if (docIn != null)
++        docIn.close();
++    } finally {
++      try {
++        if (skipIn != null)
++          skipIn.close();
++      } finally {
++        try {
++          if (posIn != null) {
++            posIn.close();
++          }
++        } finally {
++          if (payloadIn != null) {
++            payloadIn.close();
++          }
++        }
++      }
++    }
++  }
++
++  private static final class FixedTermState extends BlockTermState {
++    // We store only the seek point to the docs file because
++    // the rest of the info (freqIndex, posIndex, etc.) is
++    // stored in the docs file:
++    IntIndexInput.Index docIndex;
++    IntIndexInput.Index posIndex;
++    long payloadFP;
++    long skipFP;
++
++    // Only used for "primary" term state; these are never
++    // copied on clone:
++    byte[] bytes;
++    ByteArrayDataInput bytesReader;
++
++    @Override
++    public Object clone() {
++      FixedTermState other = (FixedTermState) super.clone();
++      other.docIndex = (IntIndexInput.Index) docIndex.clone();
++      if (posIndex != null) {
++        other.posIndex = (IntIndexInput.Index) posIndex.clone();
++      }
++      return other;
++    }
++
++    @Override
++    public void copyFrom(TermState _other) {
++      super.copyFrom(_other);
++      FixedTermState other = (FixedTermState) _other;
++      docIndex.set(other.docIndex);
++      if (posIndex != null && other.posIndex != null) {
++        posIndex.set(other.posIndex);
++      }
++      payloadFP = other.payloadFP;
++      skipFP = other.skipFP;
++    }
++
++    @Override
++    public String toString() {
++      return super.toString() + " docIndex=" + docIndex + " posIndex=" + posIndex + " payloadFP=" + payloadFP + " skipFP=" + skipFP;
++    }
++  }
++
++  @Override
++  public BlockTermState newTermState() throws IOException {
++    final FixedTermState state = new FixedTermState();
++    state.docIndex = docIn.index();
++    if (posIn != null) {
++      state.posIndex = posIn.index();
++    }
++    return state;
++  }
++
++  @Override
++  public void readTermsBlock(IndexInput termsIn, FieldInfo fieldInfo, BlockTermState _termState) throws IOException {
++    final FixedTermState termState = (FixedTermState) _termState;
++    final int len = termsIn.readVInt();
++    //System.out.println("SepR.readTermsBlock len=" + len);
++    if (termState.bytes == null) {
++      termState.bytes = new byte[ArrayUtil.oversize(len, 1)];
++      termState.bytesReader = new ByteArrayDataInput(termState.bytes);
++    } else if (termState.bytes.length < len) {
++      termState.bytes = new byte[ArrayUtil.oversize(len, 1)];
++    }
++    termState.bytesReader.reset(termState.bytes, 0, len);
++    termsIn.readBytes(termState.bytes, 0, len);
++  }
++
++  @Override
++  public void nextTerm(FieldInfo fieldInfo, BlockTermState _termState) throws IOException {
++    final FixedTermState termState = (FixedTermState) _termState;
++    //System.out.println("SepR.nextTerm termCount=" + termState.termCount);
++    //System.out.println("  docFreq=" + termState.docFreq);
++    final boolean isFirstTerm = termState.termCount == 0;
++    termState.docIndex.read(termState.bytesReader, isFirstTerm);
++    //System.out.println("  docIndex=" + termState.docIndex);
++    if (!fieldInfo.omitTermFreqAndPositions) {
++      termState.posIndex.read(termState.bytesReader, isFirstTerm);
++      //System.out.println("  posIndex=" + termState.posIndex);
++      if (fieldInfo.storePayloads) {
++        if (isFirstTerm) {
++          termState.payloadFP = termState.bytesReader.readVLong();
++        } else {
++          termState.payloadFP += termState.bytesReader.readVLong();
++        }
++        //System.out.println("  payloadFP=" + termState.payloadFP);
++      }
++    }
++    if (termState.docFreq >= skipMinimum) {
++      //System.out.println("   readSkip @ " + termState.bytesReader.pos);
++      if (isFirstTerm) {
++        termState.skipFP = termState.bytesReader.readVLong();
++      } else {
++        termState.skipFP += termState.bytesReader.readVLong();
++      }
++      //System.out.println("  skipFP=" + termState.skipFP);
++    } else if (isFirstTerm) {
++      termState.skipFP = termState.bytesReader.readVLong();
++    }
++  }
++
++  @Override
++  public DocsEnum docs(FieldInfo fieldInfo, BlockTermState _termState, Bits skipDocs, DocsEnum reuse) throws IOException {
++    final FixedTermState termState = (FixedTermState) _termState;
++    if (fieldInfo.omitTermFreqAndPositions) {
++      FixedDocsEnum docsEnum;
++      if (reuse == null || !(reuse instanceof FixedDocsEnum) || !((FixedDocsEnum) reuse).canReuse(docIn)) {
++        docsEnum = new FixedDocsEnum();
++      } else {
++        docsEnum = (FixedDocsEnum) reuse;
++      }
++
++      return docsEnum.init(fieldInfo, termState, skipDocs);
++    } else {
++      FixedDocsAndFreqsEnum docsEnum;
++      if (reuse == null || !(reuse instanceof FixedDocsAndFreqsEnum) || !((FixedDocsAndFreqsEnum) reuse).canReuse(docIn)) {
++        docsEnum = new FixedDocsAndFreqsEnum();
++      } else {
++        docsEnum = (FixedDocsAndFreqsEnum) reuse;
++      }
++      
++      return docsEnum.init(fieldInfo, termState, skipDocs);
++    }
++  }
++
++  private FixedBulkPostingsEnum lastBulkEnum;
++
++  @Override
++  public BulkPostingsEnum bulkPostings(FieldInfo fieldInfo, BlockTermState _termState, BulkPostingsEnum reuse, boolean doFreqs, boolean doPositions) throws IOException {
++    final FixedTermState termState = (FixedTermState) _termState;
++    final FixedBulkPostingsEnum lastBulkEnum = this.lastBulkEnum;
++    if (lastBulkEnum != null && reuse == lastBulkEnum) {
++      // fastpath
++      return lastBulkEnum.init(termState);
++    } else {
++      FixedBulkPostingsEnum postingsEnum;
++      if (reuse == null || !(reuse instanceof FixedBulkPostingsEnum) || !((FixedBulkPostingsEnum) reuse).canReuse(fieldInfo, docIn, doFreqs, doPositions, fieldInfo.omitTermFreqAndPositions)) {
++        postingsEnum = new FixedBulkPostingsEnum(fieldInfo, doFreqs, doPositions);
++      } else {
++        postingsEnum = (FixedBulkPostingsEnum) reuse;
++      }
++      this.lastBulkEnum = postingsEnum;
++      return postingsEnum.init(termState);
++    }
++  }
++
++  public DocsAndPositionsEnum docsAndPositions(FieldInfo fieldInfo, BlockTermState _termState, Bits skipDocs, DocsAndPositionsEnum reuse) throws IOException {
++    assert !fieldInfo.omitTermFreqAndPositions;
++    final FixedTermState termState = (FixedTermState) _termState;
++    if (!fieldInfo.storePayloads) {
++      FixedDocsAndPositionsEnum postingsEnum;
++      if (reuse == null || !(reuse instanceof FixedDocsAndPositionsEnum) || !((FixedDocsAndPositionsEnum) reuse).canReuse(docIn)) {
++        postingsEnum = new FixedDocsAndPositionsEnum();
++      } else {
++        postingsEnum = (FixedDocsAndPositionsEnum) reuse;
++      }
++
++    return postingsEnum.init(fieldInfo, termState, skipDocs);
++    } else {
++      FixedDocsAndPositionsAndPayloadsEnum postingsEnum;
++      if (reuse == null || !(reuse instanceof FixedDocsAndPositionsAndPayloadsEnum) || !((FixedDocsAndPositionsAndPayloadsEnum) reuse).canReuse(docIn)) {
++        postingsEnum = new FixedDocsAndPositionsAndPayloadsEnum();
++      } else {
++        postingsEnum = (FixedDocsAndPositionsAndPayloadsEnum) reuse;
++      }
++
++    return postingsEnum.init(fieldInfo, termState, skipDocs);
++    }
++  }
++
++  final class FixedDocsEnum extends DocsEnum {
++    int docFreq;
++    int doc;
++    int count;
++
++    private boolean storePayloads;
++    private Bits skipDocs;
++    private final FixedIntBlockIndexInput.Reader docReader;
++    private final int[] docDeltaBuffer;
++    private int upto;
++    private long skipFP;
++
++    private final IntIndexInput.Index docIndex;
++    private final IntIndexInput.Index posIndex;
++    private final IntIndexInput startDocIn;
++    
++    boolean skipped;
++    FixedSkipListReader skipper;
++
++    public FixedDocsEnum() throws IOException {
++      startDocIn = docIn;
++      docReader = docIn.reader();
++      docDeltaBuffer = docReader.getBuffer();
++      docIndex = docIn.index();
++      if (posIn != null) {
++        posIndex = posIn.index();                 // only init this so skipper can read it
++      } else {
++        posIndex = null;
++      }
++    }
++
++    // nocommit -- somehow we have to prevent re-decode of
++    // the same block if we have just .next()'d to next term
++    // in the terms dict -- this is an O(N^2) cost to eg
++    // TermRangeQuery when it steps through low freq terms!!
++    FixedDocsEnum init(FieldInfo fieldInfo, FixedTermState termState, Bits skipDocs) throws IOException {
++      this.skipDocs = skipDocs;
++      assert fieldInfo.omitTermFreqAndPositions == true;
++      storePayloads = fieldInfo.storePayloads;
++
++      // TODO: can't we only do this if consumer
++      // skipped consuming the previous docs?
++      //System.out.println("fixedDocsEnum init: " + termState.docIndex);
++      docIndex.set(termState.docIndex);
++
++      //System.out.println("fixedDocsEnum init: " + docDeltaBuffer[upto]);
++      docIndex.seek(docReader);
++
++      upto = docReader.offset();
++      
++      docFreq = termState.docFreq;
++      assert docFreq > 0;
++      // NOTE: unused if docFreq < skipMinimum:
++      skipFP = termState.skipFP;
++      count = 0;
++      doc = 0;
++      skipped = false;
++      //System.out.println("  docFreq=" + docFreq);
++
++      return this;
++    }
++
++    public boolean canReuse(IntIndexInput docsIn) {
++      return startDocIn == docsIn;
++    }
++
++    @Override
++    public int nextDoc() throws IOException {
++      //System.out.println("  sep.nextDoc");
++
++      while(true) {
++        if (count == docFreq) {
++          return doc = NO_MORE_DOCS;
++        }
++
++        assert upto <= blocksize: "docDeltaUpto=" + upto + " docDeltaLimit=" + blocksize;
++
++        if (upto == blocksize) {
++          // refill
++          docReader.fill();
++          upto = 0;
++        }
++
++        count++;
++
++        // Decode next doc
++        doc += docDeltaBuffer[upto++];
++        //System.out.println("    doc="+ doc + " docDeltaUpto=" + (docDeltaUpto-1) + " skipDocs=" + skipDocs + " deleted?=" + (skipDocs != null && skipDocs.get(doc)));
++          
++        if (skipDocs == null || !skipDocs.get(doc)) {
++          break;
++        }
++      }
++      return doc;
++    }
++
++    @Override
++    public int freq() {
++      return 1;
++    }
++
++    @Override
++    public int docID() {
++      return doc;
++    }
++
++    @Override
++    public int advance(int target) throws IOException {
++      //System.out.println("SepDocsEnum.advance target=" + target);
++
++      if ((target - blocksize) >= doc && docFreq >= skipMinimum) {
++      //System.out.println("SepDocsEnum.advance target=" + target);
++
++        // There are enough docs in the posting to have
++        // skip data, and its not too close
++
++        if (skipper == null) {
++          // This DocsEnum has never done any skipping
++          //System.out.println("  init skipper");
++          skipper = new FixedSkipListReader((IndexInput) skipIn.clone(),
++                                          docIn,
++                                          posIn,
++                                          maxSkipLevels, skipInterval);
++
++        }
++
++        if (!skipped) {
++          //System.out.println("  init skipper2");
++          // We haven't yet skipped for this posting
++          skipper.init(skipFP,
++                       docIndex,
++                       posIndex,
++                       0,
++                       docFreq,
++                       storePayloads);
++          skipper.setOmitTF(true);
++
++          skipped = true;
++        }
++
++        final int newCount = skipper.skipTo(target); 
++
++        if (newCount > count) {
++          // Skipper did move
++          skipper.getDocIndex().seek(docReader);
++          
++          upto = docReader.offset();
++          
++          count = newCount;
++          doc = skipper.getDoc();
++          //System.out.println("  did move count=" + newCount + " doc=" + doc);
++        }
++      }
++        
++      // Now, linear scan for the rest:
++      do {
++        if (nextDoc() == NO_MORE_DOCS) {
++          return NO_MORE_DOCS;
++        }
++      } while (target > doc);
++
++      return doc;
++    }
++  }
++  
++  final class FixedDocsAndFreqsEnum extends DocsEnum {
++    int docFreq;
++    int doc;
++    int count;
++    int freq;
++
++    private boolean storePayloads;
++    private Bits skipDocs;
++    private final FixedIntBlockIndexInput.Reader docReader;
++    private final int[] docDeltaBuffer;
++    private final FixedIntBlockIndexInput.Reader freqReader;
++    private final int[] freqBuffer;
++    private int upto;
++    private long skipFP;
++
++    private final IntIndexInput.Index docIndex;
++    private final IntIndexInput.Index posIndex;
++    private final IntIndexInput startDocIn;
++    
++    boolean skipped;
++    FixedSkipListReader skipper;
++
++    public FixedDocsAndFreqsEnum() throws IOException {
++      startDocIn = docIn;
++      docReader = docIn.reader();
++      docDeltaBuffer = docReader.getBuffer();
++      docIndex = docIn.index();
++      if (freqIn != null) {
++        freqReader = freqIn.reader(docReader);
++        freqBuffer = freqReader.getBuffer();
++      } else {
++        freqReader = null;
++        freqBuffer = null;
++      }
++      if (posIn != null) {
++        posIndex = posIn.index();                 // only init this so skipper can read it
++      } else {
++        posIndex = null;
++      }
++    }
++
++    // nocommit -- somehow we have to prevent re-decode of
++    // the same block if we have just .next()'d to next term
++    // in the terms dict -- this is an O(N^2) cost to eg
++    // TermRangeQuery when it steps through low freq terms!!
++    FixedDocsAndFreqsEnum init(FieldInfo fieldInfo, FixedTermState termState, Bits skipDocs) throws IOException {
++      this.skipDocs = skipDocs;
++      assert fieldInfo.omitTermFreqAndPositions == false;
++      storePayloads = fieldInfo.storePayloads;
++
++      // TODO: can't we only do this if consumer
++      // skipped consuming the previous docs?
++      //System.out.println("fixedDocsEnum init: " + termState.docIndex);
++      docIndex.set(termState.docIndex);
++
++      //System.out.println("fixedDocsEnum init: " + docDeltaBuffer[upto]);
++      docReader.seek(docIndex, freqReader, true);
++
++      upto = docReader.offset();
++      
++      docFreq = termState.docFreq;
++      assert docFreq > 0;
++      // NOTE: unused if docFreq < skipMinimum:
++      skipFP = termState.skipFP;
++      count = 0;
++      doc = 0;
++      skipped = false;
++      //System.out.println("  docFreq=" + docFreq);
++
++      return this;
++    }
++
++    public boolean canReuse(IntIndexInput docsIn) {
++      return startDocIn == docsIn;
++    }
++
++    @Override
++    public int nextDoc() throws IOException {
++      //System.out.println("  sep.nextDoc");
++
++      while(true) {
++        if (count == docFreq) {
++          return doc = NO_MORE_DOCS;
++        }
++
++        assert upto <= blocksize: "docDeltaUpto=" + upto + " docDeltaLimit=" + blocksize;
++
++        if (upto == blocksize) {
++          // refill
++          docReader.fill();
++          upto = 0;
++          freqReader.fill();
++        }
++
++        count++;
++
++        //System.out.println("docDelta" + docDeltaBuffer[upto]);
++        freq = freqBuffer[upto];
++        doc += docDeltaBuffer[upto++];
++        //System.out.println("    doc="+ doc + " docDeltaUpto=" + (docDeltaUpto-1) + " skipDocs=" + skipDocs + " deleted?=" + (skipDocs != null && skipDocs.get(doc)));
++          
++        if (skipDocs == null || !skipDocs.get(doc)) {
++          break;
++        }
++      }
++      return doc;
++    }
++
++    @Override
++    public int freq() {
++      return freq;
++    }
++
++    @Override
++    public int docID() {
++      return doc;
++    }
++
++    @Override
++    public int advance(int target) throws IOException {
++      //System.out.println("SepDocsEnum.advance target=" + target);
++
++      if ((target - blocksize) >= doc && docFreq >= skipMinimum) {
++      //System.out.println("SepDocsEnum.advance target=" + target);
++
++        // There are enough docs in the posting to have
++        // skip data, and its not too close
++
++        if (skipper == null) {
++          // This DocsEnum has never done any skipping
++          //System.out.println("  init skipper");
++          skipper = new FixedSkipListReader((IndexInput) skipIn.clone(),
++                                          docIn,
++                                          posIn,
++                                          maxSkipLevels, skipInterval);
++
++        }
++
++        if (!skipped) {
++          //System.out.println("  init skipper2");
++          // We haven't yet skipped for this posting
++          skipper.init(skipFP,
++                       docIndex,
++                       posIndex,
++                       0,
++                       docFreq,
++                       storePayloads);
++          skipper.setOmitTF(false);
++
++          skipped = true;
++        }
++
++        final int newCount = skipper.skipTo(target); 
++
++        if (newCount > count) {
++          // Skipper did move
++          final IntIndexInput.Index idx = skipper.getDocIndex();
++
++          docReader.seek(idx, freqReader, true);
++          
++          upto = docReader.offset();
++          
++          count = newCount;
++          doc = skipper.getDoc();
++          //System.out.println("  did move count=" + newCount + " doc=" + doc);
++        }
++      }
++        
++      // Now, linear scan for the rest:
++      return scan(target);
++      /*
++      do {
++        if (nextDoc() == NO_MORE_DOCS) {
++          return NO_MORE_DOCS;
++        }
++      } while (target > doc);
++
++      return doc;
++      */
++    }
++    
++    /** 
++     * optimized scan, it reads docbuffer one step ahead of freqs,
++     * so that it can skipBlock() whenever possible over freqs
++     */
++    int scan(int target) throws IOException {
++      // nocommit: bulkpostings needs this
++      // nocommit: rewrite entire enum to lazy-decode freqs in case caller doesnt call freq() ?
++      boolean freqsPending = false;
++      
++      while (true) {  
++        if (count == docFreq) {
++          // nocommit: can we skipBlock / must we do this?
++          if (freqsPending) {
++            freqReader.fill();
++          }
++          return NO_MORE_DOCS;
++        }
++        
++        if (upto == blocksize) {
++          // leapfrog
++          if (freqsPending) {
++            freqReader.skipBlock();
++          }
++          // refill
++          docReader.fill();
++          upto = 0;
++          freqsPending = true;
++        }
++        
++        count++;
++
++        doc += docDeltaBuffer[upto++];
++        
++        if (doc >= target && (skipDocs == null || !skipDocs.get(doc))) {
++          if (freqsPending) {
++            freqReader.fill();
++          }
++          freq = freqBuffer[upto-1];
++          return doc;
++        }
++      }
++    }
++  }
++
++  final class FixedDocsAndPositionsEnum extends DocsAndPositionsEnum {
++    int docFreq;
++    int doc;
++    int count;
++    int freq;
++
++    private Bits skipDocs;
++    private final FixedIntBlockIndexInput.Reader docReader;
++    private final int[] docDeltaBuffer;
++    private final FixedIntBlockIndexInput.Reader freqReader;
++    private final int[] freqBuffer;
++    private int upto;
++    private final FixedIntBlockIndexInput.Reader posReader;
++    private final int[] posBuffer;
++    private int posUpto;
++    private long skipFP;
++
++    private final IndexInput payloadIn;
++
++    private final IntIndexInput.Index docIndex;
++    private final IntIndexInput.Index posIndex;
++    private final IntIndexInput startDocIn;
++
++    private long payloadFP;
++
++    private int pendingPosCount;
++    private int position;
++    private boolean posSeekPending;
++
++    boolean skipped;
++    FixedSkipListReader skipper;
++
++    public FixedDocsAndPositionsEnum() throws IOException {
++      startDocIn = docIn;
++      docReader = docIn.reader();
++      docDeltaBuffer = docReader.getBuffer();
++      docIndex = docIn.index();
++      freqReader = freqIn.reader(docReader);
++      freqBuffer = freqReader.getBuffer();
++      posReader = posIn.reader();
++      posBuffer = posReader.getBuffer();
++      posIndex = posIn.index();
++      payloadIn = (IndexInput) FixedPostingsReaderImpl.this.payloadIn.clone();
++    }
++
++    // nocommit -- somehow we have to prevent re-decode of
++    // the same block if we have just .next()'d to next term
++    // in the terms dict -- this is an O(N^2) cost to eg
++    // TermRangeQuery when it steps through low freq terms!!
++    FixedDocsAndPositionsEnum init(FieldInfo fieldInfo, FixedTermState termState, Bits skipDocs) throws IOException {
++      this.skipDocs = skipDocs;
++      //System.out.println("sep d&p init");
++      assert !fieldInfo.omitTermFreqAndPositions;
++      assert !fieldInfo.storePayloads;
++      //System.out.println("Sep D&P init");
++
++      // TODO: can't we only do this if consumer
++      // skipped consuming the previous docs?
++      docIndex.set(termState.docIndex);
++      // nocommit -- verify, during merge, this seek is
++      // sometimes w/in block:
++      docReader.seek(docIndex, freqReader, true);
++      upto = docReader.offset();
++      //System.out.println("  docIndex=" + docIndex);
++
++      posIndex.set(termState.posIndex);
++      //System.out.println("  posIndex=" + posIndex);
++      posSeekPending = true;
++
++      payloadFP = termState.payloadFP;
++      skipFP = termState.skipFP;
++      //System.out.println("  skipFP=" + skipFP);
++      /*
++      if (docDeltaUpto >= docDeltaLimit) {
++        // nocommit -- needed anymore?
++        docDeltaLimit = docReader.fill();
++        docDeltaUpto = 0;
++      }
++      */
++
++      docFreq = termState.docFreq;
++      assert docFreq > 0;
++      count = 0;
++      doc = 0;
++      pendingPosCount = 0;
++      skipped = false;
++
++      //System.out.println("  docUpto=" + docDeltaUpto + " docMax=" + docDeltaLimit + " freqUpto=" + freqUpto + " freqMax=" + freqLimit);
++
++      return this;
++    }
++
++    public boolean canReuse(IntIndexInput docsIn) {
++      return startDocIn == docsIn;
++    }
++
++    @Override
++    public int nextDoc() throws IOException {
++      while(true) {
++        if (count == docFreq) {
++          return doc = NO_MORE_DOCS;
++        }
++
++        if (upto == blocksize) {
++          // refill
++          docReader.fill();
++          freqReader.fill();
++          upto = 0;
++        }
++
++        count++;
++
++        // Decode next doc
++        freq = freqBuffer[upto];
++        doc += docDeltaBuffer[upto++];
++
++        pendingPosCount += freq;
++
++        if (skipDocs == null || !skipDocs.get(doc)) {
++          break;
++        }
++      }
++
++      position = 0;
++      return doc;
++    }
++
++    @Override
++    public int freq() {
++      return freq;
++    }
++
++    @Override
++    public int docID() {
++      return doc;
++    }
++
++    @Override
++    public int advance(int target) throws IOException {
++      //System.out.println("SepD&P advance target=" + target + " vs current=" + doc + " this=" + this);
++
++      if ((target - blocksize) >= doc && docFreq >= skipMinimum) {
++
++        // There are enough docs in the posting to have
++        // skip data, and its not too close
++
++        if (skipper == null) {
++          //System.out.println("  create skipper");
++          // This DocsEnum has never done any skipping
++          skipper = new FixedSkipListReader((IndexInput) skipIn.clone(),
++                                          docIn,
++                                          posIn,
++                                          maxSkipLevels, skipInterval);
++
++        }
++
++        if (!skipped) {
++          //System.out.println("  init skip data skipFP=" + skipFP);
++          // We haven't yet skipped for this posting
++          skipper.init(skipFP,
++                       docIndex,
++                       posIndex,
++                       payloadFP,
++                       docFreq,
++                       false);
++          skipped = true;
++        }
++        final int newCount = skipper.skipTo(target); 
++        //System.out.println("  skip newCount=" + newCount + " vs " + count);
++
++        if (newCount > count) {
++
++          // Skipper did move
++          final IntIndexInput.Index idx = skipper.getDocIndex();
++          docReader.seek(idx, freqReader, true);
++          upto = docReader.offset();
++
++          // NOTE: don't seek pos here; do it lazily
++          // instead.  Eg a PhraseQuery may skip to many
++          // docs before finally asking for positions...
++          posIndex.set(skipper.getPosIndex());
++          posSeekPending = true;
++          count = newCount;
++          doc = skipper.getDoc();
++
++          //System.out.println("    moved to doc=" + doc);
++          //payloadIn.seek(skipper.getPayloadPointer());
++          payloadFP = skipper.getPayloadPointer();
++          pendingPosCount = 0;
++          //System.out.println("    move payloadLen=" + payloadLength);
++        }
++      }
++        
++      // Now, linear scan for the rest:
++      do {
++        if (nextDoc() == NO_MORE_DOCS) {
++          //System.out.println("  advance nextDoc=END");
++          return NO_MORE_DOCS;
++        }
++        //System.out.println("  advance nextDoc=" + doc);
++      } while (target > doc);
++
++      //System.out.println("  return doc=" + doc);
++      return doc;
++    }
++
++    @Override
++    public int nextPosition() throws IOException {
++      if (posSeekPending) {
++        posIndex.seek(posReader);
++        posUpto = posReader.offset();
++        payloadIn.seek(payloadFP);
++        posSeekPending = false;
++      }
++
++      // scan over any docs that were iterated without their
++      // positions
++      if (pendingPosCount > freq) {
++        int remaining = pendingPosCount - freq;
++        final int bufferedRemaining = blocksize - posUpto;
++        if (remaining <= bufferedRemaining) {
++          posUpto += remaining; // just advance upto
++        } else {
++          remaining -= bufferedRemaining;
++          final int blocksToSkip = remaining / blocksize;
++          for (int i = 0; i < blocksToSkip; i++)
++            posReader.skipBlock();
++          posReader.fill();
++          posUpto = remaining % blocksize;
++        }
++        pendingPosCount = freq;
++      }
++      /*
++      
++      while (pendingPosCount > freq) {
++        nextPosInt();
++
++        pendingPosCount--;
++        position = 0;
++      }
++      */
++
++      final int code = nextPosInt();
++
++      assert code >= 0;
++      position += code;
++    
++      pendingPosCount--;
++      assert pendingPosCount >= 0;
++      return position;
++    }
++
++    private int nextPosInt() throws IOException {
++      if (posUpto == blocksize) {
++        posReader.fill();
++        posUpto = 0;
++      }
++      return posBuffer[posUpto++];
++    }
++
++    @Override
++    public BytesRef getPayload() throws IOException {
++      throw new IOException("no payload exists for this field.");
++    }
++
++    @Override
++    public boolean hasPayload() {
++      return false;
++    }
++  }
++
++  final class FixedDocsAndPositionsAndPayloadsEnum extends DocsAndPositionsEnum {
++    int docFreq;
++    int doc;
++    int count;
++    int freq;
++
++    private boolean storePayloads;
++    private Bits skipDocs;
++    private final FixedIntBlockIndexInput.Reader docReader;
++    private final int[] docDeltaBuffer;
++    private final FixedIntBlockIndexInput.Reader freqReader;
++    private final int[] freqBuffer;
++    private int upto;
++    private final BulkPostingsEnum.BlockReader posReader;
++    private final int[] posBuffer;
++    private int posUpto;
++    private long skipFP;
++
++    private final IndexInput payloadIn;
++
++    private final IntIndexInput.Index docIndex;
++    private final IntIndexInput.Index posIndex;
++    private final IntIndexInput startDocIn;
++
++    private long payloadFP;
++
++    private int pendingPosCount;
++    private int position;
++    private int payloadLength;
++    private long pendingPayloadBytes;
++    private boolean payloadPending;
++    private boolean posSeekPending;
++
++    boolean skipped;
++    FixedSkipListReader skipper;
++
++    public FixedDocsAndPositionsAndPayloadsEnum() throws IOException {
++      startDocIn = docIn;
++      docReader = docIn.reader();
++      docDeltaBuffer = docReader.getBuffer();
++      docIndex = docIn.index();
++      freqReader = freqIn.reader(docReader);
++      freqBuffer = freqReader.getBuffer();
++      posReader = posIn.reader();
++      posBuffer = posReader.getBuffer();
++      posIndex = posIn.index();
++      payloadIn = (IndexInput) FixedPostingsReaderImpl.this.payloadIn.clone();
++    }
++
++    // nocommit -- somehow we have to prevent re-decode of
++    // the same block if we have just .next()'d to next term
++    // in the terms dict -- this is an O(N^2) cost to eg
++    // TermRangeQuery when it steps through low freq terms!!
++    FixedDocsAndPositionsAndPayloadsEnum init(FieldInfo fieldInfo, FixedTermState termState, Bits skipDocs) throws IOException {
++      this.skipDocs = skipDocs;
++      //System.out.println("sep d&p init");
++      assert !fieldInfo.omitTermFreqAndPositions;
++      storePayloads = fieldInfo.storePayloads;
++      //System.out.println("Sep D&P init");
++
++      // TODO: can't we only do this if consumer
++      // skipped consuming the previous docs?
++      docIndex.set(termState.docIndex);
++      // nocommit -- verify, during merge, this seek is
++      // sometimes w/in block:
++      docReader.seek(docIndex, freqReader, true);
++      upto = docReader.offset();
++      //System.out.println("  docIndex=" + docIndex);
++
++      posIndex.set(termState.posIndex);
++      //System.out.println("  posIndex=" + posIndex);
++      posSeekPending = true;
++      payloadPending = false;
++
++      payloadFP = termState.payloadFP;
++      skipFP = termState.skipFP;
++      //System.out.println("  skipFP=" + skipFP);
++      /*
++      if (docDeltaUpto >= docDeltaLimit) {
++        // nocommit -- needed anymore?
++        docDeltaLimit = docReader.fill();
++        docDeltaUpto = 0;
++      }
++      */
++
++      docFreq = termState.docFreq;
++      assert docFreq > 0;
++      count = 0;
++      doc = 0;
++      pendingPosCount = 0;
++      pendingPayloadBytes = 0;
++      skipped = false;
++
++      //System.out.println("  docUpto=" + docDeltaUpto + " docMax=" + docDeltaLimit + " freqUpto=" + freqUpto + " freqMax=" + freqLimit);
++
++      return this;
++    }
++
++    public boolean canReuse(IntIndexInput docsIn) {
++      return startDocIn == docsIn;
++    }
++
++    @Override
++    public int nextDoc() throws IOException {
++      while(true) {
++        if (count == docFreq) {
++          return doc = NO_MORE_DOCS;
++        }
++
++        if (upto == blocksize) {
++          // refill
++          docReader.fill();
++          freqReader.fill();
++          upto = 0;
++        }
++
++        count++;
++
++        // Decode next doc
++        freq = freqBuffer[upto];
++        doc += docDeltaBuffer[upto++];
++
++        pendingPosCount += freq;
++
++        if (skipDocs == null || !skipDocs.get(doc)) {
++          break;
++        }
++      }
++
++      position = 0;
++      return doc;
++    }
++
++    @Override
++    public int freq() {
++      return freq;
++    }
++
++    @Override
++    public int docID() {
++      return doc;
++    }
++
++    @Override
++    public int advance(int target) throws IOException {
++      //System.out.println("SepD&P advance target=" + target + " vs current=" + doc + " this=" + this);
++
++      if ((target - blocksize) >= doc && docFreq >= skipMinimum) {
++
++        // There are enough docs in the posting to have
++        // skip data, and its not too close
++
++        if (skipper == null) {
++          //System.out.println("  create skipper");
++          // This DocsEnum has never done any skipping
++          skipper = new FixedSkipListReader((IndexInput) skipIn.clone(),
++                                          docIn,
++                                          posIn,
++                                          maxSkipLevels, skipInterval);
++
++        }
++
++        if (!skipped) {
++          //System.out.println("  init skip data skipFP=" + skipFP);
++          // We haven't yet skipped for this posting
++          skipper.init(skipFP,
++                       docIndex,
++                       posIndex,
++                       payloadFP,
++                       docFreq,
++                       storePayloads);
++          skipped = true;
++        }
++        final int newCount = skipper.skipTo(target); 
++        //System.out.println("  skip newCount=" + newCount + " vs " + count);
++
++        if (newCount > count) {
++
++          // Skipper did move
++          final IntIndexInput.Index idx = skipper.getDocIndex();
++          docReader.seek(idx, freqReader, true);
++          upto = docReader.offset();
++
++          // NOTE: don't seek pos here; do it lazily
++          // instead.  Eg a PhraseQuery may skip to many
++          // docs before finally asking for positions...
++          posIndex.set(skipper.getPosIndex());
++          posSeekPending = true;
++          count = newCount;
++          doc = skipper.getDoc();
++
++          //System.out.println("    moved to doc=" + doc);
++          //payloadIn.seek(skipper.getPayloadPointer());
++          payloadFP = skipper.getPayloadPointer();
++          pendingPosCount = 0;
++          pendingPayloadBytes = 0;
++          payloadPending = false;
++          payloadLength = skipper.getPayloadLength();
++          //System.out.println("    move payloadLen=" + payloadLength);
++        }
++      }
++        
++      // Now, linear scan for the rest:
++      do {
++        if (nextDoc() == NO_MORE_DOCS) {
++          //System.out.println("  advance nextDoc=END");
++          return NO_MORE_DOCS;
++        }
++        //System.out.println("  advance nextDoc=" + doc);
++      } while (target > doc);
++
++      //System.out.println("  return doc=" + doc);
++      return doc;
++    }
++
++    @Override
++    public int nextPosition() throws IOException {
++      if (posSeekPending) {
++        posIndex.seek(posReader);
++        posUpto = posReader.offset();
++        payloadIn.seek(payloadFP);
++        posSeekPending = false;
++      }
++
++      // scan over any docs that were iterated without their
++      // positions
++      while (pendingPosCount > freq) {
++
++        final int code = nextPosInt();
++
++        if (storePayloads && (code & 1) != 0) {
++          // Payload length has changed
++          payloadLength = nextPosInt();
++          assert payloadLength >= 0;
++        }
++        pendingPosCount--;
++        position = 0;
++        pendingPayloadBytes += payloadLength;
++      }
++
++      final int code = nextPosInt();
++
++      assert code >= 0;
++      if (storePayloads) {
++        if ((code & 1) != 0) {
++          // Payload length has changed
++          payloadLength = nextPosInt();
++          assert payloadLength >= 0;
++        }
++        position += code >> 1;
++        pendingPayloadBytes += payloadLength;
++        payloadPending = payloadLength > 0;
++      } else {
++        position += code;
++      }
++    
++      pendingPosCount--;
++      assert pendingPosCount >= 0;
++      return position;
++    }
++
++    private int nextPosInt() throws IOException {
++      if (posUpto == blocksize) {
++        posReader.fill();
++        posUpto = 0;
++      }
++      return posBuffer[posUpto++];
++    }
++
++    private BytesRef payload;
++
++    @Override
++    public BytesRef getPayload() throws IOException {
++      if (!payloadPending) {
++        throw new IOException("Either no payload exists at this term position or an attempt was made to load it more than once.");
++      }
++
++      assert pendingPayloadBytes >= payloadLength;
++
++      if (pendingPayloadBytes > payloadLength) {
++        payloadIn.seek(payloadIn.getFilePointer() + (pendingPayloadBytes - payloadLength));
++      }
++
++      if (payload == null) {
++        payload = new BytesRef();
++        payload.bytes = new byte[payloadLength];
++      } else if (payload.bytes.length < payloadLength) {
++        payload.grow(payloadLength);
++      }
++
++      payloadIn.readBytes(payload.bytes, 0, payloadLength);
++      payloadPending = false;
++      payload.length = payloadLength;
++      pendingPayloadBytes = 0;
++      return payload;
++    }
++
++    @Override
++    public boolean hasPayload() {
++      return payloadPending && payloadLength > 0;
++    }
++  }
++
++  static final class FreqSkippingDocReader extends BulkPostingsEnum.BlockReader {
++    final BulkPostingsEnum.BlockReader docs;
++    final FixedIntBlockIndexInput.Reader freqs;
++    
++    FreqSkippingDocReader(BulkPostingsEnum.BlockReader docs, FixedIntBlockIndexInput.Reader freqs) {
++      this.docs = docs;
++      this.freqs = freqs;
++    }
++    
++    @Override
++    public int[] getBuffer() {
++      return docs.getBuffer();
++    }
++
++    @Override
++    public int fill() throws IOException {
++      final int ret = docs.fill();
++      freqs.skipBlock();
++      return ret;
++    }
++
++    @Override
++    public int end() {
++      return docs.end();
++    }
++
++    @Override
++    public int offset() {
++      return docs.offset();
++    }
++  }
++  
++  final class FixedBulkPostingsEnum extends BulkPostingsEnum {
++    private int docFreq;
++
++    private final BulkPostingsEnum.BlockReader docReader;
++    // nocommit: confusing. just a pointer to the above, when doFreq = true
++    // when doFreq = false and omitTF is false, freqReader is null,
++    // but this one automatically fills() the child.
++    private final FixedIntBlockIndexInput.Reader parentDocReader;
++
++    private final IntIndexInput.Index docIndex;
++
++    private final FixedIntBlockIndexInput.Reader freqReader;
++    // nocommit: confusing. just a pointer to the above, when doFreq = true
++    // when doFreq = false and omitTF is false, freqReader is null,
++    // but this one is still valid so it can skipBlocks
++    private final FixedIntBlockIndexInput.Reader childFreqReader;
++
++    private final BulkPostingsEnum.BlockReader posReader;
++    private final IntIndexInput.Index posIndex;
++
++    private final boolean storePayloads;
++    private final boolean omitTF;
++    private long skipFP;
++
++    private final IntIndexInput startDocIn;
++
++    private boolean skipped;
++    private FixedSkipListReader skipper;
++    
++    public FixedBulkPostingsEnum(FieldInfo fieldInfo, boolean doFreq, boolean doPos) throws IOException {
++      this.storePayloads = fieldInfo.storePayloads;
++      this.omitTF = fieldInfo.omitTermFreqAndPositions;
++      startDocIn = docIn;
++
++      parentDocReader = docIn.reader();
++      
++      if (doFreq && !omitTF) {
++        childFreqReader = freqReader = freqIn.reader(parentDocReader);
++      } else if (!doFreq && !omitTF) {
++        childFreqReader = freqIn.reader(parentDocReader); // for skipping blocks
++        freqReader = null;
++      } else {
++        childFreqReader = null;
++        freqReader = null;
++      }
++
++      if (!doFreq && !omitTF) {
++        docReader = new FreqSkippingDocReader(parentDocReader, childFreqReader);
++      } else {
++        docReader = parentDocReader;
++      }
++      
++      docIndex = docIn.index();
++
++      if (doPos && !omitTF) {
++        if (storePayloads) {
++          // Must rewrite each posDelta:
++          posReader = new PosPayloadReader(posIn.reader());
++        } else {
++          // Pass through
++          posReader = posIn.reader();
++        }
++      } else {
++        posReader = null;
++      }
++
++      if (!omitTF) {
++        // we have to pull these even if doFreq is false
++        // just so we can decode the index from the docs
++        // file
++        posIndex = posIn.index();
++      } else {
++        posIndex = null;
++      }
++    }
++
++    public boolean canReuse(FieldInfo fieldInfo, IntIndexInput docIn, boolean doFreq, boolean doPos, boolean omitTF) {
++      return fieldInfo.storePayloads == storePayloads &&
++        startDocIn == docIn &&
++        doFreq == (freqReader != null) &&
++        omitTF == (this.omitTF) &&
++        doPos == (posReader != null);
++    }
++
++    // nocommit -- make sure this is tested!!
++
++    // Only used when payloads were stored -- we cannot do
++    // pass-through read for this since the payload lengths
++    // are also encoded into the position deltas
++    private final class PosPayloadReader extends BulkPostingsEnum.BlockReader {
++      final BulkPostingsEnum.BlockReader other;
++      private boolean fillPending;
++      private int pendingOffset;
++      private int limit;
++      private boolean skipNext;
++
++      public PosPayloadReader(BulkPostingsEnum.BlockReader other) {
++        this.other = other;
++      }
++
++      void doAfterSeek() {
++        limit = 0;
++        skipNext = false;
++        fillPending = false;
++      }
++
++      @Override
++      public int[] getBuffer() {
++        return other.getBuffer();
++      }
++
++      // nocommit -- make sure this works correctly in the
++      // "reuse"/seek case
++      @Override
++      public int offset() {
++        pendingOffset = other.offset();
++        return 0;
++      }
++
++      @Override
++      public int fill() throws IOException {
++        // Translate code back to pos deltas, and filter out
++        // any changes in payload length.  NOTE: this is a
++        // perf hit on indices that encode payloads, even if
++        // they use "normal" positional queries
++        limit = 0;
++        boolean skippedLast = false;
++        do { 
++          final int otherLimit = fillPending ? other.fill() : other.end();
++          fillPending = true;
++          assert otherLimit > pendingOffset;
++          final int[] buffer = other.getBuffer();
++          for(int i=pendingOffset;i<otherLimit;i++) {
++            if (skipNext) {
++              skipNext = false;
++              skippedLast = true;
++            } else {
++              skippedLast = false;
++              final int code = buffer[i];
++              buffer[limit++] = code >>> 1;
++              if ((code & 1) != 0) {
++                // skip the payload length
++                skipNext = true;
++              }
++            }
++          }
++          pendingOffset = 0;
++          /*
++           *  some readers will only fill a single element of the buffer
++           *  if that single element is skipped we need to do another round.
++           */
++        }while(limit == 0 && skippedLast);
++        return limit;
++      }
++
++      @Override
++      public int end() {
++        return limit;
++      }
++    }
++
++    /** Position readers to the specified term */
++    FixedBulkPostingsEnum init(FixedTermState termState) throws IOException {
++
++      // To reduce cost of scanning the terms dict, sep
++      // codecs store only the docDelta index in the terms
++      // dict, and then stuff the other term metadata (freq
++      // index, pos index, skip offset) into the front of
++      // the docDeltas.  So here we seek the docReader and
++      // decode this metadata:
++
++      // nocommit -- make sure seek w/in buffer is efficient
++      // here:
++
++      // TODO: can't we only do this if consumer
++      // skipped consuming the previous docs?
++      docIndex.set(termState.docIndex);
++      //System.out.println("sep init offset=" + docReader.offset() + " limit=" + docReader.end() + " omitTF=" + omitTF);
++      //System.out.println("  v[0]=" + docReader.getBuffer()[0]);
++
++      if (!omitTF) {
++        // nocommit -- would be better (fewer bytes used) to
++        // make this a relative index read (pass false not
++        // true), eg relative to first term in the terms
++        // index block
++        parentDocReader.seek(docIndex, childFreqReader, freqReader != null);
++
++        posIndex.set(termState.posIndex);
++      } else {
++        docIndex.seek(parentDocReader);
++      }
++
++      skipFP = termState.skipFP;
++      //System.out.println("skipOffset=" + skipOffset);
++
++      if (posReader != null) {
++        if (storePayloads) {
++          PosPayloadReader posPayloadReader = (PosPayloadReader) posReader;
++          posIndex.seek(posPayloadReader.other);
++          posPayloadReader.doAfterSeek();
++        } else {
++          posIndex.seek(posReader);
++        }
++      }
++
++      docFreq = termState.docFreq;
++      skipped = false;
++
++      return this;
++    }
++
++    @Override
++    public BulkPostingsEnum.BlockReader getDocDeltasReader() {
++      // Maximize perf -- just pass through the underlying
++      // intblock reader:
++      return docReader;
++    }
++
++    @Override
++    public BulkPostingsEnum.BlockReader getFreqsReader() {
++      // Maximize perf -- just pass through the underlying
++      // intblock reader:
++      return freqReader;
++    }
++
++    @Override
++    public BulkPostingsEnum.BlockReader getPositionDeltasReader() {
++      // Maximize perf -- just pass through the underlying
++      // intblock reader (if payloads were not indexed):
++      return posReader;
++    }
++
++    private final JumpResult jumpResult = new JumpResult();
++
++    @Override
++    public JumpResult jump(int target, int curCount) throws IOException {
++
++      // TODO: require jump to take current docid and prevent skipping for close jumps?
++      if (docFreq >= skipMinimum) {
++
++        // There are enough docs in the posting to have
++        // skip data
++
++        if (skipper == null) {
++          // This enum has never done any skipping
++          skipper = new FixedSkipListReader((IndexInput) skipIn.clone(),
++                                          docIn,
++                                          posIn,
++                                          maxSkipLevels, skipInterval);
++        }
++
++        if (!skipped) {
++          // We haven't yet skipped for this particular posting
++          skipper.init(skipFP,
++                       docIndex,
++                       posIndex,
++                       0,
++                       docFreq,
++                       storePayloads);
++          skipper.setOmitTF(omitTF);
++          skipped = true;
++        }
++
++        final int newCount = skipper.skipTo(target); 
++        //System.out.println("  sep skip newCount=" + newCount + " vs count=" + curCount);
++
++        if (newCount > curCount) {
++
++          // Skipper did move -- seek all readers:
++          final IntIndexInput.Index idx = skipper.getDocIndex();
++          
++          if (!omitTF) {
++            parentDocReader.seek(idx, childFreqReader, freqReader != null);
++          } else {
++            idx.seek(parentDocReader);
++          }
++          
++          if (posReader != null) {
++            if (storePayloads) {
++              PosPayloadReader posPayloadReader = (PosPayloadReader) posReader;
++              skipper.getPosIndex().seek(posPayloadReader.other);
++              posPayloadReader.doAfterSeek();
++            } else {
++              skipper.getPosIndex().seek(posReader);
++            }
++          }
++          jumpResult.count = newCount;
++          jumpResult.docID = skipper.getDoc();
++          return jumpResult;
++        }
++      }
++      return null;
++    }        
++  }
++}
+
+Property changes on: lucene\src\java\org\apache\lucene\index\codecs\fixed\FixedPostingsReaderImpl.java
+___________________________________________________________________
+Added: svn:eol-style
+   + native
+
+Index: lucene/src/java/org/apache/lucene/index/codecs/fixed/FixedIntStreamFactory.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/index/codecs/fixed/FixedIntStreamFactory.java	(revision 0)
++++ lucene/src/java/org/apache/lucene/index/codecs/fixed/FixedIntStreamFactory.java	(revision 0)
+@@ -0,0 +1,52 @@
++package org.apache.lucene.index.codecs.fixed;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++
++import org.apache.lucene.index.codecs.intblock.FixedIntBlockIndexInput;
++import org.apache.lucene.index.codecs.intblock.FixedIntBlockIndexOutput;
++import org.apache.lucene.index.codecs.sep.IntStreamFactory;
++import org.apache.lucene.store.BufferedIndexInput;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.store.IndexOutput;
++
++/** @lucene.experimental */
++public abstract class FixedIntStreamFactory extends IntStreamFactory {
++
++  // nocommit?: the below three methods are dumb: they exist so your codec can easily support sep or interleaved.
++  @Override
++  public final FixedIntBlockIndexInput openInput(Directory dir, String fileName) throws IOException {
++    return openInput(dir, fileName, BufferedIndexInput.BUFFER_SIZE);
++  }
++
++  @Override
++  public final FixedIntBlockIndexInput openInput(Directory dir, String fileName, int readBufferSize) throws IOException {
++    return openInput(dir.openInput(fileName, readBufferSize), fileName, false);
++  }
++
++  @Override
++  public final FixedIntBlockIndexOutput createOutput(Directory dir, String fileName) throws IOException {
++    return createOutput(dir.createOutput(fileName), fileName, false);
++  }
++  
++  public abstract FixedIntBlockIndexInput openInput(IndexInput in, String fileName, boolean isChild) throws IOException;
++  
++  public abstract FixedIntBlockIndexOutput createOutput(IndexOutput out, String fileName, boolean isChild) throws IOException;
++}
+
+Property changes on: lucene\src\java\org\apache\lucene\index\codecs\fixed\FixedIntStreamFactory.java
+___________________________________________________________________
+Added: svn:eol-style
+   + native
+
+Index: lucene/src/java/org/apache/lucene/index/codecs/intblock/FixedIntBlockIndexInput.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/index/codecs/intblock/FixedIntBlockIndexInput.java	(revision 1070267)
++++ lucene/src/java/org/apache/lucene/index/codecs/intblock/FixedIntBlockIndexInput.java	(working copy)
+@@ -39,7 +39,8 @@
+ public abstract class FixedIntBlockIndexInput extends IntIndexInput {
+ 
+   private final IndexInput in;
+-  protected final int blockSize;
++  /** @lucene.internal */
++  public final int blockSize;
+   
+   public FixedIntBlockIndexInput(final IndexInput in) throws IOException {
+     this.in = in;
+@@ -55,6 +56,14 @@
+     // TODO: can this be simplified?
+     return new Reader(clone, buffer, this.getBlockReader(clone, buffer));
+   }
++  
++  /** return a reader piggybacking on a previous reader.
++   * They share the same underlying indexinput (e.g. interleaved docs/freqs)
++   */
++  public Reader reader(Reader parent) throws IOException {
++    final int[] buffer = new int[blockSize];
++    return new Reader(parent.in, buffer, this.getBlockReader(parent.in, buffer));
++  }
+ 
+   @Override
+   public void close() throws IOException {
+@@ -70,10 +79,12 @@
+ 
+   public interface BlockReader {
+     public void readBlock() throws IOException;
++    public void skipBlock() throws IOException;
+     // nocommit -- need seek here so mmapdir "knows"
+   }
+ 
+-  private static class Reader extends BulkPostingsEnum.BlockReader {
++  /** @lucene.internal */
++  public static class Reader extends BulkPostingsEnum.BlockReader {
+     private final IndexInput in;
+ 
+     protected final int[] pending;
+@@ -93,6 +104,7 @@
+ 
+     void seek(final long fp, final int upto) throws IOException {
+       offset = upto;
++      //System.out.println("parent fill: " + in.getFilePointer() + " last=" + lastBlockFP + " fp=" + fp);
+       if (fp != lastBlockFP) {
+         // Seek to new block; this may in fact be the next
+         // block ie when caller is doing sequential scan (eg
+@@ -104,7 +116,29 @@
+         // Seek within current block
+         //System.out.println("  seek in-block fp=" + fp + " upto=" + offset);
+       }
++      //System.out.println("fill complete: " + in.getFilePointer());
+     }
++    
++    //nocommit: could this be more ugly?
++    public void seek(IntIndexInput.Index idx, Reader child, boolean fill) throws IOException {
++      Index index = (Index) idx;
++      final long fp = index.fp;
++     // System.out.println("child len=" + in.length());
++     // System.out.println("child fill: " + in.getFilePointer() + " parent=" + parent.in.getFilePointer() + " last=" + lastBlockFP);
++      child.offset = offset = index.upto;
++      // nocommit: if the child previously skipBlock'ed, we fill both.. can we do better? 
++      if ((index.fp != lastBlockFP) || (fill && child.lastBlockFP == -1)) {
++        in.seek(fp);
++        fill();
++        if (fill) {
++          child.fill();
++        } else {
++          child.skipBlock();
++        }
++      } else {
++        // seek within block
++      }
++    }
+ 
+     @Override
+     public int[] getBuffer() {
+@@ -132,6 +166,11 @@
+       blockReader.readBlock();
+       return blockSize;
+     }
++    
++    public void skipBlock() throws IOException {
++      lastBlockFP = -1; /* nocommit: clear lastblockFP */
++      blockReader.skipBlock();
++    }
+   }
+ 
+   private class Index extends IntIndexInput.Index {
+Index: lucene/src/java/org/apache/lucene/index/codecs/intblock/FixedIntBlockIndexOutput.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/index/codecs/intblock/FixedIntBlockIndexOutput.java	(revision 1070267)
++++ lucene/src/java/org/apache/lucene/index/codecs/intblock/FixedIntBlockIndexOutput.java	(working copy)
+@@ -37,7 +37,8 @@
+ public abstract class FixedIntBlockIndexOutput extends IntIndexOutput {
+ 
+   protected final IndexOutput out;
+-  private final int blockSize;
++  /** @lucene.internal */
++  public final int blockSize;
+   protected final int[] buffer;
+   private int upto;
+ 
+@@ -116,22 +117,26 @@
+     }
+   }
+ 
++  public void flush() throws IOException {
++    // NOTE: entries in the block after current upto are
++    // invalid
++    if (!abort) {
++      while(upto != 0) {
++        // nocommit -- risky since in theory a "smart" int
++        // encoder could do run-length-encoding and thus
++        // never flush on an infinite stream of 0s; maybe
++        // flush upto instead?  or random ints heh
++        // stuff 0s until final block is flushed
++        //System.out.println("upto=" + upto + " stuff 0; blockSize=" + blockSize);
++        write(0);
++      }
++    }
++  }
++
+   @Override
+   public void close() throws IOException {
+     try {
+-      // NOTE: entries in the block after current upto are
+-      // invalid
+-      if (!abort) {
+-        while(upto != 0) {
+-          // nocommit -- risky since in theory a "smart" int
+-          // encoder could do run-length-encoding and thus
+-          // never flush on an infinite stream of 0s; maybe
+-          // flush upto instead?  or random ints heh
+-          // stuff 0s until final block is flushed
+-          //System.out.println("upto=" + upto + " stuff 0; blockSize=" + blockSize);
+-          write(0);
+-        }
+-      }
++      flush();
+       /*
+       if (upto > 0) {
+         while(upto < blockSize) {
+Index: lucene/src/java/org/apache/lucene/index/codecs/pfordelta/PForDeltaIndexInput.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/index/codecs/pfordelta/PForDeltaIndexInput.java	(revision 1070267)
++++ lucene/src/java/org/apache/lucene/index/codecs/pfordelta/PForDeltaIndexInput.java	(working copy)
+@@ -44,6 +44,11 @@
+     public void readBlock() throws IOException {
+       decompressor.decompress();
+     }
++    
++    // nocommit
++    public void skipBlock() throws IOException {
++      readBlock();
++    }
+   }
+ 
+   protected BlockReader getBlockReader(IndexInput in, int[] buffer) {
+Index: lucene/src/java/org/apache/lucene/index/codecs/pfordelta/FORIndexInput.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/index/codecs/pfordelta/FORIndexInput.java	(revision 1070267)
++++ lucene/src/java/org/apache/lucene/index/codecs/pfordelta/FORIndexInput.java	(working copy)
+@@ -45,6 +45,11 @@
+       decompressor.decompress();
+       //System.out.println("  FOR.readBlock");
+     }
++    
++    // nocommit
++    public void skipBlock() throws IOException {
++      readBlock();
++    }
+   }
+ 
+   protected FixedIntBlockIndexInput.BlockReader getBlockReader(IndexInput in, int[] buffer) {
+Index: lucene/src/java/org/apache/lucene/index/codecs/bulkvint/BulkVIntCodec.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/index/codecs/bulkvint/BulkVIntCodec.java	(revision 1070267)
++++ lucene/src/java/org/apache/lucene/index/codecs/bulkvint/BulkVIntCodec.java	(working copy)
+@@ -27,11 +27,9 @@
+ import org.apache.lucene.index.codecs.Codec;
+ import org.apache.lucene.index.codecs.FieldsConsumer;
+ import org.apache.lucene.index.codecs.FieldsProducer;
+-import org.apache.lucene.index.codecs.sep.IntStreamFactory;
+-import org.apache.lucene.index.codecs.sep.IntIndexInput;
+-import org.apache.lucene.index.codecs.sep.IntIndexOutput;
+-import org.apache.lucene.index.codecs.sep.SepPostingsReaderImpl;
+-import org.apache.lucene.index.codecs.sep.SepPostingsWriterImpl;
++import org.apache.lucene.index.codecs.fixed.FixedIntStreamFactory;
++import org.apache.lucene.index.codecs.fixed.FixedPostingsReaderImpl;
++import org.apache.lucene.index.codecs.fixed.FixedPostingsWriterImpl;
+ import org.apache.lucene.index.codecs.intblock.FixedIntBlockIndexInput;
+ import org.apache.lucene.index.codecs.intblock.FixedIntBlockIndexOutput;
+ import org.apache.lucene.index.codecs.PostingsWriterBase;
+@@ -67,21 +65,30 @@
+   }
+ 
+   // only for testing
+-  public IntStreamFactory getIntFactory() {
++  public FixedIntStreamFactory getIntFactory() {
+     return new BulkVIntFactory();
+   }
+ 
+-  private class BulkVIntFactory extends IntStreamFactory {
++  private class BulkVIntFactory extends FixedIntStreamFactory {
+ 
+     @Override
+-    public IntIndexInput openInput(Directory dir, String fileName, int readBufferSize) throws IOException {
+-      return new FixedIntBlockIndexInput(dir.openInput(fileName, readBufferSize)) {
++    public FixedIntBlockIndexInput openInput(IndexInput in, String fileName, boolean isChild) throws IOException {
++      return new FixedIntBlockIndexInput(in) {
+ 
+         @Override
+         protected BlockReader getBlockReader(final IndexInput in, final int[] buffer) throws IOException {
+           return new BlockReader() {
+             final byte bytes[] = new byte[blockSize*5]; // header * max(Vint)
+             
++            public void skipBlock() throws IOException {
++              final int numBytes = in.readVInt(); // read header
++              in.seek(in.getFilePointer() + numBytes); // seek past block
++              /*
++              //nocommit
++              readBlock();
++              */
++            }
++
+             public void readBlock() throws IOException {
+               final int numBytes = in.readVInt(); // read header
+               if (numBytes == 0) { // 1's
+@@ -110,8 +117,8 @@
+     }
+ 
+     @Override
+-    public IntIndexOutput createOutput(Directory dir, String fileName) throws IOException {
+-      return new FixedIntBlockIndexOutput(dir.createOutput(fileName), blockSize) {
++    public FixedIntBlockIndexOutput createOutput(IndexOutput out, String fileName, boolean isChild) throws IOException {
++      return new FixedIntBlockIndexOutput(out, blockSize) {
+         final byte bytes[] = new byte[blockSize*5]; // header * max(Vint)
+         
+         @Override
+@@ -149,7 +156,7 @@
+ 
+   @Override
+   public FieldsConsumer fieldsConsumer(SegmentWriteState state) throws IOException {
+-    PostingsWriterBase postingsWriter = new SepPostingsWriterImpl(state, new BulkVIntFactory());
++    PostingsWriterBase postingsWriter = new FixedPostingsWriterImpl(state, new BulkVIntFactory());
+ 
+     boolean success = false;
+     TermsIndexWriterBase indexWriter;
+@@ -180,7 +187,7 @@
+ 
+   @Override
+   public FieldsProducer fieldsProducer(SegmentReadState state) throws IOException {
+-    PostingsReaderBase postingsReader = new SepPostingsReaderImpl(state.dir,
++    PostingsReaderBase postingsReader = new FixedPostingsReaderImpl(state.dir,
+                                                                       state.segmentInfo,
+                                                                       state.readBufferSize,
+                                                                       new BulkVIntFactory(), state.codecId);
+@@ -226,14 +233,14 @@
+ 
+   @Override
+   public void files(Directory dir, SegmentInfo segmentInfo, String codecId, Set<String> files) {
+-    SepPostingsReaderImpl.files(segmentInfo, codecId, files);
++    FixedPostingsReaderImpl.files(segmentInfo, codecId, files);
+     BlockTermsReader.files(dir, segmentInfo, codecId, files);
+     VariableGapTermsIndexReader.files(dir, segmentInfo, codecId, files);
+   }
+ 
+   @Override
+   public void getExtensions(Set<String> extensions) {
+-    SepPostingsWriterImpl.getExtensions(extensions);
++    FixedPostingsWriterImpl.getExtensions(extensions);
+     BlockTermsReader.getExtensions(extensions);
+     VariableGapTermsIndexReader.getIndexExtensions(extensions);
+   }
+Index: lucene/src/java/org/apache/lucene/index/codecs/pfordelta2/PForDeltaFixedIntBlockCodec.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/index/codecs/pfordelta2/PForDeltaFixedIntBlockCodec.java	(revision 1070267)
++++ lucene/src/java/org/apache/lucene/index/codecs/pfordelta2/PForDeltaFixedIntBlockCodec.java	(working copy)
+@@ -134,6 +134,11 @@
+                   decodeOneBlockWithPForDelta(compressedData, blockSize, buffer);
+                 }
+               }
++              
++              // nocommit
++              public void skipBlock() throws IOException {
++                readBlock();
++              }
+             };
+           }
+         };
+Index: lucene/src/test-framework/org/apache/lucene/index/codecs/mockintblock/MockFixedIntBlockCodec.java
+===================================================================
+--- lucene/src/test-framework/org/apache/lucene/index/codecs/mockintblock/MockFixedIntBlockCodec.java	(revision 1070267)
++++ lucene/src/test-framework/org/apache/lucene/index/codecs/mockintblock/MockFixedIntBlockCodec.java	(working copy)
+@@ -90,6 +90,10 @@
+                 buffer[i] = in.readVInt();
+               }
+             }
++            
++            public void skipBlock() throws IOException {
++              readBlock();
++            }
+           };
+         }
+       };

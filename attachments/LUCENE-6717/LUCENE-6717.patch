@@ -1,0 +1,925 @@
+Index: lucene/core/src/java/org/apache/lucene/search/Scorer.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/search/Scorer.java	(revision 1695067)
++++ lucene/core/src/java/org/apache/lucene/search/Scorer.java	(working copy)
+@@ -26,7 +26,7 @@
+  *
+  * <p>
+  * A <code>Scorer</code> iterates over documents matching a
+- * query in increasing order of doc Id.
++ * query in increasing order of doc id.
+  * </p>
+  * <p>
+  * Document scores are computed using a given <code>Similarity</code>
+Index: lucene/sandbox/src/java/org/apache/lucene/search/TermAutomatonQuery.java
+===================================================================
+--- lucene/sandbox/src/java/org/apache/lucene/search/TermAutomatonQuery.java	(revision 1695067)
++++ lucene/sandbox/src/java/org/apache/lucene/search/TermAutomatonQuery.java	(working copy)
+@@ -17,16 +17,9 @@
+  * limitations under the License.
+  */
+ 
+-import java.io.IOException;
+-import java.util.ArrayList;
+-import java.util.HashMap;
+-import java.util.List;
+-import java.util.Map;
+-import java.util.Set;
+-
+-import org.apache.lucene.index.PostingsEnum;
+ import org.apache.lucene.index.IndexReaderContext;
+ import org.apache.lucene.index.LeafReaderContext;
++import org.apache.lucene.index.PostingsEnum;
+ import org.apache.lucene.index.ReaderUtil;
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.index.TermContext;
+@@ -39,12 +32,20 @@
+ import org.apache.lucene.util.automaton.Operations;
+ import org.apache.lucene.util.automaton.Transition;
+ 
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.BitSet;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
+ import static org.apache.lucene.util.automaton.Operations.DEFAULT_MAX_DETERMINIZED_STATES;
+ 
+ // TODO
+ //    - compare perf to PhraseQuery exact and sloppy
+-//    - optimize: find terms that are in fact MUST (because all paths
+-//      through the A include that term)
+ //    - if we ever store posLength in the index, it would be easy[ish]
+ //      to take it into account here
+ 
+@@ -66,7 +67,7 @@
+  *
+  *  @lucene.experimental */
+ 
+-public class TermAutomatonQuery extends Query {
++public final class TermAutomatonQuery extends Query {
+   private final String field;
+   private final Automaton.Builder builder;
+   Automaton det;
+@@ -73,6 +74,7 @@
+   private final Map<BytesRef,Integer> termToID = new HashMap<>();
+   private final Map<Integer,BytesRef> idToTerm = new HashMap<>();
+   private int anyTermID = -1;
++  private Set<Integer> requiredTermIDs;
+ 
+   public TermAutomatonQuery(String field) {
+     this.field = field;
+@@ -121,8 +123,6 @@
+   public void finish(int maxDeterminizedStates) {
+     Automaton automaton = builder.finish();
+ 
+-    // System.out.println("before det:\n" + automaton.toDot());
+-
+     Transition t = new Transition();
+ 
+     // TODO: should we add "eps back to initial node" for all states,
+@@ -182,12 +182,18 @@
+       automaton = newAutomaton;
+     }
+ 
+-    det = Operations.removeDeadStates(Operations.determinize(automaton,
+-      maxDeterminizedStates));
++    det = Operations.removeDeadStates(Operations.determinize(automaton, maxDeterminizedStates));
++
++    if (det.isAccept(0)) {
++      throw new IllegalStateException("cannot execute automaton that accepts the empty string");
++    }
++
++    requiredTermIDs = findRequiredTermIDs(det, termToID.size());
+   }
+ 
+   @Override
+   public Weight createWeight(IndexSearcher searcher, boolean needsScores) throws IOException {
++    checkFinishCalled();
+     IndexReaderContext context = searcher.getTopReaderContext();
+     Map<Integer,TermContext> termStates = new HashMap<>();
+ 
+@@ -197,7 +203,7 @@
+       }
+     }
+ 
+-    return new TermAutomatonWeight(det, searcher, termStates);
++    return new TermAutomatonWeight(det, searcher, termStates, needsScores);
+   }
+ 
+   @Override
+@@ -239,9 +245,7 @@
+     }
+     TermAutomatonQuery other = (TermAutomatonQuery) o;
+ 
+-    if (det == null) {
+-      throw new IllegalStateException("please call finish first");
+-    }
++    checkFinishCalled();
+     if (other.det == null) {
+       throw new IllegalStateException("please call other.finish first");
+     }
+@@ -256,10 +260,23 @@
+   /** Returns a hash code value for this object.  This is very costly! */
+   @Override
+   public int hashCode() {
++    checkFinishCalled();
++    return super.hashCode() ^ termToID.hashCode() + det.toDot().hashCode();
++  }
++
++  /** For testing */
++  boolean termIsRequired(String term) {
++    Integer termID = termToID.get(new BytesRef(term));
++    if (termID == null) {
++      throw new IllegalArgumentException("term \"" + term + "\" is never used in this query");
++    }
++    return requiredTermIDs.contains(termID);
++  }
++
++  private void checkFinishCalled() {
+     if (det == null) {
+       throw new IllegalStateException("please call finish first");
+     }
+-    return super.hashCode() ^ termToID.hashCode() + det.toDot().hashCode();
+   }
+ 
+   /** Returns the dot (graphviz) representation of this automaton.
+@@ -266,6 +283,8 @@
+    *  This is extremely useful for visualizing the automaton. */
+   public String toDot() {
+ 
++    checkFinishCalled();
++
+     // TODO: refactor & share with Automaton.toDot!
+ 
+     StringBuilder b = new StringBuilder();
+@@ -316,6 +335,7 @@
+   static class EnumAndScorer {
+     public final int termID;
+     public final PostingsEnum posEnum;
++    public final boolean required;
+ 
+     // How many positions left in the current document:
+     public int posLeft;
+@@ -323,9 +343,10 @@
+     // Current position
+     public int pos;
+ 
+-    public EnumAndScorer(int termID, PostingsEnum posEnum) {
++    public EnumAndScorer(int termID, PostingsEnum posEnum, boolean required) {
+       this.termID = termID;
+       this.posEnum = posEnum;
++      this.required = required;
+     }
+   }
+ 
+@@ -335,13 +356,15 @@
+     private final Map<Integer,TermContext> termStates;
+     private final Similarity.SimWeight stats;
+     private final Similarity similarity;
++    private final boolean needsScores;
+ 
+-    public TermAutomatonWeight(Automaton automaton, IndexSearcher searcher, Map<Integer,TermContext> termStates) throws IOException {
++    public TermAutomatonWeight(Automaton automaton, IndexSearcher searcher, Map<Integer,TermContext> termStates, boolean needsScores) throws IOException {
+       super(TermAutomatonQuery.this);
+       this.automaton = automaton;
+       this.searcher = searcher;
+       this.termStates = termStates;
+-      this.similarity = searcher.getSimilarity(true);
++      this.similarity = searcher.getSimilarity(needsScores);
++      this.needsScores = needsScores;
+       List<TermStatistics> allTermStats = new ArrayList<>();
+       for(Map.Entry<Integer,BytesRef> ent : idToTerm.entrySet()) {
+         Integer termID = ent.getKey();
+@@ -386,21 +409,28 @@
+       EnumAndScorer[] enums = new EnumAndScorer[idToTerm.size()];
+ 
+       boolean any = false;
++
+       for(Map.Entry<Integer,TermContext> ent : termStates.entrySet()) {
++        Integer termID = ent.getKey();
+         TermContext termContext = ent.getValue();
+         assert termContext.topReaderContext == ReaderUtil.getTopLevelContext(context) : "The top-reader used to create Weight (" + termContext.topReaderContext + ") is not the same as the current reader's top-reader (" + ReaderUtil.getTopLevelContext(context);
+-        BytesRef term = idToTerm.get(ent.getKey());
++        BytesRef term = idToTerm.get(termID);
+         TermState state = termContext.get(context.ord);
++        boolean isRequired = requiredTermIDs.contains(termID);
+         if (state != null) {
+           TermsEnum termsEnum = context.reader().terms(field).iterator();
+           termsEnum.seekExact(term, state);
+-          enums[ent.getKey()] = new EnumAndScorer(ent.getKey(), termsEnum.postings(null, PostingsEnum.POSITIONS));
++          enums[termID] = new EnumAndScorer(termID, termsEnum.postings(null, PostingsEnum.POSITIONS), isRequired);
+           any = true;
++        } else if (isRequired) {
++          // This term is required in the automaton (all paths contain it), yet this segment doesn't
++          // have this term --> no hits:
++          return null;
+         }
+       }
+ 
+       if (any) {
+-        return new TermAutomatonScorer(this, enums, anyTermID, idToTerm, similarity.simScorer(stats, context));
++        return new TermAutomatonScorer(this, enums, anyTermID, similarity.simScorer(stats, context), needsScores);
+       } else {
+         return null;
+       }
+@@ -412,4 +442,54 @@
+       return null;
+     }
+   }
++
++  /** Recursively walks the automaton, finding those terms (if any) that must
++   *  always appear in order for the automaton to match. */
++  // TODO: we could almost use getFiniteStrings, except it gets angry w/ cycles
++  // TODO: probably there is a faster algo
++  static Set<Integer> findRequiredTermIDs(Automaton automaton, int termCount) {
++    Set<Integer> required = new HashSet<>();
++    for(int i=0;i<termCount;i++) {
++      required.add(i);
++    }
++    findRequiredTermIDs(automaton, required, new BitSet(automaton.getNumStates()), new HashSet<Integer>(), 0);
++    return required;
++  }
++
++  static void findRequiredTermIDs(Automaton automaton, Set<Integer> required, BitSet onPath, Set<Integer> curPathTermIDs, int nodeID) {
++
++    if (required.isEmpty()) {
++      return;
++    }
++
++    if (automaton.isAccept(nodeID)) {
++      Iterator<Integer> it = required.iterator();
++      while (it.hasNext()) {
++        int termID = it.next();
++        if (curPathTermIDs.contains(termID) == false) {
++          it.remove();
++        }
++      }
++    }
++
++    Transition t = new Transition();
++    int count = automaton.initTransition(nodeID, t);
++    for(int i=0;i<count;i++) {
++      automaton.getNextTransition(t);
++      // We simply avoid cycles.  This is safe becase we only
++      // want the shortest path, and any terms that participate
++      // only via a cycle are optional:
++      if (onPath.get(t.dest) == false) {
++        onPath.set(t.dest);
++        for(int termID = t.min; termID <= t.max; termID++) {
++          boolean didAdd = curPathTermIDs.add(termID);
++          findRequiredTermIDs(automaton, required, onPath, curPathTermIDs, t.dest);
++          if (didAdd) {
++            curPathTermIDs.remove(termID);
++          }
++        }
++        onPath.clear(t.dest);
++      }
++    }
++  }
+ }
+Index: lucene/sandbox/src/java/org/apache/lucene/search/TermAutomatonScorer.java
+===================================================================
+--- lucene/sandbox/src/java/org/apache/lucene/search/TermAutomatonScorer.java	(revision 1695067)
++++ lucene/sandbox/src/java/org/apache/lucene/search/TermAutomatonScorer.java	(working copy)
+@@ -17,28 +17,32 @@
+  * limitations under the License.
+  */
+ 
+-import java.io.IOException;
+-import java.util.Map;
+-
+ import org.apache.lucene.search.TermAutomatonQuery.EnumAndScorer;
+ import org.apache.lucene.search.TermAutomatonQuery.TermAutomatonWeight;
+ import org.apache.lucene.search.similarities.Similarity;
+ import org.apache.lucene.util.ArrayUtil;
+-import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.PriorityQueue;
+ import org.apache.lucene.util.RamUsageEstimator;
+ import org.apache.lucene.util.automaton.Automaton;
+ import org.apache.lucene.util.automaton.RunAutomaton;
+ 
+-// TODO: add two-phase and needsScores support. maybe use conjunctionDISI internally?
+-class TermAutomatonScorer extends Scorer {
+-  private final EnumAndScorer[] subs;
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++
++final class TermAutomatonScorer extends Scorer {
+   private final EnumAndScorer[] subsOnDoc;
+   private final PriorityQueue<EnumAndScorer> docIDQueue;
+   private final PriorityQueue<EnumAndScorer> posQueue;
+   private final RunAutomaton runAutomaton;
+-  private final Map<Integer,BytesRef> idToTerm;
++  private final boolean needsScores;
+ 
++  // Approximation, only used when automaton has at least 1 required
++  // term, else this is null.  When it's non-null, those sub-scorers
++  // never participate in the docIDQueue:
++  private final DocIdSetIterator required;
++  private final EnumAndScorer[] requiredSubs;
++
+   // We reuse this array to check for matches starting from an initial
+   // position; we increase posShift every time we move to a new possible
+   // start:
+@@ -57,33 +61,86 @@
+   private int docID = -1;
+   private int freq;
+ 
+-  public TermAutomatonScorer(TermAutomatonWeight weight, EnumAndScorer[] subs, int anyTermID, Map<Integer,BytesRef> idToTerm, Similarity.SimScorer docScorer) throws IOException {
++  public TermAutomatonScorer(TermAutomatonWeight weight, EnumAndScorer[] subs, int anyTermID, Similarity.SimScorer docScorer, boolean needsScores) throws IOException {
+     super(weight);
+-    //System.out.println("  automaton:\n" + weight.automaton.toDot());
+     this.runAutomaton = new TermRunAutomaton(weight.automaton, subs.length);
+     this.docScorer = docScorer;
+-    this.idToTerm = idToTerm;
+-    this.subs = subs;
+     this.docIDQueue = new DocIDQueue(subs.length);
+     this.posQueue = new PositionQueue(subs.length);
+     this.anyTermID = anyTermID;
+     this.subsOnDoc = new EnumAndScorer[subs.length];
+     this.positions = new PosState[4];
++    this.needsScores = needsScores;
+     for(int i=0;i<this.positions.length;i++) {
+       this.positions[i] = new PosState();
+     }
+-    long cost = 0;
+ 
++    long costSum = 0;
++
+     // Init docIDQueue:
++    List<DocIdSetIterator> requiredList = new ArrayList<>();
++    List<EnumAndScorer> requiredSubsList = new ArrayList<>();
+     for(EnumAndScorer sub : subs) {
+       if (sub != null) {
+-        cost += sub.posEnum.cost();
++        costSum += sub.posEnum.cost();
++        if (sub.required) {
++          requiredList.add(sub.posEnum);
++          requiredSubsList.add(sub);
++        } else {
++          subsOnDoc[numSubsOnDoc++] = sub;
++        }
++      }
++    }
++
++    // TODO: we should also add in disjunctions here ... would not be so hard, i.e. take all the non-required
++    // terms and add as disjunction.  Then we can delegate all next/advance to the approx, and we only do
++    // positions checking here:
++
++    if (requiredList.size() > 0) {
++      if (requiredList.size() > 1) {
++        required = ConjunctionDISI.intersect(requiredList);
++      } else {
++        required = requiredList.get(0);
++      }
++      requiredSubs = requiredSubsList.toArray(new EnumAndScorer[requiredSubsList.size()]);
++      this.cost = required.cost();
++    } else {
++      for(EnumAndScorer sub : requiredSubsList) {
+         subsOnDoc[numSubsOnDoc++] = sub;
+       }
++      required = null;
++      requiredSubs = null;
++      this.cost = costSum;
+     }
+-    this.cost = cost;
+   }
+ 
++  @Override
++  public TwoPhaseIterator asTwoPhaseIterator() {
++    if (required != null) {
++      return new TwoPhaseIterator(required) {
++
++        @Override
++        public boolean matches() throws IOException {
++
++          int reqDocID = required.docID();
++          assert reqDocID < NO_MORE_DOCS;
++
++          pushAndAdvance(reqDocID);
++
++          popCurrentDoc();
++
++          countMatches();
++
++          return freq > 0;
++        }
++      };
++    } else {
++      return null;
++    }
++  }
++
++  // TODO: maybe just a single queue, sorting first by doc then by position?
++
+   /** Sorts by docID so we can quickly pull out all scorers that are on
+    *  the same (lowest) docID. */
+   private static class DocIDQueue extends PriorityQueue<EnumAndScorer> {
+@@ -110,12 +167,30 @@
+     }
+   }
+ 
++  /** Pushes current doc back into docIDQueue and then advances
++   *  all entries the specified target. */
++  private void pushAndAdvance(int target) throws IOException {
++    pushCurrentDoc();
++    if (docIDQueue.size() > 0) {
++      while (docIDQueue.top().posEnum.docID() < target) {
++        docIDQueue.top().posEnum.advance(target);
++        docIDQueue.updateTop();
++      }
++    }
++  }
++
+   /** Pops all enums positioned on the current (minimum) doc */
+   private void popCurrentDoc() {
+     assert numSubsOnDoc == 0;
+-    assert docIDQueue.size() > 0;
+-    subsOnDoc[numSubsOnDoc++] = docIDQueue.pop();
+-    docID = subsOnDoc[0].posEnum.docID();
++    if (required != null) {
++      docID = required.docID();
++    } else {
++      assert docIDQueue.size() > 0;
++      // TODO: opto: don't pop() but instead leave in the queue and updateTop?
++      subsOnDoc[numSubsOnDoc++] = docIDQueue.pop();
++      docID = subsOnDoc[0].posEnum.docID();
++    }
++
+     while (docIDQueue.size() > 0 && docIDQueue.top().posEnum.docID() == docID) {
+       subsOnDoc[numSubsOnDoc++] = docIDQueue.pop();
+     }
+@@ -131,16 +206,20 @@
+ 
+   @Override
+   public int nextDoc() throws IOException {
+-    // we only need to advance docs that are positioned since all docs in the
+-    // pq are guaranteed to be beyond the current doc already
+-    for(int i=0;i<numSubsOnDoc;i++) {
+-      EnumAndScorer sub = subsOnDoc[i];
+-      if (sub.posEnum.nextDoc() != NO_MORE_DOCS) {
+-        sub.posLeft = sub.posEnum.freq()-1;
+-        sub.pos = sub.posEnum.nextPosition();
++    if (required != null) {
++      int reqDocID = required.nextDoc();
++      if (reqDocID == NO_MORE_DOCS) {
++        return NO_MORE_DOCS;
+       }
++      pushAndAdvance(reqDocID);
++    } else {
++      // we only need to next the enums that are positioned since all docs in the
++      // pq are guaranteed to be beyond the current doc already
++      for(int i=0;i<numSubsOnDoc;i++) {
++        subsOnDoc[i].posEnum.nextDoc();
++      }
++      pushCurrentDoc();
+     }
+-    pushCurrentDoc();
+     return doNext();
+   }
+ 
+@@ -148,37 +227,23 @@
+   public int advance(int target) throws IOException {
+     // Both positioned docs and docs in the pq might be behind target
+ 
+-    // 1. Advance the PQ
+-    if (docIDQueue.size() > 0) {
+-      EnumAndScorer top = docIDQueue.top();
+-      while (top.posEnum.docID() < target) {
+-        if (top.posEnum.advance(target) != NO_MORE_DOCS) {
+-          top.posLeft = top.posEnum.freq()-1;
+-          top.pos = top.posEnum.nextPosition();
+-        }
+-        top = docIDQueue.updateTop();
++    if (required != null) {
++      target = required.advance(target);
++      if (target == NO_MORE_DOCS) {
++        return NO_MORE_DOCS;
+       }
+     }
+ 
+-    // 2. Advance subsOnDoc
+-    for(int i=0;i<numSubsOnDoc;i++) {
+-      EnumAndScorer sub = subsOnDoc[i];
+-      if (sub.posEnum.advance(target) != NO_MORE_DOCS) {
+-        sub.posLeft = sub.posEnum.freq()-1;
+-        sub.pos = sub.posEnum.nextPosition();
+-      }
+-    }
+-    pushCurrentDoc();
++    pushAndAdvance(target);
++
+     return doNext();
+   }
+ 
+   private int doNext() throws IOException {
+     assert numSubsOnDoc == 0;
+-    assert docIDQueue.top().posEnum.docID() > docID;
++    //assert docIDQueue.size() == 0 || docIDQueue.top().posEnum.docID() > docID;
+     while (true) {
+-      //System.out.println("  doNext: cycle");
+       popCurrentDoc();
+-      //System.out.println("    docID=" + docID);
+       if (docID == NO_MORE_DOCS) {
+         return docID;
+       }
+@@ -186,14 +251,18 @@
+       if (freq > 0) {
+         return docID;
+       }
+-      for(int i=0;i<numSubsOnDoc;i++) {
+-        EnumAndScorer sub = subsOnDoc[i];
+-        if (sub.posEnum.nextDoc() != NO_MORE_DOCS) {
+-          sub.posLeft = sub.posEnum.freq()-1;
+-          sub.pos = sub.posEnum.nextPosition();
++      if (required != null) {
++        int reqDocID = required.nextDoc();
++        if (reqDocID == NO_MORE_DOCS) {
++          return NO_MORE_DOCS;
+         }
++        pushAndAdvance(reqDocID);
++      } else {
++        for(int i=0;i<numSubsOnDoc;i++) {
++          subsOnDoc[i].posEnum.nextDoc();
++        }
++        pushCurrentDoc();
+       }
+-      pushCurrentDoc();
+     }
+   }
+ 
+@@ -209,18 +278,33 @@
+     posShift = pos;
+   }
+ 
+-  private void countMatches() throws IOException {
++  void countMatches() throws IOException {
++    assert posQueue.size() == 0;
++
+     freq = 0;
+     for(int i=0;i<numSubsOnDoc;i++) {
+-      posQueue.add(subsOnDoc[i]);
++      EnumAndScorer sub = subsOnDoc[i];
++      assert sub.posEnum.docID() == docID;
++      sub.posLeft = sub.posEnum.freq() - 1;
++      sub.pos = sub.posEnum.nextPosition();
++      posQueue.add(sub);
+     }
+-    // System.out.println("\ncountMatches: " + numSubsOnDoc + " terms in doc=" + docID + " anyTermID=" + anyTermID + " id=" + reader.document(docID).get("id"));
+-    // System.out.println("\ncountMatches: " + numSubsOnDoc + " terms in doc=" + docID + " anyTermID=" + anyTermID);
+ 
++    if (required != null) {
++      for(EnumAndScorer sub : requiredSubs) {
++        assert sub.posEnum.docID() == docID: "sub.posEnum.docID()=" + sub.posEnum.docID() + " docID=" + docID;
++        sub.pos = sub.posEnum.nextPosition();
++        sub.posLeft = sub.posEnum.freq()-1;
++        posQueue.add(sub);
++      }
++    }
++
+     int lastPos = -1;
+ 
+     posShift = -1;
+ 
++    posQueueLoop:
++
+     while (posQueue.size() != 0) {
+       EnumAndScorer sub = posQueue.pop();
+ 
+@@ -243,37 +327,31 @@
+         positions = newPositions;
+       }
+ 
+-      // System.out.println("  term=" + idToTerm.get(sub.termID).utf8ToString() + " pos=" + pos + " (count=" + getPosition(pos).count + " lastPos=" + lastPos + ") posQueue.size=" + posQueue.size() + " posShift=" + posShift);
+-
+       PosState posState;
+       PosState nextPosState;
+ 
+       // Maybe advance ANY matches:
+-      if (lastPos != -1) {
+-        if (anyTermID != -1) {
+-          int startLastPos = lastPos;
+-          while (lastPos < pos) {
+-            posState = getPosition(lastPos);
+-            if (posState.count == 0 && lastPos > startLastPos) {
+-              // Petered out...
+-              lastPos = pos;
+-              break;
+-            }
+-            // System.out.println("  iter lastPos=" + lastPos + " count=" + posState.count);
++      if (lastPos != -1 && anyTermID != -1) {
++        int startLastPos = lastPos;
++        while (lastPos < pos) {
++          posState = getPosition(lastPos);
++          if (posState.count == 0 && lastPos > startLastPos) {
++            // Petered out...
++            lastPos = pos;
++            break;
++          }
+ 
+-            nextPosState = getPosition(lastPos+1);
++          nextPosState = getPosition(lastPos+1);
+ 
+-            // Advance all states from lastPos -> pos, if they had an any arc:
+-            for(int i=0;i<posState.count;i++) {
+-              int state = runAutomaton.step(posState.states[i], anyTermID);
+-              if (state != -1) {
+-                // System.out.println("    add pos=" + (lastPos+1) + " state=" + state);
+-                nextPosState.add(state);
+-              }
++          // Advance all states from lastPos -> pos, if they had an any arc:
++          for(int i=0;i<posState.count;i++) {
++            int state = runAutomaton.step(posState.states[i], anyTermID);
++            if (state != -1) {
++              nextPosState.add(state);
+             }
++          }
+ 
+-            lastPos++;
+-          }
++          lastPos++;
+         }
+       }
+ 
+@@ -290,14 +368,15 @@
+ 
+       // Match current token:
+       for(int i=0;i<posState.count;i++) {
+-        // System.out.println("    check cur state=" + posState.states[i]);
+         int state = runAutomaton.step(posState.states[i], sub.termID);
+         if (state != -1) {
+-          // System.out.println("      --> " + state);
+           nextPosState.add(state);
+           if (runAutomaton.isAccept(state)) {
+-            // System.out.println("      *** (1)");
+             freq++;
++            if (needsScores == false) {
++              posQueue.clear();
++              break posQueueLoop;
++            }
+           }
+         }
+       }
+@@ -305,11 +384,13 @@
+       // Also consider starting a new match from this position:
+       int state = runAutomaton.step(0, sub.termID);
+       if (state != -1) {
+-        // System.out.println("  add init state=" + state);
+         nextPosState.add(state);
+         if (runAutomaton.isAccept(state)) {
+-          // System.out.println("      *** (2)");
+           freq++;
++          if (needsScores == false) {
++            posQueue.clear();
++            break posQueueLoop;
++          }
+         }
+       }
+ 
+Index: lucene/sandbox/src/test/org/apache/lucene/search/TestTermAutomatonQuery.java
+===================================================================
+--- lucene/sandbox/src/test/org/apache/lucene/search/TestTermAutomatonQuery.java	(revision 1695067)
++++ lucene/sandbox/src/test/org/apache/lucene/search/TestTermAutomatonQuery.java	(working copy)
+@@ -254,8 +254,18 @@
+         token("network", 1, 1)
+       });
+ 
++
+     TermAutomatonQuery q = new TokenStreamToTermAutomatonQuery().toQuery("field", ts);
+-    // System.out.println("DOT: " + q.toDot());
++    //System.out.println("DOT: " + q.toDot());
++
++    // Only network is required:
++    assertTrue(q.termIsRequired("network"));
++    assertFalse(q.termIsRequired("fast"));
++    assertFalse(q.termIsRequired("speedy"));
++    assertFalse(q.termIsRequired("wifi"));
++    assertFalse(q.termIsRequired("wi"));
++    assertFalse(q.termIsRequired("fi"));
++
+     assertEquals(4, s.search(q, 1).totalHits);
+ 
+     w.close();
+@@ -413,7 +423,12 @@
+       });
+ 
+     TermAutomatonQuery q = new TokenStreamToTermAutomatonQuery().toQuery("field", ts);
+-    // System.out.println("DOT: " + q.toDot());
++
++    assertTrue(q.termIsRequired("comes"));
++    assertFalse(q.termIsRequired("sun"));
++    assertFalse(q.termIsRequired("moon"));
++
++    //System.out.println("DOT: " + q.toDot());
+     assertEquals(3, s.search(q, 1).totalHits);
+ 
+     w.close();
+@@ -693,9 +708,11 @@
+     TermAutomatonQuery q = new TermAutomatonQuery("field");
+     int init = q.createState();
+     int s1 = q.createState();
++    int s2 = q.createState();
+     q.addTransition(init, s1, "here");
+-    q.addTransition(s1, init, "comes");
+-    q.setAccept(init, true);
++    q.addTransition(s1, s2, "comes");
++    q.addTransition(s2, s1, "here");
++    q.setAccept(s2, true);
+     q.finish();
+ 
+     assertEquals(1, s.search(q, 1).totalHits);
+@@ -785,4 +802,188 @@
+     r.close();
+     dir.close();
+   }
++
++  public void testDisjunction() throws Exception {
++    Directory dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++    Document doc = new Document();
++    doc.add(newTextField("field", "x y z", Field.Store.NO));
++    w.addDocument(doc);
++
++    doc = new Document();
++    doc.add(newTextField("field", "a b c", Field.Store.NO));
++    w.addDocument(doc);
++
++    IndexReader r = w.getReader();
++    IndexSearcher s = newSearcher(r);
++
++    TermAutomatonQuery q = new TermAutomatonQuery("field");
++    int init = q.createState();
++    int s1 = q.createState();
++    q.setAccept(s1, true);
++    q.addTransition(init, s1, "a");
++    q.addTransition(init, s1, "x");
++    q.finish();
++
++    assertEquals(2, s.search(q, 1).totalHits);
++
++    w.close();
++    r.close();
++    dir.close();
++  }
++
++  public void testOneTermRequired() throws Exception {
++    Directory dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++    Document doc = new Document();
++    doc.add(newTextField("field", "x y z", Field.Store.NO));
++    w.addDocument(doc);
++
++    doc = new Document();
++    doc.add(newTextField("field", "a b c", Field.Store.NO));
++    w.addDocument(doc);
++
++    IndexReader r = w.getReader();
++    IndexSearcher s = newSearcher(r);
++
++    TermAutomatonQuery q = new TermAutomatonQuery("field");
++    int init = q.createState();
++    int s1 = q.createState();
++    int s2 = q.createState();
++    q.setAccept(s2, true);
++    q.addTransition(init, s1, "a");
++    q.addTransition(s1, s2, "x");
++    q.addTransition(s1, s2, "b");
++    q.finish();
++
++    assertEquals(1, s.search(q, 1).totalHits);
++
++    w.close();
++    r.close();
++    dir.close();
++  }
++
++  public void testTwoTermsRequired() throws Exception {
++    Directory dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++    Document doc = new Document();
++    doc.add(newTextField("field", "x y z", Field.Store.NO));
++    w.addDocument(doc);
++
++    doc = new Document();
++    doc.add(newTextField("field", "a b c", Field.Store.NO));
++    w.addDocument(doc);
++
++    IndexReader r = w.getReader();
++    IndexSearcher s = newSearcher(r);
++
++    TermAutomatonQuery q = new TermAutomatonQuery("field");
++    int init = q.createState();
++    int s1 = q.createState();
++    int s2 = q.createState();
++    int s3 = q.createState();
++    q.setAccept(s3, true);
++    q.addTransition(init, s1, "a");
++    q.addTransition(s1, s2, "b");
++    q.addTransition(s2, s3, "c");
++    q.addTransition(s2, s3, "x");
++    q.finish();
++
++    assertEquals(1, s.search(q, 1).totalHits);
++
++    w.close();
++    r.close();
++    dir.close();
++  }
++
++  public void testNeedsScoreFalse() throws Exception {
++    Directory dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++    Document doc = new Document();
++    doc.add(newTextField("field", "x y z x y z x y z", Field.Store.NO));
++    w.addDocument(doc);
++    w.addDocument(doc);
++    w.addDocument(doc);
++
++    IndexReader r = w.getReader();
++    IndexSearcher s = newSearcher(r);
++
++    TermAutomatonQuery q = new TermAutomatonQuery("field");
++    int init = q.createState();
++    int s1 = q.createState();
++    int s2 = q.createState();
++    int s3 = q.createState();
++    q.setAccept(s3, true);
++    q.addTransition(init, s1, "x");
++    q.addTransition(s1, s2, "y");
++    q.addTransition(s2, s3, "z");
++    q.finish();
++
++    assertEquals(3, s.search(q, 1, Sort.INDEXORDER).totalHits);
++
++    w.close();
++    r.close();
++    dir.close();
++  }
++
++  public void testAcceptsEmptyString() throws Exception {
++    TermAutomatonQuery q = new TermAutomatonQuery("field");
++    int init = q.createState();
++    q.setAccept(init, true);
++    try {
++      q.finish();
++      fail("did not hit exception");
++    } catch (IllegalStateException ise) {
++      // expected
++    }
++  }
++
++  public void testAcceptsOnlyWildcard() throws Exception {
++    TermAutomatonQuery q = new TermAutomatonQuery("field");
++    int init = q.createState();
++    int fini = q.createState();
++    q.setAccept(fini, true);
++    q.addAnyTransition(init, fini);
++    try {
++      q.finish();
++      fail("did not hit exception");
++    } catch (IllegalStateException ise) {
++      // expected
++    }
++  }
++
++  public void testForgotToCallFinish() throws Exception {
++    Directory dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++    Document doc = new Document();
++    doc.add(newTextField("field", "x y z x y z x y z", Field.Store.NO));
++    w.addDocument(doc);
++    w.addDocument(doc);
++    w.addDocument(doc);
++
++    IndexReader r = w.getReader();
++    IndexSearcher s = newSearcher(r);
++
++    TermAutomatonQuery q = new TermAutomatonQuery("field");
++    int init = q.createState();
++    int s1 = q.createState();
++    int s2 = q.createState();
++    int s3 = q.createState();
++    q.setAccept(s3, true);
++    q.addTransition(init, s1, "x");
++    q.addTransition(s1, s2, "y");
++    q.addTransition(s2, s3, "z");
++
++    try {
++      s.search(q, 1, Sort.INDEXORDER);
++      fail("did not hit exception");
++    } catch (IllegalStateException ise) {
++      // expected
++    }
++
++    w.close();
++    r.close();
++    dir.close();
++  }
+ }
++

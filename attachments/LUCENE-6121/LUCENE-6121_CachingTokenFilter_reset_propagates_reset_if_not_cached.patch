@@ -1,0 +1,339 @@
+Index: lucene/core/src/test/org/apache/lucene/analysis/TestCachingTokenFilter.java
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/analysis/TestCachingTokenFilter.java	(revision 1645984)
++++ lucene/core/src/test/org/apache/lucene/analysis/TestCachingTokenFilter.java	(revision )
+@@ -19,14 +19,15 @@
+ 
+ 
+ import java.io.IOException;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+-import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
+ import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
++import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.TextField;
++import org.apache.lucene.index.DocsAndPositionsEnum;
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.MultiFields;
+-import org.apache.lucene.index.DocsAndPositionsEnum;
+ import org.apache.lucene.index.RandomIndexWriter;
+ import org.apache.lucene.search.DocIdSetIterator;
+ import org.apache.lucene.store.Directory;
+@@ -39,12 +40,19 @@
+     Directory dir = newDirectory();
+     RandomIndexWriter writer = new RandomIndexWriter(random(), dir);
+     Document doc = new Document();
++    AtomicInteger resetCount = new AtomicInteger(0);
+     TokenStream stream = new TokenStream() {
+       private int index = 0;
+       private CharTermAttribute termAtt = addAttribute(CharTermAttribute.class);
+       private OffsetAttribute offsetAtt = addAttribute(OffsetAttribute.class);
+-      
++
+       @Override
++      public void reset() throws IOException {
++        super.reset();
++        resetCount.incrementAndGet();
++      }
++
++      @Override
+       public boolean incrementToken() {
+         if (index == tokens.length) {
+           return false;
+@@ -57,16 +65,20 @@
+       }
+       
+     };
+-    
++
+     stream = new CachingTokenFilter(stream);
+-    
++
+     doc.add(new TextField("preanalyzed", stream));
+-    
++
+     // 1) we consume all tokens twice before we add the doc to the index
++    assertFalse(((CachingTokenFilter)stream).isCached());
++    stream.reset();
++    assertFalse(((CachingTokenFilter) stream).isCached());
+     checkTokens(stream);
+     stream.reset();  
+     checkTokens(stream);
++    assertTrue(((CachingTokenFilter)stream).isCached());
+-    
++
+     // 2) now add the document to the index and verify if all tokens are indexed
+     //    don't reset the stream here, the DocumentWriter should do that implicitly
+     writer.addDocument(doc);
+@@ -101,7 +113,25 @@
+     // 3) reset stream and consume tokens again
+     stream.reset();
+     checkTokens(stream);
++
++    assertEquals(1, resetCount.get());
++
+     dir.close();
++  }
++
++  public void testDoubleResetFails() throws IOException {
++    Analyzer analyzer = new MockAnalyzer(random());
++    final TokenStream input = analyzer.tokenStream("field", "abc");
++    CachingTokenFilter buffer = new CachingTokenFilter(input);
++    buffer.reset();//ok
++    boolean madeIt = false;
++    try {
++      buffer.reset();//bad (this used to work which we don't want)
++      madeIt = true;
++    } catch (Throwable e) {
++      //ignore
++    }
++    assertFalse(madeIt);
+   }
+   
+   private void checkTokens(TokenStream stream) throws IOException {
+Index: lucene/core/src/java/org/apache/lucene/analysis/CachingTokenFilter.java
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/analysis/CachingTokenFilter.java	(revision 1645984)
++++ lucene/core/src/java/org/apache/lucene/analysis/CachingTokenFilter.java	(revision )
+@@ -28,11 +28,11 @@
+  * This class can be used if the token attributes of a TokenStream
+  * are intended to be consumed more than once. It caches
+  * all token attribute states locally in a List when the first call to
+- * {@link #incrementToken()} is called.
+- * 
+- * <P>CachingTokenFilter implements the optional method
+- * {@link TokenStream#reset()}, which repositions the
+- * stream to the first Token. 
++ * {@link #incrementToken()} is called. Subsequent calls will used the cache.
++ * <p/>
++ * <em>Important:</em> Like any proper TokenFilter, {@link #reset()} propagates
++ * to the input, although only before {@link #incrementToken()} is called the
++ * first time. Prior to  Lucene 5, it was never propagated.
+  */
+ public final class CachingTokenFilter extends TokenFilter {
+   private List<AttributeSource.State> cache = null;
+@@ -40,17 +40,31 @@
+   private AttributeSource.State finalState;
+   
+   /**
+-   * Create a new CachingTokenFilter around <code>input</code>,
+-   * caching its token attributes, which can be replayed again
+-   * after a call to {@link #reset()}.
++   * Create a new CachingTokenFilter around <code>input</code>. As with
++   * any normal TokenFilter, do <em>not</em> call reset on the input; this filter
++   * will do it normally.
+    */
+   public CachingTokenFilter(TokenStream input) {
+     super(input);
+   }
+-  
++
++  /**
++   * Propagates reset if incrementToken has not yet been called. Otherwise
++   * it rewinds the iterator to the beginning of the cached list.
++   */
+   @Override
++  public void reset() throws IOException {
++    if (cache == null) {//first time
++      input.reset();
++    } else {
++      iterator = cache.iterator();
++    }
++  }
++
++  /** The first time called, it'll read and cache all tokens from the input. */
++  @Override
+   public final boolean incrementToken() throws IOException {
+-    if (cache == null) {
++    if (cache == null) {//first-time
+       // fill cache lazily
+       cache = new ArrayList<>(64);
+       fillCache();
+@@ -65,28 +79,14 @@
+     restoreState(iterator.next());
+     return true;
+   }
+-  
++
+   @Override
+   public final void end() {
+     if (finalState != null) {
+       restoreState(finalState);
+-    }
+-  }
+-
+-  /**
+-   * Rewinds the iterator to the beginning of the cached list.
+-   * <p>
+-   * Note that this does not call reset() on the wrapped tokenstream ever, even
+-   * the first time. You should reset() the inner tokenstream before wrapping
+-   * it with CachingTokenFilter.
+-   */
+-  @Override
+-  public void reset() {
+-    if (cache != null) {
+-      iterator = cache.iterator();
+     }
+   }
+-  
++
+   private void fillCache() throws IOException {
+     while (input.incrementToken()) {
+       cache.add(captureState());
+Index: lucene/analysis/common/src/test/org/apache/lucene/analysis/sinks/TestTeeSinkTokenFilter.java
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- lucene/analysis/common/src/test/org/apache/lucene/analysis/sinks/TestTeeSinkTokenFilter.java	(revision 1645984)
++++ lucene/analysis/common/src/test/org/apache/lucene/analysis/sinks/TestTeeSinkTokenFilter.java	(revision )
+@@ -143,9 +143,8 @@
+     final TeeSinkTokenFilter tee1 = new TeeSinkTokenFilter(whitespaceMockTokenizer(buffer1.toString()));
+     final TeeSinkTokenFilter.SinkTokenStream dogDetector = tee1.newSinkTokenStream(dogFilter);
+     final TeeSinkTokenFilter.SinkTokenStream theDetector = tee1.newSinkTokenStream(theFilter);
+-    tee1.reset();
+     final TokenStream source1 = new CachingTokenFilter(tee1);
+-    
++
+     tee1.addAttribute(CheckClearAttributesAttribute.class);
+     dogDetector.addAttribute(CheckClearAttributesAttribute.class);
+     theDetector.addAttribute(CheckClearAttributesAttribute.class);
+@@ -163,7 +162,6 @@
+     assertTokenStreamContents(theDetector, new String[]{"The", "the", "The", "the"});
+     assertTokenStreamContents(dogDetector, new String[]{"Dogs", "Dogs"});
+     
+-    source1.reset();
+     TokenStream lowerCasing = new LowerCaseFilter(source1);
+     String[] lowerCaseTokens = new String[tokens1.length];
+     for (int i = 0; i < tokens1.length; i++)
+Index: lucene/core/src/test/org/apache/lucene/index/TestTermVectorsWriter.java
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/index/TestTermVectorsWriter.java	(revision 1645984)
++++ lucene/core/src/test/org/apache/lucene/index/TestTermVectorsWriter.java	(revision )
+@@ -175,14 +175,12 @@
+     Analyzer analyzer = new MockAnalyzer(random());
+     IndexWriter w = new IndexWriter(dir, newIndexWriterConfig(analyzer));
+     Document doc = new Document();
+-    try (TokenStream stream = analyzer.tokenStream("field", "abcd   ")) {
+-      stream.reset(); // TODO: weird to reset before wrapping with CachingTokenFilter... correct?
+-      TokenStream cachedStream = new CachingTokenFilter(stream);
++    try (TokenStream stream = new CachingTokenFilter(analyzer.tokenStream("field", "abcd   "))) {
+       FieldType customType = new FieldType(TextField.TYPE_NOT_STORED);
+       customType.setStoreTermVectors(true);
+       customType.setStoreTermVectorPositions(true);
+       customType.setStoreTermVectorOffsets(true);
+-      Field f = new Field("field", cachedStream, customType);
++      Field f = new Field("field", stream, customType);
+       doc.add(f);
+       doc.add(f);
+       w.addDocument(doc);
+Index: lucene/queryparser/src/java/org/apache/lucene/queryparser/flexible/standard/processors/AnalyzerQueryNodeProcessor.java
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- lucene/queryparser/src/java/org/apache/lucene/queryparser/flexible/standard/processors/AnalyzerQueryNodeProcessor.java	(revision 1645984)
++++ lucene/queryparser/src/java/org/apache/lucene/queryparser/flexible/standard/processors/AnalyzerQueryNodeProcessor.java	(revision )
+@@ -130,9 +130,9 @@
+       
+       try {
+         try (TokenStream source = this.analyzer.tokenStream(field, text)) {
+-          source.reset();
+           buffer = new CachingTokenFilter(source);
++          buffer.reset();
+-  
++
+           if (buffer.hasAttribute(PositionIncrementAttribute.class)) {
+             posIncrAtt = buffer.getAttribute(PositionIncrementAttribute.class);
+           }
+@@ -160,8 +160,12 @@
+         }
+         
+         // rewind the buffer stream
++        try {
+-        buffer.reset();
++          buffer.reset();
++        } catch (IOException e) {
++          //impossible on subsequent reset()'s
++        }
+-  
++
+         if (!buffer.hasAttribute(CharTermAttribute.class)) {
+           return new NoTokenFoundQueryNode();
+         }
+Index: lucene/highlighter/src/java/org/apache/lucene/search/highlight/Highlighter.java
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- lucene/highlighter/src/java/org/apache/lucene/search/highlight/Highlighter.java	(revision 1645984)
++++ lucene/highlighter/src/java/org/apache/lucene/search/highlight/Highlighter.java	(revision )
+@@ -187,7 +187,6 @@
+ 
+     CharTermAttribute termAtt = tokenStream.addAttribute(CharTermAttribute.class);
+     OffsetAttribute offsetAtt = tokenStream.addAttribute(OffsetAttribute.class);
+-    tokenStream.reset();
+     TextFragment currentFrag =  new TextFragment(newText,newText.length(), docFrags.size());
+ 
+     if (fragmentScorer instanceof QueryScorer) {
+@@ -214,6 +213,7 @@
+ 
+       TokenGroup tokenGroup=new TokenGroup(tokenStream);
+ 
++      tokenStream.reset();
+       for (boolean next = tokenStream.incrementToken(); next && (offsetAtt.startOffset()< maxDocCharsToAnalyze);
+             next = tokenStream.incrementToken())
+       {
+Index: lucene/highlighter/src/java/org/apache/lucene/search/highlight/WeightedSpanTermExtractor.java
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- lucene/highlighter/src/java/org/apache/lucene/search/highlight/WeightedSpanTermExtractor.java	(revision 1645984)
++++ lucene/highlighter/src/java/org/apache/lucene/search/highlight/WeightedSpanTermExtractor.java	(revision )
+@@ -394,7 +394,6 @@
+           indexer.addField(DelegatingLeafReader.FIELD_NAME,
+               new OffsetLimitTokenFilter(tokenStream, maxDocCharsToAnalyze));
+         }
+-        tokenStream.reset();//reset to beginning when we return
+         final IndexSearcher searcher = indexer.createSearcher();
+         // MEM index has only atomic ctx
+         internalReader = ((LeafReaderContext) searcher.getTopReaderContext()).reader();
+Index: lucene/core/src/java/org/apache/lucene/util/QueryBuilder.java
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/QueryBuilder.java	(revision 1645984)
++++ lucene/core/src/java/org/apache/lucene/util/QueryBuilder.java	(revision )
+@@ -203,7 +203,6 @@
+     boolean hasMoreTokens = false;    
+     
+     try (TokenStream source = analyzer.tokenStream(field, queryText)) {
+-      source.reset();
+       buffer = new CachingTokenFilter(source);
+       buffer.reset();
+ 
+@@ -232,7 +231,11 @@
+     }
+     
+     // rewind the buffer stream
++    try {
+-    buffer.reset();
++      buffer.reset();
++    } catch (IOException e) {
++      //impossible on subsequent reset calls
++    }
+ 
+     BytesRef bytes = termAtt == null ? null : termAtt.getBytesRef();
+ 

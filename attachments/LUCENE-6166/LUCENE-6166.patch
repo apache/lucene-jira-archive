@@ -1,0 +1,256 @@
+Index: lucene/core/src/java/org/apache/lucene/index/IndexWriter.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/index/IndexWriter.java	(revision 1650199)
++++ lucene/core/src/java/org/apache/lucene/index/IndexWriter.java	(working copy)
+@@ -402,7 +402,7 @@
+     poolReaders = true;
+     DirectoryReader r = null;
+     doBeforeFlush();
+-    boolean anySegmentFlushed = false;
++    boolean anyChanges = false;
+     /*
+      * for releasing a NRT reader we must ensure that 
+      * DW doesn't add any segments or deletes until we are
+@@ -415,8 +415,8 @@
+       synchronized (fullFlushLock) {
+         boolean success = false;
+         try {
+-          anySegmentFlushed = docWriter.flushAllThreads();
+-          if (!anySegmentFlushed) {
++          anyChanges = docWriter.flushAllThreads();
++          if (!anyChanges) {
+             // prevent double increment since docWriter#doFlush increments the flushcount
+             // if we flushed anything.
+             flushCount.incrementAndGet();
+@@ -426,7 +426,7 @@
+           // reader; in theory we could instead do similar retry logic,
+           // just like we do when loading segments_N
+           synchronized(this) {
+-            maybeApplyDeletes(applyAllDeletes);
++            anyChanges |= maybeApplyDeletes(applyAllDeletes);
+             r = StandardDirectoryReader.open(this, segmentInfos, applyAllDeletes);
+             if (infoStream.isEnabled("IW")) {
+               infoStream.message("IW", "return reader version=" + r.getVersion() + " reader=" + r);
+@@ -450,7 +450,7 @@
+           }
+         }
+       }
+-      if (anySegmentFlushed) {
++      if (anyChanges) {
+         maybeMerge(config.getMergePolicy(), MergeTrigger.FULL_FLUSH, UNBOUNDED_MAX_MERGE_SEGMENTS);
+       }
+       if (infoStream.isEnabled("IW")) {
+@@ -2996,6 +2996,7 @@
+     }
+   }
+ 
++  /** Returns true a segment was flushed or deletes were applied. */
+   private boolean doFlush(boolean applyAllDeletes) throws IOException {
+     if (tragedy != null) {
+       throw new IllegalStateException("this writer hit an unrecoverable error; cannot flush", tragedy);
+@@ -3010,12 +3011,16 @@
+         infoStream.message("IW", "  start flush: applyAllDeletes=" + applyAllDeletes);
+         infoStream.message("IW", "  index before flush " + segString());
+       }
+-      final boolean anySegmentFlushed;
++      boolean anyChanges = false;
+       
+       synchronized (fullFlushLock) {
+       boolean flushSuccess = false;
+         try {
+-          anySegmentFlushed = docWriter.flushAllThreads();
++          anyChanges = docWriter.flushAllThreads();
++          if (!anyChanges) {
++            // flushCount is incremented in flushAllThreads
++            flushCount.incrementAndGet();
++        }
+           flushSuccess = true;
+         } finally {
+           docWriter.finishFullFlush(flushSuccess);
+@@ -3023,14 +3028,10 @@
+         }
+       }
+       synchronized(this) {
+-        maybeApplyDeletes(applyAllDeletes);
++        anyChanges |= maybeApplyDeletes(applyAllDeletes);
+         doAfterFlush();
+-        if (!anySegmentFlushed) {
+-          // flushCount is incremented in flushAllThreads
+-          flushCount.incrementAndGet();
+-        }
+         success = true;
+-        return anySegmentFlushed;
++        return anyChanges;
+       }
+     } catch (AbortingException | OutOfMemoryError tragedy) {
+       tragicEvent(tragedy, "doFlush");
+@@ -3045,18 +3046,20 @@
+     }
+   }
+   
+-  final synchronized void maybeApplyDeletes(boolean applyAllDeletes) throws IOException {
++  final synchronized boolean maybeApplyDeletes(boolean applyAllDeletes) throws IOException {
+     if (applyAllDeletes) {
+       if (infoStream.isEnabled("IW")) {
+         infoStream.message("IW", "apply all deletes during flush");
+       }
+-      applyAllDeletesAndUpdates();
++      return applyAllDeletesAndUpdates();
+     } else if (infoStream.isEnabled("IW")) {
+       infoStream.message("IW", "don't apply deletes now delTermCount=" + bufferedUpdatesStream.numTerms() + " bytesUsed=" + bufferedUpdatesStream.ramBytesUsed());
+     }
++
++    return false;
+   }
+   
+-  final synchronized void applyAllDeletesAndUpdates() throws IOException {
++  final synchronized boolean applyAllDeletesAndUpdates() throws IOException {
+     flushDeletesCount.incrementAndGet();
+     final BufferedUpdatesStream.ApplyDeletesResult result;
+     if (infoStream.isEnabled("IW")) {
+@@ -3084,6 +3087,7 @@
+       checkpoint();
+     }
+     bufferedUpdatesStream.prune(segmentInfos);
++    return result.anyDeletes;
+   }
+ 
+   // for testing only
+@@ -4580,7 +4584,9 @@
+     try {
+       purge(forcePurge);
+     } finally {
+-      applyAllDeletesAndUpdates();
++      if (applyAllDeletesAndUpdates()) {
++        maybeMerge(config.getMergePolicy(), MergeTrigger.SEGMENT_FLUSH, UNBOUNDED_MAX_MERGE_SEGMENTS);
++      }
+       flushCount.incrementAndGet();
+     }
+   }
+Index: lucene/core/src/test/org/apache/lucene/index/TestIndexWriterDelete.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/index/TestIndexWriterDelete.java	(revision 1650199)
++++ lucene/core/src/test/org/apache/lucene/index/TestIndexWriterDelete.java	(working copy)
+@@ -1242,4 +1242,122 @@
+     r.close();
+     d.close();
+   }
++
++  public void testOnlyDeletesTriggersMergeOnClose() throws Exception {
++    Directory dir = newDirectory();
++    IndexWriterConfig iwc = new IndexWriterConfig(new MockAnalyzer(random()));
++    iwc.setMaxBufferedDocs(2);
++    LogDocMergePolicy mp = new LogDocMergePolicy();
++    mp.setMinMergeDocs(1);
++    iwc.setMergePolicy(mp);
++    iwc.setMergeScheduler(new SerialMergeScheduler());
++    IndexWriter w = new IndexWriter(dir, iwc);
++    for(int i=0;i<38;i++) {
++      Document doc = new Document();
++      doc.add(newStringField("id", ""+i, Field.Store.NO));
++      w.addDocument(doc);
++    }
++    w.commit();
++
++    for(int i=0;i<18;i++) {
++      w.deleteDocuments(new Term("id", ""+i));
++    }
++
++    w.close();
++    DirectoryReader r = DirectoryReader.open(dir);
++    assertEquals(1, r.leaves().size());
++    r.close();
++
++    dir.close();
++  }
++
++  public void testOnlyDeletesTriggersMergeOnGetReader() throws Exception {
++    Directory dir = newDirectory();
++    IndexWriterConfig iwc = new IndexWriterConfig(new MockAnalyzer(random()));
++    iwc.setMaxBufferedDocs(2);
++    LogDocMergePolicy mp = new LogDocMergePolicy();
++    mp.setMinMergeDocs(1);
++    iwc.setMergePolicy(mp);
++    iwc.setMergeScheduler(new SerialMergeScheduler());
++    IndexWriter w = new IndexWriter(dir, iwc);
++    for(int i=0;i<38;i++) {
++      Document doc = new Document();
++      doc.add(newStringField("id", ""+i, Field.Store.NO));
++      w.addDocument(doc);
++    }
++    w.commit();
++
++    for(int i=0;i<18;i++) {
++      w.deleteDocuments(new Term("id", ""+i));
++    }
++
++    // First one triggers, but does not reflect, the merge:
++    DirectoryReader.open(w, true).close();
++    IndexReader r =DirectoryReader.open(w, true);
++    assertEquals(1, r.leaves().size());
++    r.close();
++
++    w.close();
++    dir.close();
++  }
++
++  public void testOnlyDeletesTriggersMergeOnFlush() throws Exception {
++    Directory dir = newDirectory();
++    IndexWriterConfig iwc = new IndexWriterConfig(new MockAnalyzer(random()));
++    iwc.setMaxBufferedDocs(2);
++    LogDocMergePolicy mp = new LogDocMergePolicy();
++    mp.setMinMergeDocs(1);
++    iwc.setMergePolicy(mp);
++    iwc.setMergeScheduler(new SerialMergeScheduler());
++    iwc.setMaxBufferedDeleteTerms(18);
++    IndexWriter w = new IndexWriter(dir, iwc);
++    for(int i=0;i<38;i++) {
++      Document doc = new Document();
++      doc.add(newStringField("id", ""+i, Field.Store.NO));
++      w.addDocument(doc);
++    }
++    w.commit();
++
++    for(int i=0;i<18;i++) {
++      w.deleteDocuments(new Term("id", ""+i));
++    }
++    w.commit();
++
++    DirectoryReader r = DirectoryReader.open(dir);
++    assertEquals(1, r.leaves().size());
++    r.close();
++
++    w.close();
++    dir.close();
++  }
++
++  public void testOnlyDeletesDeleteAllDocs() throws Exception {
++    Directory dir = newDirectory();
++    IndexWriterConfig iwc = new IndexWriterConfig(new MockAnalyzer(random()));
++    iwc.setMaxBufferedDocs(2);
++    LogDocMergePolicy mp = new LogDocMergePolicy();
++    mp.setMinMergeDocs(1);
++    iwc.setMergePolicy(mp);
++    iwc.setMergeScheduler(new SerialMergeScheduler());
++    iwc.setMaxBufferedDeleteTerms(18);
++    IndexWriter w = new IndexWriter(dir, iwc);
++    for(int i=0;i<38;i++) {
++      Document doc = new Document();
++      doc.add(newStringField("id", ""+i, Field.Store.NO));
++      w.addDocument(doc);
++    }
++    w.commit();
++
++    for(int i=0;i<38;i++) {
++      w.deleteDocuments(new Term("id", ""+i));
++    }
++
++    DirectoryReader r = DirectoryReader.open(w, true);
++    assertEquals(0, r.leaves().size());
++    assertEquals(0, r.maxDoc());
++    r.close();
++
++    w.close();
++    dir.close();
++  }
+ }

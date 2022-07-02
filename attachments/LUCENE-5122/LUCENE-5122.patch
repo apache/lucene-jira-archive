@@ -1,0 +1,210 @@
+Index: lucene/codecs/src/java/org/apache/lucene/codecs/diskdv/DiskDocValuesProducer.java
+===================================================================
+--- lucene/codecs/src/java/org/apache/lucene/codecs/diskdv/DiskDocValuesProducer.java	(revision 1508139)
++++ lucene/codecs/src/java/org/apache/lucene/codecs/diskdv/DiskDocValuesProducer.java	(working copy)
+@@ -20,6 +20,7 @@
+ import static org.apache.lucene.codecs.diskdv.DiskDocValuesConsumer.DELTA_COMPRESSED;
+ import static org.apache.lucene.codecs.diskdv.DiskDocValuesConsumer.GCD_COMPRESSED;
+ import static org.apache.lucene.codecs.diskdv.DiskDocValuesConsumer.TABLE_COMPRESSED;
++import static org.apache.lucene.codecs.diskdv.DiskDocValuesConsumer.BITPACK_COMPRESSED;
+ 
+ import java.io.IOException;
+ import java.util.HashMap;
+@@ -62,7 +63,7 @@
+     final int version;
+     try {
+       version = CodecUtil.checkHeader(in, metaCodec, 
+-                                      DiskDocValuesFormat.VERSION_START,
++                                      DiskDocValuesFormat.VERSION_CURRENT,
+                                       DiskDocValuesFormat.VERSION_CURRENT);
+       numerics = new HashMap<Integer,NumericEntry>();
+       ords = new HashMap<Integer,NumericEntry>();
+@@ -84,7 +85,7 @@
+       String dataName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, dataExtension);
+       data = state.directory.openInput(dataName, state.context);
+       final int version2 = CodecUtil.checkHeader(data, dataCodec, 
+-                                                 DiskDocValuesFormat.VERSION_START,
++                                                 DiskDocValuesFormat.VERSION_CURRENT,
+                                                  DiskDocValuesFormat.VERSION_CURRENT);
+       if (version != version2) {
+         throw new CorruptIndexException("Format versions mismatch");
+@@ -188,6 +189,9 @@
+         break;
+       case DELTA_COMPRESSED:
+         break;
++      case BITPACK_COMPRESSED:
++        entry.bitsRequired = meta.readVInt();
++        break;
+       default:
+         throw new CorruptIndexException("Unknown format: " + entry.format + ", input=" + meta);
+     }
+@@ -247,6 +251,14 @@
+             return table[(int) ords.get((int) id)];
+           }
+         };
++      case BITPACK_COMPRESSED:
++        final PackedInts.Reader bits = PackedInts.getDirectReaderNoHeader(data, PackedInts.Format.PACKED, entry.packedIntsVersion, (int) entry.count, entry.bitsRequired);
++        return new LongNumericDocValues() {
++          @Override
++          public long get(long id) {
++            return bits.get((int) id);
++          }
++        };
+       default:
+         throw new AssertionError();
+     }
+@@ -325,10 +337,7 @@
+   public SortedDocValues getSorted(FieldInfo field) throws IOException {
+     final int valueCount = (int) binaries.get(field.number).count;
+     final BinaryDocValues binary = getBinary(field);
+-    NumericEntry entry = ords.get(field.number);
+-    IndexInput data = this.data.clone();
+-    data.seek(entry.offset);
+-    final BlockPackedReader ordinals = new BlockPackedReader(data, entry.packedIntsVersion, entry.blockSize, entry.count, true);
++    final NumericDocValues ordinals = getNumeric(ords.get(field.number));
+     
+     return new SortedDocValues() {
+ 
+@@ -414,6 +423,7 @@
+     int packedIntsVersion;
+     long count;
+     int blockSize;
++    int bitsRequired;
+     
+     long minValue;
+     long gcd;
+Index: lucene/codecs/src/java/org/apache/lucene/codecs/diskdv/DiskDocValuesFormat.java
+===================================================================
+--- lucene/codecs/src/java/org/apache/lucene/codecs/diskdv/DiskDocValuesFormat.java	(revision 1508139)
++++ lucene/codecs/src/java/org/apache/lucene/codecs/diskdv/DiskDocValuesFormat.java	(working copy)
+@@ -53,7 +53,8 @@
+   public static final String META_CODEC = "DiskDocValuesMetadata";
+   public static final String META_EXTENSION = "dvdm";
+   public static final int VERSION_START = 0;
+-  public static final int VERSION_CURRENT = VERSION_START;
++  public static final int VERSION_BITPACKED = 1;
++  public static final int VERSION_CURRENT = VERSION_BITPACKED;
+   public static final byte NUMERIC = 0;
+   public static final byte BINARY = 1;
+   public static final byte SORTED = 2;
+Index: lucene/codecs/src/java/org/apache/lucene/codecs/diskdv/DiskDocValuesConsumer.java
+===================================================================
+--- lucene/codecs/src/java/org/apache/lucene/codecs/diskdv/DiskDocValuesConsumer.java	(revision 1508139)
++++ lucene/codecs/src/java/org/apache/lucene/codecs/diskdv/DiskDocValuesConsumer.java	(working copy)
+@@ -39,12 +39,14 @@
+ 
+   static final int BLOCK_SIZE = 16384;
+ 
+-  /** Compressed using packed blocks of ints. */
++  /** Compressed using delta-encoded packed blocks of ints. */
+   public static final int DELTA_COMPRESSED = 0;
+   /** Compressed by computing the GCD. */
+   public static final int GCD_COMPRESSED = 1;
+   /** Compressed by giving IDs to unique values. */
+   public static final int TABLE_COMPRESSED = 2;
++  /** Compressed using just bitpacked integers. */
++  public static final int BITPACK_COMPRESSED = 3;
+ 
+   final IndexOutput data, meta;
+   final int maxDoc;
+@@ -112,6 +114,7 @@
+     } else {
+       for (@SuppressWarnings("unused") Number nv : values) {
+         ++count;
++        maxValue = Math.max(maxValue, nv.longValue());
+       }
+     }
+     
+@@ -124,8 +127,10 @@
+       format = TABLE_COMPRESSED;
+     } else if (gcd != 0 && gcd != 1) {
+       format = GCD_COMPRESSED;
++    } else if (optimizeStorage || count == 0 || count >= Integer.MAX_VALUE) {
++      format = DELTA_COMPRESSED;
+     } else {
+-      format = DELTA_COMPRESSED;
++      format = BITPACK_COMPRESSED;
+     }
+     meta.writeVInt(field.number);
+     meta.writeByte(DiskDocValuesFormat.NUMERIC);
+@@ -167,6 +172,17 @@
+         }
+         ordsWriter.finish();
+         break;
++      case BITPACK_COMPRESSED:
++        assert count > 0;
++        assert maxValue >= 0;
++        final int bpv = PackedInts.bitsRequired(maxValue);
++        meta.writeVInt(bpv);
++        final PackedInts.Writer bitWriter = PackedInts.getWriterNoHeader(data, PackedInts.Format.PACKED, (int) count, bpv, PackedInts.DEFAULT_BUFFER_SIZE);
++        for (Number nv : values) {
++          bitWriter.add(nv.longValue());
++        }
++        bitWriter.finish();
++        break;
+       default:
+         throw new AssertionError();
+     }
+Index: lucene/test-framework/src/java/org/apache/lucene/codecs/cheapbastard/CheapBastardDocValuesProducer.java
+===================================================================
+--- lucene/test-framework/src/java/org/apache/lucene/codecs/cheapbastard/CheapBastardDocValuesProducer.java	(revision 1508139)
++++ lucene/test-framework/src/java/org/apache/lucene/codecs/cheapbastard/CheapBastardDocValuesProducer.java	(working copy)
+@@ -17,6 +17,7 @@
+  * limitations under the License.
+  */
+ 
++import static org.apache.lucene.codecs.diskdv.DiskDocValuesConsumer.BITPACK_COMPRESSED;
+ import static org.apache.lucene.codecs.diskdv.DiskDocValuesConsumer.DELTA_COMPRESSED;
+ import static org.apache.lucene.codecs.diskdv.DiskDocValuesConsumer.GCD_COMPRESSED;
+ import static org.apache.lucene.codecs.diskdv.DiskDocValuesConsumer.TABLE_COMPRESSED;
+@@ -58,7 +59,7 @@
+     final int version;
+     try {
+       version = CodecUtil.checkHeader(in, metaCodec, 
+-                                      DiskDocValuesFormat.VERSION_START,
++                                      DiskDocValuesFormat.VERSION_CURRENT,
+                                       DiskDocValuesFormat.VERSION_CURRENT);
+       numerics = new HashMap<Integer,NumericEntry>();
+       ords = new HashMap<Integer,NumericEntry>();
+@@ -80,7 +81,7 @@
+       String dataName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, dataExtension);
+       data = state.directory.openInput(dataName, state.context);
+       final int version2 = CodecUtil.checkHeader(data, dataCodec, 
+-                                                 DiskDocValuesFormat.VERSION_START,
++                                                 DiskDocValuesFormat.VERSION_CURRENT,
+                                                  DiskDocValuesFormat.VERSION_CURRENT);
+       if (version != version2) {
+         throw new CorruptIndexException("Versions mismatch");
+@@ -185,6 +186,9 @@
+         break;
+       case DELTA_COMPRESSED:
+         break;
++      case BITPACK_COMPRESSED:
++        entry.bitsRequired = meta.readVInt();
++        break;
+       default:
+         throw new CorruptIndexException("Unknown format: " + entry.format + ", input=" + meta);
+     }
+@@ -244,6 +248,14 @@
+             return table[(int) ords.get((int) id)];
+           }
+         };
++      case BITPACK_COMPRESSED:
++        final PackedInts.Reader bits = PackedInts.getDirectReaderNoHeader(data, PackedInts.Format.PACKED, entry.packedIntsVersion, (int) entry.count, entry.bitsRequired);
++        return new LongNumericDocValues() {
++          @Override
++          public long get(long id) {
++            return bits.get((int) id);
++          }
++        };
+       default:
+         throw new AssertionError();
+     }
+@@ -388,6 +400,7 @@
+     int packedIntsVersion;
+     long count;
+     int blockSize;
++    int bitsRequired;
+     
+     long minValue;
+     long gcd;

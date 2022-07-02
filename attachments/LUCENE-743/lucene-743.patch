@@ -1,0 +1,801 @@
+Index: src/java/org/apache/lucene/index/FilterIndexReader.java
+===================================================================
+--- src/java/org/apache/lucene/index/FilterIndexReader.java	(revision 561867)
++++ src/java/org/apache/lucene/index/FilterIndexReader.java	(working copy)
+@@ -103,6 +103,22 @@
+     this.in = in;
+   }
+ 
++  /**
++   * Tries to reopen the underlying IndexReader instance.
++   * (See {@link IndexReader#reopen()}).
++   * <br>
++   * If the underlying IndexReader was refreshed successfully, then
++   * a new instance of FilterIndexReader is returned, otherwise this
++   * instance is returned.
++   * 
++   * @throws CorruptIndexException if the index is corrupt
++   * @throws IOException if there is a low-level IO error
++   */
++  public synchronized IndexReader reopen() throws CorruptIndexException, IOException {
++    IndexReader reopened = in.reopen();
++    return (reopened == in) ? this : new FilterIndexReader(reopened);
++  }
++  
+   public TermFreqVector[] getTermFreqVectors(int docNumber)
+           throws IOException {
+     ensureOpen();
+Index: src/java/org/apache/lucene/index/IndexReader.java
+===================================================================
+--- src/java/org/apache/lucene/index/IndexReader.java	(revision 561867)
++++ src/java/org/apache/lucene/index/IndexReader.java	(working copy)
+@@ -27,6 +27,10 @@
+ import java.io.IOException;
+ import java.util.Arrays;
+ import java.util.Collection;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.Map;
++import java.util.Set;
+ 
+ /** IndexReader is an abstract class, providing an interface for accessing an
+  index.  Search of an index is done entirely through this abstract interface,
+@@ -108,12 +112,16 @@
+     this.directoryOwner = directoryOwner;
+     this.closeDirectory = closeDirectory;
+   }
++  
++  void init(IndexReader reader, SegmentInfos segmentInfos) {
++    init(reader.directory, segmentInfos, reader.closeDirectory, reader.directoryOwner);
++  }
+ 
+   private Directory directory;
+   private boolean directoryOwner;
+   private boolean closeDirectory;
+   private IndexDeletionPolicy deletionPolicy;
+-  private boolean closed;
++  boolean closed;
+ 
+   /**
+    * @throws AlreadyClosedException if this IndexReader is closed
+@@ -215,7 +223,123 @@
+       }
+     }.run();
+   }
++  
++  /**
++   * Refreshes an IndexReader if the index has changed since this instance 
++   * was (re)opened. 
++   * <p>
++   * Opening an IndexReader is an expensive operation. This method can be used
++   * to refresh an existing IndexReader to reduce these costs. This method 
++   * tries to only load segments that have changed or were created after the 
++   * IndexReader was opened.
++   * <p>
++   * If the IndexReader could be refreshed successfully then a new IndexReader
++   * instance is returned and the old instance is closed, i. e. not usable 
++   * anymore. If the index has not changed since, then the same IndexReader
++   * instance is returned.
++   * 
++   * @throws CorruptIndexException if the index is corrupt
++   * @throws IOException if there is a low-level IO error
++   */
++  public synchronized IndexReader reopen() throws CorruptIndexException, IOException {
++    if (this.isCurrent() || 
++        !(this instanceof SegmentReader || this instanceof MultiSegmentReader)) {
++      return this;
++    }
+ 
++    final IndexReader reader = this;
++    
++    IndexReader newReader = (IndexReader) new SegmentInfos.FindSegmentsFile(reader.directory) {
++
++      protected Object doBody(String segmentFileName) throws CorruptIndexException, IOException {
++        IndexReader newReader = null;
++
++        SegmentInfos infos = new SegmentInfos();
++        infos.read(directory, segmentFileName);
++
++        if (infos.size() == 1) {
++          // the index has only one segment
++
++          if (reader instanceof SegmentReader) {
++            // the index has currently one segment and the IndexReader to be refreshed
++            // is a SegmentReader so there are two possibilities:
++            // 1) this is an entirely new segment, then SegmentReader.reopen() will
++            //    return null and we will open a new SegmentReader
++            // 2) the segment has changed (either deleted docs or norms),
++            //    SegmentReader refresh and return a new instance
++            newReader = ((SegmentReader) reader).reopen(infos);
++          }
++
++          if (newReader == null) {
++            // either the SegmentReader couldn't be refreshed or a MultiSegmentReader was passed
++            // in; in the latter case we can't refresh the MultiSegmentReader because the index
++            // is now optimized
++            newReader = SegmentReader.get(infos, infos.info(0), reader.closeDirectory);
++          }
++
++          if (newReader != reader) {
++            // reader successfully refreshed; close old one
++            reader.close();
++          }
++
++        } else {
++          // the index has multiple segments
++
++          IndexReader[] oldReaders;
++
++          if (reader instanceof SegmentReader) {
++            // the passed in reader was a single SegmentReader - we try to reuse it in the new
++            // MultiSegmentReader
++            oldReaders = new IndexReader[] {reader};
++          } else {
++            // get SegmentReaders from passed in MultiSegmentReader
++            MultiSegmentReader mr = (MultiSegmentReader) reader;
++            oldReaders = mr.getSubReaders();
++          }
++
++          Map segmentReaders = new HashMap();
++
++          // create a Map SegmentName->SegmentReader
++          for (int i = 0; i < oldReaders.length; i++) {
++            segmentReaders.put(((SegmentReader) oldReaders[i]).getSegmentName(), oldReaders[i]);
++          }
++
++          SegmentReader[] newReaders = new SegmentReader[infos.size()];
++          boolean[] closeAfterException = new boolean[infos.size()];
++
++          for (int i = infos.size() - 1; i>=0; i--) {
++            newReaders[i] = (SegmentReader) segmentReaders.get(infos.info(i).name);
++
++            try {
++              if (newReaders[i] == null) {
++                newReaders[i] = SegmentReader.get(infos.info(i));
++                // this is a new reader; in case we hit an exception we can close it safely
++                closeAfterException[i] = true;
++              } else {
++                newReaders[i] = newReaders[i].reopen(infos);
++
++              }
++            } catch (IOException e) {
++              for (i++; i < infos.size(); i++) {
++                if (closeAfterException[i]) {
++                  newReaders[i].close();
++                }
++              }
++              throw e;
++            }
++          }
++
++          newReader = new MultiSegmentReader(reader.directory, infos, reader.closeDirectory, newReaders);
++        }
++
++        newReader.deletionPolicy = reader.deletionPolicy;
++        return newReader;
++      }
++    }.run();
++
++    return newReader;
++  }
++
+   /** Returns the directory this index resides in.
+    */
+   public Directory directory() {
+@@ -333,7 +457,8 @@
+    */
+   public boolean isCurrent() throws CorruptIndexException, IOException {
+     ensureOpen();
+-    return SegmentInfos.readCurrentVersion(directory) == segmentInfos.getVersion();
++    return this.hasChanges // reader has write lock, must be up to date 
++             || SegmentInfos.readCurrentVersion(directory) == segmentInfos.getVersion();
+   }
+ 
+   /**
+Index: src/java/org/apache/lucene/index/MultiReader.java
+===================================================================
+--- src/java/org/apache/lucene/index/MultiReader.java	(revision 561867)
++++ src/java/org/apache/lucene/index/MultiReader.java	(working copy)
+@@ -17,15 +17,7 @@
+  * limitations under the License.
+  */
+ 
+-import org.apache.lucene.document.Document;
+-import org.apache.lucene.document.FieldSelector;
+-import org.apache.lucene.store.Directory;
+-
+ import java.io.IOException;
+-import java.util.Collection;
+-import java.util.HashSet;
+-import java.util.Hashtable;
+-import java.util.Set;
+ 
+ /** An IndexReader which reads multiple indexes, appending their content.
+  *
+@@ -65,4 +57,38 @@
+   public long getVersion() {
+     throw new UnsupportedOperationException("MultiReader does not support this method.");
+   }
++  
++  /**
++   * Tries to reopen the subreaders (see {@link IndexReader#reopen()}).
++   * <br>
++   * If one or more subreaders were reopened successfully, then a new
++   * MultiReader instance is returned and the old MultiReader is closed.
++   * Otherwise this instance is returned.
++   * 
++   * @throws CorruptIndexException if the index is corrupt
++   * @throws IOException if there is a low-level IO error 
++   */
++  public synchronized IndexReader reopen() throws CorruptIndexException, IOException {
++    boolean reopened = false;
++    IndexReader[] newSubReaders = new IndexReader[subReaders.length];
++    for (int i = 0; i < subReaders.length; i++) {
++      newSubReaders[i] = subReaders[i].reopen();
++      // if at least one of the subreaders was updated we remember that
++      // and return a new MultiReader
++      reopened |= (newSubReaders[i] != subReaders[i]);
++    }
++    
++    if (reopened) {
++      MultiReader mr = new MultiReader(newSubReaders);
++      for (int i = 0; i < subReaders.length; i++) {
++    	if (subReaders[i] != newSubReaders[i]) {
++    	  subReaders[i].close();
++    	}
++      }
++      closed = true;
++      return mr;
++    } else {
++      return this;
++    }
++  }
+ }
+Index: src/java/org/apache/lucene/index/MultiSegmentReader.java
+===================================================================
+--- src/java/org/apache/lucene/index/MultiSegmentReader.java	(revision 561867)
++++ src/java/org/apache/lucene/index/MultiSegmentReader.java	(working copy)
+@@ -122,6 +122,10 @@
+     return hasDeletions;
+   }
+ 
++  IndexReader[] getSubReaders() {
++    return this.subReaders;
++  }
++  
+   protected void doDelete(int n) throws CorruptIndexException, IOException {
+     numDocs = -1;                             // invalidate cache
+     int i = readerIndex(n);                   // find segment num
+Index: src/java/org/apache/lucene/index/ParallelReader.java
+===================================================================
+--- src/java/org/apache/lucene/index/ParallelReader.java	(revision 561882)
++++ src/java/org/apache/lucene/index/ParallelReader.java	(working copy)
+@@ -104,6 +104,46 @@
+       storedFieldReaders.add(reader);             // add to storedFieldReaders
+     readers.add(reader);
+   }
++  
++  /**
++   * Tries to reopen the subreaders (see {@link IndexReader#reopen()}).
++   * <br>
++   * If one or more subreaders were reopened successfully, then a new
++   * ParallelReader instance is returned and the old ParallelReader is closed.
++   * Otherwise this instance is returned.
++   * 
++   * @throws CorruptIndexException if the index is corrupt
++   * @throws IOException if there is a low-level IO error 
++   */
++  public synchronized IndexReader reopen() throws CorruptIndexException, IOException {
++    boolean reopened = false;
++    List newReaders = new ArrayList();
++    for (int i = 0; i < readers.size(); i++) {
++      IndexReader oldReader = (IndexReader) readers.get(i);
++      IndexReader newReader = oldReader.reopen();
++      newReaders.add(newReader);
++      // if at least one of the subreaders was updated we remember that
++      // and return a new MultiReader
++      reopened |= (newReader != oldReader); 
++    }
++    
++    if (reopened) {
++      ParallelReader pr = new ParallelReader();
++      for (int i = 0; i < readers.size(); i++) {
++        IndexReader oldReader = (IndexReader) readers.get(i);
++        IndexReader newReader = (IndexReader) newReaders.get(i);
++        if (oldReader != newReader) {
++          oldReader.close();
++        }
++        pr.add(newReader, !storedFieldReaders.contains(readers.get(i)));
++      }
++      closed = true;
++      return pr;
++    } else {
++      // No subreader was refreshed
++      return this;
++    }
++  }
+ 
+   public int numDocs() {
+     // Don't call ensureOpen() here (it could affect performance)
+Index: src/java/org/apache/lucene/index/SegmentInfo.java
+===================================================================
+--- src/java/org/apache/lucene/index/SegmentInfo.java	(revision 561867)
++++ src/java/org/apache/lucene/index/SegmentInfo.java	(working copy)
+@@ -380,6 +380,10 @@
+     return IndexFileNames.fileNameFromGeneration(name, prefix + number, WITHOUT_GEN);
+   }
+ 
++  int getNumFields() {
++    return normGen == null ? 0 : normGen.length;
++  }
++  
+   /**
+    * Mark whether this segment is stored as a compound file.
+    *
+Index: src/java/org/apache/lucene/index/SegmentReader.java
+===================================================================
+--- src/java/org/apache/lucene/index/SegmentReader.java	(revision 561867)
++++ src/java/org/apache/lucene/index/SegmentReader.java	(working copy)
+@@ -52,6 +52,8 @@
+   private boolean rollbackNormsDirty = false;
+   private boolean rollbackUndeleteAll = false;
+ 
++  private int readBufferSize;
++  
+   IndexInput freqStream;
+   IndexInput proxStream;
+ 
+@@ -201,7 +203,8 @@
+   private void initialize(SegmentInfo si, int readBufferSize, boolean doOpenStores) throws CorruptIndexException, IOException {
+     segment = si.name;
+     this.si = si;
+-
++    this.readBufferSize = readBufferSize;
++    
+     boolean success = false;
+ 
+     try {
+@@ -251,16 +254,8 @@
+ 
+       tis = new TermInfosReader(cfsDir, segment, fieldInfos, readBufferSize);
+       
+-      // NOTE: the bitvector is stored using the regular directory, not cfs
+-      if (hasDeletions(si)) {
+-        deletedDocs = new BitVector(directory(), si.getDelFileName());
++      loadDeletedDocs();
+ 
+-        // Verify # deletes does not exceed maxDoc for this segment:
+-        if (deletedDocs.count() > maxDoc()) {
+-          throw new CorruptIndexException("number of deletes (" + deletedDocs.count() + ") exceeds max doc (" + maxDoc() + ") for segment " + si.name);
+-        }
+-      }
+-
+       // make sure that all index files have been read or are kept open
+       // so that if an index update removes them we'll still have them
+       freqStream = cfsDir.openInput(segment + ".frq", readBufferSize);
+@@ -288,7 +283,95 @@
+       }
+     }
+   }
++  
++  private void loadDeletedDocs() throws IOException {
++    // NOTE: the bitvector is stored using the regular directory, not cfs
++    if (hasDeletions(si)) {
++      deletedDocs = new BitVector(directory(), si.getDelFileName());
+ 
++      // Verify # deletes does not exceed maxDoc for this segment:
++      if (deletedDocs.count() > maxDoc()) {
++        throw new CorruptIndexException("number of deletes (" + deletedDocs.count() + ") exceeds max doc (" + maxDoc() + ") for segment " + si.name);
++      }
++    }
++  }
++  
++  SegmentReader reopen(SegmentInfos sis) throws CorruptIndexException, IOException {
++    ensureOpen();
++    
++    SegmentInfo segInfo = null;
++    
++    // find SegmentInfo for this reader
++    for (int i = 0; i < sis.size(); i++) {
++      SegmentInfo s = sis.info(i);
++      if (segment.equals(s.name)) {
++        segInfo = s;
++        break;
++      }
++    }    
++
++    if (segInfo == null ||              // segment not referenced anymore, reopen not possible
++          segInfo.getUseCompoundFile() != si.getUseCompoundFile()) { // segment format changed
++      return null;
++    }
++    
++    boolean deletionsUpToDate = (si.hasDeletions() == segInfo.hasDeletions()) 
++                                  && (!si.hasDeletions() || si.getDelFileName().equals(segInfo.getDelFileName()));
++    boolean normsUpToDate = si.getNumFields() == segInfo.getNumFields();
++     
++    if (normsUpToDate) {
++      for (int i = 0; i < si.getNumFields(); i++) {
++        if (!si.getNormFileName(i).equals(segInfo.getNormFileName(i))) {
++          normsUpToDate = false;
++          break;
++        }
++      }
++    }
++    
++    if (normsUpToDate && deletionsUpToDate) {
++      return this;
++    }    
++    
++    // clone reader
++    SegmentReader clone = new SegmentReader();
++    clone.init(this, sis);
++    clone.si = segInfo;
++    clone.segment = segment;
++    clone.readBufferSize = readBufferSize;
++    clone.cfsReader = cfsReader;
++    clone.storeCFSReader = storeCFSReader;
++    clone.fieldInfos = fieldInfos;
++    clone.fieldsReader = fieldsReader;
++    clone.tis = tis;
++    clone.freqStream = freqStream;
++    clone.proxStream = proxStream;
++    clone.termVectorsReaderOrig = termVectorsReaderOrig;
++    clone.termVectorsLocal = termVectorsLocal;
++    
++    if (!deletionsUpToDate) {
++      // load deleted docs
++      clone.deletedDocs = null;
++      clone.loadDeletedDocs();
++    } else {
++      clone.deletedDocs = deletedDocs;
++    }
++    
++    if (!normsUpToDate) {
++      // load norms
++      clone.norms = new Hashtable();
++      clone.openNorms(si.getUseCompoundFile() ? cfsReader : directory(), readBufferSize);
++      closeNorms();
++    } else {
++      clone.norms = norms;
++      clone.singleNormStream = singleNormStream;
++    }
++
++    // mark this reader as closed
++    closed = true;
++    return clone;
++  }
++
++
+   protected void doCommit() throws IOException {
+     if (deletedDocsDirty) {               // re-write deleted
+       si.advanceDelGen();
+Index: src/test/org/apache/lucene/index/TestIndexReaderReopen.java
+===================================================================
+--- src/test/org/apache/lucene/index/TestIndexReaderReopen.java	(revision 0)
++++ src/test/org/apache/lucene/index/TestIndexReaderReopen.java	(revision 0)
+@@ -0,0 +1,325 @@
++package org.apache.lucene.index;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.Collection;
++import java.util.Iterator;
++
++import org.apache.lucene.analysis.WhitespaceAnalyzer;
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.Field;
++import org.apache.lucene.document.Field.Index;
++import org.apache.lucene.document.Field.Store;
++import org.apache.lucene.index.IndexReader.FieldOption;
++import org.apache.lucene.store.AlreadyClosedException;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.store.RAMDirectory;
++
++import junit.framework.TestCase;
++
++public class TestIndexReaderReopen extends TestCase {
++    
++  public void testReopen() throws Exception {
++    Directory dir = new RAMDirectory();
++    
++    createIndex(dir);
++    
++    IndexReader index1 = IndexReader.open(dir);
++    IndexReader index2 = IndexReader.open(dir);
++    assertIndexEquals(index1, index2);
++    
++    index2 = refreshReader(index2, false);
++    
++    // delete two documents
++    modifyIndex1(dir);
++    
++    // refresh IndexReader
++    index1.close();
++    index1 = IndexReader.open(dir);    
++    index2 = refreshReader(index2, true);
++    assertIndexEquals(index1, index2);
++
++    modifyIndex2(dir);
++    
++    // refresh IndexReader
++    index1.close();
++    index1 = IndexReader.open(dir);    
++    index2 = refreshReader(index2, true);
++    assertIndexEquals(index1, index2);
++
++    modifyIndex3(dir);
++    
++    // refresh IndexReader
++    index1.close();
++    index1 = IndexReader.open(dir);    
++    index2 = refreshReader(index2, true);
++    assertIndexEquals(index1, index2);
++
++    modifyIndex4(dir);
++    
++    // refresh IndexReader
++    index1.close();
++    index1 = IndexReader.open(dir);    
++    index2 = refreshReader(index2, true);
++    assertIndexEquals(index1, index2);
++    
++    index1.close();
++    index2.close();
++  }
++  
++  public void testFilterIndexReaderReopen() throws Exception {
++    Directory dir = new RAMDirectory();
++    
++    createIndex(dir);
++    
++    IndexReader index1 = IndexReader.open(dir);
++    IndexReader index2 = new FilterIndexReader(IndexReader.open(dir));
++    assertIndexEquals(index1, index2);
++    
++    index2 = refreshReader(index2, false);
++    
++    // delete two documents
++    modifyIndex1(dir);
++    
++    // refresh IndexReader
++    index1.close();
++    index1 = IndexReader.open(dir);    
++    index2 = refreshReader(index2, true);
++    assertIndexEquals(index1, index2);
++    
++    index1.close();
++    index2.close();
++  }
++  
++  public void testParallelReaderReopen() throws Exception {
++	Directory dir1 = new RAMDirectory();
++	createIndex(dir1);
++    Directory dir2 = new RAMDirectory();
++    createIndex(dir2);
++    ParallelReader pr1 = new ParallelReader();
++    pr1.add(IndexReader.open(dir1));
++    pr1.add(IndexReader.open(dir2));
++    
++    // no new instance should be returned as this ParallelReader is up to date
++    IndexReader pr1_refreshed = refreshReader(pr1, false);
++    
++    // change norms in one index
++    modifyIndex2(dir1);
++    
++    // we refresh the ParallelReader 
++    pr1_refreshed = refreshReader(pr1, true);
++    
++    // open a fresh ParallelReader to compare with the refreshed one
++    ParallelReader pr2 = new ParallelReader();
++    pr2.add(IndexReader.open(dir1));
++    pr2.add(IndexReader.open(dir2));
++
++    assertIndexEquals(pr1_refreshed, pr2);
++    
++    assertTrue(pr1_refreshed.isCurrent());
++    // the refreshed reader should now throw an IOException 
++    // indicating that one subreader was closed during reopen()
++    try {
++      assertTrue(pr1.isCurrent());
++      fail("Expected exception not thrown.");
++    } catch (AlreadyClosedException expected) {
++      // expected exception
++    }
++    
++    pr1_refreshed.close();
++    pr2.close();
++  }
++
++  public void testMultiReaderReopen() throws Exception {
++    Directory dir1 = new RAMDirectory();
++    createIndex(dir1);
++    Directory dir2 = new RAMDirectory();
++    createIndex(dir2);
++    MultiReader mr1 = new MultiReader(
++        new IndexReader[] {IndexReader.open(dir1), IndexReader.open(dir2)});
++
++    // no new instance should be returned as this MultiReader is up to date
++    IndexReader mr1_refreshed = refreshReader(mr1, false);
++    
++    modifyIndex1(dir1);
++    modifyIndex2(dir2);    
++    
++    MultiReader mr2 = new MultiReader(
++        new IndexReader[] {IndexReader.open(dir1), IndexReader.open(dir2)});
++
++    // refresh the MultiReader 
++    mr1_refreshed = refreshReader(mr1, true);
++    
++    assertIndexEquals(mr1_refreshed, mr2);
++    
++    assertTrue(mr1_refreshed.isCurrent());
++    // the refreshed reader should now throw an IOException 
++    // indicating that one subreader was closed during reopen()
++    try {
++      assertTrue(mr1.isCurrent());
++      fail("Expected exception not thrown.");
++    } catch (AlreadyClosedException expected) {
++      // expected exception
++    }
++    
++    mr1_refreshed.close();
++    mr2.close();
++  }
++
++  
++  private IndexReader refreshReader(IndexReader reader, boolean hasChanges) throws IOException {
++    IndexReader refreshed = reader.reopen();
++    if (hasChanges) {
++      if (refreshed == reader) {
++        fail("No new IndexReader instance created during refresh.");
++      }
++    } else {
++      if (refreshed != reader) {
++        fail("New IndexReader instance created during refresh even though index had no changes.");
++      }
++    }
++    
++    return refreshed;
++  }
++  
++  private void createIndex(Directory dir) throws IOException {
++    IndexWriter w = new IndexWriter(dir, new WhitespaceAnalyzer());
++    w.setMaxBufferedDocs(10);
++    
++    for (int i = 0; i < 100; i++) {
++      w.addDocument(createDocument(i));
++    }
++    
++    w.close();
++  }
++
++  private Document createDocument(int n) {
++    StringBuffer sb = new StringBuffer();
++    Document doc = new Document();
++    sb.append("a");
++    sb.append(n);
++    doc.add(new Field("field1", sb.toString(), Store.YES, Index.TOKENIZED));
++    sb.append(" b");
++    sb.append(n);
++    doc.add(new Field("field2", sb.toString(), Store.YES, Index.TOKENIZED));
++    return doc;
++  }
++  
++  private void modifyIndex1(Directory dir) throws IOException {
++    IndexWriter w = new IndexWriter(dir, new WhitespaceAnalyzer());
++    w.deleteDocuments(new Term("field2", "a11"));
++    w.deleteDocuments(new Term("field2", "b30"));
++    w.close();
++  }
++
++  private void modifyIndex2(Directory dir) throws IOException {
++    IndexReader reader = IndexReader.open(dir);
++    reader.setNorm(4, "field1", 123);
++    reader.setNorm(44, "field2", 222);
++    reader.close();
++  }
++
++  private void modifyIndex3(Directory dir) throws IOException {
++    IndexWriter w = new IndexWriter(dir, new WhitespaceAnalyzer());
++    w.optimize();
++    w.close();
++  }
++
++  private void modifyIndex4(Directory dir) throws IOException {
++    IndexWriter w = new IndexWriter(dir, new WhitespaceAnalyzer());
++    w.addDocument(createDocument(101));
++    w.optimize();
++    w.addDocument(createDocument(102));
++    w.addDocument(createDocument(103));
++    w.close();
++  }
++  
++  public void assertIndexEquals(IndexReader index1, IndexReader index2) throws Exception {
++    assertEquals("IndexReaders have different values for numDocs.", index1.numDocs(), index2.numDocs());
++    assertEquals("IndexReaders have different values for maxDoc.", index1.maxDoc(), index2.maxDoc());
++    assertEquals("Only one IndexReader has deletions.", index1.hasDeletions(), index2.hasDeletions());
++    assertEquals("Only one index is optimized.", index1.isOptimized(), index2.isOptimized());
++    
++    // check field names
++    Collection fields1 = index1.getFieldNames(FieldOption.ALL);
++    Collection fields2 = index1.getFieldNames(FieldOption.ALL);
++    assertEquals("IndexReaders have different numbers of fields.", fields1.size(), fields2.size());
++    Iterator it1 = fields1.iterator();
++    Iterator it2 = fields1.iterator();
++    while (it1.hasNext()) {
++      assertEquals("Different field names.", (String) it1.next(), (String) it2.next());
++    }
++    
++    // check norms
++    it1 = fields1.iterator();
++    while (it1.hasNext()) {
++      String curField = (String) it1.next();
++      byte[] norms1 = index1.norms(curField);
++      byte[] norms2 = index2.norms(curField);
++      assertEquals(norms1.length, norms2.length);
++      for (int i = 0; i < norms1.length; i++) {
++        assertEquals("Norm different for doc " + i + " and field '" + curField + "'.", norms1[i], norms2[i]);
++      }      
++    }
++    
++    // check deletions
++    for (int i = 0; i < index1.maxDoc(); i++) {
++      assertEquals("Doc " + i + " only deleted in one index.", index1.isDeleted(i), index2.isDeleted(i));
++    }
++    
++    // check stored fields
++    for (int i = 0; i < index1.maxDoc(); i++) {
++      if (!index1.isDeleted(i)) {
++        Document doc1 = index1.document(i);
++        Document doc2 = index2.document(i);
++        fields1 = doc1.getFields();
++        fields2 = doc2.getFields();
++        assertEquals("Different numbers of fields for doc " + i + ".", fields1.size(), fields2.size());
++        it1 = fields1.iterator();
++        it2 = fields2.iterator();
++        while (it1.hasNext()) {
++          Field curField1 = (Field) it1.next();
++          Field curField2 = (Field) it2.next();
++          assertEquals("Different fields names for doc " + i + ".", curField1.name(), curField2.name());
++          assertEquals("Different field values for doc " + i + ".", curField1.stringValue(), curField2.stringValue());
++        }          
++      }
++    }
++    
++    // check dictionary and posting lists
++    TermEnum enum1 = index1.terms();
++    TermEnum enum2 = index2.terms();
++    TermPositions tp1 = index1.termPositions();
++    TermPositions tp2 = index2.termPositions();
++    while(enum1.next()) {
++      assertTrue(enum2.next());
++      assertEquals("Different term in dictionary.", enum1.term(), enum2.term());
++      tp1.seek(enum1.term());
++      tp2.seek(enum1.term());
++      while(tp1.next()) {
++        assertTrue(tp2.next());
++        assertEquals("Different doc id in postinglist of term " + enum1.term() + ".", tp1.doc(), tp2.doc());
++        assertEquals("Different term frequence in postinglist of term " + enum1.term() + ".", tp1.freq(), tp2.freq());
++        for (int i = 0; i < tp1.freq(); i++) {
++          assertEquals("Different positions in postinglist of term " + enum1.term() + ".", tp1.nextPosition(), tp2.nextPosition());
++        }
++      }
++    }
++  }
++}

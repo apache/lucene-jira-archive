@@ -1,0 +1,356 @@
+Index: lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java	(revision 1669711)
++++ lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java	(working copy)
+@@ -74,8 +74,8 @@
+  */
+ public class IndexSearcher {
+ 
+-  // 32MB and at most 10,000 queries
+-  private static QueryCache DEFAULT_QUERY_CACHE = new LRUQueryCache(10000, 1 << 25);
++  // disabled by default
++  private static QueryCache DEFAULT_QUERY_CACHE = null;
+   private static QueryCachingPolicy DEFAULT_CACHING_POLICY = new UsageTrackingQueryCachingPolicy();
+ 
+   final IndexReader reader; // package private for testing!
+@@ -187,7 +187,10 @@
+    * A value of {@code null} indicates that query matches should never be
+    * cached. This method should be called <b>before</b> starting using this
+    * {@link IndexSearcher}.
++   * <p>NOTE: When using a query cache, queries should not be modified after
++   * they have been passed to IndexSearcher.
+    * @see QueryCache
++   * @lucene.experimental
+    */
+   public void setQueryCache(QueryCache queryCache) {
+     this.queryCache = queryCache;
+@@ -198,6 +201,7 @@
+    * This method should be called <b>before</b> starting using this
+    * {@link IndexSearcher}.
+    * @see QueryCachingPolicy
++   * @lucene.experimental
+    */
+   public void setQueryCachingPolicy(QueryCachingPolicy queryCachingPolicy) {
+     this.queryCachingPolicy = Objects.requireNonNull(queryCachingPolicy);
+Index: lucene/core/src/java/org/apache/lucene/search/LRUQueryCache.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/search/LRUQueryCache.java	(revision 1669711)
++++ lucene/core/src/java/org/apache/lucene/search/LRUQueryCache.java	(working copy)
+@@ -21,6 +21,7 @@
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.Collections;
++import java.util.ConcurrentModificationException;
+ import java.util.IdentityHashMap;
+ import java.util.Iterator;
+ import java.util.LinkedHashMap;
+@@ -269,10 +270,20 @@
+   synchronized void evictIfNecessary() {
+     // under a lock to make sure that mostRecentlyUsedQueries and cache keep sync'ed
+     if (requiresEviction()) {
++      
+       Iterator<Query> iterator = mostRecentlyUsedQueries.iterator();
+       do {
+         final Query query = iterator.next();
++        final int size = mostRecentlyUsedQueries.size();
+         iterator.remove();
++        if (size == mostRecentlyUsedQueries.size()) {
++          // size did not decrease, because the hash of the query changed since it has been
++          // put into the cache
++          throw new ConcurrentModificationException("Removal from the cache failed! This " +
++              "is probably due to a query which has been modified after having been put into " +
++              " the cache or a badly implemented clone(). Query class: [" + query.getClass() +
++              "], query: [" + query + "]");
++        }
+         onEviction(query);
+       } while (iterator.hasNext() && requiresEviction());
+     }
+Index: lucene/core/src/test/org/apache/lucene/search/TestLRUQueryCache.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/search/TestLRUQueryCache.java	(revision 1669711)
++++ lucene/core/src/test/org/apache/lucene/search/TestLRUQueryCache.java	(working copy)
+@@ -22,6 +22,7 @@
+ import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.Collections;
++import java.util.ConcurrentModificationException;
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.LinkedHashMap;
+@@ -45,6 +46,7 @@
+ import org.apache.lucene.search.BooleanClause.Occur;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.util.Bits;
++import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.LuceneTestCase;
+ import org.apache.lucene.util.RamUsageTester;
+ import org.apache.lucene.util.TestUtil;
+@@ -913,4 +915,56 @@
+     queryCache.assertConsistent();
+   }
+ 
++  private static class BadQuery extends Query {
++
++    int[] i = new int[] {42}; // an array so that clone keeps the reference
++    
++    @Override
++    public Weight createWeight(IndexSearcher searcher, boolean needsScores) throws IOException {
++      return new ConstantScoreWeight(this) {
++        
++        @Override
++        Scorer scorer(LeafReaderContext context, Bits acceptDocs, float score) throws IOException {
++          return null;
++        }
++      };
++    }
++    
++    @Override
++    public String toString(String field) {
++      return "BadQuery";
++    }
++    
++    @Override
++    public int hashCode() {
++      return super.hashCode() ^ i[0];
++    }
++    
++  }
++
++  public void testDetectMutatedQueries() throws IOException {
++    Directory dir = newDirectory();
++    final RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++    w.addDocument(new Document());
++    IndexReader reader = w.getReader();
++
++    // size of 1 so that 2nd query evicts from the cache
++    final LRUQueryCache queryCache = new LRUQueryCache(1, 10000);
++    final IndexSearcher searcher = newSearcher(reader);
++    searcher.setQueryCache(queryCache);
++    searcher.setQueryCachingPolicy(QueryCachingPolicy.ALWAYS_CACHE);
++    
++    BadQuery query = new BadQuery();
++    searcher.count(query);
++    query.i[0] += 1; // change the hashCode!
++    try {
++      // trigger an eviction
++      searcher.count(new MatchAllDocsQuery());
++      fail();
++    } catch (ConcurrentModificationException e) {
++      // expected
++    }
++    
++    IOUtils.close(w, reader, dir);
++  }
+ }
+Index: lucene/core/src/test/org/apache/lucene/search/TestSloppyPhraseQuery2.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/search/TestSloppyPhraseQuery2.java	(revision 1669711)
++++ lucene/core/src/test/org/apache/lucene/search/TestSloppyPhraseQuery2.java	(working copy)
+@@ -21,25 +21,24 @@
+ 
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.util.TestUtil;
+-import org.apache.lucene.util.LuceneTestCase.AwaitsFix;
+ 
+ /**
+  * random sloppy phrase query tests
+  */
+-@AwaitsFix(bugUrl="https://issues.apache.org/jira/browse/LUCENE-6369")
+ public class TestSloppyPhraseQuery2 extends SearchEquivalenceTestBase {
+   /** "A B"~N ⊆ "A B"~N+1 */
+   public void testIncreasingSloppiness() throws Exception {
+     Term t1 = randomTerm();
+     Term t2 = randomTerm();
+-    PhraseQuery q1 = new PhraseQuery();
+-    q1.add(t1);
+-    q1.add(t2);
+-    PhraseQuery q2 = new PhraseQuery();
+-    q2.add(t1);
+-    q2.add(t2);
+     for (int i = 0; i < 10; i++) {
++      PhraseQuery q1 = new PhraseQuery();
++      q1.add(t1); 
++      q1.add(t2);
+       q1.setSlop(i);
++      PhraseQuery q2 = new PhraseQuery();
++      q2.add(t1); 
++      q2.add(t2);
++      q1.setSlop(i);
+       q2.setSlop(i+1);
+       assertSubsetOf(q1, q2);
+     }
+@@ -49,14 +48,14 @@
+   public void testIncreasingSloppinessWithHoles() throws Exception {
+     Term t1 = randomTerm();
+     Term t2 = randomTerm();
+-    PhraseQuery q1 = new PhraseQuery();
+-    q1.add(t1);
+-    q1.add(t2, 2);
+-    PhraseQuery q2 = new PhraseQuery();
+-    q2.add(t1);
+-    q2.add(t2, 2);
+     for (int i = 0; i < 10; i++) {
++      PhraseQuery q1 = new PhraseQuery();
++      q1.add(t1); 
++      q1.add(t2, 2);
+       q1.setSlop(i);
++      PhraseQuery q2 = new PhraseQuery();
++      q2.add(t1);
++      q2.add(t2, 2);
+       q2.setSlop(i+1);
+       assertSubsetOf(q1, q2);
+     }
+@@ -67,16 +66,16 @@
+     Term t1 = randomTerm();
+     Term t2 = randomTerm();
+     Term t3 = randomTerm();
+-    PhraseQuery q1 = new PhraseQuery();
+-    q1.add(t1);
+-    q1.add(t2);
+-    q1.add(t3);
+-    PhraseQuery q2 = new PhraseQuery();
+-    q2.add(t1);
+-    q2.add(t2);
+-    q2.add(t3);
+     for (int i = 0; i < 10; i++) {
++      PhraseQuery q1 = new PhraseQuery();
++      q1.add(t1); 
++      q1.add(t2); 
++      q1.add(t3);
+       q1.setSlop(i);
++      PhraseQuery q2 = new PhraseQuery();
++      q2.add(t1);
++      q2.add(t2);
++      q2.add(t3);
+       q2.setSlop(i+1);
+       assertSubsetOf(q1, q2);
+     }
+@@ -89,16 +88,16 @@
+     Term t3 = randomTerm();
+     int pos1 = 1 + random().nextInt(3);
+     int pos2 = pos1 + 1 + random().nextInt(3);
+-    PhraseQuery q1 = new PhraseQuery();
+-    q1.add(t1);
+-    q1.add(t2, pos1);
+-    q1.add(t3, pos2);
+-    PhraseQuery q2 = new PhraseQuery();
+-    q2.add(t1);
+-    q2.add(t2, pos1);
+-    q2.add(t3, pos2);
+     for (int i = 0; i < 10; i++) {
++      PhraseQuery q1 = new PhraseQuery();
++      q1.add(t1);
++      q1.add(t2, pos1);
++      q1.add(t3, pos2);
+       q1.setSlop(i);
++      PhraseQuery q2 = new PhraseQuery();
++      q2.add(t1);
++      q2.add(t2, pos1);
++      q2.add(t3, pos2);
+       q2.setSlop(i+1);
+       assertSubsetOf(q1, q2);
+     }
+@@ -107,14 +106,14 @@
+   /** "A A"~N ⊆ "A A"~N+1 */
+   public void testRepetitiveIncreasingSloppiness() throws Exception {
+     Term t = randomTerm();
+-    PhraseQuery q1 = new PhraseQuery();
+-    q1.add(t);
+-    q1.add(t);
+-    PhraseQuery q2 = new PhraseQuery();
+-    q2.add(t);
+-    q2.add(t);
+     for (int i = 0; i < 10; i++) {
++      PhraseQuery q1 = new PhraseQuery();
++      q1.add(t);
++      q1.add(t);
+       q1.setSlop(i);
++      PhraseQuery q2 = new PhraseQuery();
++      q2.add(t);
++      q2.add(t);
+       q2.setSlop(i+1);
+       assertSubsetOf(q1, q2);
+     }
+@@ -123,14 +122,14 @@
+   /** same as the above with posincr */
+   public void testRepetitiveIncreasingSloppinessWithHoles() throws Exception {
+     Term t = randomTerm();
+-    PhraseQuery q1 = new PhraseQuery();
+-    q1.add(t);
+-    q1.add(t, 2);
+-    PhraseQuery q2 = new PhraseQuery();
+-    q2.add(t);
+-    q2.add(t, 2);
+     for (int i = 0; i < 10; i++) {
++      PhraseQuery q1 = new PhraseQuery();
++      q1.add(t);
++      q1.add(t, 2);
+       q1.setSlop(i);
++      PhraseQuery q2 = new PhraseQuery();
++      q2.add(t);
++      q2.add(t, 2);
+       q2.setSlop(i+1);
+       assertSubsetOf(q1, q2);
+     }
+@@ -139,16 +138,16 @@
+   /** "A A A"~N ⊆ "A A A"~N+1 */
+   public void testRepetitiveIncreasingSloppiness3() throws Exception {
+     Term t = randomTerm();
+-    PhraseQuery q1 = new PhraseQuery();
+-    q1.add(t);
+-    q1.add(t);
+-    q1.add(t);
+-    PhraseQuery q2 = new PhraseQuery();
+-    q2.add(t);
+-    q2.add(t);
+-    q2.add(t);
+     for (int i = 0; i < 10; i++) {
++      PhraseQuery q1 = new PhraseQuery();
++      q1.add(t);
++      q1.add(t);
++      q1.add(t);
+       q1.setSlop(i);
++      PhraseQuery q2 = new PhraseQuery();
++      q2.add(t);
++      q2.add(t);
++      q2.add(t);
+       q2.setSlop(i+1);
+       assertSubsetOf(q1, q2);
+     }
+@@ -159,16 +158,16 @@
+     Term t = randomTerm();
+     int pos1 = 1 + random().nextInt(3);
+     int pos2 = pos1 + 1 + random().nextInt(3);
+-    PhraseQuery q1 = new PhraseQuery();
+-    q1.add(t);
+-    q1.add(t, pos1);
+-    q1.add(t, pos2);
+-    PhraseQuery q2 = new PhraseQuery();
+-    q2.add(t);
+-    q2.add(t, pos1);
+-    q2.add(t, pos2);
+     for (int i = 0; i < 10; i++) {
++      PhraseQuery q1 = new PhraseQuery();
++      q1.add(t);
++      q1.add(t, pos1);
++      q1.add(t, pos2);
+       q1.setSlop(i);
++      PhraseQuery q2 = new PhraseQuery();
++      q2.add(t);
++      q2.add(t, pos1);
++      q2.add(t, pos2);
+       q2.setSlop(i+1);
+       assertSubsetOf(q1, q2);
+     }
+@@ -177,9 +176,9 @@
+   /** MultiPhraseQuery~N ⊆ MultiPhraseQuery~N+1 */
+   public void testRandomIncreasingSloppiness() throws Exception {
+     long seed = random().nextLong();
+-    MultiPhraseQuery q1 = randomPhraseQuery(seed);
+-    MultiPhraseQuery q2 = randomPhraseQuery(seed);
+     for (int i = 0; i < 10; i++) {
++      MultiPhraseQuery q1 = randomPhraseQuery(seed);
++      MultiPhraseQuery q2 = randomPhraseQuery(seed);
+       q1.setSlop(i);
+       q2.setSlop(i+1);
+       assertSubsetOf(q1, q2);

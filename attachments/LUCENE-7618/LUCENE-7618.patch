@@ -1,0 +1,310 @@
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/DocValuesRangeQuery.java b/lucene/sandbox/src/java/org/apache/lucene/search/DocValuesRangeQuery.java
+index 459ffa4..b0d5ce9 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/search/DocValuesRangeQuery.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/search/DocValuesRangeQuery.java
+@@ -183,10 +183,61 @@ public final class DocValuesRangeQuery extends Query {
+             max = -1 + (long) upperVal;
+           }
+ 
++          // optimized case: can't match any docs in this segment
+           if (min > max) {
+             return null;
+           }
+ 
++          // optimized case: no need to compare every value to Long.MIN_VALUE
++          if (Long.MIN_VALUE == min) {
++            // nocommit: optimize MIN_VALUE==min && MAX_VALUE==max as "match any doc with value" (too niche?)
++            
++            return new TwoPhaseIterator(values) {
++              @Override
++              public boolean matches() throws IOException {
++                final int count = values.docValueCount();
++                assert count > 0;
++                for (int i = 0; i < count; ++i) {
++                  final long value = values.nextValue();
++                  if (value <= max) {
++                    return true;
++                  }
++                }
++                return false;
++              }
++              
++              @Override
++              public float matchCost() {
++                return 1; // 1 comparison
++              }
++            };
++          }
++          
++          // optimized case: no need to compare every value to Long.MAX_VALUE
++          if (Long.MAX_VALUE == max) {
++            return new TwoPhaseIterator(values) {
++              @Override
++              public boolean matches() throws IOException {
++                final int count = values.docValueCount();
++                assert count > 0;
++                for (int i = 0; i < count; ++i) {
++                  final long value = values.nextValue();
++                  if (min <= value) {
++                    return true;
++                  }
++                }
++                return false;
++              }
++              
++              @Override
++              public float matchCost() {
++                return 1; // 1 comparison
++              }
++            };
++
++          }
++
++          // default case, compare every value to min & max
+           return new TwoPhaseIterator(values) {
+ 
+             @Override
+@@ -212,7 +263,7 @@ public final class DocValuesRangeQuery extends Query {
+         } else if (lowerVal instanceof BytesRef || upperVal instanceof BytesRef) {
+ 
+           final SortedSetDocValues values = DocValues.getSortedSet(context.reader(), field);
+-
++          final long segment_max_ord = values.getValueCount() - 1;
+           final long minOrd;
+           if (lowerVal == null) {
+             minOrd = 0;
+@@ -229,7 +280,7 @@ public final class DocValuesRangeQuery extends Query {
+ 
+           final long maxOrd;
+           if (upperVal == null) {
+-            maxOrd = values.getValueCount() - 1;
++            maxOrd = segment_max_ord;
+           } else {
+             final long ord = values.lookupTerm((BytesRef) upperVal);
+             if (ord < 0) {
+@@ -241,10 +292,55 @@ public final class DocValuesRangeQuery extends Query {
+             }
+           }
+ 
++          // optimized case: can't match any docs in this segment
+           if (minOrd > maxOrd) {
+             return null;
+           }
+ 
++          // optimized case: no need to compare every ord to 0 (min possible ord)
++          if (0 == minOrd) {
++            // nocommit: optimize 0==minOrd && segment_max_ord==maxOrd as "match any doc with value"
++            // nocommit: more likely for SortedSet then SortedNumeric since ords are per segment?
++            
++            return new TwoPhaseIterator(values) {
++              @Override
++              public boolean matches() throws IOException {
++                for (long ord = values.nextOrd(); ord != SortedSetDocValues.NO_MORE_ORDS; ord = values.nextOrd()) {
++                  if (ord <= maxOrd) {
++                    return true;
++                  }
++                }
++                return false;
++              }
++              
++              @Override
++              public float matchCost() {
++                return 1; // 1 comparison
++              }
++            };
++          }
++          
++          // nocommit: optimized case: no need to compare every value to Long.MAX_VALUE
++          if (segment_max_ord == minOrd) {
++            return new TwoPhaseIterator(values) {
++              @Override
++              public boolean matches() throws IOException {
++                for (long ord = values.nextOrd(); ord != SortedSetDocValues.NO_MORE_ORDS; ord = values.nextOrd()) {
++                  if (minOrd <= ord) {
++                    return true;
++                  }
++                }
++                return false;
++              }
++              
++              @Override
++              public float matchCost() {
++                return 1; // 1 comparison
++              }
++            };
++          }
++
++          // default case, compare every ord to minOrd & maxOrd
+           return new TwoPhaseIterator(values) {
+ 
+             @Override
+diff --git a/lucene/sandbox/src/test/org/apache/lucene/search/TestDocValuesRangeQueryOptimizations.java b/lucene/sandbox/src/test/org/apache/lucene/search/TestDocValuesRangeQueryOptimizations.java
+new file mode 100644
+index 0000000..4a8ea9a0
+--- /dev/null
++++ b/lucene/sandbox/src/test/org/apache/lucene/search/TestDocValuesRangeQueryOptimizations.java
+@@ -0,0 +1,164 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.search;
++
++import java.io.IOException;
++
++import org.apache.lucene.analysis.MockAnalyzer;
++import org.apache.lucene.document.LongPoint;
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.Field.Store;
++import org.apache.lucene.document.NumericDocValuesField;
++import org.apache.lucene.document.SortedDocValuesField;
++import org.apache.lucene.document.SortedNumericDocValuesField;
++import org.apache.lucene.document.SortedSetDocValuesField;
++import org.apache.lucene.document.StringField;
++import org.apache.lucene.index.DirectoryReader;
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.LeafReaderContext;
++import org.apache.lucene.index.IndexWriter;
++import org.apache.lucene.index.IndexWriterConfig;
++import org.apache.lucene.index.RandomIndexWriter;
++import org.apache.lucene.index.Term;
++import org.apache.lucene.search.BooleanClause.Occur;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util.NumericUtils;
++import org.apache.lucene.util.TestUtil;
++
++import org.junit.AfterClass;
++import org.junit.BeforeClass;
++
++public class TestDocValuesRangeQueryOptimizations extends LuceneTestCase {
++
++  private static long maxId;
++  private static Directory INDEX = null;
++  
++  @BeforeClass
++  public static void buildIndex() throws IOException {
++    INDEX = newDirectory();
++    // try (RandomIndexWriter iw = new RandomIndexWriter(random(), INDEX)) {
++    // nocommit: use lucene defaults for micorbenchmark..
++    try (IndexWriter iw = new IndexWriter(INDEX, new IndexWriterConfig(new MockAnalyzer(random())))) {
++      maxId = 50000L; // nocommit: huge for micro benchmark // (long) atLeast(1000);
++      for (long id = 1L; id <= maxId; id++) {
++        Document doc = new Document();
++
++        // id based fields are always increasing
++        // testing range queries against this field semi-simulates queries against
++        // a timestamp field, or an auto-incrementing id field
++        // also makes it easy to test the speed of open end ranges queries simply by counting the matches
++        doc.add(new SortedNumericDocValuesField("id_sndv", id));
++        doc.add(new SortedSetDocValuesField("id_ssdv", toSortableBytes(id)));
++        doc.add(new LongPoint("id_p", id));
++        // nocommit: also compare Term index based field & range queries?
++
++        // random value fields
++        final int numValues = random().nextInt(2);
++        for (int j = 0; j < numValues; ++j) {
++          final long value = random().nextLong();
++          doc.add(new SortedNumericDocValuesField("r_sndv", value));
++          doc.add(new SortedSetDocValuesField("r_ssdv", toSortableBytes(value)));
++          doc.add(new LongPoint("r_p", value));
++        }
++        iw.addDocument(doc);
++      }
++      iw.commit();
++    }
++  }
++
++  @AfterClass
++  public static void clearIndex() throws IOException {
++    INDEX.close();
++    INDEX = null;
++  }
++
++  private interface RangeQueryBuilder {
++    Query build(Long min, Long max, boolean includeMin, boolean includeMax);
++  }
++
++  public void testOpenEnded_Id_SNDV_Field() throws IOException {
++    doOpenEndedIdFieldTest((min, max, includeMin, includeMax) ->
++                           DocValuesRangeQuery.newLongRange("id_sndv", min, max, includeMin, includeMax));
++  }
++  public void testOpenEnded_Id_SSDV_Field() throws IOException {
++    doOpenEndedIdFieldTest((min, max, includeMin, includeMax) ->
++                           DocValuesRangeQuery.newBytesRefRange("id_ssdv", toSortableBytes(min), toSortableBytes(max), includeMin, includeMax));
++  }
++  public void testOpenEnded_Id_P_Field() throws IOException {
++    doOpenEndedIdFieldTest((min, max, includeMin, includeMax) -> {
++        long lower = (null == min ? Long.MIN_VALUE : Math.addExact(min.longValue(), includeMin ? 0 : 1 ));
++        long upper = (null == max ? Long.MAX_VALUE : Math.addExact(max.longValue(), includeMax ? 0 : -1));
++        return LongPoint.newRangeQuery("id_p", lower, upper);
++      });
++
++  }
++  
++  public void doOpenEndedIdFieldTest(RangeQueryBuilder qBuilder) throws IOException {
++    try (IndexReader reader = DirectoryReader.open(INDEX)) {
++      final IndexSearcher searcher = newSearcher(reader, false);
++      
++      final int numIters = 10000; // nocommit: huge for micro benchmark // atLeast(100);
++      for (int i = 0; i < numIters; ++i) {
++        final Long value = TestUtil.nextLong(random(), 1, maxId);
++        final boolean inclusive = random().nextBoolean();
++        if (random().nextBoolean()) {
++          final Query q = qBuilder.build(value, null, inclusive, false);
++          assertEquals(q.toString(),
++                       (maxId - value) + (inclusive ? 1 : 0),
++                       searcher.count(q));
++        } else {
++          final Query q = qBuilder.build(null, value, false, inclusive);
++          assertEquals(q.toString(),
++                       value - (inclusive ? 0 : 1),
++                       searcher.count(q));
++        }
++      }
++    }
++  }
++
++  // nocommit: add more testing of Id field with non-open ended ranges
++  
++  // nocommit: add some testing of the random fields, using assertSameMatches
++
++  // nocommit: add some whitebox testing that inspects the underlying scorers
++  
++  private static BytesRef toSortableBytes(Long l) {
++    if (l == null) {
++      return null;
++    } else {
++      byte[] bytes = new byte[Long.BYTES];
++      NumericUtils.longToSortableBytes(l, bytes, 0);
++      return new BytesRef(bytes);
++    }
++  }
++
++  private void assertSameMatches(IndexSearcher searcher, Query q1, Query q2, boolean scores) throws IOException {
++    final int maxDoc = searcher.getIndexReader().maxDoc();
++    final TopDocs td1 = searcher.search(q1, maxDoc, scores ? Sort.RELEVANCE : Sort.INDEXORDER);
++    final TopDocs td2 = searcher.search(q2, maxDoc, scores ? Sort.RELEVANCE : Sort.INDEXORDER);
++    assertEquals(td1.totalHits, td2.totalHits);
++    for (int i = 0; i < td1.scoreDocs.length; ++i) {
++      assertEquals(td1.scoreDocs[i].doc, td2.scoreDocs[i].doc);
++      if (scores) {
++        assertEquals(td1.scoreDocs[i].score, td2.scoreDocs[i].score, 10e-7);
++      }
++    }
++  }
++
++}

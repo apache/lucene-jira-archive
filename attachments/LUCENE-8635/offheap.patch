@@ -1,0 +1,460 @@
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/blocktree/BlockTreeTermsReader.java b/lucene/core/src/java/org/apache/lucene/codecs/blocktree/BlockTreeTermsReader.java
+index 0e14bf7418..be2b104ef1 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/blocktree/BlockTreeTermsReader.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/blocktree/BlockTreeTermsReader.java
+@@ -112,6 +112,8 @@ public final class BlockTreeTermsReader extends FieldsProducer {
+ 
+   // Open input to the main terms dict file (_X.tib)
+   final IndexInput termsIn;
++  // Open input to the terms index file (_X.tip)
++  final IndexInput indexIn;
+ 
+   //private static final boolean DEBUG = BlockTreeTermsWriter.DEBUG;
+ 
+@@ -128,7 +130,6 @@ public final class BlockTreeTermsReader extends FieldsProducer {
+   /** Sole constructor. */
+   public BlockTreeTermsReader(PostingsReaderBase postingsReader, SegmentReadState state) throws IOException {
+     boolean success = false;
+-    IndexInput indexIn = null;
+     
+     this.postingsReader = postingsReader;
+     this.segment = state.segmentInfo.name;
+@@ -206,13 +207,11 @@ public final class BlockTreeTermsReader extends FieldsProducer {
+           throw new CorruptIndexException("duplicate field: " + fieldInfo.name, termsIn);
+         }
+       }
+-      
+-      indexIn.close();
+       success = true;
+     } finally {
+       if (!success) {
+         // this.close() will close in:
+-        IOUtils.closeWhileHandlingException(indexIn, this);
++        IOUtils.closeWhileHandlingException(this);
+       }
+     }
+   }
+@@ -246,7 +245,7 @@ public final class BlockTreeTermsReader extends FieldsProducer {
+   @Override
+   public void close() throws IOException {
+     try {
+-      IOUtils.close(termsIn, postingsReader);
++      IOUtils.close(indexIn, termsIn, postingsReader);
+     } finally { 
+       // Clear so refs to terms index is GCable even if
+       // app hangs onto us:
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/blocktree/FieldReader.java b/lucene/core/src/java/org/apache/lucene/codecs/blocktree/FieldReader.java
+index 4ee3826240..44bf2ef46c 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/blocktree/FieldReader.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/blocktree/FieldReader.java
+@@ -34,6 +34,7 @@ import org.apache.lucene.util.RamUsageEstimator;
+ import org.apache.lucene.util.automaton.CompiledAutomaton;
+ import org.apache.lucene.util.fst.ByteSequenceOutputs;
+ import org.apache.lucene.util.fst.FST;
++import org.apache.lucene.util.fst.OffHeapFSTStore;
+ 
+ /**
+  * BlockTree's implementation of {@link Terms}.
+@@ -88,7 +89,7 @@ public final class FieldReader extends Terms implements Accountable {
+       final IndexInput clone = indexIn.clone();
+       //System.out.println("start=" + indexStartFP + " field=" + fieldInfo.name);
+       clone.seek(indexStartFP);
+-      index = new FST<>(clone, ByteSequenceOutputs.getSingleton());
++      index = new FST<>(clone, ByteSequenceOutputs.getSingleton(), new OffHeapFSTStore());
+         
+       /*
+         if (false) {
+diff --git a/lucene/core/src/java/org/apache/lucene/util/fst/FST.java b/lucene/core/src/java/org/apache/lucene/util/fst/FST.java
+index c801743417..2358cea356 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/fst/FST.java
++++ b/lucene/core/src/java/org/apache/lucene/util/fst/FST.java
+@@ -147,8 +147,7 @@ public final class FST<T> implements Accountable {
+    *  GB then bytesArray is set instead. */
+   final BytesStore bytes;
+ 
+-  /** Used at read time when the FST fits into a single byte[]. */
+-  final byte[] bytesArray;
++  private final FSTStore fstStore;
+ 
+   private long startNode = -1;
+ 
+@@ -258,7 +257,7 @@ public final class FST<T> implements Accountable {
+     this.inputType = inputType;
+     this.outputs = outputs;
+     version = VERSION_CURRENT;
+-    bytesArray = null;
++    fstStore = null;
+     bytes = new BytesStore(bytesPageBits);
+     // pad: ensure no node gets address 0 which is reserved to mean
+     // the stop state w/ no arcs
+@@ -271,18 +270,16 @@ public final class FST<T> implements Accountable {
+ 
+   /** Load a previously saved FST. */
+   public FST(DataInput in, Outputs<T> outputs) throws IOException {
+-    this(in, outputs, DEFAULT_MAX_BLOCK_BITS);
++    this(in, outputs, new OnHeapFSTStore(DEFAULT_MAX_BLOCK_BITS));
+   }
+ 
+   /** Load a previously saved FST; maxBlockBits allows you to
+    *  control the size of the byte[] pages used to hold the FST bytes. */
+-  public FST(DataInput in, Outputs<T> outputs, int maxBlockBits) throws IOException {
++  public FST(DataInput in, Outputs<T> outputs, FSTStore fstStore) throws IOException {
++    bytes = null;
++    this.fstStore = fstStore;
+     this.outputs = outputs;
+ 
+-    if (maxBlockBits < 1 || maxBlockBits > 30) {
+-      throw new IllegalArgumentException("maxBlockBits should be 1 .. 30; got " + maxBlockBits);
+-    }
+-
+     // NOTE: only reads most recent format; we don't have
+     // back-compat promise for FSTs (they are experimental):
+     version = CodecUtil.checkHeader(in, FILE_FORMAT_NAME, VERSION_PACKED, VERSION_CURRENT);
+@@ -332,17 +329,7 @@ public final class FST<T> implements Accountable {
+     }
+ 
+     long numBytes = in.readVLong();
+-    if (numBytes > 1 << maxBlockBits) {
+-      // FST is big: we need multiple pages
+-      bytes = new BytesStore(in, numBytes, 1<<maxBlockBits);
+-      bytesArray = null;
+-    } else {
+-      // FST fits into a single block: use ByteArrayBytesStoreReader for less overhead
+-      bytes = null;
+-      bytesArray = new byte[(int) numBytes];
+-      in.readBytes(bytesArray, 0, bytesArray.length);
+-    }
+-    
++    this.fstStore.init(in, numBytes);
+     cacheRootArcs();
+   }
+ 
+@@ -374,11 +361,12 @@ public final class FST<T> implements Accountable {
+   @Override
+   public long ramBytesUsed() {
+     long size = BASE_RAM_BYTES_USED;
+-    if (bytesArray != null) {
+-      size += bytesArray.length;
++    if (this.fstStore != null) {
++      size += this.fstStore.ramBytesUsed();
+     } else {
+       size += bytes.ramBytesUsed();
+     }
++
+     size += cachedArcsBytesUsed;
+     return size;
+   }
+@@ -497,9 +485,8 @@ public final class FST<T> implements Accountable {
+       out.writeVLong(numBytes);
+       bytes.writeTo(out);
+     } else {
+-      assert bytesArray != null;
+-      out.writeVLong(bytesArray.length);
+-      out.writeBytes(bytesArray, 0, bytesArray.length);
++      assert fstStore != null;
++      fstStore.writeTo(out);
+     }
+   }
+   
+@@ -1191,8 +1178,8 @@ public final class FST<T> implements Accountable {
+   /** Returns a {@link BytesReader} for this FST, positioned at
+    *  position 0. */
+   public BytesReader getBytesReader() {
+-    if (bytesArray != null) {
+-      return new ReverseBytesReader(bytesArray);
++    if (this.fstStore != null) {
++      return this.fstStore.getReverseBytesReader();
+     } else {
+       return bytes.getReverseReader();
+     }
+diff --git a/lucene/core/src/java/org/apache/lucene/util/fst/FSTStore.java b/lucene/core/src/java/org/apache/lucene/util/fst/FSTStore.java
+new file mode 100644
+index 0000000000..80a75fd5f2
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/util/fst/FSTStore.java
+@@ -0,0 +1,29 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.util.fst;
++
++import org.apache.lucene.store.DataInput;
++import org.apache.lucene.store.DataOutput;
++import org.apache.lucene.util.Accountable;
++
++import java.io.IOException;
++
++public interface FSTStore extends Accountable {
++    void init(DataInput in, long numBytes) throws IOException;
++    FST.BytesReader getReverseBytesReader();
++    void writeTo(DataOutput out) throws IOException;
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/util/fst/OffHeapFSTStore.java b/lucene/core/src/java/org/apache/lucene/util/fst/OffHeapFSTStore.java
+new file mode 100644
+index 0000000000..cca81b44e5
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/util/fst/OffHeapFSTStore.java
+@@ -0,0 +1,63 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.util.fst;
++
++import org.apache.lucene.store.DataInput;
++import org.apache.lucene.store.DataOutput;
++import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.util.RamUsageEstimator;
++
++import java.io.IOException;
++
++/** Provides off heap storage of finite state machine (FST),
++ *  using underlying index input instead of byte store on heap
++ *
++ * @lucene.experimental
++ */
++public final class OffHeapFSTStore implements FSTStore {
++
++    private static final long BASE_RAM_BYTES_USED = RamUsageEstimator.shallowSizeOfInstance(OffHeapFSTStore.class);
++
++    private IndexInput in;
++    private long indexStartFP;
++
++    @Override
++    public void init(DataInput in, long numBytes) throws IOException {
++        if (in instanceof IndexInput) {
++            this.in = (IndexInput) in;
++        } else {
++            throw new IllegalArgumentException("parameter:in should be an instance of IndexInput for using OffHeapFSTStore");
++        }
++
++        this.indexStartFP = this.in.getFilePointer();
++    }
++
++    @Override
++    public long ramBytesUsed() {
++        return BASE_RAM_BYTES_USED;
++    }
++
++    @Override
++    public FST.BytesReader getReverseBytesReader() {
++        return new ReverseIndexInputReader(in.clone(), indexStartFP);
++    }
++
++    @Override
++    public void writeTo(DataOutput out) throws IOException {
++        throw new UnsupportedOperationException("writeToOutput operation is not supported for OffHeapFSTStore");
++    }
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/util/fst/OnHeapFSTStore.java b/lucene/core/src/java/org/apache/lucene/util/fst/OnHeapFSTStore.java
+new file mode 100644
+index 0000000000..7dc09b9f55
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/util/fst/OnHeapFSTStore.java
+@@ -0,0 +1,97 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.util.fst;
++
++import org.apache.lucene.store.DataInput;
++import org.apache.lucene.store.DataOutput;
++import org.apache.lucene.util.RamUsageEstimator;
++
++import java.io.IOException;
++
++/** Provides storage of finite state machine (FST),
++ *  using byte array or byte store allocated on heap.
++ *
++ * @lucene.experimental
++ */
++public final class OnHeapFSTStore implements FSTStore {
++
++    private static final long BASE_RAM_BYTES_USED = RamUsageEstimator.shallowSizeOfInstance(OnHeapFSTStore.class);
++
++    /** A {@link BytesStore}, used during building, or during reading when
++     *  the FST is very large (more than 1 GB).  If the FST is less than 1
++     *  GB then bytesArray is set instead. */
++    private BytesStore bytes;
++
++    /** Used at read time when the FST fits into a single byte[]. */
++    private byte[] bytesArray;
++
++    private final int maxBlockBits;
++
++    public OnHeapFSTStore(int maxBlockBits) {
++        if (maxBlockBits < 1 || maxBlockBits > 30) {
++            throw new IllegalArgumentException("maxBlockBits should be 1 .. 30; got " + maxBlockBits);
++        }
++
++        this.maxBlockBits = maxBlockBits;
++    }
++
++    @Override
++    public void init(DataInput in, long numBytes) throws IOException {
++        if (numBytes > 1 << this.maxBlockBits) {
++            // FST is big: we need multiple pages
++            bytes = new BytesStore(in, numBytes, 1<<this.maxBlockBits);
++        } else {
++            // FST fits into a single block: use ByteArrayBytesStoreReader for less overhead
++            bytesArray = new byte[(int) numBytes];
++            in.readBytes(bytesArray, 0, bytesArray.length);
++        }
++    }
++
++    @Override
++    public long ramBytesUsed() {
++        long size = BASE_RAM_BYTES_USED;
++        if (bytesArray != null) {
++            size += bytesArray.length;
++        } else {
++            size += bytes.ramBytesUsed();
++        }
++
++        return size;
++    }
++
++    @Override
++    public FST.BytesReader getReverseBytesReader() {
++        if (bytesArray != null) {
++            return new ReverseBytesReader(bytesArray);
++        } else {
++            return bytes.getReverseReader();
++        }
++    }
++
++    @Override
++    public void writeTo(DataOutput out) throws IOException {
++        if (bytes != null) {
++            long numBytes = bytes.getPosition();
++            out.writeVLong(numBytes);
++            bytes.writeTo(out);
++        } else {
++            assert bytesArray != null;
++            out.writeVLong(bytesArray.length);
++            out.writeBytes(bytesArray, 0, bytesArray.length);
++        }
++    }
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/util/fst/ReverseIndexInputReader.java b/lucene/core/src/java/org/apache/lucene/util/fst/ReverseIndexInputReader.java
+new file mode 100644
+index 0000000000..10a985bf31
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/util/fst/ReverseIndexInputReader.java
+@@ -0,0 +1,78 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.util.fst;
++
++import java.io.IOException;
++import org.apache.lucene.store.IndexInput;
++
++/** Implements reverse read from an index input. */
++final class ReverseIndexInputReader extends FST.BytesReader {
++    private final IndexInput in;
++    private final long startFP;
++
++    public ReverseIndexInputReader(IndexInput in, long startFP) {
++        this.in = in;
++        this.startFP = startFP;
++    }
++
++    @Override
++    public byte readByte() throws IOException {
++        final byte b = this.in.readByte();
++        this.skipBytes(2);
++        return b;
++    }
++
++    @Override
++    public void readBytes(byte[] b, int offset, int len) throws IOException {
++        this.skipBytes(len - 1);
++        this.in.readBytes(b, offset, len);
++        int i = offset, j = offset + len - 1;
++        byte tmp;
++        while (j > i) {
++            tmp = b[j];
++            b[j--] = b[i];
++            b[i++] = tmp;
++        }
++        this.skipBytes(len + 1);
++    }
++
++    @Override
++    public void skipBytes(long count) {
++        this.setPosition(this.getPosition() - count);
++    }
++
++    @Override
++    public long getPosition() {
++        final long position = this.in.getFilePointer() - startFP;
++        return position;
++    }
++
++    @Override
++    public void setPosition(long pos) {
++        try {
++            this.in.seek(startFP + pos);
++        } catch (IOException ex) {
++            System.out.println(String.format("Unreported exception in set position at %d - %s", pos, ex.getMessage()));
++        }
++    }
++
++    @Override
++    public boolean reversed() {
++        return true;
++    }
++}
++

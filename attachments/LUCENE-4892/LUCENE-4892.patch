@@ -1,0 +1,1499 @@
+diff --git a/lucene/benchmark/src/java/org/apache/lucene/benchmark/byTask/tasks/CreateIndexTask.java b/lucene/benchmark/src/java/org/apache/lucene/benchmark/byTask/tasks/CreateIndexTask.java
+index c2c145b..879f084 100644
+--- a/lucene/benchmark/src/java/org/apache/lucene/benchmark/byTask/tasks/CreateIndexTask.java
++++ b/lucene/benchmark/src/java/org/apache/lucene/benchmark/byTask/tasks/CreateIndexTask.java
+@@ -29,7 +29,7 @@ import org.apache.lucene.benchmark.byTask.PerfRunData;
+ import org.apache.lucene.benchmark.byTask.utils.Config;
+ import org.apache.lucene.codecs.Codec;
+ import org.apache.lucene.codecs.PostingsFormat;
+-import org.apache.lucene.codecs.lucene70.Lucene70Codec;
++import org.apache.lucene.codecs.lucene74.Lucene74Codec;
+ import org.apache.lucene.index.ConcurrentMergeScheduler;
+ import org.apache.lucene.index.IndexCommit;
+ import org.apache.lucene.index.IndexDeletionPolicy;
+@@ -139,7 +139,7 @@ public class CreateIndexTask extends PerfTask {
+     if (defaultCodec == null && postingsFormat != null) {
+       try {
+         final PostingsFormat postingsFormatChosen = PostingsFormat.forName(postingsFormat);
+-        iwConf.setCodec(new Lucene70Codec() {
++        iwConf.setCodec(new Lucene74Codec() {
+           @Override
+           public PostingsFormat getPostingsFormatForField(String field) {
+             return postingsFormatChosen;
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/Codec.java b/lucene/core/src/java/org/apache/lucene/codecs/Codec.java
+index d864710..cca4928 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/Codec.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/Codec.java
+@@ -57,7 +57,7 @@ public abstract class Codec implements NamedSPILoader.NamedSPI {
+     }
+     
+     // TODO: should we use this, or maybe a system property is better?
+-    static Codec defaultCodec = LOADER.lookup("Lucene70");
++    static Codec defaultCodec = LOADER.lookup("Lucene74");
+   }
+ 
+   private final String name;
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/lucene74/HashBits.java b/lucene/core/src/java/org/apache/lucene/codecs/lucene74/HashBits.java
+new file mode 100644
+index 0000000..bcf930a
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/codecs/lucene74/HashBits.java
+@@ -0,0 +1,273 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.codecs.lucene74;
++
++import java.io.IOException;
++import java.util.Arrays;
++
++import org.apache.lucene.store.DataInput;
++import org.apache.lucene.store.DataOutput;
++import org.apache.lucene.util.FixedBitSet;
++import org.apache.lucene.util.MutableBits;
++
++/**
++ * A hash set for dense integers:
++ *  - Uses open addressing with linear probing
++ *  - The hash takes the lower bits of the integer
++ *  - The higher bits are stored in a short[] alongside the delta between the
++ *    hash and the slot that the value is stored in. In order to not overflow
++ *    a short, the hash table doubles its size if there are not enough bits
++ *    available to store both numbers on a short.
++ * 
++ */
++final class HashBits implements MutableBits, Cloneable {
++
++  private static final short NOT_FOUND = -1;
++
++  private final int length; // upper bound of indices
++  private final boolean failIfLargerThanBitSet;
++  private final long memoryThreshold; // approximate memory usage of a bitset
++  private final int bitsRequired;
++  private short[] table; // length of this table is a power of two
++  // number of entries in this table
++  private int size;
++  // number of bits required to reconstruct a value from its hash and its delta
++  private int remainderBits;
++  // max delta that we can store without risking to use the special -1 which is reserved for NOT FOUND
++  private int maxDelta;
++  // number of bits for hashing
++  private int hashBits;
++  // mask to apply to compute the hash
++  private int hashMask;
++
++  HashBits(int length, boolean failIfLargerThanBitSet) {
++    if (length < 0) {
++      throw new IllegalArgumentException("Length must be positive or null, got " + length);
++    }
++    this.failIfLargerThanBitSet = failIfLargerThanBitSet;
++    this.length = length;
++    final long numLongsForBitSet = (length + 63L) / 64L;
++    this.memoryThreshold = numLongsForBitSet * 8L;
++    this.bitsRequired = Integer.SIZE - Integer.numberOfLeadingZeros(length - 1);
++    try {
++      setRemainderBits(Math.min(Short.SIZE - 1, bitsRequired), -1);
++    } catch (TooLargeException cannotHappen) {
++      throw new AssertionError(cannotHappen);
++    }
++  }
++
++  private void setRemainderBits(int remainderBits, int pending) {
++    assert remainderBits >= 0;
++    assert remainderBits <= Short.SIZE - 1;
++    int hashBits = bitsRequired - remainderBits;
++    assert hashBits >= 0;
++    if (failIfLargerThanBitSet && ((long) Short.BYTES << hashBits) >= memoryThreshold) {
++      throw new TooLargeException(pending);
++    }
++    this.hashBits = hashBits;
++    this.remainderBits = remainderBits;
++    hashMask = (1 << hashBits) - 1;
++    table = new short[hashMask + 1];
++    Arrays.fill(table, NOT_FOUND);
++    size = 0;
++    maxDelta = Math.min(table.length,
++        1 << (Short.SIZE - remainderBits) - 1);
++  }
++
++  @Override
++  public int length() {
++    return length;
++  }
++
++  @Override
++  public boolean get(int index) {
++    for (int i = 0; i < maxDelta; ++i) {
++      final int idx = (index + i) & hashMask;
++      final short v = table[idx];
++      if (v == NOT_FOUND) {
++        return true;
++      }
++
++      final short expected = (short) ((i << remainderBits) | (index >>> hashBits));
++      assert expected != NOT_FOUND;
++      if (expected == v) {
++        return false;
++      }
++    }
++    return true;
++  }
++
++  @Override
++  public void clear(int index) {
++    if (size >= (table.length >>> 1) && remainderBits > 0) {
++      if (get(index) == false) {
++        return;
++      }
++
++      // Maintain a load factor of at most 50%
++      grow(index);
++    }
++
++    index = clearNoGrowth(index);
++    if (index == -1) { // cleared successfully
++      return;
++    }
++
++    grow(index);
++    index = clearNoGrowth(index);
++
++    if (index != -1) {
++      throw new AssertionError();
++    }
++  }
++
++  /**
++   * Try to clear the bit at the given index. Returns {@code -1} in case of
++   * success and an index to add in case of failure.
++   */
++  private int clearNoGrowth(int index) {
++    int delta = 0;
++    while (delta < maxDelta) {
++      final int idx = (index + delta) & hashMask;
++      final short v = table[idx];
++      final short insertedValue = (short) ((delta << remainderBits) | (index >>> hashBits));
++      assert insertedValue != NOT_FOUND;
++      if (v == NOT_FOUND) { // free slot
++        table[idx] = insertedValue;
++        size++;
++        return -1;
++      } else if (v == insertedValue) { // already present in the table
++        return -1;
++      } else {
++        final int vDelta = v >>> remainderBits;
++        if (vDelta < delta) {
++          // this value has a lower delta, we have more chances to succeed
++          // without growing by putting our new value here, and then trying to
++          // put the value that was previously here somewhere else
++          table[idx] = insertedValue;
++          index = ((v & ((1 << remainderBits) - 1)) << hashBits) | ((idx - vDelta) & hashMask);
++          delta = vDelta;
++        }
++      }
++      delta++;
++    }
++    return index;
++  }
++
++  private void grow(int pending) {
++    int oldHashBits = hashBits;
++    int oldHashMask = hashMask;
++    int oldRemainderBits = remainderBits;
++    int oldRemainderMask = (1 << oldRemainderBits) - 1;
++    short[] oldTable = table;
++    int oldSize = size;
++
++    setRemainderBits(remainderBits - 1, pending);
++
++    // We re-add bits to this hash table in an order that ensures that new
++    // deltas will be less than or equal to the old deltas.
++
++    // 1st round
++    for (int i = 0; i < oldTable.length; ++i) {
++      short v = oldTable[i];
++      if (v == NOT_FOUND) {
++        continue;
++      }
++      final int delta = v >>> oldRemainderBits;
++      if (delta > i) {
++        // this value should be at the end of the array but ended up here
++        // because of collisions, we will deal with it in a second round
++        continue;
++      }
++      int originalIndex = ((v & oldRemainderMask) << oldHashBits) | (i - delta);
++      if (clearNoGrowth(originalIndex) != -1) {
++        throw new AssertionError();
++      }
++    }
++
++    // 2nd round
++    for (int i = 0; i < oldTable.length; ++i) {
++      short v = oldTable[i];
++      if (v == NOT_FOUND) {
++        continue;
++      }
++      final int delta = v >>> oldRemainderBits;
++      if (delta <= i) {
++        // already done
++        continue;
++      }
++      int originalIndex = ((v & oldRemainderMask) << oldHashBits) | ((i - delta) & oldHashMask);
++      if (clearNoGrowth(originalIndex) != -1) {
++        throw new AssertionError();
++      }
++    }
++
++    assert size == oldSize : size + " " + oldSize;
++  }
++
++  int cardinality() {
++    return length - size;
++  }
++
++  FixedBitSet toFixedBitSet() {
++    FixedBitSet bitSet = new FixedBitSet(length);
++    bitSet.set(0, length);
++
++    final int remainderMask = (1 << remainderBits) - 1;
++    for (int i = 0; i < table.length; ++i) {
++      short v = table[i];
++      if (v == NOT_FOUND) {
++        continue;
++      }
++      final int delta = v >>> remainderBits;
++      int originalIndex = ((v & remainderMask) << hashBits) | ((i - delta) & hashMask);
++      bitSet.clear(originalIndex);
++    }
++
++    return bitSet;
++  }
++
++  @Override
++  public HashBits clone() {
++    try {
++      HashBits clone = (HashBits) super.clone();
++      clone.table = clone.table.clone();
++      return clone;
++    } catch (CloneNotSupportedException cannotHappen) {
++      throw new RuntimeException(cannotHappen);
++    }
++  }
++
++  HashBits(int length, DataInput in) throws IOException {
++    this(length, true);
++    setRemainderBits(in.readByte(), -1);
++    for (int i = 0; i < table.length; ++i) {
++      table[i] = in.readShort();
++      if (table[i] != NOT_FOUND) {
++        ++size;
++      }
++    }
++  }
++
++  void writeTo(DataOutput out) throws IOException {
++    assert failIfLargerThanBitSet;
++    out.writeByte((byte) remainderBits);
++    for (int i = 0; i < table.length; ++i) {
++      out.writeShort(table[i]);
++    }
++  }
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/lucene74/LiveDocsBits.java b/lucene/core/src/java/org/apache/lucene/codecs/lucene74/LiveDocsBits.java
+new file mode 100644
+index 0000000..30864ea
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/codecs/lucene74/LiveDocsBits.java
+@@ -0,0 +1,143 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.codecs.lucene74;
++
++import java.io.IOException;
++
++import org.apache.lucene.store.DataInput;
++import org.apache.lucene.store.DataOutput;
++import org.apache.lucene.util.Bits;
++import org.apache.lucene.util.FixedBitSet;
++import org.apache.lucene.util.MutableBits;
++
++/**
++ * Implementation of the live docs, which start with a {@link HashBits} instance
++ * before upgrading to a {@link FixedBitSet} when too many bits are cleared.
++ */
++final class LiveDocsBits implements MutableBits, Cloneable {
++
++  private final int length;
++  private FixedBitSet fixedBitSet;
++  private HashBits hashBits;
++
++  LiveDocsBits(int length) {
++    this.length = length;
++    hashBits = new HashBits(length, true);
++    fixedBitSet = null;
++  }
++
++  @Override
++  protected LiveDocsBits clone() {
++    try {
++      LiveDocsBits clone = (LiveDocsBits) super.clone();
++      if (clone.hashBits != null) {
++        clone.hashBits = clone.hashBits.clone();
++      }
++      if (clone.fixedBitSet != null) {
++        clone.fixedBitSet = clone.fixedBitSet.clone();
++      }
++      return clone;
++    } catch (CloneNotSupportedException cannotHappen) {
++      throw new RuntimeException(cannotHappen);
++    }
++  }
++
++  @Override
++  public int length() {
++    return length;
++  }
++
++  @Override
++  public boolean get(int index) {
++    return hashBits != null ? hashBits.get(index) : fixedBitSet.get(index);
++  }
++
++  @Override
++  public void clear(int index) {
++    if (hashBits != null) {
++      try {
++        hashBits.clear(index);
++      } catch (TooLargeException e) {
++        upgradeToBitset();
++        fixedBitSet.clear(e.pendingIndex);
++      }
++    } else {
++      fixedBitSet.clear(index);
++    }
++  }
++
++  private void upgradeToBitset() {
++    FixedBitSet fixedBitSet = hashBits.toFixedBitSet();
++    this.hashBits = null;
++    this.fixedBitSet = fixedBitSet;
++  }
++
++  Bits readOnlyBits() {
++    if (hashBits != null) {
++      return hashBits;
++    } else {
++      return fixedBitSet;
++    }
++  }
++
++  int cardinality() {
++    if (hashBits != null) {
++      return hashBits.cardinality();
++    } else {
++      return fixedBitSet.cardinality();
++    }
++  }
++
++  // for testing
++  FixedBitSet toFixedBitSet() {
++    if (fixedBitSet != null) {
++      return fixedBitSet;
++    } else {
++      return hashBits.toFixedBitSet();
++    }
++  }
++
++  LiveDocsBits(int length, DataInput in) throws IOException {
++    this(length);
++    byte b = in.readByte();
++    if (b == 0) {
++      hashBits = new HashBits(length, in);
++      fixedBitSet = null;
++    } else if (b == 1) {
++      hashBits = null;
++      long data[] = new long[FixedBitSet.bits2words(length)];
++      for (int i = 0; i < data.length; i++) {
++        data[i] = in.readLong();
++      }
++      fixedBitSet = new FixedBitSet(data, length);
++    }
++  }
++
++  void writeTo(DataOutput out) throws IOException {
++    if (hashBits != null) {
++      out.writeByte((byte) 0);
++      hashBits.writeTo(out);
++    } else {
++      out.writeByte((byte) 1);
++      long data[] = fixedBitSet.getBits();
++      for (int i = 0; i < data.length; i++) {
++        out.writeLong(data[i]);
++      }
++    }
++  }
++
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/lucene74/Lucene74Codec.java b/lucene/core/src/java/org/apache/lucene/codecs/lucene74/Lucene74Codec.java
+new file mode 100644
+index 0000000..9370a44
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/codecs/lucene74/Lucene74Codec.java
+@@ -0,0 +1,176 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.codecs.lucene74;
++
++import java.util.Objects;
++
++import org.apache.lucene.codecs.Codec;
++import org.apache.lucene.codecs.CompoundFormat;
++import org.apache.lucene.codecs.DocValuesFormat;
++import org.apache.lucene.codecs.FieldInfosFormat;
++import org.apache.lucene.codecs.FilterCodec;
++import org.apache.lucene.codecs.LiveDocsFormat;
++import org.apache.lucene.codecs.NormsFormat;
++import org.apache.lucene.codecs.PointsFormat;
++import org.apache.lucene.codecs.PostingsFormat;
++import org.apache.lucene.codecs.SegmentInfoFormat;
++import org.apache.lucene.codecs.StoredFieldsFormat;
++import org.apache.lucene.codecs.TermVectorsFormat;
++import org.apache.lucene.codecs.lucene50.Lucene50CompoundFormat;
++import org.apache.lucene.codecs.lucene50.Lucene50StoredFieldsFormat;
++import org.apache.lucene.codecs.lucene50.Lucene50StoredFieldsFormat.Mode;
++import org.apache.lucene.codecs.lucene50.Lucene50TermVectorsFormat;
++import org.apache.lucene.codecs.lucene60.Lucene60FieldInfosFormat;
++import org.apache.lucene.codecs.lucene60.Lucene60PointsFormat;
++import org.apache.lucene.codecs.lucene70.Lucene70NormsFormat;
++import org.apache.lucene.codecs.lucene70.Lucene70SegmentInfoFormat;
++import org.apache.lucene.codecs.perfield.PerFieldDocValuesFormat;
++import org.apache.lucene.codecs.perfield.PerFieldPostingsFormat;
++
++/**
++ * Implements the Lucene 7.4 index format, with configurable per-field postings
++ * and docvalues formats.
++ * <p>
++ * If you want to reuse functionality of this codec in another codec, extend
++ * {@link FilterCodec}.
++ *
++ * @see org.apache.lucene.codecs.lucene74 package documentation for file format details.
++ *
++ * @lucene.experimental
++ */
++public class Lucene74Codec extends Codec {
++  private final TermVectorsFormat vectorsFormat = new Lucene50TermVectorsFormat();
++  private final FieldInfosFormat fieldInfosFormat = new Lucene60FieldInfosFormat();
++  private final SegmentInfoFormat segmentInfosFormat = new Lucene70SegmentInfoFormat();
++  private final LiveDocsFormat liveDocsFormat = new Lucene74LiveDocsFormat();
++  private final CompoundFormat compoundFormat = new Lucene50CompoundFormat();
++  
++  private final PostingsFormat postingsFormat = new PerFieldPostingsFormat() {
++    @Override
++    public PostingsFormat getPostingsFormatForField(String field) {
++      return Lucene74Codec.this.getPostingsFormatForField(field);
++    }
++  };
++  
++  private final DocValuesFormat docValuesFormat = new PerFieldDocValuesFormat() {
++    @Override
++    public DocValuesFormat getDocValuesFormatForField(String field) {
++      return Lucene74Codec.this.getDocValuesFormatForField(field);
++    }
++  };
++  
++  private final StoredFieldsFormat storedFieldsFormat;
++
++  /** 
++   * Instantiates a new codec.
++   */
++  public Lucene74Codec() {
++    this(Mode.BEST_SPEED);
++  }
++  
++  /** 
++   * Instantiates a new codec, specifying the stored fields compression
++   * mode to use.
++   * @param mode stored fields compression mode to use for newly 
++   *             flushed/merged segments.
++   */
++  public Lucene74Codec(Mode mode) {
++    super("Lucene74");
++    this.storedFieldsFormat = new Lucene50StoredFieldsFormat(Objects.requireNonNull(mode));
++  }
++  
++  @Override
++  public final StoredFieldsFormat storedFieldsFormat() {
++    return storedFieldsFormat;
++  }
++  
++  @Override
++  public final TermVectorsFormat termVectorsFormat() {
++    return vectorsFormat;
++  }
++
++  @Override
++  public final PostingsFormat postingsFormat() {
++    return postingsFormat;
++  }
++  
++  @Override
++  public final FieldInfosFormat fieldInfosFormat() {
++    return fieldInfosFormat;
++  }
++  
++  @Override
++  public final SegmentInfoFormat segmentInfoFormat() {
++    return segmentInfosFormat;
++  }
++  
++  @Override
++  public final LiveDocsFormat liveDocsFormat() {
++    return liveDocsFormat;
++  }
++
++  @Override
++  public final CompoundFormat compoundFormat() {
++    return compoundFormat;
++  }
++
++  @Override
++  public final PointsFormat pointsFormat() {
++    return new Lucene60PointsFormat();
++  }
++
++  /** Returns the postings format that should be used for writing 
++   *  new segments of <code>field</code>.
++   *  
++   *  The default implementation always returns "Lucene50".
++   *  <p>
++   *  <b>WARNING:</b> if you subclass, you are responsible for index 
++   *  backwards compatibility: future version of Lucene are only 
++   *  guaranteed to be able to read the default implementation. 
++   */
++  public PostingsFormat getPostingsFormatForField(String field) {
++    return defaultFormat;
++  }
++  
++  /** Returns the docvalues format that should be used for writing 
++   *  new segments of <code>field</code>.
++   *  
++   *  The default implementation always returns "Lucene70".
++   *  <p>
++   *  <b>WARNING:</b> if you subclass, you are responsible for index 
++   *  backwards compatibility: future version of Lucene are only 
++   *  guaranteed to be able to read the default implementation. 
++   */
++  public DocValuesFormat getDocValuesFormatForField(String field) {
++    return defaultDVFormat;
++  }
++  
++  @Override
++  public final DocValuesFormat docValuesFormat() {
++    return docValuesFormat;
++  }
++
++  private final PostingsFormat defaultFormat = PostingsFormat.forName("Lucene50");
++  private final DocValuesFormat defaultDVFormat = DocValuesFormat.forName("Lucene70");
++
++  private final NormsFormat normsFormat = new Lucene70NormsFormat();
++
++  @Override
++  public final NormsFormat normsFormat() {
++    return normsFormat;
++  }
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/lucene74/Lucene74LiveDocsFormat.java b/lucene/core/src/java/org/apache/lucene/codecs/lucene74/Lucene74LiveDocsFormat.java
+new file mode 100644
+index 0000000..a9168d3
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/codecs/lucene74/Lucene74LiveDocsFormat.java
+@@ -0,0 +1,123 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.codecs.lucene74;
++
++import java.io.IOException;
++import java.util.Collection;
++
++import org.apache.lucene.codecs.CodecUtil;
++import org.apache.lucene.codecs.LiveDocsFormat;
++import org.apache.lucene.index.CorruptIndexException;
++import org.apache.lucene.index.IndexFileNames;
++import org.apache.lucene.index.SegmentCommitInfo;
++import org.apache.lucene.store.ChecksumIndexInput;
++import org.apache.lucene.store.DataOutput;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.store.IOContext;
++import org.apache.lucene.store.IndexOutput;
++import org.apache.lucene.util.Bits;
++import org.apache.lucene.util.MutableBits;
++
++/** 
++ * Lucene 7.4 live docs format 
++ * <p>The .liv file is optional, and only exists when a segment contains
++ * deletions.
++ * <p>Although per-segment, this file is maintained exterior to compound segment
++ * files.
++ * <p>Deletions (.liv) --&gt; IndexHeader,Generation,Format,Bits
++ * <ul>
++ *   <li>SegmentHeader --&gt; {@link CodecUtil#writeIndexHeader IndexHeader}</li>
++ *   <li>Format --&gt; a {@link DataOutput#writeByte Byte}: 0 means sparse encoding and 1 means dense encoding </li>
++ *   <li>Bits --&gt; a hashtable in case of sparse encoding and a bit set otherwise</li>
++ * </ul>
++ */
++public final class Lucene74LiveDocsFormat extends LiveDocsFormat {
++
++  /** Sole constructor. */
++  public Lucene74LiveDocsFormat() {
++  }
++  
++  /** extension of live docs */
++  private static final String EXTENSION = "liv";
++  
++  /** codec of live docs */
++  private static final String CODEC_NAME = "Lucene70LiveDocs";
++  
++  /** supported version range */
++  private static final int VERSION_START = 0;
++  private static final int VERSION_CURRENT = VERSION_START;
++
++  @Override
++  public MutableBits newLiveDocs(int size) throws IOException {
++    return new LiveDocsBits(size);
++  }
++
++  @Override
++  public MutableBits newLiveDocs(Bits existing) throws IOException {
++    LiveDocsBits bits = (LiveDocsBits) existing;
++    return bits.clone();
++  }
++
++  @Override
++  public Bits readLiveDocs(Directory dir, SegmentCommitInfo info, IOContext context) throws IOException {
++    long gen = info.getDelGen();
++    String name = IndexFileNames.fileNameFromGeneration(info.info.name, EXTENSION, gen);
++    final int length = info.info.maxDoc();
++    try (ChecksumIndexInput input = dir.openChecksumInput(name, context)) {
++      Throwable priorE = null;
++      try {
++        CodecUtil.checkIndexHeader(input, CODEC_NAME, VERSION_START, VERSION_CURRENT, 
++                                     info.info.getId(), Long.toString(gen, Character.MAX_RADIX));
++        LiveDocsBits liveDocs = new LiveDocsBits(length, input);
++        if (liveDocs.length() - liveDocs.cardinality() != info.getDelCount()) {
++          throw new CorruptIndexException("bits.deleted=" + (liveDocs.length() - liveDocs.cardinality()) + 
++                                          " info.delcount=" + info.getDelCount(), input);
++        }
++        return liveDocs;
++      } catch (Throwable exception) {
++        priorE = exception;
++      } finally {
++        CodecUtil.checkFooter(input, priorE);
++      }
++    }
++    throw new AssertionError();
++  }
++
++  @Override
++  public void writeLiveDocs(MutableBits bits, Directory dir, SegmentCommitInfo info, int newDelCount, IOContext context) throws IOException {
++    long gen = info.getNextDelGen();
++    String name = IndexFileNames.fileNameFromGeneration(info.info.name, EXTENSION, gen);
++    LiveDocsBits liveDocs = (LiveDocsBits) bits;
++    if (liveDocs.length() - liveDocs.cardinality() != info.getDelCount() + newDelCount) {
++      throw new CorruptIndexException("bits.deleted=" + (liveDocs.length() - liveDocs.cardinality()) + 
++                                      " info.delcount=" + info.getDelCount() + " newdelcount=" + newDelCount, name);
++    }
++    try (IndexOutput output = dir.createOutput(name, context)) {
++      CodecUtil.writeIndexHeader(output, CODEC_NAME, VERSION_CURRENT, info.info.getId(), Long.toString(gen, Character.MAX_RADIX));
++      liveDocs.writeTo(output);
++      CodecUtil.writeFooter(output);
++    }
++  }
++
++  @Override
++  public void files(SegmentCommitInfo info, Collection<String> files) throws IOException {
++    if (info.hasDeletions()) {
++      files.add(IndexFileNames.fileNameFromGeneration(info.info.name, EXTENSION, info.getDelGen()));
++    }
++  }
++
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/lucene74/TooLargeException.java b/lucene/core/src/java/org/apache/lucene/codecs/lucene74/TooLargeException.java
+new file mode 100644
+index 0000000..0e9a3e5
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/codecs/lucene74/TooLargeException.java
+@@ -0,0 +1,35 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.codecs.lucene74;
++
++import org.apache.lucene.util.MutableBits;
++
++/**
++ * Thrown when resizing a {@link HashBits} instance would make it too large;
++ */
++final class TooLargeException extends RuntimeException {
++
++  /**
++   * An index that has not been {@link MutableBits#clear(int) cleared} yet.
++   */
++  public final int pendingIndex;
++
++  TooLargeException(int pendingIndex) {
++    this.pendingIndex = pendingIndex;
++  }
++
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/lucene74/package-info.java b/lucene/core/src/java/org/apache/lucene/codecs/lucene74/package-info.java
+new file mode 100644
+index 0000000..cf305aa
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/codecs/lucene74/package-info.java
+@@ -0,0 +1,405 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * Lucene 7.4 file format.
++ * 
++ * <h1>Apache Lucene - Index File Formats</h1>
++ * <div>
++ * <ul>
++ * <li><a href="#Introduction">Introduction</a></li>
++ * <li><a href="#Definitions">Definitions</a>
++ *   <ul>
++ *   <li><a href="#Inverted_Indexing">Inverted Indexing</a></li>
++ *   <li><a href="#Types_of_Fields">Types of Fields</a></li>
++ *   <li><a href="#Segments">Segments</a></li>
++ *   <li><a href="#Document_Numbers">Document Numbers</a></li>
++ *   </ul>
++ * </li>
++ * <li><a href="#Overview">Index Structure Overview</a></li>
++ * <li><a href="#File_Naming">File Naming</a></li>
++ * <li><a href="#file-names">Summary of File Extensions</a>
++ *   <ul>
++ *   <li><a href="#Lock_File">Lock File</a></li>
++ *   <li><a href="#History">History</a></li>
++ *   <li><a href="#Limitations">Limitations</a></li>
++ *   </ul>
++ * </li>
++ * </ul>
++ * </div>
++ * <a name="Introduction"></a>
++ * <h2>Introduction</h2>
++ * <div>
++ * <p>This document defines the index file formats used in this version of Lucene.
++ * If you are using a different version of Lucene, please consult the copy of
++ * <code>docs/</code> that was distributed with
++ * the version you are using.</p>
++ * <p>This document attempts to provide a high-level definition of the Apache
++ * Lucene file formats.</p>
++ * </div>
++ * <a name="Definitions"></a>
++ * <h2>Definitions</h2>
++ * <div>
++ * <p>The fundamental concepts in Lucene are index, document, field and term.</p>
++ * <p>An index contains a sequence of documents.</p>
++ * <ul>
++ * <li>A document is a sequence of fields.</li>
++ * <li>A field is a named sequence of terms.</li>
++ * <li>A term is a sequence of bytes.</li>
++ * </ul>
++ * <p>The same sequence of bytes in two different fields is considered a different 
++ * term. Thus terms are represented as a pair: the string naming the field, and the
++ * bytes within the field.</p>
++ * <a name="Inverted_Indexing"></a>
++ * <h3>Inverted Indexing</h3>
++ * <p>The index stores statistics about terms in order to make term-based search
++ * more efficient. Lucene's index falls into the family of indexes known as an
++ * <i>inverted index.</i> This is because it can list, for a term, the documents
++ * that contain it. This is the inverse of the natural relationship, in which
++ * documents list terms.</p>
++ * <a name="Types_of_Fields"></a>
++ * <h3>Types of Fields</h3>
++ * <p>In Lucene, fields may be <i>stored</i>, in which case their text is stored
++ * in the index literally, in a non-inverted manner. Fields that are inverted are
++ * called <i>indexed</i>. A field may be both stored and indexed.</p>
++ * <p>The text of a field may be <i>tokenized</i> into terms to be indexed, or the
++ * text of a field may be used literally as a term to be indexed. Most fields are
++ * tokenized, but sometimes it is useful for certain identifier fields to be
++ * indexed literally.</p>
++ * <p>See the {@link org.apache.lucene.document.Field Field}
++ * java docs for more information on Fields.</p>
++ * <a name="Segments"></a>
++ * <h3>Segments</h3>
++ * <p>Lucene indexes may be composed of multiple sub-indexes, or <i>segments</i>.
++ * Each segment is a fully independent index, which could be searched separately.
++ * Indexes evolve by:</p>
++ * <ol>
++ * <li>Creating new segments for newly added documents.</li>
++ * <li>Merging existing segments.</li>
++ * </ol>
++ * <p>Searches may involve multiple segments and/or multiple indexes, each index
++ * potentially composed of a set of segments.</p>
++ * <a name="Document_Numbers"></a>
++ * <h3>Document Numbers</h3>
++ * <p>Internally, Lucene refers to documents by an integer <i>document number</i>.
++ * The first document added to an index is numbered zero, and each subsequent
++ * document added gets a number one greater than the previous.</p>
++ * <p>Note that a document's number may change, so caution should be taken when
++ * storing these numbers outside of Lucene. In particular, numbers may change in
++ * the following situations:</p>
++ * <ul>
++ * <li>
++ * <p>The numbers stored in each segment are unique only within the segment, and
++ * must be converted before they can be used in a larger context. The standard
++ * technique is to allocate each segment a range of values, based on the range of
++ * numbers used in that segment. To convert a document number from a segment to an
++ * external value, the segment's <i>base</i> document number is added. To convert
++ * an external value back to a segment-specific value, the segment is identified
++ * by the range that the external value is in, and the segment's base value is
++ * subtracted. For example two five document segments might be combined, so that
++ * the first segment has a base value of zero, and the second of five. Document
++ * three from the second segment would have an external value of eight.</p>
++ * </li>
++ * <li>
++ * <p>When documents are deleted, gaps are created in the numbering. These are
++ * eventually removed as the index evolves through merging. Deleted documents are
++ * dropped when segments are merged. A freshly-merged segment thus has no gaps in
++ * its numbering.</p>
++ * </li>
++ * </ul>
++ * </div>
++ * <a name="Overview"></a>
++ * <h2>Index Structure Overview</h2>
++ * <div>
++ * <p>Each segment index maintains the following:</p>
++ * <ul>
++ * <li>
++ * {@link org.apache.lucene.codecs.lucene70.Lucene70SegmentInfoFormat Segment info}.
++ *    This contains metadata about a segment, such as the number of documents,
++ *    what files it uses, 
++ * </li>
++ * <li>
++ * {@link org.apache.lucene.codecs.lucene50.Lucene50FieldInfosFormat Field names}. 
++ *    This contains the set of field names used in the index.
++ * </li>
++ * <li>
++ * {@link org.apache.lucene.codecs.lucene50.Lucene50StoredFieldsFormat Stored Field values}. 
++ * This contains, for each document, a list of attribute-value pairs, where the attributes 
++ * are field names. These are used to store auxiliary information about the document, such as 
++ * its title, url, or an identifier to access a database. The set of stored fields are what is 
++ * returned for each hit when searching. This is keyed by document number.
++ * </li>
++ * <li>
++ * {@link org.apache.lucene.codecs.lucene50.Lucene50PostingsFormat Term dictionary}. 
++ * A dictionary containing all of the terms used in all of the
++ * indexed fields of all of the documents. The dictionary also contains the number
++ * of documents which contain the term, and pointers to the term's frequency and
++ * proximity data.
++ * </li>
++ * <li>
++ * {@link org.apache.lucene.codecs.lucene50.Lucene50PostingsFormat Term Frequency data}. 
++ * For each term in the dictionary, the numbers of all the
++ * documents that contain that term, and the frequency of the term in that
++ * document, unless frequencies are omitted (IndexOptions.DOCS_ONLY)
++ * </li>
++ * <li>
++ * {@link org.apache.lucene.codecs.lucene50.Lucene50PostingsFormat Term Proximity data}. 
++ * For each term in the dictionary, the positions that the
++ * term occurs in each document. Note that this will not exist if all fields in
++ * all documents omit position data.
++ * </li>
++ * <li>
++ * {@link org.apache.lucene.codecs.lucene70.Lucene70NormsFormat Normalization factors}. 
++ * For each field in each document, a value is stored
++ * that is multiplied into the score for hits on that field.
++ * </li>
++ * <li>
++ * {@link org.apache.lucene.codecs.lucene50.Lucene50TermVectorsFormat Term Vectors}. 
++ * For each field in each document, the term vector (sometimes
++ * called document vector) may be stored. A term vector consists of term text and
++ * term frequency. To add Term Vectors to your index see the 
++ * {@link org.apache.lucene.document.Field Field} constructors
++ * </li>
++ * <li>
++ * {@link org.apache.lucene.codecs.lucene70.Lucene70DocValuesFormat Per-document values}. 
++ * Like stored values, these are also keyed by document
++ * number, but are generally intended to be loaded into main memory for fast
++ * access. Whereas stored values are generally intended for summary results from
++ * searches, per-document values are useful for things like scoring factors.
++ * </li>
++ * <li>
++ * {@link org.apache.lucene.codecs.lucene74.Lucene74LiveDocsFormat Live documents}. 
++ * An optional file indicating which documents are live.
++ * </li>
++ * <li>
++ * {@link org.apache.lucene.codecs.lucene60.Lucene60PointsFormat Point values}.
++ * Optional pair of files, recording dimensionally indexed fields, to enable fast
++ * numeric range filtering and large numeric values like BigInteger and BigDecimal (1D)
++ * and geographic shape intersection (2D, 3D).
++ * </li>
++ * </ul>
++ * <p>Details on each of these are provided in their linked pages.</p>
++ * </div>
++ * <a name="File_Naming"></a>
++ * <h2>File Naming</h2>
++ * <div>
++ * <p>All files belonging to a segment have the same name with varying extensions.
++ * The extensions correspond to the different file formats described below. When
++ * using the Compound File format (default for small segments) these files (except
++ * for the Segment info file, the Lock file, and Deleted documents file) are collapsed 
++ * into a single .cfs file (see below for details)</p>
++ * <p>Typically, all segments in an index are stored in a single directory,
++ * although this is not required.</p>
++ * <p>File names are never re-used. That is, when any file is saved
++ * to the Directory it is given a never before used filename. This is achieved
++ * using a simple generations approach. For example, the first segments file is
++ * segments_1, then segments_2, etc. The generation is a sequential long integer
++ * represented in alpha-numeric (base 36) form.</p>
++ * </div>
++ * <a name="file-names"></a>
++ * <h2>Summary of File Extensions</h2>
++ * <div>
++ * <p>The following table summarizes the names and extensions of the files in
++ * Lucene:</p>
++ * <table cellspacing="1" cellpadding="4" summary="lucene filenames by extension">
++ * <tr>
++ * <th>Name</th>
++ * <th>Extension</th>
++ * <th>Brief Description</th>
++ * </tr>
++ * <tr>
++ * <td>{@link org.apache.lucene.index.SegmentInfos Segments File}</td>
++ * <td>segments_N</td>
++ * <td>Stores information about a commit point</td>
++ * </tr>
++ * <tr>
++ * <td><a href="#Lock_File">Lock File</a></td>
++ * <td>write.lock</td>
++ * <td>The Write lock prevents multiple IndexWriters from writing to the same
++ * file.</td>
++ * </tr>
++ * <tr>
++ * <td>{@link org.apache.lucene.codecs.lucene70.Lucene70SegmentInfoFormat Segment Info}</td>
++ * <td>.si</td>
++ * <td>Stores metadata about a segment</td>
++ * </tr>
++ * <tr>
++ * <td>{@link org.apache.lucene.codecs.lucene50.Lucene50CompoundFormat Compound File}</td>
++ * <td>.cfs, .cfe</td>
++ * <td>An optional "virtual" file consisting of all the other index files for
++ * systems that frequently run out of file handles.</td>
++ * </tr>
++ * <tr>
++ * <td>{@link org.apache.lucene.codecs.lucene50.Lucene50FieldInfosFormat Fields}</td>
++ * <td>.fnm</td>
++ * <td>Stores information about the fields</td>
++ * </tr>
++ * <tr>
++ * <td>{@link org.apache.lucene.codecs.lucene50.Lucene50StoredFieldsFormat Field Index}</td>
++ * <td>.fdx</td>
++ * <td>Contains pointers to field data</td>
++ * </tr>
++ * <tr>
++ * <td>{@link org.apache.lucene.codecs.lucene50.Lucene50StoredFieldsFormat Field Data}</td>
++ * <td>.fdt</td>
++ * <td>The stored fields for documents</td>
++ * </tr>
++ * <tr>
++ * <td>{@link org.apache.lucene.codecs.lucene50.Lucene50PostingsFormat Term Dictionary}</td>
++ * <td>.tim</td>
++ * <td>The term dictionary, stores term info</td>
++ * </tr>
++ * <tr>
++ * <td>{@link org.apache.lucene.codecs.lucene50.Lucene50PostingsFormat Term Index}</td>
++ * <td>.tip</td>
++ * <td>The index into the Term Dictionary</td>
++ * </tr>
++ * <tr>
++ * <td>{@link org.apache.lucene.codecs.lucene50.Lucene50PostingsFormat Frequencies}</td>
++ * <td>.doc</td>
++ * <td>Contains the list of docs which contain each term along with frequency</td>
++ * </tr>
++ * <tr>
++ * <td>{@link org.apache.lucene.codecs.lucene50.Lucene50PostingsFormat Positions}</td>
++ * <td>.pos</td>
++ * <td>Stores position information about where a term occurs in the index</td>
++ * </tr>
++ * <tr>
++ * <td>{@link org.apache.lucene.codecs.lucene50.Lucene50PostingsFormat Payloads}</td>
++ * <td>.pay</td>
++ * <td>Stores additional per-position metadata information such as character offsets and user payloads</td>
++ * </tr>
++ * <tr>
++ * <td>{@link org.apache.lucene.codecs.lucene70.Lucene70NormsFormat Norms}</td>
++ * <td>.nvd, .nvm</td>
++ * <td>Encodes length and boost factors for docs and fields</td>
++ * </tr>
++ * <tr>
++ * <td>{@link org.apache.lucene.codecs.lucene70.Lucene70DocValuesFormat Per-Document Values}</td>
++ * <td>.dvd, .dvm</td>
++ * <td>Encodes additional scoring factors or other per-document information.</td>
++ * </tr>
++ * <tr>
++ * <td>{@link org.apache.lucene.codecs.lucene50.Lucene50TermVectorsFormat Term Vector Index}</td>
++ * <td>.tvx</td>
++ * <td>Stores offset into the document data file</td>
++ * </tr>
++ * <tr>
++ * <td>{@link org.apache.lucene.codecs.lucene50.Lucene50TermVectorsFormat Term Vector Data}</td>
++ * <td>.tvd</td>
++ * <td>Contains term vector data.</td>
++ * </tr>
++ * <tr>
++ * <td>{@link org.apache.lucene.codecs.lucene74.Lucene74LiveDocsFormat Live Documents}</td>
++ * <td>.liv</td>
++ * <td>Info about what documents are live</td>
++ * </tr>
++ * <tr>
++ * <td>{@link org.apache.lucene.codecs.lucene60.Lucene60PointsFormat Point values}</td>
++ * <td>.dii, .dim</td>
++ * <td>Holds indexed points, if any</td>
++ * </tr>
++ * </table>
++ * </div>
++ * <a name="Lock_File"></a>
++ * <h2>Lock File</h2>
++ * The write lock, which is stored in the index directory by default, is named
++ * "write.lock". If the lock directory is different from the index directory then
++ * the write lock will be named "XXXX-write.lock" where XXXX is a unique prefix
++ * derived from the full path to the index directory. When this file is present, a
++ * writer is currently modifying the index (adding or removing documents). This
++ * lock file ensures that only one writer is modifying the index at a time.
++ * <a name="History"></a>
++ * <h2>History</h2>
++ * <p>Compatibility notes are provided in this document, describing how file
++ * formats have changed from prior versions:</p>
++ * <ul>
++ * <li>In version 2.1, the file format was changed to allow lock-less commits (ie,
++ * no more commit lock). The change is fully backwards compatible: you can open a
++ * pre-2.1 index for searching or adding/deleting of docs. When the new segments
++ * file is saved (committed), it will be written in the new file format (meaning
++ * no specific "upgrade" process is needed). But note that once a commit has
++ * occurred, pre-2.1 Lucene will not be able to read the index.</li>
++ * <li>In version 2.3, the file format was changed to allow segments to share a
++ * single set of doc store (vectors &amp; stored fields) files. This allows for
++ * faster indexing in certain cases. The change is fully backwards compatible (in
++ * the same way as the lock-less commits change in 2.1).</li>
++ * <li>In version 2.4, Strings are now written as true UTF-8 byte sequence, not
++ * Java's modified UTF-8. See <a href="http://issues.apache.org/jira/browse/LUCENE-510">
++ * LUCENE-510</a> for details.</li>
++ * <li>In version 2.9, an optional opaque Map&lt;String,String&gt; CommitUserData
++ * may be passed to IndexWriter's commit methods (and later retrieved), which is
++ * recorded in the segments_N file. See <a href="http://issues.apache.org/jira/browse/LUCENE-1382">
++ * LUCENE-1382</a> for details. Also,
++ * diagnostics were added to each segment written recording details about why it
++ * was written (due to flush, merge; which OS/JRE was used; etc.). See issue
++ * <a href="http://issues.apache.org/jira/browse/LUCENE-1654">LUCENE-1654</a> for details.</li>
++ * <li>In version 3.0, compressed fields are no longer written to the index (they
++ * can still be read, but on merge the new segment will write them, uncompressed).
++ * See issue <a href="http://issues.apache.org/jira/browse/LUCENE-1960">LUCENE-1960</a> 
++ * for details.</li>
++ * <li>In version 3.1, segments records the code version that created them. See
++ * <a href="http://issues.apache.org/jira/browse/LUCENE-2720">LUCENE-2720</a> for details. 
++ * Additionally segments track explicitly whether or not they have term vectors. 
++ * See <a href="http://issues.apache.org/jira/browse/LUCENE-2811">LUCENE-2811</a> 
++ * for details.</li>
++ * <li>In version 3.2, numeric fields are written as natively to stored fields
++ * file, previously they were stored in text format only.</li>
++ * <li>In version 3.4, fields can omit position data while still indexing term
++ * frequencies.</li>
++ * <li>In version 4.0, the format of the inverted index became extensible via
++ * the {@link org.apache.lucene.codecs.Codec Codec} api. Fast per-document storage
++ * ({@code DocValues}) was introduced. Normalization factors need no longer be a 
++ * single byte, they can be any {@link org.apache.lucene.index.NumericDocValues NumericDocValues}.
++ * Terms need not be unicode strings, they can be any byte sequence. Term offsets 
++ * can optionally be indexed into the postings lists. Payloads can be stored in the 
++ * term vectors.</li>
++ * <li>In version 4.1, the format of the postings list changed to use either
++ * of FOR compression or variable-byte encoding, depending upon the frequency
++ * of the term. Terms appearing only once were changed to inline directly into
++ * the term dictionary. Stored fields are compressed by default. </li>
++ * <li>In version 4.2, term vectors are compressed by default. DocValues has 
++ * a new multi-valued type (SortedSet), that can be used for faceting/grouping/joining
++ * on multi-valued fields.</li>
++ * <li>In version 4.5, DocValues were extended to explicitly represent missing values.</li>
++ * <li>In version 4.6, FieldInfos were extended to support per-field DocValues generation, to 
++ * allow updating NumericDocValues fields.</li>
++ * <li>In version 4.8, checksum footers were added to the end of each index file 
++ * for improved data integrity. Specifically, the last 8 bytes of every index file
++ * contain the zlib-crc32 checksum of the file.</li>
++ * <li>In version 4.9, DocValues has a new multi-valued numeric type (SortedNumeric)
++ * that is suitable for faceting/sorting/analytics.
++ * <li>In version 5.4, DocValues have been improved to store more information on disk:
++ * addresses for binary fields and ord indexes for multi-valued fields.
++ * <li>In version 6.0, Points were added, for multi-dimensional range/distance search.
++ * <li>In version 6.2, new Segment info format that reads/writes the index sort, to support index sorting.
++ * <li>In version 7.0, DocValues have been improved to better support sparse doc values
++ * thanks to an iterator API.
++ * </li>
++ * </ul>
++ * <a name="Limitations"></a>
++ * <h2>Limitations</h2>
++ * <div>
++ * <p>Lucene uses a Java <code>int</code> to refer to
++ * document numbers, and the index file format uses an <code>Int32</code>
++ * on-disk to store document numbers. This is a limitation
++ * of both the index file format and the current implementation. Eventually these
++ * should be replaced with either <code>UInt64</code> values, or
++ * better yet, {@link org.apache.lucene.store.DataOutput#writeVInt VInt} values which have no limit.</p>
++ * </div>
++ */
++package org.apache.lucene.codecs.lucene74;
+diff --git a/lucene/core/src/resources/META-INF/services/org.apache.lucene.codecs.Codec b/lucene/core/src/resources/META-INF/services/org.apache.lucene.codecs.Codec
+index 773c168..a833344 100644
+--- a/lucene/core/src/resources/META-INF/services/org.apache.lucene.codecs.Codec
++++ b/lucene/core/src/resources/META-INF/services/org.apache.lucene.codecs.Codec
+@@ -14,3 +14,4 @@
+ #  limitations under the License.
+ 
+ org.apache.lucene.codecs.lucene70.Lucene70Codec
++org.apache.lucene.codecs.lucene74.Lucene74Codec
+diff --git a/lucene/core/src/test/org/apache/lucene/codecs/lucene70/TestLucene70NormsFormat.java b/lucene/core/src/test/org/apache/lucene/codecs/lucene70/TestLucene70NormsFormat.java
+index cc07cee..f8d4b16 100644
+--- a/lucene/core/src/test/org/apache/lucene/codecs/lucene70/TestLucene70NormsFormat.java
++++ b/lucene/core/src/test/org/apache/lucene/codecs/lucene70/TestLucene70NormsFormat.java
+@@ -18,14 +18,14 @@ package org.apache.lucene.codecs.lucene70;
+ 
+ 
+ import org.apache.lucene.codecs.Codec;
+-import org.apache.lucene.codecs.lucene70.Lucene70Codec;
++import org.apache.lucene.codecs.lucene74.Lucene74Codec;
+ import org.apache.lucene.index.BaseNormsFormatTestCase;
+ 
+ /**
+  * Tests Lucene70NormsFormat
+  */
+ public class TestLucene70NormsFormat extends BaseNormsFormatTestCase {
+-  private final Codec codec = new Lucene70Codec();
++  private final Codec codec = new Lucene74Codec();
+   
+   @Override
+   protected Codec getCodec() {
+diff --git a/lucene/core/src/test/org/apache/lucene/codecs/lucene74/TestHashBits.java b/lucene/core/src/test/org/apache/lucene/codecs/lucene74/TestHashBits.java
+new file mode 100644
+index 0000000..6cf3b1b
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/codecs/lucene74/TestHashBits.java
+@@ -0,0 +1,134 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.codecs.lucene74;
++
++import java.util.Random;
++
++import org.apache.lucene.util.FixedBitSet;
++import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util.TestUtil;
++
++public class TestHashBits extends LuceneTestCase {
++
++  public void testBasics() {
++    HashBits hb = new HashBits(10, false);
++    assertEquals(10, hb.cardinality());
++    for (int i = 0; i < 10; ++i) {
++      assertTrue(hb.get(i));
++    }
++
++    hb.clear(7);
++    assertEquals(9, hb.cardinality());
++    for (int i = 0; i < 10; ++i) {
++      assertEquals(i != 7, hb.get(i));
++    }
++
++    hb.clear(3);
++    assertEquals(8, hb.cardinality());
++    for (int i = 0; i < 10; ++i) {
++      assertEquals(i != 3 && i != 7, hb.get(i));
++    }
++
++    hb.clear(6);
++    assertEquals(7, hb.cardinality());
++    for (int i = 0; i < 10; ++i) {
++      assertEquals("" + i, i != 3 && i != 6 && i != 7, hb.get(i));
++    }
++
++    hb.clear(2);
++    assertEquals(6, hb.cardinality());
++    for (int i = 0; i < 10; ++i) {
++      assertEquals(i != 2 && i != 3 && i != 6 && i != 7, hb.get(i));
++    }
++
++    hb.clear(8);
++    assertEquals(5, hb.cardinality());
++    for (int i = 0; i < 10; ++i) {
++      assertEquals(i != 2 && i != 3 && i != 6 && i != 7 && i != 8, hb.get(i));
++    }
++
++    hb.clear(0);
++    assertEquals(4, hb.cardinality());
++    for (int i = 0; i < 10; ++i) {
++      assertEquals(i == 1 || i == 4 || i == 5 || i == 9, hb.get(i));
++    }
++
++    hb.clear(4);
++    assertEquals(3, hb.cardinality());
++    for (int i = 0; i < 10; ++i) {
++      assertEquals(i == 1 || i == 5 || i == 9, hb.get(i));
++    }
++
++    hb.clear(5);
++    assertEquals(2, hb.cardinality());
++    for (int i = 0; i < 10; ++i) {
++      assertEquals(i == 1 || i == 9, hb.get(i));
++    }
++
++    hb.clear(9);
++    assertEquals(1, hb.cardinality());
++    for (int i = 0; i < 10; ++i) {
++      assertEquals(i == 1, hb.get(i));
++    }
++
++    hb.clear(1);
++    assertEquals(0, hb.cardinality());
++    for (int i = 0; i < 10; ++i) {
++      assertFalse(hb.get(i));
++    }
++  }
++
++  public void testDuelFixedBitSetWithFailure() {
++    for (int iter = 0; iter < 5; ++iter) {
++      doTestDuelFixedBitSet(true);
++    }
++  }
++
++  public void testDuelFixedBitSet() {
++    for (int iter = 0; iter < 5; ++iter) {
++      doTestDuelFixedBitSet(false);
++    }
++  }
++
++  private void doTestDuelFixedBitSet(boolean failIfLargerThhanBitSet) {
++    final Random random = random();
++    final int length = TestUtil.nextInt(random, 1, 1 << TestUtil.nextInt(random, 2, 23));
++
++    HashBits hb = new HashBits(length, failIfLargerThhanBitSet);
++    FixedBitSet fb = new FixedBitSet(length);
++    fb.set(0, length);
++
++    for (int i = 0, end = Math.min(length, 1_000_000); i < end; ++i) {
++      int index = random.nextInt(length);
++      fb.clear(index);
++      try {
++        hb.clear(index);
++      } catch (TooLargeException e) {
++        assertTrue(failIfLargerThhanBitSet);
++        assertTrue(hb.get(e.pendingIndex));
++        assertFalse(fb.get(e.pendingIndex));
++        fb.set(e.pendingIndex);
++        break;
++      }
++      if (random.nextInt(1 + end / 1000) == 0) {
++        assertEquals(hb.toFixedBitSet(), fb);
++      }
++    }
++    assertEquals(hb.toFixedBitSet(), fb);
++  }
++
++}
+diff --git a/lucene/core/src/test/org/apache/lucene/codecs/lucene74/TestLiveDocsBits.java b/lucene/core/src/test/org/apache/lucene/codecs/lucene74/TestLiveDocsBits.java
+new file mode 100644
+index 0000000..8fd0da2
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/codecs/lucene74/TestLiveDocsBits.java
+@@ -0,0 +1,52 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.codecs.lucene74;
++
++import java.util.Random;
++
++import org.apache.lucene.util.FixedBitSet;
++import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util.TestUtil;
++
++public class TestLiveDocsBits extends LuceneTestCase {
++
++  public void testDuelFixedBitSet() {
++    for (int iter = 0; iter < 5; ++iter) {
++      doTestDuelFixedBitSet();
++    }
++  }
++
++  private void doTestDuelFixedBitSet() {
++    final Random random = random();
++    final int length = TestUtil.nextInt(random, 1, 1 << TestUtil.nextInt(random, 2, 23));
++
++    LiveDocsBits hb = new LiveDocsBits(length);
++    FixedBitSet fb = new FixedBitSet(length);
++    fb.set(0, length);
++
++    for (int i = 0, end = Math.min(length, 1_000_000); i < end; ++i) {
++      int index = random.nextInt(length);
++      fb.clear(index);
++      hb.clear(index);
++      if (random.nextInt(1 + end / 1000) == 0) {
++        assertEquals(hb.toFixedBitSet(), fb);
++      }
++    }
++    assertEquals(hb.toFixedBitSet(), fb);
++  }
++
++}
+diff --git a/lucene/suggest/src/test/org/apache/lucene/search/suggest/document/TestSuggestField.java b/lucene/suggest/src/test/org/apache/lucene/search/suggest/document/TestSuggestField.java
+index a6659e0..77e01fd 100644
+--- a/lucene/suggest/src/test/org/apache/lucene/search/suggest/document/TestSuggestField.java
++++ b/lucene/suggest/src/test/org/apache/lucene/search/suggest/document/TestSuggestField.java
+@@ -35,7 +35,7 @@ import org.apache.lucene.analysis.MockAnalyzer;
+ import org.apache.lucene.analysis.TokenStream;
+ import org.apache.lucene.codecs.Codec;
+ import org.apache.lucene.codecs.PostingsFormat;
+-import org.apache.lucene.codecs.lucene70.Lucene70Codec;
++import org.apache.lucene.codecs.lucene74.Lucene74Codec;
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.Field;
+ import org.apache.lucene.document.IntPoint;
+@@ -880,7 +880,7 @@ public class TestSuggestField extends LuceneTestCase {
+   static IndexWriterConfig iwcWithSuggestField(Analyzer analyzer, final Set<String> suggestFields) {
+     IndexWriterConfig iwc = newIndexWriterConfig(random(), analyzer);
+     iwc.setMergePolicy(newLogMergePolicy());
+-    Codec filterCodec = new Lucene70Codec() {
++    Codec filterCodec = new Lucene74Codec() {
+       PostingsFormat postingsFormat = new Completion50PostingsFormat();
+ 
+       @Override
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/util/TestUtil.java b/lucene/test-framework/src/java/org/apache/lucene/util/TestUtil.java
+index 2969788..13e63a5 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/util/TestUtil.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/util/TestUtil.java
+@@ -53,8 +53,8 @@ import org.apache.lucene.codecs.asserting.AssertingCodec;
+ import org.apache.lucene.codecs.blockterms.LuceneFixedGap;
+ import org.apache.lucene.codecs.blocktreeords.BlockTreeOrdsPostingsFormat;
+ import org.apache.lucene.codecs.lucene50.Lucene50PostingsFormat;
+-import org.apache.lucene.codecs.lucene70.Lucene70Codec;
+ import org.apache.lucene.codecs.lucene70.Lucene70DocValuesFormat;
++import org.apache.lucene.codecs.lucene74.Lucene74Codec;
+ import org.apache.lucene.codecs.perfield.PerFieldDocValuesFormat;
+ import org.apache.lucene.codecs.perfield.PerFieldPostingsFormat;
+ import org.apache.lucene.document.BinaryDocValuesField;
+@@ -913,7 +913,7 @@ public final class TestUtil {
+    * This may be different than {@link Codec#getDefault()} because that is randomized. 
+    */
+   public static Codec getDefaultCodec() {
+-    return new Lucene70Codec();
++    return new Lucene74Codec();
+   }
+   
+   /** 

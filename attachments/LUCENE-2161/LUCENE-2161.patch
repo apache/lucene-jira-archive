@@ -1,0 +1,291 @@
+Index: CHANGES.txt
+===================================================================
+--- CHANGES.txt	(revision 890749)
++++ CHANGES.txt	(working copy)
+@@ -100,6 +100,9 @@
+   the FieldCache rather than waiting for the WeakHashMap to release
+   the reference (Mike McCandless)
+ 
++* LUCENE-2161: Improve concurrency of IndexReader, especially in the
++  context of near real-time readers.  (Mike McCandless)
++
+ Build
+ 
+  * LUCENE-2124: Moved the JDK-based collation support from contrib/collation 
+Index: src/java/org/apache/lucene/index/SegmentReader.java
+===================================================================
+--- src/java/org/apache/lucene/index/SegmentReader.java	(revision 890749)
++++ src/java/org/apache/lucene/index/SegmentReader.java	(working copy)
+@@ -588,20 +588,28 @@
+     core.openDocStores(si);
+   }
+ 
++  private boolean checkDeletedCounts() throws IOException {
++    final int recomputedCount = deletedDocs.getRecomputedCount();
++     
++    assert deletedDocs.count() == recomputedCount : "deleted count=" + deletedDocs.count() + " vs recomputed count=" + recomputedCount;
++
++    assert si.getDelCount() == recomputedCount : 
++    "delete count mismatch: info=" + si.getDelCount() + " vs BitVector=" + recomputedCount;
++
++    // Verify # deletes does not exceed maxDoc for this
++    // segment:
++    assert si.getDelCount() <= maxDoc() : 
++    "delete count mismatch: " + recomputedCount + ") exceeds max doc (" + maxDoc() + ") for segment " + si.name;
++
++    return true;
++  }
++
+   private void loadDeletedDocs() throws IOException {
+     // NOTE: the bitvector is stored using the regular directory, not cfs
+     if (hasDeletions(si)) {
+       deletedDocs = new BitVector(directory(), si.getDelFileName());
+       deletedDocsRef = new AtomicInteger(1);
+-     
+-      assert si.getDelCount() == deletedDocs.count() : 
+-        "delete count mismatch: info=" + si.getDelCount() + " vs BitVector=" + deletedDocs.count();
+-
+-      // Verify # deletes does not exceed maxDoc for this
+-      // segment:
+-      assert si.getDelCount() <= maxDoc() : 
+-        "delete count mismatch: " + deletedDocs.count() + ") exceeds max doc (" + maxDoc() + ") for segment " + si.name;
+-
++      assert checkDeletedCounts();
+     } else
+       assert si.getDelCount() == 0;
+   }
+Index: src/java/org/apache/lucene/index/MultiReader.java
+===================================================================
+--- src/java/org/apache/lucene/index/MultiReader.java	(revision 890749)
++++ src/java/org/apache/lucene/index/MultiReader.java	(working copy)
+@@ -39,7 +39,7 @@
+   private boolean[] decrefOnClose;                // remember which subreaders to decRef on close
+   private Map<String,byte[]> normsCache = new HashMap<String,byte[]>();
+   private int maxDoc = 0;
+-  private int numDocs = -1;
++  private volatile int numDocs = -1;
+   private boolean hasDeletions = false;
+   
+  /**
+@@ -224,7 +224,7 @@
+   }
+   
+   @Override
+-  public synchronized int numDocs() {
++  public int numDocs() {
+     // Don't call ensureOpen() here (it could affect performance)
+     if (numDocs == -1) {        // check cache
+       int n = 0;                // cache miss--recompute
+Index: src/java/org/apache/lucene/index/DirectoryReader.java
+===================================================================
+--- src/java/org/apache/lucene/index/DirectoryReader.java	(revision 890749)
++++ src/java/org/apache/lucene/index/DirectoryReader.java	(working copy)
+@@ -62,7 +62,7 @@
+   private int[] starts;                           // 1st docno for each segment
+   private Map<String,byte[]> normsCache = new HashMap<String,byte[]>();
+   private int maxDoc = 0;
+-  private int numDocs = -1;
++  private volatile int numDocs = -1;
+   private boolean hasDeletions = false;
+ 
+   static IndexReader open(final Directory directory, final IndexDeletionPolicy deletionPolicy, final IndexCommit commit, final boolean readOnly,
+@@ -126,7 +126,7 @@
+   DirectoryReader(IndexWriter writer, SegmentInfos infos, int termInfosIndexDivisor) throws IOException {
+     this.directory = writer.getDirectory();
+     this.readOnly = true;
+-    this.segmentInfos = infos;
++    segmentInfos = infos;
+     segmentInfosStart = (SegmentInfos) infos.clone();
+     this.termInfosIndexDivisor = termInfosIndexDivisor;
+     if (!readOnly) {
+@@ -346,22 +346,43 @@
+   }
+ 
+   @Override
+-  public final synchronized IndexReader reopen() throws CorruptIndexException, IOException {
++  public final IndexReader reopen() throws CorruptIndexException, IOException {
+     // Preserve current readOnly
+     return doReopen(readOnly, null);
+   }
+ 
+   @Override
+-  public final synchronized IndexReader reopen(boolean openReadOnly) throws CorruptIndexException, IOException {
++  public final IndexReader reopen(boolean openReadOnly) throws CorruptIndexException, IOException {
+     return doReopen(openReadOnly, null);
+   }
+ 
+   @Override
+-  public final synchronized IndexReader reopen(final IndexCommit commit) throws CorruptIndexException, IOException {
++  public final IndexReader reopen(final IndexCommit commit) throws CorruptIndexException, IOException {
+     return doReopen(true, commit);
+   }
+ 
+-  private synchronized IndexReader doReopen(final boolean openReadOnly, IndexCommit commit) throws CorruptIndexException, IOException {
++  private final IndexReader doReopenFromWriter(boolean openReadOnly, IndexCommit commit) throws CorruptIndexException, IOException {
++    assert readOnly;
++
++    if (!openReadOnly) {
++      throw new IllegalArgumentException("a reader obtained from IndexWriter.getReader() can only be reopened with openReadOnly=true (got false)");
++    }
++
++    if (commit != null) {
++      throw new IllegalArgumentException("a reader obtained from IndexWriter.getReader() cannot currently accept a commit");
++    }
++
++    if (!writer.isOpen(true)) {
++      throw new AlreadyClosedException("cannot reopen: the IndexWriter this reader was obtained from is now closed");
++    }
++
++    // TODO: right now we *always* make a new reader; in
++    // the future we could have write make some effort to
++    // detect that no changes have occurred
++    return writer.getReader();
++  }
++
++  private IndexReader doReopen(final boolean openReadOnly, IndexCommit commit) throws CorruptIndexException, IOException {
+     ensureOpen();
+ 
+     assert commit == null || openReadOnly;
+@@ -369,27 +390,14 @@
+     // If we were obtained by writer.getReader(), re-ask the
+     // writer to get a new reader.
+     if (writer != null) {
+-      assert readOnly;
++      return doReopenFromWriter(openReadOnly, commit);
++    } else {
++      return doReopenNoWriter(openReadOnly, commit);
++    }
++  }
+ 
+-      if (!openReadOnly) {
+-        throw new IllegalArgumentException("a reader obtained from IndexWriter.getReader() can only be reopened with openReadOnly=true (got false)");
+-      }
++  private synchronized IndexReader doReopenNoWriter(final boolean openReadOnly, IndexCommit commit) throws CorruptIndexException, IOException {
+ 
+-      if (commit != null) {
+-        throw new IllegalArgumentException("a reader obtained from IndexWriter.getReader() cannot currently accept a commit");
+-      }
+-
+-      if (!writer.isOpen(true)) {
+-        throw new AlreadyClosedException("cannot reopen: the IndexWriter this reader was obtained from is now closed");
+-      }
+-
+-      // TODO: right now we *always* make a new reader; in
+-      // the future we could have write make some effort to
+-      // detect that no changes have occurred
+-      IndexReader reader = writer.getReader();
+-      return reader;
+-    }
+-
+     if (commit == null) {
+       if (hasChanges) {
+         // We have changes, which means we are not readOnly:
+@@ -492,9 +500,9 @@
+     ensureOpen();
+     return segmentInfos.size() == 1 && !hasDeletions();
+   }
+-  
++
+   @Override
+-  public synchronized int numDocs() {
++  public int numDocs() {
+     // Don't call ensureOpen() here (it could affect performance)
+     if (numDocs == -1) {        // check cache
+       int n = 0;                // cache miss--recompute
+@@ -1278,4 +1286,25 @@
+       return ((TermPositions) current).isPayloadAvailable();
+     }
+   }
++
++  public String segString() {
++    StringBuilder buffer = new StringBuilder();
++    final SegmentInfos infos;
++    if (segmentInfosStart != null) {
++      infos = segmentInfosStart;
++    } else {
++      infos = segmentInfos;
++    }
++    final int count = infos.size();
++    assert count == subReaders.length;
++    for(int i = 0; i < count; i++) {
++      if (i > 0) {
++        buffer.append(' ');
++      }
++      final SegmentInfo info = infos.info(i);
++      buffer.append(info.segString(directory));
++      buffer.append("/" + subReaders[i].numDeletedDocs());
++    }
++    return buffer.toString();
++  }
+ }
+Index: src/java/org/apache/lucene/index/IndexReader.java
+===================================================================
+--- src/java/org/apache/lucene/index/IndexReader.java	(revision 890749)
++++ src/java/org/apache/lucene/index/IndexReader.java	(working copy)
+@@ -1165,4 +1165,15 @@
+   public long getUniqueTermCount() throws IOException {
+     throw new UnsupportedOperationException("this reader does not implement getUniqueTermCount()");
+   }
++
++  /** Expert: returns String description of the segments in
++   *  the index (for debugging).
++   *
++   * <b>NOTE</b>: This API, including the string format in
++   * the returned result, the  is subject to change
++   * suddenly.
++   */
++  public String segString() {
++    return "";
++  }
+ }
+Index: src/java/org/apache/lucene/util/BitVector.java
+===================================================================
+--- src/java/org/apache/lucene/util/BitVector.java	(revision 890749)
++++ src/java/org/apache/lucene/util/BitVector.java	(working copy)
+@@ -36,24 +36,28 @@
+ 
+   private byte[] bits;
+   private int size;
+-  private int count = -1;
++  private int count;
+ 
+   /** Constructs a vector capable of holding <code>n</code> bits. */
+   public BitVector(int n) {
+     size = n;
+     bits = new byte[(size >> 3) + 1];
++    count = 0;
+   }
+   
+   BitVector(byte[] bits, int size) {
+     this.bits = bits;
+     this.size = size;
++    count = -1;
+   }
+   
+   @Override
+   public Object clone() {
+     byte[] copyBits = new byte[bits.length];
+     System.arraycopy(bits, 0, copyBits, 0, bits.length);
+-    return new BitVector(copyBits, size);
++    BitVector clone = new BitVector(copyBits, size);
++    clone.count = count;
++    return clone;
+   }
+   
+   /** Sets the value of <code>bit</code> to one. */
+@@ -121,6 +125,15 @@
+     return count;
+   }
+ 
++  /** For testing */
++  public final int getRecomputedCount() {
++    int c = 0;
++    int end = bits.length;
++    for (int i = 0; i < end; i++)
++      c += BYTE_COUNTS[bits[i] & 0xFF];	  // sum bits per byte
++    return c;
++  }
++
+   private static final byte[] BYTE_COUNTS = {	  // table of bits/byte
+     0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
+     1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5,

@@ -1,0 +1,179 @@
+Index: lucene/core/src/java/org/apache/lucene/codecs/blocktree/FieldReader.java
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/blocktree/FieldReader.java	(revision 523590310775ba7c4276e738183ee6b4e9575167)
++++ lucene/core/src/java/org/apache/lucene/codecs/blocktree/FieldReader.java	(revision )
+@@ -60,7 +60,15 @@
+   final int longsSize;
+   final BlockTreeTermsReader parent;
+ 
+-  final FST<BytesRef> index;
++  private volatile IndexInput indexInClone; // if non-null then 'index' hasn't been loaded yet. See comments below:
++  /**
++   * Prefix index in-memory.
++   * IMPORTANT: "index" is lazily initialized; see {@link #loadIndexIfNotLoaded()}. All accesses
++   * (except {@link Accountable} methods) will call that first (see {@link BlockTreeTermsReader#terms(String)}) in the
++   * same thread.
++   * Accountable methods use synchronization; the index needn't be loaded yet.
++   */
++  FST<BytesRef> index;
+   //private boolean DEBUG;
+ 
+   FieldReader(BlockTreeTermsReader parent, FieldInfo fieldInfo, long numTerms, BytesRef rootCode, long sumTotalTermFreq, long sumDocFreq, int docCount,
+@@ -84,23 +92,28 @@
+ 
+     rootBlockFP = (new ByteArrayDataInput(rootCode.bytes, rootCode.offset, rootCode.length)).readVLong() >>> BlockTreeTermsReader.OUTPUT_FLAGS_NUM_BITS;
+ 
++    //TODO DWS: I don't see how it can be null.  Lots of null checks on "index" in BlockTree could be removed.
+     if (indexIn != null) {
+-      final IndexInput clone = indexIn.clone();
++      // note: BlockTreeTermsReader will keep indexIn open
++      IndexInput indexInClone = indexIn.clone();
+       //System.out.println("start=" + indexStartFP + " field=" + fieldInfo.name);
+-      clone.seek(indexStartFP);
+-      index = new FST<>(clone, ByteSequenceOutputs.getSingleton());
+-        
+-      /*
+-        if (false) {
+-        final String dotFileName = segment + "_" + fieldInfo.name + ".dot";
+-        Writer w = new OutputStreamWriter(new FileOutputStream(dotFileName));
+-        Util.toDot(index, w, false, false);
+-        System.out.println("FST INDEX: SAVED to " + dotFileName);
+-        w.close();
+-        }
+-      */
++      indexInClone.seek(indexStartFP);
++      this.indexInClone = indexInClone; // volatile-write
+     } else {
+-      index = null;
++      this.indexInClone = null; // volatile-write
++    }
++  }
++
++  /** Called by {@link BlockTreeTermsReader#terms(String)} to ensure the FST prefix index is loaded. */
++  void loadIndexIfNotLoaded() throws IOException {
++    // Note: can't avoid volatile-read if index != null since FST's fields aren't all final (unlike say String)
++    if (indexInClone != null) { // double-check lock idiom
++      synchronized (this) {
++        if (indexInClone != null) {
++          index = new FST<>(indexInClone, ByteSequenceOutputs.getSingleton());
++          indexInClone = null; // free memory and also volatile-write
++        }
++      }
+     }
+   }
+ 
+@@ -190,15 +203,19 @@
+     
+   @Override
+   public long ramBytesUsed() {
+-    return BASE_RAM_BYTES_USED + ((index!=null)? index.ramBytesUsed() : 0);
++    synchronized (this) {
++      return BASE_RAM_BYTES_USED + ((index!=null)? index.ramBytesUsed() : 0);
++    }
+   }
+ 
+   @Override
+   public Collection<Accountable> getChildResources() {
+-    if (index == null) {
+-      return Collections.emptyList();
+-    } else {
+-      return Collections.singleton(Accountables.namedAccountable("term index", index));
++    synchronized (this) {
++      if (index == null) {
++        return Collections.emptyList();
++      } else {
++        return Collections.singleton(Accountables.namedAccountable("term index", index));
++      }
+     }
+   }
+ 
+Index: lucene/core/src/java/org/apache/lucene/codecs/blocktree/BlockTreeTermsReader.java
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/blocktree/BlockTreeTermsReader.java	(revision 523590310775ba7c4276e738183ee6b4e9575167)
++++ lucene/core/src/java/org/apache/lucene/codecs/blocktree/BlockTreeTermsReader.java	(revision )
+@@ -34,8 +34,8 @@
+ import org.apache.lucene.index.IndexOptions;
+ import org.apache.lucene.index.SegmentReadState;
+ import org.apache.lucene.index.Terms;
+-import org.apache.lucene.search.PrefixQuery;  // javadocs
+-import org.apache.lucene.search.TermRangeQuery;  // javadocs
++import org.apache.lucene.search.PrefixQuery;
++import org.apache.lucene.search.TermRangeQuery;
+ import org.apache.lucene.store.IndexInput;
+ import org.apache.lucene.util.Accountable;
+ import org.apache.lucene.util.Accountables;
+@@ -81,7 +81,6 @@
+  *
+  * @lucene.experimental
+  */
+-
+ public final class BlockTreeTermsReader extends FieldsProducer {
+ 
+   static final Outputs<BytesRef> FST_OUTPUTS = ByteSequenceOutputs.getSingleton();
+@@ -110,8 +109,10 @@
+   static final String TERMS_INDEX_EXTENSION = "tip";
+   final static String TERMS_INDEX_CODEC_NAME = "BlockTreeTermsIndex";
+ 
+-  // Open input to the main terms dict file (_X.tib)
++  // Open input to the main terms dict file (_X.tim)
+   final IndexInput termsIn;
++  // input to the prefix index of the terms dict (_X.tip)
++  private final IndexInput indexIn;
+ 
+   //private static final boolean DEBUG = BlockTreeTermsWriter.DEBUG;
+ 
+@@ -134,8 +135,7 @@
+   /** Sole constructor. */
+   public BlockTreeTermsReader(PostingsReaderBase postingsReader, SegmentReadState state) throws IOException {
+     boolean success = false;
+-    IndexInput indexIn = null;
+-    
++
+     this.postingsReader = postingsReader;
+     this.segment = state.segmentInfo.name;
+     
+@@ -219,12 +219,11 @@
+         }
+       }
+       
+-      indexIn.close();
+       success = true;
+     } finally {
+       if (!success) {
+-        // this.close() will close in:
+-        IOUtils.closeWhileHandlingException(indexIn, this);
++        // this.close() will close inputs:
++        IOUtils.closeWhileHandlingException(this);
+       }
+     }
+   }
+@@ -253,7 +252,7 @@
+   @Override
+   public void close() throws IOException {
+     try {
+-      IOUtils.close(termsIn, postingsReader);
++      IOUtils.close(termsIn, indexIn, postingsReader);
+     } finally { 
+       // Clear so refs to terms index is GCable even if
+       // app hangs onto us:
+@@ -269,7 +268,13 @@
+   @Override
+   public Terms terms(String field) throws IOException {
+     assert field != null;
+-    return fields.get(field);
++    FieldReader fieldReader = fields.get(field);
++    if (fieldReader != null) {
++      // alternatively we could call this in FieldReader when SegmentTermsEnum/IntersectTermsEnum is needed but
++      //   this spot is probably right.
++      fieldReader.loadIndexIfNotLoaded();
++    }
++    return fieldReader;
+   }
+ 
+   @Override

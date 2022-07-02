@@ -1,0 +1,321 @@
+Index: CHANGES.txt
+===================================================================
+--- CHANGES.txt	(revision 888398)
++++ CHANGES.txt	(working copy)
+@@ -8,6 +8,10 @@
+   class is no longer used by Lucene.  (Gunnar Wagenknecht via Mike
+   McCandless)
+ 
++* LUCENE-2135: Added FieldCache.purge(IndexReader) method to the
++  interface.  Anyone implementing FieldCache externally will need to
++  fix their code to implement this, on upgrading.  (Mike McCandless)
++
+ Changes in runtime behavior
+ 
+ API Changes
+@@ -75,6 +79,10 @@
+   This avoid the overhead of using a PQ unecessarily.  (Mike
+   McCandless)
+ 
++* LUCENE-2135: On IndexReader.close, forcefully evict any entries from
++  the FieldCache rather than waiting for the WeakHashMap to release
++  the reference (Mike McCandless)
++
+ Build
+ 
+ Test Cases
+Index: src/test/org/apache/lucene/index/TestIndexReader.java
+===================================================================
+--- src/test/org/apache/lucene/index/TestIndexReader.java	(revision 888398)
++++ src/test/org/apache/lucene/index/TestIndexReader.java	(working copy)
+@@ -1620,9 +1620,9 @@
+ 
+     // Clone reader
+     IndexReader r2 = (IndexReader) r.clone();
++    final int[] ints2 = FieldCache.DEFAULT.getInts(r2, "number");
+     r.close();
+     assertTrue(r2 != r);
+-    final int[] ints2 = FieldCache.DEFAULT.getInts(r2, "number");
+     r2.close();
+ 
+     assertEquals(1, ints2.length);
+@@ -1656,9 +1656,9 @@
+ 
+     // Reopen reader1 --> reader2
+     IndexReader r2 = r.reopen();
+-    r.close();
+     IndexReader sub0 = r2.getSequentialSubReaders()[0];
+     final int[] ints2 = FieldCache.DEFAULT.getInts(sub0, "number");
++    r.close();
+     r2.close();
+     assertTrue(ints == ints2);
+ 
+@@ -1694,10 +1694,10 @@
+ 
+     // Reopen reader1 --> reader2
+     IndexReader r2 = r.reopen(true);
+-    r.close();
+     assertTrue(r2 instanceof ReadOnlyDirectoryReader);
+     IndexReader[] subs = r2.getSequentialSubReaders();
+     final int[] ints2 = FieldCache.DEFAULT.getInts(subs[0], "number");
++    r.close();
+     r2.close();
+ 
+     assertTrue(subs[0] instanceof ReadOnlySegmentReader);
+Index: src/java/org/apache/lucene/search/FieldCache.java
+===================================================================
+--- src/java/org/apache/lucene/search/FieldCache.java	(revision 888398)
++++ src/java/org/apache/lucene/search/FieldCache.java	(working copy)
+@@ -594,6 +594,15 @@
+   public abstract void purgeAllCaches();
+ 
+   /**
++   * Expert: drops all cache entries associated with this
++   * reader.  NOTE: this reader must precisely match the
++   * reader that the cache entry is keyed on. If you pass a
++   * top-level reader, it usually will have no effect as
++   * Lucene now caches at the segment reader level.
++   */
++  public abstract void purge(IndexReader r);
++
++  /**
+    * If non-null, FieldCacheImpl will warn whenever
+    * entries are created that are not sane according to
+    * {@link org.apache.lucene.util.FieldCacheSanityChecker}.
+Index: src/java/org/apache/lucene/search/FieldCacheImpl.java
+===================================================================
+--- src/java/org/apache/lucene/search/FieldCacheImpl.java	(revision 888398)
++++ src/java/org/apache/lucene/search/FieldCacheImpl.java	(working copy)
+@@ -61,6 +61,12 @@
+   public void purgeAllCaches() {
+     init();
+   }
++
++  public void purge(IndexReader r) {
++    for(Cache c : caches.values()) {
++      c.purge(r);
++    }
++  }
+   
+   public CacheEntry[] getCacheEntries() {
+     List<CacheEntry> result = new ArrayList<CacheEntry>(17);
+@@ -144,6 +150,14 @@
+     protected abstract Object createValue(IndexReader reader, Entry key)
+         throws IOException;
+ 
++    /** Remove this reader from the cache, if present. */
++    public void purge(IndexReader r) {
++      Object readerKey = r.getFieldCacheKey();
++      synchronized(readerCache) {
++        readerCache.remove(readerKey);
++      }
++    }
++
+     public Object get(IndexReader reader, Entry key) throws IOException {
+       Map<Entry,Object> innerCache;
+       Object value;
+Index: src/java/org/apache/lucene/index/ParallelReader.java
+===================================================================
+--- src/java/org/apache/lucene/index/ParallelReader.java	(revision 888398)
++++ src/java/org/apache/lucene/index/ParallelReader.java	(working copy)
+@@ -21,6 +21,7 @@
+ import org.apache.lucene.document.FieldSelector;
+ import org.apache.lucene.document.FieldSelectorResult;
+ import org.apache.lucene.document.Fieldable;
++import org.apache.lucene.search.FieldCache; // not great (circular); used only to purge FieldCache entry on close
+ 
+ import java.io.IOException;
+ import java.util.*;
+@@ -470,6 +471,8 @@
+         readers.get(i).close();
+       }
+     }
++
++    FieldCache.DEFAULT.purge(this);
+   }
+ 
+   @Override
+Index: src/java/org/apache/lucene/index/SegmentReader.java
+===================================================================
+--- src/java/org/apache/lucene/index/SegmentReader.java	(revision 888398)
++++ src/java/org/apache/lucene/index/SegmentReader.java	(working copy)
+@@ -37,6 +37,7 @@
+ import org.apache.lucene.store.IndexOutput;
+ import org.apache.lucene.util.BitVector;
+ import org.apache.lucene.util.CloseableThreadLocal;
++import org.apache.lucene.search.FieldCache; // not great (circular); used only to purge FieldCache entry on close
+ 
+ /** @version $Id */
+ /**
+@@ -92,16 +93,19 @@
+     final int readBufferSize;
+     final int termsIndexDivisor;
+ 
++    private final SegmentReader origInstance;
++
+     TermInfosReader tis;
+     FieldsReader fieldsReaderOrig;
+     TermVectorsReader termVectorsReaderOrig;
+     CompoundFileReader cfsReader;
+     CompoundFileReader storeCFSReader;
+ 
+-    CoreReaders(Directory dir, SegmentInfo si, int readBufferSize, int termsIndexDivisor) throws IOException {
++    CoreReaders(SegmentReader origInstance, Directory dir, SegmentInfo si, int readBufferSize, int termsIndexDivisor) throws IOException {
+       segment = si.name;
+       this.readBufferSize = readBufferSize;
+       this.dir = dir;
++      this.origInstance = origInstance;
+ 
+       boolean success = false;
+ 
+@@ -232,6 +236,11 @@
+         if (storeCFSReader != null) {
+           storeCFSReader.close();
+         }
++
++        // Force FieldCache to evict our entries at this point
++        if (freqStream != null) {
++          FieldCache.DEFAULT.purge(origInstance);
++        }
+       }
+     }
+ 
+@@ -573,7 +582,7 @@
+     boolean success = false;
+ 
+     try {
+-      instance.core = new CoreReaders(dir, si, readBufferSize, termInfosIndexDivisor);
++      instance.core = new CoreReaders(instance, dir, si, readBufferSize, termInfosIndexDivisor);
+       if (doOpenStores) {
+         instance.core.openDocStores(si);
+       }
+Index: src/java/org/apache/lucene/index/MultiReader.java
+===================================================================
+--- src/java/org/apache/lucene/index/MultiReader.java	(revision 888398)
++++ src/java/org/apache/lucene/index/MultiReader.java	(working copy)
+@@ -29,6 +29,7 @@
+ import org.apache.lucene.index.DirectoryReader.MultiTermEnum;
+ import org.apache.lucene.index.DirectoryReader.MultiTermPositions;
+ import org.apache.lucene.search.Similarity;
++import org.apache.lucene.search.FieldCache; // not great (circular); used only to purge FieldCache entry on close
+ 
+ /** An IndexReader which reads multiple indexes, appending
+  * their content. */
+@@ -415,6 +416,11 @@
+         subReaders[i].close();
+       }
+     }
++
++    // NOTE: only needed in case someone had asked for
++    // FieldCache for top-level reader (which is generally
++    // not a good idea):
++    FieldCache.DEFAULT.purge(this);
+   }
+   
+   @Override
+Index: src/java/org/apache/lucene/index/DirectoryReader.java
+===================================================================
+--- src/java/org/apache/lucene/index/DirectoryReader.java	(revision 888398)
++++ src/java/org/apache/lucene/index/DirectoryReader.java	(working copy)
+@@ -36,6 +36,7 @@
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.Lock;
+ import org.apache.lucene.store.LockObtainFailedException;
++import org.apache.lucene.search.FieldCache; // not great (circular); used only to purge FieldCache entry on close
+ 
+ /** 
+  * An IndexReader which reads indexes with multiple segments.
+@@ -854,6 +855,12 @@
+         if (ioe == null) ioe = e;
+       }
+     }
++
++    // NOTE: only needed in case someone had asked for
++    // FieldCache for top-level reader (which is generally
++    // not a good idea):
++    FieldCache.DEFAULT.purge(this);
++
+     // throw the first exception
+     if (ioe != null) throw ioe;
+   }
+Index: src/java/org/apache/lucene/index/FilterIndexReader.java
+===================================================================
+--- src/java/org/apache/lucene/index/FilterIndexReader.java	(revision 888398)
++++ src/java/org/apache/lucene/index/FilterIndexReader.java	(working copy)
+@@ -20,6 +20,7 @@
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.FieldSelector;
+ import org.apache.lucene.store.Directory;
++import org.apache.lucene.search.FieldCache; // not great (circular); used only to purge FieldCache entry on close
+ 
+ import java.io.IOException;
+ import java.util.Collection;
+@@ -241,9 +242,16 @@
+   protected void doCommit(Map<String,String> commitUserData) throws IOException { in.commit(commitUserData); }
+   
+   @Override
+-  protected void doClose() throws IOException { in.close(); }
++  protected void doClose() throws IOException {
++    in.close();
+ 
++    // NOTE: only needed in case someone had asked for
++    // FieldCache for top-level reader (which is generally
++    // not a good idea):
++    FieldCache.DEFAULT.purge(this);
++  }
+ 
++
+   @Override
+   public Collection<String> getFieldNames(IndexReader.FieldOption fieldNames) {
+     ensureOpen();
+@@ -272,4 +280,12 @@
+   public IndexReader[] getSequentialSubReaders() {
+     return in.getSequentialSubReaders();
+   }
++
++  /** If the subclass of FilteredIndexReader modifies the
++   *  contents of the FieldCache, you must override this
++   *  method to provide a different key */
++  @Override
++  public Object getFieldCacheKey() {
++    return in.getFieldCacheKey();
++  }
+ }
+Index: tags/lucene_3_0_back_compat_tests_20091207/src/test/org/apache/lucene/index/TestIndexReader.java
+===================================================================
+--- tags/lucene_3_0_back_compat_tests_20091207/src/test/org/apache/lucene/index/TestIndexReader.java	(revision 888493)
++++ tags/lucene_3_0_back_compat_tests_20091207/src/test/org/apache/lucene/index/TestIndexReader.java	(working copy)
+@@ -1622,9 +1622,9 @@
+ 
+     // Clone reader
+     IndexReader r2 = (IndexReader) r.clone();
++    final int[] ints2 = FieldCache.DEFAULT.getInts(r2, "number");
+     r.close();
+     assertTrue(r2 != r);
+-    final int[] ints2 = FieldCache.DEFAULT.getInts(r2, "number");
+     r2.close();
+ 
+     assertEquals(1, ints2.length);
+@@ -1658,9 +1658,9 @@
+ 
+     // Reopen reader1 --> reader2
+     IndexReader r2 = r.reopen();
+-    r.close();
+     IndexReader sub0 = r2.getSequentialSubReaders()[0];
+     final int[] ints2 = FieldCache.DEFAULT.getInts(sub0, "number");
++    r.close();
+     r2.close();
+     assertTrue(ints == ints2);
+ 
+@@ -1696,10 +1696,10 @@
+ 
+     // Reopen reader1 --> reader2
+     IndexReader r2 = r.reopen(true);
+-    r.close();
+     assertTrue(r2 instanceof ReadOnlyDirectoryReader);
+     IndexReader[] subs = r2.getSequentialSubReaders();
+     final int[] ints2 = FieldCache.DEFAULT.getInts(subs[0], "number");
++    r.close();
+     r2.close();
+ 
+     assertTrue(subs[0] instanceof ReadOnlySegmentReader);

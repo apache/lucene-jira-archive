@@ -1,0 +1,1876 @@
+Index: lucene/facet/src/java/org/apache/lucene/facet/search/CountingFacetsCollector.java
+===================================================================
+--- lucene/facet/src/java/org/apache/lucene/facet/search/CountingFacetsCollector.java	(révision 1438955)
++++ lucene/facet/src/java/org/apache/lucene/facet/search/CountingFacetsCollector.java	(copie de travail)
+@@ -7,6 +7,7 @@
+ import java.util.Comparator;
+ import java.util.HashMap;
+ import java.util.List;
++import java.util.Map;
+ import java.util.Map.Entry;
+ 
+ import org.apache.lucene.facet.index.params.CategoryListParams;
+@@ -24,12 +25,16 @@
+ import org.apache.lucene.index.AtomicReaderContext;
+ import org.apache.lucene.index.DocValues;
+ import org.apache.lucene.index.DocValues.Source;
++import org.apache.lucene.index.SegmentReader;
+ import org.apache.lucene.search.Collector;
+ import org.apache.lucene.search.Scorer;
++import org.apache.lucene.util.ArrayUtil;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.FixedBitSet;
++import org.apache.lucene.util.IntsRef;
+ import org.apache.lucene.util.PriorityQueue;
+ import org.apache.lucene.util.encoding.DGapVInt8IntDecoder;
++import org.apache.lucene.util.packed.PackedInts;
+ 
+ /*
+  * Licensed to the Apache Software Foundation (ASF) under one or more
+@@ -84,6 +89,77 @@
+  */
+ public class CountingFacetsCollector extends FacetsCollector {
+   
++  private static class PackedBytes {
++
++    private static final int MAX_BYTES;
++    static {
++      int maxBytes = 0;
++      for (int bpv = 1; bpv <= 32; ++bpv) {
++        maxBytes = Math.max(maxBytes, PackedInts.getDecoder(PackedInts.Format.PACKED, PackedInts.VERSION_CURRENT, bpv).byteBlockCount());
++      }
++      MAX_BYTES = maxBytes;
++    }
++
++    private final byte[] bytes;
++    private final PackedInts.Encoder encoder;
++    private final PackedInts.Decoder decoder;
++    private final int bitsPerValue;
++    private final int mask;
++    private final int shift;
++    private final IntsRef ints;
++
++    private PackedBytes(int valueCount, int bitsPerValue) {
++      this.bitsPerValue = bitsPerValue;
++      // nocommit cannot grow beyond 2G
++      int byteCount = (int) PackedInts.Format.PACKED.byteCount(PackedInts.VERSION_CURRENT, valueCount, bitsPerValue);
++      bytes = new byte[byteCount + MAX_BYTES];
++      this.encoder = PackedInts.getEncoder(PackedInts.Format.PACKED, PackedInts.VERSION_CURRENT, bitsPerValue);
++      this.decoder = PackedInts.getDecoder(PackedInts.Format.PACKED, PackedInts.VERSION_CURRENT, bitsPerValue);
++      switch (decoder.byteValueCount()) {
++        case 1:
++          shift = 0;
++          mask = 0;
++          break;
++        case 2:
++          shift = 1;
++          mask = 1;
++          break;
++        case 4:
++          shift = 2;
++          mask = 3;
++          break;
++        case 8:
++          shift = 3;
++          mask = 7;
++          break;
++        default: throw new AssertionError();
++      }
++      this.ints = new IntsRef(8);
++    }
++
++    public IntsRef get(int index, int length) {
++      assert length > 0;
++      ints.offset = index & mask;
++      ints.length = length;
++      if (ints.ints.length < ints.offset + length + 7) {
++        ints.ints = new int[ArrayUtil.oversize(ints.offset + length + 7, 4)];
++      }
++      final int iterations = (ints.offset + length + mask) >>> shift;
++      final int bytesOffset = (int) (((long) (index - ints.offset) * bitsPerValue) >>> 3);
++      decoder.decode(bytes, bytesOffset, ints.ints, 0, iterations);
++      return ints;
++    }
++
++    public void set(int index, int value) {
++      final int i = index & mask;
++      final int bytesOffset = (int) (((long) (index - i) * bitsPerValue) >>> 3);
++      decoder.decode(bytes, bytesOffset, ints.ints, 0, 1);
++      ints.ints[i] = value;
++      encoder.encode(ints.ints, 0, bytes, bytesOffset, 1);
++    }
++  
++  }
++
+   private final FacetSearchParams fsp;
+   private final OrdinalPolicy ordinalPolicy;
+   private final TaxonomyReader taxoReader;
+@@ -92,11 +168,109 @@
+   private final int[] counts;
+   private final String facetsField;
+   private final boolean useDirectSource;
+-  private final HashMap<Source,FixedBitSet> matchingDocs = new HashMap<Source,FixedBitSet>();
++  private final HashMap<CachedInts,FixedBitSet> matchingDocs = new HashMap<CachedInts,FixedBitSet>();
+   
+   private DocValues facetsValues;
+   private FixedBitSet bits;
+-  
++  private static int totalBytes;
++
++  private static class CachedInts {
++    //final PackedInts.Reader docOffset;
++    //final PackedInts.Reader values;
++    final int[] docOffset;
++    //final int[] values;
++    final PackedBytes values;
++
++    public CachedInts(Source source, int maxDoc) {
++      System.out.println("build cache maxDoc=" + maxDoc);
++      BytesRef buf = new BytesRef();
++
++      // First pass: just count how many ords we have:
++
++      // nocommit this could require long?:
++      int totOrds = 0;
++      int maxOrd = -1;
++
++      for(int docID=0;docID<maxDoc;docID++) {
++        source.getBytes(docID, buf);
++        if (buf.length > 0) {
++          // this document has facets
++          int upto = buf.offset + buf.length;
++          int ord = 0;
++          int offset = buf.offset;
++          int prev = 0;
++          while (offset < upto) {
++            byte b = buf.bytes[offset++];
++            if (b >= 0) {
++              prev = ord = ((ord << 7) | b) + prev;
++              maxOrd = Math.max(maxOrd, ord);
++              totOrds++;
++              ord = 0;
++            } else {
++              ord = (ord << 7) | (b & 0x7F);
++            }
++          }
++        }
++      }
++
++      // Second pass: encode to packed ints:
++      /*
++      PackedInts.Mutable docOffset = PackedInts.getMutable(maxDoc+1, PackedInts.bitsRequired(totOrds), PackedInts.DEFAULT);
++      PackedInts.Mutable values = PackedInts.getMutable(totOrds, PackedInts.bitsRequired(maxOrd), PackedInts.DEFAULT);
++      */
++      System.out.println("  docOffset = " + (4*(maxDoc+1)) + " bytes");
++      System.out.println("  values = " + (4*totOrds) + " bytes");
++      docOffset = new int[maxDoc+1];
++      //values = new int[totOrds];
++      values = new PackedBytes(totOrds, PackedInts.bitsRequired(maxOrd));
++      totalBytes += 4*(maxDoc+1+totOrds);
++      System.out.println("  total=" + (totalBytes/1024) + " KB");
++      totOrds = 0;
++      for(int docID=0;docID<maxDoc;docID++) {
++        //docOffset.set(docID, totOrds);
++        docOffset[docID] = totOrds;
++        source.getBytes(docID, buf);
++        if (buf.length > 0) {
++          // this document has facets
++          int upto = buf.offset + buf.length;
++          int ord = 0;
++          int offset = buf.offset;
++          int prev = 0;
++          while (offset < upto) {
++            byte b = buf.bytes[offset++];
++            if (b >= 0) {
++              prev = ord = ((ord << 7) | b) + prev;
++              //values.set(totOrds, ord);
++              //values[totOrds] = ord;
++              values.set(totOrds, ord);
++              totOrds++;
++              ord = 0;
++            } else {
++              ord = (ord << 7) | (b & 0x7F);
++            }
++          }
++        }
++      }
++      //docOffset.set(maxDoc, totOrds);
++      docOffset[maxDoc] = totOrds;
++
++      //this.docOffset = docOffset;
++      //this.values = values;
++    }
++  }
++
++  private static final Map<Source,CachedInts> sourceCache = new HashMap<Source,CachedInts>();
++
++  private static synchronized CachedInts getCachedInts(Source source, int maxDoc, SegmentReader r) {
++    CachedInts ci = sourceCache.get(source);
++    if (ci == null) {
++      System.out.println("r=" + r);
++      ci = new CachedInts(source, maxDoc);
++      sourceCache.put(source, ci);
++    }
++    return ci;
++  }
++    
+   public CountingFacetsCollector(FacetSearchParams fsp, TaxonomyReader taxoReader) {
+     this(fsp, taxoReader, new FacetArrays(taxoReader.getSize()), false);
+   }
+@@ -174,7 +348,7 @@
+     if (facetsValues != null) {
+       Source facetSource = useDirectSource ? facetsValues.getDirectSource() : facetsValues.getSource();
+       bits = new FixedBitSet(context.reader().maxDoc());
+-      matchingDocs.put(facetSource, bits);
++      matchingDocs.put(getCachedInts(facetSource, context.reader().maxDoc(), (SegmentReader) context.reader()), bits);
+     }
+   }
+   
+@@ -188,31 +362,30 @@
+   }
+   
+   private void countFacets() {
+-    for (Entry<Source,FixedBitSet> entry : matchingDocs.entrySet()) {
+-      Source facetsSource = entry.getKey();
++    for (Entry<CachedInts,FixedBitSet> entry : matchingDocs.entrySet()) {
++      //PackedInts.Reader docOffset = entry.getKey().docOffset;
++      //PackedInts.Reader values = entry.getKey().values;
++      int[] docOffset = entry.getKey().docOffset;
++      //int[] values = entry.getKey().values;
++      final PackedBytes values = entry.getKey().values;
+       FixedBitSet bits = entry.getValue();
+       int doc = 0;
+       int length = bits.length();
+       while (doc < length && (doc = bits.nextSetBit(doc)) != -1) {
+-        facetsSource .getBytes(doc, buf);
+-        if (buf.length > 0) {
+-          // this document has facets
+-          int upto = buf.offset + buf.length;
+-          int ord = 0;
+-          int offset = buf.offset;
+-          int prev = 0;
+-          while (offset < upto) {
+-            byte b = buf.bytes[offset++];
+-            if (b >= 0) {
+-              prev = ord = ((ord << 7) | b) + prev;
+-              counts[ord]++;
+-              ord = 0;
+-            } else {
+-              ord = (ord << 7) | (b & 0x7F);
+-            }
+-          }
++        //int start = (int) docOffset.get(doc);
++        //int end = (int) docOffset.get(doc+1);
++        int start = docOffset[doc];
++        int end = docOffset[doc+1];
++        // nocommit use bulk read api:
++        /*for(int i=start;i<end;i++) {
++          //counts[(int) values.get(i)]++;
++          counts[values[i]]++;
++        }*/
++        final IntsRef v = values.get(start, end - start);
++        for (int i = 0; i < v.length; ++i) {
++          counts[v.ints[v.offset + i]]++;
+         }
+-        ++doc;
++        doc++;
+       }
+     }
+   }
+@@ -357,7 +530,7 @@
+       // both have the same value, break tie by ordinal
+       return a.ordinal < b.ordinal;
+     }
+-    
++   
+   }
+   
+ }
+Index: lucene/core/src/test/org/apache/lucene/util/packed/TestPackedInts.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/util/packed/TestPackedInts.java	(révision 1438948)
++++ lucene/core/src/test/org/apache/lucene/util/packed/TestPackedInts.java	(copie de travail)
+@@ -203,7 +203,7 @@
+           if (!format.isSupported(bpv)) {
+             continue;
+           }
+-          final long byteCount = format.byteCount(version, valueCount, bpv); 
++          final long byteCount = format.byteCount(version, valueCount, bpv);
+           String msg = "format=" + format + ",version=" + version + ",valueCount=" + valueCount + ",bpv=" + bpv;
+ 
+           // test iterator
+@@ -697,16 +697,22 @@
+ 
+         final PackedInts.Encoder encoder = PackedInts.getEncoder(format, PackedInts.VERSION_CURRENT, bpv);
+         final PackedInts.Decoder decoder = PackedInts.getDecoder(format, PackedInts.VERSION_CURRENT, bpv);
+-        final int blockCount = encoder.blockCount();
+-        final int valueCount = encoder.valueCount();
+-        assertEquals(blockCount, decoder.blockCount());
+-        assertEquals(valueCount, decoder.valueCount());
++        final int longBlockCount = encoder.longBlockCount();
++        final int longValueCount = encoder.longValueCount();
++        final int byteBlockCount = encoder.byteBlockCount();
++        final int byteValueCount = encoder.byteValueCount();
++        assertEquals(longBlockCount, decoder.longBlockCount());
++        assertEquals(longValueCount, decoder.longValueCount());
++        assertEquals(byteBlockCount, decoder.byteBlockCount());
++        assertEquals(byteValueCount, decoder.byteValueCount());
+ 
+-        final int iterations = random().nextInt(100);
++        final int longIterations = random().nextInt(100);
++        final int byteIterations = longIterations * longValueCount / byteValueCount;
++        assertEquals(longIterations * longValueCount, byteIterations * byteValueCount);
+         final int blocksOffset = random().nextInt(100);
+         final int valuesOffset = random().nextInt(100);
+         final int blocksOffset2 = random().nextInt(100);
+-        final int blocksLen = iterations * blockCount;
++        final int blocksLen = longIterations * longBlockCount;
+ 
+         // 1. generate random inputs
+         final long[] blocks = new long[blocksOffset + blocksLen];
+@@ -720,8 +726,8 @@
+         }
+ 
+         // 2. decode
+-        final long[] values = new long[valuesOffset + iterations * valueCount];
+-        decoder.decode(blocks, blocksOffset, values, valuesOffset, iterations);
++        final long[] values = new long[valuesOffset + longIterations * longValueCount];
++        decoder.decode(blocks, blocksOffset, values, valuesOffset, longIterations);
+         for (long value : values) {
+           assertTrue(value <= PackedInts.maxValue(bpv));
+         }
+@@ -729,7 +735,7 @@
+         final int[] intValues;
+         if (bpv <= 32) {
+           intValues = new int[values.length];
+-          decoder.decode(blocks, blocksOffset, intValues, valuesOffset, iterations);
++          decoder.decode(blocks, blocksOffset, intValues, valuesOffset, longIterations);
+           assertTrue(equals(intValues, values));
+         } else {
+           intValues = null;
+@@ -737,21 +743,21 @@
+ 
+         // 3. re-encode
+         final long[] blocks2 = new long[blocksOffset2 + blocksLen];
+-        encoder.encode(values, valuesOffset, blocks2, blocksOffset2, iterations);
++        encoder.encode(values, valuesOffset, blocks2, blocksOffset2, longIterations);
+         assertArrayEquals(msg, Arrays.copyOfRange(blocks, blocksOffset, blocks.length),
+             Arrays.copyOfRange(blocks2, blocksOffset2, blocks2.length));
+         // test encoding from int[]
+         if (bpv <= 32) {
+           final long[] blocks3 = new long[blocks2.length];
+-          encoder.encode(intValues, valuesOffset, blocks3, blocksOffset2, iterations);
++          encoder.encode(intValues, valuesOffset, blocks3, blocksOffset2, longIterations);
+           assertArrayEquals(msg, blocks2, blocks3);
+         }
+ 
+         // 4. byte[] decoding
+         final byte[] byteBlocks = new byte[8 * blocks.length];
+         ByteBuffer.wrap(byteBlocks).asLongBuffer().put(blocks);
+-        final long[] values2 = new long[valuesOffset + iterations * valueCount];
+-        decoder.decode(byteBlocks, blocksOffset * 8, values2, valuesOffset, iterations);
++        final long[] values2 = new long[valuesOffset + longIterations * longValueCount];
++        decoder.decode(byteBlocks, blocksOffset * 8, values2, valuesOffset, byteIterations);
+         for (long value : values2) {
+           assertTrue(msg, value <= PackedInts.maxValue(bpv));
+         }
+@@ -759,18 +765,18 @@
+         // test decoding to int[]
+         if (bpv <= 32) {
+           final int[] intValues2 = new int[values2.length];
+-          decoder.decode(byteBlocks, blocksOffset * 8, intValues2, valuesOffset, iterations);
++          decoder.decode(byteBlocks, blocksOffset * 8, intValues2, valuesOffset, byteIterations);
+           assertTrue(msg, equals(intValues2, values2));
+         }
+ 
+         // 5. byte[] encoding
+         final byte[] blocks3 = new byte[8 * (blocksOffset2 + blocksLen)];
+-        encoder.encode(values, valuesOffset, blocks3, 8 * blocksOffset2, iterations);
++        encoder.encode(values, valuesOffset, blocks3, 8 * blocksOffset2, byteIterations);
+         assertEquals(msg, LongBuffer.wrap(blocks2), ByteBuffer.wrap(blocks3).asLongBuffer());
+         // test encoding from int[]
+         if (bpv <= 32) {
+           final byte[] blocks4 = new byte[blocks3.length];
+-          encoder.encode(intValues, valuesOffset, blocks4, 8 * blocksOffset2, iterations);
++          encoder.encode(intValues, valuesOffset, blocks4, 8 * blocksOffset2, byteIterations);
+           assertArrayEquals(msg, blocks3, blocks4);
+         }
+       }
+Index: lucene/core/src/java/org/apache/lucene/codecs/lucene41/ForUtil.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/lucene41/ForUtil.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/codecs/lucene41/ForUtil.java	(copie de travail)
+@@ -63,7 +63,7 @@
+           }
+           final PackedInts.Decoder decoder = PackedInts.getDecoder(format, version, bpv);
+           final int iterations = computeIterations(decoder);
+-          maxDataSize = Math.max(maxDataSize, iterations * decoder.valueCount());
++          maxDataSize = Math.max(maxDataSize, iterations * decoder.byteValueCount());
+         }
+       }
+     }
+@@ -75,7 +75,7 @@
+    * values with the provided {@link Decoder}.
+    */
+   private static int computeIterations(PackedInts.Decoder decoder) {
+-    return (int) Math.ceil((float) BLOCK_SIZE / decoder.valueCount());
++    return (int) Math.ceil((float) BLOCK_SIZE / decoder.byteValueCount());
+   }
+ 
+   /**
+@@ -165,9 +165,9 @@
+     assert numBits > 0 && numBits <= 32 : numBits;
+     final PackedInts.Encoder encoder = encoders[numBits];
+     final int iters = iterations[numBits];
+-    assert iters * encoder.valueCount() >= BLOCK_SIZE;
++    assert iters * encoder.longValueCount() >= BLOCK_SIZE;
+     final int encodedSize = encodedSizes[numBits];
+-    assert (iters * encoder.blockCount()) << 3 >= encodedSize;
++    assert (iters * encoder.longBlockCount()) << 3 >= encodedSize;
+ 
+     out.writeByte((byte) numBits);
+ 
+@@ -198,7 +198,7 @@
+ 
+     final PackedInts.Decoder decoder = decoders[numBits];
+     final int iters = iterations[numBits];
+-    assert iters * decoder.valueCount() >= BLOCK_SIZE;
++    assert iters * decoder.byteValueCount() >= BLOCK_SIZE;
+ 
+     decoder.decode(encoded, 0, decoded, 0, iters);
+   }
+Index: lucene/core/src/java/org/apache/lucene/util/packed/gen_BulkOperation.py
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/gen_BulkOperation.py	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/gen_BulkOperation.py	(copie de travail)
+@@ -72,13 +72,13 @@
+    * <code>ramBudget / (8 * (b + v))</code> (since a long is 8 bytes).
+    */
+   public final int computeIterations(int valueCount, int ramBudget) {
+-    final int iterations = (ramBudget >>> 3) / (blockCount() + valueCount());
++    final int iterations = ramBudget / (byteBlockCount() + 8 * byteValueCount());
+     if (iterations == 0) {
+       // at least 1
+       return 1;
+-    } else if ((iterations - 1) * blockCount() >= valueCount) {
++    } else if ((iterations - 1) * byteBlockCount() >= valueCount) {
+       // don't allocate for more than the size of the reader
+-      return (int) Math.ceil((double) valueCount / valueCount());
++      return (int) Math.ceil((double) valueCount / byteValueCount());
+     } else {
+       return iterations;
+     }
+@@ -131,14 +131,11 @@
+   return (blocks, values)
+ 
+ def packed64(bpv, f):
+-  blocks, values = block_value_count(bpv)
+   mask = (1 << bpv) - 1
+ 
+   f.write("\n")
+   f.write("  public BulkOperationPacked%d() {\n" %bpv)
+   f.write("    super(%d);\n" %bpv)
+-  f.write("    assert blockCount() == %d;\n" %blocks)
+-  f.write("    assert valueCount() == %d;\n" %values)
+   f.write("  }\n\n")
+ 
+   if bpv == 64:
+@@ -215,20 +212,19 @@
+   if bits < bpv:
+     f.write("    throw new UnsupportedOperationException();\n")
+   else:
+-
+     if is_power_of_two(bpv) and bpv < 8:
+-      f.write("    for (int j = 0; j < 8 * iterations; ++j) {\n")
++      f.write("    for (int j = 0; j < iterations; ++j) {\n")
+       f.write("      final byte block = blocks[blocksOffset++];\n")
+       for shift in xrange(8 - bpv, 0, -bpv):
+         f.write("      values[valuesOffset++] = (block >>> %d) & %d;\n" %(shift, mask))
+       f.write("      values[valuesOffset++] = block & %d;\n" %mask)
+       f.write("    }\n")
+     elif bpv == 8:
+-      f.write("    for (int j = 0; j < 8 * iterations; ++j) {\n")
++      f.write("    for (int j = 0; j < iterations; ++j) {\n")
+       f.write("      values[valuesOffset++] = blocks[blocksOffset++] & 0xFF;\n")
+       f.write("    }\n")
+     elif is_power_of_two(bpv) and bpv > 8:
+-      f.write("    for (int j = 0; j < %d * iterations; ++j) {\n" %(64 / bpv))
++      f.write("    for (int j = 0; j < iterations; ++j) {\n")
+       m = bits <= 32 and "0xFF" or "0xFFL"
+       f.write("      values[valuesOffset++] =")
+       for i in xrange(bpv / 8 - 1):
+@@ -236,7 +232,7 @@
+       f.write(" (blocks[blocksOffset++] & %s);\n" %m)
+       f.write("    }\n")
+     else:
+-      f.write("    for (int i = 0; i < 8 * iterations; ++i) {\n")
++      f.write("    for (int i = 0; i < iterations; ++i) {\n")
+       for i in xrange(0, byte_values):
+         byte_start = i * bpv / 8
+         bit_start = (i * bpv) % 8
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked8.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked8.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked8.java	(copie de travail)
+@@ -26,8 +26,6 @@
+ 
+   public BulkOperationPacked8() {
+     super(8);
+-    assert blockCount() == 1;
+-    assert valueCount() == 8;
+   }
+ 
+   @Override
+@@ -42,7 +40,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, int[] values, int valuesOffset, int iterations) {
+-    for (int j = 0; j < 8 * iterations; ++j) {
++    for (int j = 0; j < iterations; ++j) {
+       values[valuesOffset++] = blocks[blocksOffset++] & 0xFF;
+     }
+   }
+@@ -59,7 +57,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, long[] values, int valuesOffset, int iterations) {
+-    for (int j = 0; j < 8 * iterations; ++j) {
++    for (int j = 0; j < iterations; ++j) {
+       values[valuesOffset++] = blocks[blocksOffset++] & 0xFF;
+     }
+   }
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked.java	(copie de travail)
+@@ -1,5 +1,7 @@
+ package org.apache.lucene.util.packed;
+ 
++import java.util.Arrays;
++
+ /*
+  * Licensed to the Apache Software Foundation (ASF) under one or more
+  * contributor license agreements.  See the NOTICE file distributed with
+@@ -23,9 +25,12 @@
+ class BulkOperationPacked extends BulkOperation {
+ 
+   private final int bitsPerValue;
+-  private final int blockCount;
+-  private final int valueCount;
++  private final int longBlockCount;
++  private final int longValueCount;
++  private final int byteBlockCount;
++  private final int byteValueCount;
+   private final long mask;
++  private final int intMask;
+ 
+   public BulkOperationPacked(int bitsPerValue) {
+     this.bitsPerValue = bitsPerValue;
+@@ -34,31 +39,50 @@
+     while ((blocks & 1) == 0) {
+       blocks >>>= 1;
+     }
+-    this.blockCount = blocks;
+-    this.valueCount = 64 * blockCount / bitsPerValue;
++    this.longBlockCount = blocks;
++    this.longValueCount = 64 * longBlockCount / bitsPerValue;
++    int byteBlockCount = 8 * longBlockCount;
++    int byteValueCount = longValueCount;
++    while ((byteBlockCount & 1) == 0 && (byteValueCount & 1) == 0) {
++      byteBlockCount >>>= 1;
++      byteValueCount >>>= 1;
++    }
++    this.byteBlockCount = byteBlockCount;
++    this.byteValueCount = byteValueCount;
+     if (bitsPerValue == 64) {
+       this.mask = ~0L;
+     } else {
+       this.mask = (1L << bitsPerValue) - 1;
+     }
+-    assert valueCount * bitsPerValue == 64 * blockCount;
++    this.intMask = (int) mask;
++    assert longValueCount * bitsPerValue == 64 * longBlockCount;
+   }
+ 
+   @Override
+-  public int blockCount() {
+-    return blockCount;
++  public int longBlockCount() {
++    return longBlockCount;
+   }
+ 
+   @Override
+-  public int valueCount() {
+-    return valueCount;
++  public int longValueCount() {
++    return longValueCount;
+   }
+ 
+   @Override
++  public int byteBlockCount() {
++    return byteBlockCount;
++  }
++
++  @Override
++  public int byteValueCount() {
++    return byteValueCount;
++  }
++
++  @Override
+   public void decode(long[] blocks, int blocksOffset, long[] values,
+       int valuesOffset, int iterations) {
+     int bitsLeft = 64;
+-    for (int i = 0; i < valueCount * iterations; ++i) {
++    for (int i = 0; i < longValueCount * iterations; ++i) {
+       bitsLeft -= bitsPerValue;
+       if (bitsLeft < 0) {
+         values[valuesOffset++] =
+@@ -74,22 +98,30 @@
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, long[] values,
+       int valuesOffset, int iterations) {
+-    int blockBitsLeft = 8;
+-    int valueBitsLeft = bitsPerValue;
+-    long nextValue = 0;
+-    for (int end = valuesOffset + iterations * valueCount; valuesOffset < end; ) {
+-      if (valueBitsLeft > blockBitsLeft) {
+-        nextValue |= (blocks[blocksOffset++] & ((1L << blockBitsLeft) - 1)) << (valueBitsLeft - blockBitsLeft);
+-        valueBitsLeft -= blockBitsLeft;
+-        blockBitsLeft = 8;
++    int end = valuesOffset + byteValueCount * iterations;
++    long nextValue = 0L;
++    int bitsLeft = bitsPerValue;
++    for (int i = 0; i < iterations * byteBlockCount; ++i) {
++      final long bytes = blocks[blocksOffset++] & 0xFFL;
++      if (bitsLeft > 8) {
++        // just buffer
++        bitsLeft -= 8;
++        nextValue |= bytes << bitsLeft;
+       } else {
+-        nextValue |= ((blocks[blocksOffset] & 0xFFL) >>> (blockBitsLeft - valueBitsLeft)) & ((1L << valueBitsLeft) - 1);
+-        values[valuesOffset++] = nextValue;
+-        nextValue = 0;
+-        blockBitsLeft -= valueBitsLeft;
+-        valueBitsLeft = bitsPerValue;
++        // flush
++        int bits = 8 - bitsLeft;
++        values[valuesOffset++] = nextValue | (bytes >>> bits);
++        while (bits >= bitsPerValue) {
++          bits -= bitsPerValue;
++          values[valuesOffset++] = (bytes >>> bits) & mask;
++        }
++        // then buffer
++        bitsLeft = bitsPerValue - bits;
++        nextValue = (bytes & ((1L << bits) - 1)) << bitsLeft;
+       }
+     }
++    assert bitsLeft == bitsPerValue;
++    assert valuesOffset == end;
+   }
+ 
+   @Override
+@@ -99,7 +131,7 @@
+       throw new UnsupportedOperationException("Cannot decode " + bitsPerValue + "-bits values into an int[]");
+     }
+     int bitsLeft = 64;
+-    for (int i = 0; i < valueCount * iterations; ++i) {
++    for (int i = 0; i < longValueCount * iterations; ++i) {
+       bitsLeft -= bitsPerValue;
+       if (bitsLeft < 0) {
+         values[valuesOffset++] = (int)
+@@ -115,25 +147,28 @@
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, int[] values,
+       int valuesOffset, int iterations) {
+-    if (bitsPerValue > 32) {
+-      throw new UnsupportedOperationException("Cannot decode " + bitsPerValue + "-bits values into an int[]");
+-    }
+-    int blockBitsLeft = 8;
+-    int valueBitsLeft = bitsPerValue;
+     int nextValue = 0;
+-    for (int end = valuesOffset + iterations * valueCount; valuesOffset < end; ) {
+-      if (valueBitsLeft > blockBitsLeft) {
+-        nextValue |= (blocks[blocksOffset++] & ((1L << blockBitsLeft) - 1)) << (valueBitsLeft - blockBitsLeft);
+-        valueBitsLeft -= blockBitsLeft;
+-        blockBitsLeft = 8;
++    int bitsLeft = bitsPerValue;
++    for (int i = 0; i < iterations * byteBlockCount; ++i) {
++      final int bytes = blocks[blocksOffset++] & 0xFF;
++      if (bitsLeft > 8) {
++        // just buffer
++        bitsLeft -= 8;
++        nextValue |= bytes << bitsLeft;
+       } else {
+-        nextValue |= ((blocks[blocksOffset] & 0xFFL) >>> (blockBitsLeft - valueBitsLeft)) & ((1L << valueBitsLeft) - 1);
+-        values[valuesOffset++] = nextValue;
+-        nextValue = 0;
+-        blockBitsLeft -= valueBitsLeft;
+-        valueBitsLeft = bitsPerValue;
++        // flush
++        int bits = 8 - bitsLeft;
++        values[valuesOffset++] = nextValue | (bytes >>> bits);
++        while (bits >= bitsPerValue) {
++          bits -= bitsPerValue;
++          values[valuesOffset++] = (bytes >>> bits) & intMask;
++        }
++        // then buffer
++        bitsLeft = bitsPerValue - bits;
++        nextValue = (bytes & ((1 << bits) - 1)) << bitsLeft;
+       }
+     }
++    assert bitsLeft == bitsPerValue;
+   }
+ 
+   @Override
+@@ -141,7 +176,7 @@
+       int blocksOffset, int iterations) {
+     long nextBlock = 0;
+     int bitsLeft = 64;
+-    for (int i = 0; i < valueCount * iterations; ++i) {
++    for (int i = 0; i < longValueCount * iterations; ++i) {
+       bitsLeft -= bitsPerValue;
+       if (bitsLeft > 0) {
+         nextBlock |= values[valuesOffset++] << bitsLeft;
+@@ -164,7 +199,7 @@
+       int blocksOffset, int iterations) {
+     long nextBlock = 0;
+     int bitsLeft = 64;
+-    for (int i = 0; i < valueCount * iterations; ++i) {
++    for (int i = 0; i < longValueCount * iterations; ++i) {
+       bitsLeft -= bitsPerValue;
+       if (bitsLeft > 0) {
+         nextBlock |= (values[valuesOffset++] & 0xFFFFFFFFL) << bitsLeft;
+@@ -185,47 +220,70 @@
+   @Override
+   public void encode(long[] values, int valuesOffset, byte[] blocks,
+       int blocksOffset, int iterations) {
+-    long nextBlock = 0;
+-    int bitsLeft = 64;
+-    for (int i = 0; i < valueCount * iterations; ++i) {
+-      bitsLeft -= bitsPerValue;
+-      if (bitsLeft > 0) {
+-        nextBlock |= values[valuesOffset++] << bitsLeft;
+-      } else if (bitsLeft == 0) {
+-        nextBlock |= values[valuesOffset++];
+-        blocksOffset = writeLong(nextBlock, blocks, blocksOffset);
+-        nextBlock = 0;
+-        bitsLeft = 64;
+-      } else { // bitsLeft < 0
+-        nextBlock |= values[valuesOffset] >>> -bitsLeft;
+-        blocksOffset = writeLong(nextBlock, blocks, blocksOffset);
+-        nextBlock = (values[valuesOffset++] & ((1L << -bitsLeft) - 1)) << (64 + bitsLeft);
+-        bitsLeft += 64;
++    int nextBlock = 0;
++    int bitsLeft = 8;
++    for (int i = 0; i < byteValueCount * iterations; ++i) {
++      final long v = values[valuesOffset++];
++      assert bitsPerValue == 64 || PackedInts.bitsRequired(v) <= bitsPerValue;
++      if (bitsPerValue < bitsLeft) {
++        // just buffer
++        nextBlock |= v << (bitsLeft - bitsPerValue);
++        bitsLeft -= bitsPerValue;
++      } else {
++        // flush as many blocks as possible
++        int bits = bitsPerValue - bitsLeft;
++        blocks[blocksOffset++] = (byte) (nextBlock | (v >>> bits));
++        while (bits >= 8) {
++          bits -= 8;
++          blocks[blocksOffset++] = (byte) (v >>> bits);
++        }
++        // then buffer
++        bitsLeft = 8 - bits;
++        nextBlock = (int) ((v & ((1L << bits) - 1)) << bitsLeft);
+       }
+     }
++    assert bitsLeft == 8;
+   }
+ 
+   @Override
+   public void encode(int[] values, int valuesOffset, byte[] blocks,
+       int blocksOffset, int iterations) {
+-    long nextBlock = 0;
+-    int bitsLeft = 64;
+-    for (int i = 0; i < valueCount * iterations; ++i) {
+-      bitsLeft -= bitsPerValue;
+-      if (bitsLeft > 0) {
+-        nextBlock |= (values[valuesOffset++] & 0xFFFFFFFFL) << bitsLeft;
+-      } else if (bitsLeft == 0) {
+-        nextBlock |= (values[valuesOffset++] & 0xFFFFFFFFL);
+-        blocksOffset = writeLong(nextBlock, blocks, blocksOffset);
+-        nextBlock = 0;
+-        bitsLeft = 64;
+-      } else { // bitsLeft < 0
+-        nextBlock |= (values[valuesOffset] & 0xFFFFFFFFL) >>> -bitsLeft;
+-        blocksOffset = writeLong(nextBlock, blocks, blocksOffset);
+-        nextBlock = (values[valuesOffset++] & ((1L << -bitsLeft) - 1)) << (64 + bitsLeft);
+-        bitsLeft += 64;
++    int nextBlock = 0;
++    int bitsLeft = 8;
++    for (int i = 0; i < byteValueCount * iterations; ++i) {
++      final int v = values[valuesOffset++];
++      assert PackedInts.bitsRequired(v & 0xFFFFFFFFL) <= bitsPerValue;
++      if (bitsPerValue < bitsLeft) {
++        // just buffer
++        nextBlock |= v << (bitsLeft - bitsPerValue);
++        bitsLeft -= bitsPerValue;
++      } else {
++        // flush as many blocks as possible
++        int bits = bitsPerValue - bitsLeft;
++        blocks[blocksOffset++] = (byte) (nextBlock | (v >>> bits));
++        while (bits >= 8) {
++          bits -= 8;
++          blocks[blocksOffset++] = (byte) (v >>> bits);
++        }
++        // then buffer
++        bitsLeft = 8 - bits;
++        nextBlock = (v & ((1 << bits) - 1)) << bitsLeft;
+       }
+     }
++    assert bitsLeft == 8;
+   }
+ 
++  public static void main(String[] args) {
++    BulkOperation op = new BulkOperationPacked(1);
++    byte[] bytes = new byte[10];
++    long[] values = new long[] {0, 1, 2, 3, 4, 5, 6, 7};
++    System.out.println(op.byteBlockCount());
++    System.out.println(op.byteValueCount());
++    op.encode(values, 0, bytes, 0, 1);
++    System.out.println(Arrays.toString(bytes));
++    long[] restored = new long[8];
++    op.decode(bytes, 0, restored, 0, 1);
++    System.out.println(Arrays.toString(restored));
++  }
++  
+ }
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked21.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked21.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked21.java	(copie de travail)
+@@ -26,8 +26,6 @@
+ 
+   public BulkOperationPacked21() {
+     super(21);
+-    assert blockCount() == 21;
+-    assert valueCount() == 64;
+   }
+ 
+   @Override
+@@ -123,7 +121,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, int[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final int byte0 = blocks[blocksOffset++] & 0xFF;
+       final int byte1 = blocks[blocksOffset++] & 0xFF;
+       final int byte2 = blocks[blocksOffset++] & 0xFF;
+@@ -249,7 +247,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, long[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final long byte0 = blocks[blocksOffset++] & 0xFF;
+       final long byte1 = blocks[blocksOffset++] & 0xFF;
+       final long byte2 = blocks[blocksOffset++] & 0xFF;
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked13.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked13.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked13.java	(copie de travail)
+@@ -26,8 +26,6 @@
+ 
+   public BulkOperationPacked13() {
+     super(13);
+-    assert blockCount() == 13;
+-    assert valueCount() == 64;
+   }
+ 
+   @Override
+@@ -115,7 +113,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, int[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final int byte0 = blocks[blocksOffset++] & 0xFF;
+       final int byte1 = blocks[blocksOffset++] & 0xFF;
+       values[valuesOffset++] = (byte0 << 5) | (byte1 >>> 3);
+@@ -225,7 +223,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, long[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final long byte0 = blocks[blocksOffset++] & 0xFF;
+       final long byte1 = blocks[blocksOffset++] & 0xFF;
+       values[valuesOffset++] = (byte0 << 5) | (byte1 >>> 3);
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked17.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked17.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked17.java	(copie de travail)
+@@ -26,8 +26,6 @@
+ 
+   public BulkOperationPacked17() {
+     super(17);
+-    assert blockCount() == 17;
+-    assert valueCount() == 64;
+   }
+ 
+   @Override
+@@ -119,7 +117,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, int[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final int byte0 = blocks[blocksOffset++] & 0xFF;
+       final int byte1 = blocks[blocksOffset++] & 0xFF;
+       final int byte2 = blocks[blocksOffset++] & 0xFF;
+@@ -237,7 +235,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, long[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final long byte0 = blocks[blocksOffset++] & 0xFF;
+       final long byte1 = blocks[blocksOffset++] & 0xFF;
+       final long byte2 = blocks[blocksOffset++] & 0xFF;
+Index: lucene/core/src/java/org/apache/lucene/util/packed/Packed64.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/Packed64.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/Packed64.java	(copie de travail)
+@@ -140,9 +140,9 @@
+     final PackedInts.Decoder decoder = BulkOperation.of(PackedInts.Format.PACKED, bitsPerValue);
+ 
+     // go to the next block where the value does not span across two blocks
+-    final int offsetInBlocks = index % decoder.valueCount();
++    final int offsetInBlocks = index % decoder.longValueCount();
+     if (offsetInBlocks != 0) {
+-      for (int i = offsetInBlocks; i < decoder.valueCount() && len > 0; ++i) {
++      for (int i = offsetInBlocks; i < decoder.longValueCount() && len > 0; ++i) {
+         arr[off++] = get(index++);
+         --len;
+       }
+@@ -152,12 +152,12 @@
+     }
+ 
+     // bulk get
+-    assert index % decoder.valueCount() == 0;
++    assert index % decoder.longValueCount() == 0;
+     int blockIndex = (int) ((long) index * bitsPerValue) >>> BLOCK_BITS;
+     assert (((long)index * bitsPerValue) & MOD_MASK) == 0;
+-    final int iterations = len / decoder.valueCount();
++    final int iterations = len / decoder.longValueCount();
+     decoder.decode(blocks, blockIndex, arr, off, iterations);
+-    final int gotValues = iterations * decoder.valueCount();
++    final int gotValues = iterations * decoder.longValueCount();
+     index += gotValues;
+     len -= gotValues;
+     assert len >= 0;
+@@ -204,9 +204,9 @@
+     final PackedInts.Encoder encoder = BulkOperation.of(PackedInts.Format.PACKED, bitsPerValue);
+ 
+     // go to the next block where the value does not span across two blocks
+-    final int offsetInBlocks = index % encoder.valueCount();
++    final int offsetInBlocks = index % encoder.longValueCount();
+     if (offsetInBlocks != 0) {
+-      for (int i = offsetInBlocks; i < encoder.valueCount() && len > 0; ++i) {
++      for (int i = offsetInBlocks; i < encoder.longValueCount() && len > 0; ++i) {
+         set(index++, arr[off++]);
+         --len;
+       }
+@@ -216,12 +216,12 @@
+     }
+ 
+     // bulk set
+-    assert index % encoder.valueCount() == 0;
++    assert index % encoder.longValueCount() == 0;
+     int blockIndex = (int) ((long) index * bitsPerValue) >>> BLOCK_BITS;
+     assert (((long)index * bitsPerValue) & MOD_MASK) == 0;
+-    final int iterations = len / encoder.valueCount();
++    final int iterations = len / encoder.longValueCount();
+     encoder.encode(arr, off, blocks, blockIndex, iterations);
+-    final int setValues = iterations * encoder.valueCount();
++    final int setValues = iterations * encoder.longValueCount();
+     index += setValues;
+     len -= setValues;
+     assert len >= 0;
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked1.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked1.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked1.java	(copie de travail)
+@@ -26,8 +26,6 @@
+ 
+   public BulkOperationPacked1() {
+     super(1);
+-    assert blockCount() == 1;
+-    assert valueCount() == 64;
+   }
+ 
+   @Override
+@@ -42,7 +40,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, int[] values, int valuesOffset, int iterations) {
+-    for (int j = 0; j < 8 * iterations; ++j) {
++    for (int j = 0; j < iterations; ++j) {
+       final byte block = blocks[blocksOffset++];
+       values[valuesOffset++] = (block >>> 7) & 1;
+       values[valuesOffset++] = (block >>> 6) & 1;
+@@ -67,7 +65,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, long[] values, int valuesOffset, int iterations) {
+-    for (int j = 0; j < 8 * iterations; ++j) {
++    for (int j = 0; j < iterations; ++j) {
+       final byte block = blocks[blocksOffset++];
+       values[valuesOffset++] = (block >>> 7) & 1;
+       values[valuesOffset++] = (block >>> 6) & 1;
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked5.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked5.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked5.java	(copie de travail)
+@@ -26,8 +26,6 @@
+ 
+   public BulkOperationPacked5() {
+     super(5);
+-    assert blockCount() == 5;
+-    assert valueCount() == 64;
+   }
+ 
+   @Override
+@@ -107,7 +105,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, int[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final int byte0 = blocks[blocksOffset++] & 0xFF;
+       values[valuesOffset++] = byte0 >>> 3;
+       final int byte1 = blocks[blocksOffset++] & 0xFF;
+@@ -201,7 +199,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, long[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final long byte0 = blocks[blocksOffset++] & 0xFF;
+       values[valuesOffset++] = byte0 >>> 3;
+       final long byte1 = blocks[blocksOffset++] & 0xFF;
+Index: lucene/core/src/java/org/apache/lucene/util/packed/Packed64SingleBlock.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/Packed64SingleBlock.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/Packed64SingleBlock.java	(copie de travail)
+@@ -88,8 +88,8 @@
+     // bulk get
+     assert index % valuesPerBlock == 0;
+     final PackedInts.Decoder decoder = BulkOperation.of(PackedInts.Format.PACKED_SINGLE_BLOCK, bitsPerValue);
+-    assert decoder.blockCount() == 1;
+-    assert decoder.valueCount() == valuesPerBlock;
++    assert decoder.longBlockCount() == 1;
++    assert decoder.longValueCount() == valuesPerBlock;
+     final int blockIndex = index / valuesPerBlock;
+     final int nblocks = (index + len) / valuesPerBlock - blockIndex;
+     decoder.decode(blocks, blockIndex, arr, off, nblocks);
+@@ -132,8 +132,8 @@
+     // bulk set
+     assert index % valuesPerBlock == 0;
+     final BulkOperation op = BulkOperation.of(PackedInts.Format.PACKED_SINGLE_BLOCK, bitsPerValue);
+-    assert op.blockCount() == 1;
+-    assert op.valueCount() == valuesPerBlock;
++    assert op.longBlockCount() == 1;
++    assert op.longValueCount() == valuesPerBlock;
+     final int blockIndex = index / valuesPerBlock;
+     final int nblocks = (index + len) / valuesPerBlock - blockIndex;
+     op.encode(arr, off, blocks, blockIndex, nblocks);
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked9.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked9.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked9.java	(copie de travail)
+@@ -26,8 +26,6 @@
+ 
+   public BulkOperationPacked9() {
+     super(9);
+-    assert blockCount() == 9;
+-    assert valueCount() == 64;
+   }
+ 
+   @Override
+@@ -111,7 +109,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, int[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final int byte0 = blocks[blocksOffset++] & 0xFF;
+       final int byte1 = blocks[blocksOffset++] & 0xFF;
+       values[valuesOffset++] = (byte0 << 1) | (byte1 >>> 7);
+@@ -213,7 +211,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, long[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final long byte0 = blocks[blocksOffset++] & 0xFF;
+       final long byte1 = blocks[blocksOffset++] & 0xFF;
+       values[valuesOffset++] = (byte0 << 1) | (byte1 >>> 7);
+Index: lucene/core/src/java/org/apache/lucene/util/packed/PackedWriter.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/PackedWriter.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/PackedWriter.java	(copie de travail)
+@@ -42,8 +42,8 @@
+     this.format = format;
+     encoder = BulkOperation.of(format, bitsPerValue);
+     iterations = encoder.computeIterations(valueCount, mem);
+-    nextBlocks = new byte[8 * iterations * encoder.blockCount()];
+-    nextValues = new long[iterations * encoder.valueCount()];
++    nextBlocks = new byte[iterations * encoder.byteBlockCount()];
++    nextValues = new long[iterations * encoder.byteValueCount()];
+     off = 0;
+     written = 0;
+     finished = false;
+Index: lucene/core/src/java/org/apache/lucene/util/packed/PackedInts.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/PackedInts.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/PackedInts.java	(copie de travail)
+@@ -280,17 +280,30 @@
+   public static interface Decoder {
+ 
+     /**
+-     * The minimum number of long blocks to decode in a single call.
++     * The minimum number of long blocks to encode in a single iteration, when
++     * using long encoding.
+      */
+-    int blockCount();
++    int longBlockCount();
+ 
+     /**
+-     * The number of values that can be stored in <code>blockCount()</code> long
++     * The number of values that can be stored in {@link #longBlockCount()} long
+      * blocks.
+      */
+-    int valueCount();
++    int longValueCount();
+ 
+     /**
++     * The minimum number of byte blocks to encode in a single iteration, when
++     * using byte encoding.
++     */
++    int byteBlockCount();
++
++    /**
++     * The number of values that can be stored in {@link #byteBlockCount()} byte
++     * blocks.
++     */
++    int byteValueCount();
++
++    /**
+      * Read <code>iterations * blockCount()</code> blocks from <code>blocks</code>,
+      * decode them and write <code>iterations * valueCount()</code> values into
+      * <code>values</code>.
+@@ -350,17 +363,30 @@
+   public static interface Encoder {
+ 
+     /**
+-     * The minimum number of long blocks to encode in a single call.
++     * The minimum number of long blocks to encode in a single iteration, when
++     * using long encoding.
+      */
+-    int blockCount();
++    int longBlockCount();
+ 
+     /**
+-     * The number of values that can be stored in <code>blockCount()</code> long
++     * The number of values that can be stored in {@link #longBlockCount()} long
+      * blocks.
+      */
+-    int valueCount();
++    int longValueCount();
+ 
+     /**
++     * The minimum number of byte blocks to encode in a single iteration, when
++     * using byte encoding.
++     */
++    int byteBlockCount();
++
++    /**
++     * The number of values that can be stored in {@link #byteBlockCount()} byte
++     * blocks.
++     */
++    int byteValueCount();
++
++    /**
+      * Read <code>iterations * valueCount()</code> values from <code>values</code>,
+      * encode them and write <code>iterations * blockCount()</code> blocks into
+      * <code>blocks</code>.
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked10.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked10.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked10.java	(copie de travail)
+@@ -26,8 +26,6 @@
+ 
+   public BulkOperationPacked10() {
+     super(10);
+-    assert blockCount() == 5;
+-    assert valueCount() == 32;
+   }
+ 
+   @Override
+@@ -75,7 +73,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, int[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final int byte0 = blocks[blocksOffset++] & 0xFF;
+       final int byte1 = blocks[blocksOffset++] & 0xFF;
+       values[valuesOffset++] = (byte0 << 2) | (byte1 >>> 6);
+@@ -133,7 +131,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, long[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final long byte0 = blocks[blocksOffset++] & 0xFF;
+       final long byte1 = blocks[blocksOffset++] & 0xFF;
+       values[valuesOffset++] = (byte0 << 2) | (byte1 >>> 6);
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked22.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked22.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked22.java	(copie de travail)
+@@ -26,8 +26,6 @@
+ 
+   public BulkOperationPacked22() {
+     super(22);
+-    assert blockCount() == 11;
+-    assert valueCount() == 32;
+   }
+ 
+   @Override
+@@ -81,7 +79,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, int[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final int byte0 = blocks[blocksOffset++] & 0xFF;
+       final int byte1 = blocks[blocksOffset++] & 0xFF;
+       final int byte2 = blocks[blocksOffset++] & 0xFF;
+@@ -151,7 +149,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, long[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final long byte0 = blocks[blocksOffset++] & 0xFF;
+       final long byte1 = blocks[blocksOffset++] & 0xFF;
+       final long byte2 = blocks[blocksOffset++] & 0xFF;
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked14.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked14.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked14.java	(copie de travail)
+@@ -26,8 +26,6 @@
+ 
+   public BulkOperationPacked14() {
+     super(14);
+-    assert blockCount() == 7;
+-    assert valueCount() == 32;
+   }
+ 
+   @Override
+@@ -77,7 +75,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, int[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final int byte0 = blocks[blocksOffset++] & 0xFF;
+       final int byte1 = blocks[blocksOffset++] & 0xFF;
+       values[valuesOffset++] = (byte0 << 6) | (byte1 >>> 2);
+@@ -139,7 +137,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, long[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final long byte0 = blocks[blocksOffset++] & 0xFF;
+       final long byte1 = blocks[blocksOffset++] & 0xFF;
+       values[valuesOffset++] = (byte0 << 6) | (byte1 >>> 2);
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked18.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked18.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked18.java	(copie de travail)
+@@ -26,8 +26,6 @@
+ 
+   public BulkOperationPacked18() {
+     super(18);
+-    assert blockCount() == 9;
+-    assert valueCount() == 32;
+   }
+ 
+   @Override
+@@ -79,7 +77,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, int[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final int byte0 = blocks[blocksOffset++] & 0xFF;
+       final int byte1 = blocks[blocksOffset++] & 0xFF;
+       final int byte2 = blocks[blocksOffset++] & 0xFF;
+@@ -145,7 +143,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, long[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final long byte0 = blocks[blocksOffset++] & 0xFF;
+       final long byte1 = blocks[blocksOffset++] & 0xFF;
+       final long byte2 = blocks[blocksOffset++] & 0xFF;
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked2.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked2.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked2.java	(copie de travail)
+@@ -26,8 +26,6 @@
+ 
+   public BulkOperationPacked2() {
+     super(2);
+-    assert blockCount() == 1;
+-    assert valueCount() == 32;
+   }
+ 
+   @Override
+@@ -42,7 +40,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, int[] values, int valuesOffset, int iterations) {
+-    for (int j = 0; j < 8 * iterations; ++j) {
++    for (int j = 0; j < iterations; ++j) {
+       final byte block = blocks[blocksOffset++];
+       values[valuesOffset++] = (block >>> 6) & 3;
+       values[valuesOffset++] = (block >>> 4) & 3;
+@@ -63,7 +61,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, long[] values, int valuesOffset, int iterations) {
+-    for (int j = 0; j < 8 * iterations; ++j) {
++    for (int j = 0; j < iterations; ++j) {
+       final byte block = blocks[blocksOffset++];
+       values[valuesOffset++] = (block >>> 6) & 3;
+       values[valuesOffset++] = (block >>> 4) & 3;
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked6.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked6.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked6.java	(copie de travail)
+@@ -26,8 +26,6 @@
+ 
+   public BulkOperationPacked6() {
+     super(6);
+-    assert blockCount() == 3;
+-    assert valueCount() == 32;
+   }
+ 
+   @Override
+@@ -73,7 +71,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, int[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final int byte0 = blocks[blocksOffset++] & 0xFF;
+       values[valuesOffset++] = byte0 >>> 2;
+       final int byte1 = blocks[blocksOffset++] & 0xFF;
+@@ -127,7 +125,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, long[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final long byte0 = blocks[blocksOffset++] & 0xFF;
+       values[valuesOffset++] = byte0 >>> 2;
+       final long byte1 = blocks[blocksOffset++] & 0xFF;
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperation.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperation.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperation.java	(copie de travail)
+@@ -2,7 +2,6 @@
+ 
+ package org.apache.lucene.util.packed;
+ 
+-
+ /*
+  * Licensed to the Apache Software Foundation (ASF) under one or more
+  * contributor license agreements.  See the NOTICE file distributed with
+@@ -158,30 +157,25 @@
+    *  - 50 bits per value -> b=25, v=32
+    *  - 63 bits per value -> b=63, v=64
+    *  - ...
+-   * <p>
++   *
+    * A bulk read consists in copying <code>iterations*v</code> values that are
+    * contained in <code>iterations*b</code> blocks into a <code>long[]</code>
+    * (higher values of <code>iterations</code> are likely to yield a better
+    * throughput) => this requires n * (b + v) longs in memory.
+-   * <p>
++   *
+    * This method computes <code>iterations</code> as
+    * <code>ramBudget / (8 * (b + v))</code> (since a long is 8 bytes).
+-   * <p>
+-   * The resulting number of iterations of this method is guaranteed not to
+-   * overflow when multiplied by
+-   * <tt>8 * {@link PackedInts.Encoder#blockCount()}</tt> or
+-   * <tt>8 * {@link PackedInts.Decoder#blockCount()}</tt>.
+    */
+   public final int computeIterations(int valueCount, int ramBudget) {
+-    final int iterations = (ramBudget >>> 3) / (blockCount() + valueCount());
++    final int iterations = ramBudget / (byteBlockCount() + 8 * byteValueCount());
+     if (iterations == 0) {
+       // at least 1
+       return 1;
+-    } else if ((iterations - 1) * blockCount() >= valueCount) {
++    } else if ((iterations - 1) * byteBlockCount() >= valueCount) {
+       // don't allocate for more than the size of the reader
+-      return (int) Math.ceil((double) valueCount / valueCount());
++      return (int) Math.ceil((double) valueCount / byteValueCount());
+     } else {
+       return iterations;
+     }
+   }
+-}
+\ Pas de retour chariot à la fin du fichier
++}
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked11.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked11.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked11.java	(copie de travail)
+@@ -26,8 +26,6 @@
+ 
+   public BulkOperationPacked11() {
+     super(11);
+-    assert blockCount() == 11;
+-    assert valueCount() == 64;
+   }
+ 
+   @Override
+@@ -113,7 +111,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, int[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final int byte0 = blocks[blocksOffset++] & 0xFF;
+       final int byte1 = blocks[blocksOffset++] & 0xFF;
+       values[valuesOffset++] = (byte0 << 3) | (byte1 >>> 5);
+@@ -219,7 +217,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, long[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final long byte0 = blocks[blocksOffset++] & 0xFF;
+       final long byte1 = blocks[blocksOffset++] & 0xFF;
+       values[valuesOffset++] = (byte0 << 3) | (byte1 >>> 5);
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked23.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked23.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked23.java	(copie de travail)
+@@ -26,8 +26,6 @@
+ 
+   public BulkOperationPacked23() {
+     super(23);
+-    assert blockCount() == 23;
+-    assert valueCount() == 64;
+   }
+ 
+   @Override
+@@ -125,7 +123,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, int[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final int byte0 = blocks[blocksOffset++] & 0xFF;
+       final int byte1 = blocks[blocksOffset++] & 0xFF;
+       final int byte2 = blocks[blocksOffset++] & 0xFF;
+@@ -255,7 +253,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, long[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final long byte0 = blocks[blocksOffset++] & 0xFF;
+       final long byte1 = blocks[blocksOffset++] & 0xFF;
+       final long byte2 = blocks[blocksOffset++] & 0xFF;
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked15.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked15.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked15.java	(copie de travail)
+@@ -26,8 +26,6 @@
+ 
+   public BulkOperationPacked15() {
+     super(15);
+-    assert blockCount() == 15;
+-    assert valueCount() == 64;
+   }
+ 
+   @Override
+@@ -117,7 +115,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, int[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final int byte0 = blocks[blocksOffset++] & 0xFF;
+       final int byte1 = blocks[blocksOffset++] & 0xFF;
+       values[valuesOffset++] = (byte0 << 7) | (byte1 >>> 1);
+@@ -231,7 +229,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, long[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final long byte0 = blocks[blocksOffset++] & 0xFF;
+       final long byte1 = blocks[blocksOffset++] & 0xFF;
+       values[valuesOffset++] = (byte0 << 7) | (byte1 >>> 1);
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked19.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked19.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked19.java	(copie de travail)
+@@ -26,8 +26,6 @@
+ 
+   public BulkOperationPacked19() {
+     super(19);
+-    assert blockCount() == 19;
+-    assert valueCount() == 64;
+   }
+ 
+   @Override
+@@ -121,7 +119,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, int[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final int byte0 = blocks[blocksOffset++] & 0xFF;
+       final int byte1 = blocks[blocksOffset++] & 0xFF;
+       final int byte2 = blocks[blocksOffset++] & 0xFF;
+@@ -243,7 +241,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, long[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final long byte0 = blocks[blocksOffset++] & 0xFF;
+       final long byte1 = blocks[blocksOffset++] & 0xFF;
+       final long byte2 = blocks[blocksOffset++] & 0xFF;
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked3.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked3.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked3.java	(copie de travail)
+@@ -26,8 +26,6 @@
+ 
+   public BulkOperationPacked3() {
+     super(3);
+-    assert blockCount() == 3;
+-    assert valueCount() == 64;
+   }
+ 
+   @Override
+@@ -105,7 +103,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, int[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final int byte0 = blocks[blocksOffset++] & 0xFF;
+       values[valuesOffset++] = byte0 >>> 5;
+       values[valuesOffset++] = (byte0 >>> 2) & 7;
+@@ -195,7 +193,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, long[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final long byte0 = blocks[blocksOffset++] & 0xFF;
+       values[valuesOffset++] = byte0 >>> 5;
+       values[valuesOffset++] = (byte0 >>> 2) & 7;
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked7.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked7.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked7.java	(copie de travail)
+@@ -26,8 +26,6 @@
+ 
+   public BulkOperationPacked7() {
+     super(7);
+-    assert blockCount() == 7;
+-    assert valueCount() == 64;
+   }
+ 
+   @Override
+@@ -109,7 +107,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, int[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final int byte0 = blocks[blocksOffset++] & 0xFF;
+       values[valuesOffset++] = byte0 >>> 1;
+       final int byte1 = blocks[blocksOffset++] & 0xFF;
+@@ -207,7 +205,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, long[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final long byte0 = blocks[blocksOffset++] & 0xFF;
+       values[valuesOffset++] = byte0 >>> 1;
+       final long byte1 = blocks[blocksOffset++] & 0xFF;
+Index: lucene/core/src/java/org/apache/lucene/util/packed/PackedReaderIterator.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/PackedReaderIterator.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/PackedReaderIterator.java	(copie de travail)
+@@ -39,14 +39,23 @@
+     this.format = format;
+     this.packedIntsVersion = packedIntsVersion;
+     bulkOperation = BulkOperation.of(format, bitsPerValue);
+-    iterations = bulkOperation.computeIterations(valueCount, mem);
++    iterations = iterations(mem);
+     assert valueCount == 0 || iterations > 0;
+-    nextBlocks = new byte[8 * iterations * bulkOperation.blockCount()];
+-    nextValues = new LongsRef(new long[iterations * bulkOperation.valueCount()], 0, 0);
++    nextBlocks = new byte[iterations * bulkOperation.byteBlockCount()];
++    nextValues = new LongsRef(new long[iterations * bulkOperation.byteValueCount()], 0, 0);
+     nextValues.offset = nextValues.longs.length;
+     position = -1;
+   }
+ 
++  private int iterations(int mem) {
++    int iterations = bulkOperation.computeIterations(valueCount, mem);
++    if (packedIntsVersion < PackedInts.VERSION_BYTE_ALIGNED) {
++      // make sure iterations is a multiple of 8
++      iterations = (iterations + 7) & 0xFFFFFFF8;
++    }
++    return iterations;
++  }
++
+   @Override
+   public LongsRef next(int count) throws IOException {
+     assert nextValues.length >= 0;
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BlockPackedReader.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BlockPackedReader.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BlockPackedReader.java	(copie de travail)
+@@ -212,8 +212,8 @@
+       Arrays.fill(values, minValue);
+     } else {
+       final PackedInts.Decoder decoder = PackedInts.getDecoder(PackedInts.Format.PACKED, packedIntsVersion, bitsPerValue);
+-      final int iterations = blockSize / decoder.valueCount();
+-      final int blocksSize = iterations * 8 * decoder.blockCount();
++      final int iterations = blockSize / decoder.byteValueCount();
++      final int blocksSize = iterations * decoder.byteBlockCount();
+       if (blocks == null || blocks.length < blocksSize) {
+         blocks = new byte[blocksSize];
+       }
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked20.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked20.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked20.java	(copie de travail)
+@@ -26,8 +26,6 @@
+ 
+   public BulkOperationPacked20() {
+     super(20);
+-    assert blockCount() == 5;
+-    assert valueCount() == 16;
+   }
+ 
+   @Override
+@@ -59,7 +57,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, int[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final int byte0 = blocks[blocksOffset++] & 0xFF;
+       final int byte1 = blocks[blocksOffset++] & 0xFF;
+       final int byte2 = blocks[blocksOffset++] & 0xFF;
+@@ -99,7 +97,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, long[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final long byte0 = blocks[blocksOffset++] & 0xFF;
+       final long byte1 = blocks[blocksOffset++] & 0xFF;
+       final long byte2 = blocks[blocksOffset++] & 0xFF;
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked12.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked12.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked12.java	(copie de travail)
+@@ -26,8 +26,6 @@
+ 
+   public BulkOperationPacked12() {
+     super(12);
+-    assert blockCount() == 3;
+-    assert valueCount() == 16;
+   }
+ 
+   @Override
+@@ -57,7 +55,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, int[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final int byte0 = blocks[blocksOffset++] & 0xFF;
+       final int byte1 = blocks[blocksOffset++] & 0xFF;
+       values[valuesOffset++] = (byte0 << 4) | (byte1 >>> 4);
+@@ -93,7 +91,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, long[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final long byte0 = blocks[blocksOffset++] & 0xFF;
+       final long byte1 = blocks[blocksOffset++] & 0xFF;
+       values[valuesOffset++] = (byte0 << 4) | (byte1 >>> 4);
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked24.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked24.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked24.java	(copie de travail)
+@@ -26,8 +26,6 @@
+ 
+   public BulkOperationPacked24() {
+     super(24);
+-    assert blockCount() == 3;
+-    assert valueCount() == 8;
+   }
+ 
+   @Override
+@@ -49,7 +47,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, int[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final int byte0 = blocks[blocksOffset++] & 0xFF;
+       final int byte1 = blocks[blocksOffset++] & 0xFF;
+       final int byte2 = blocks[blocksOffset++] & 0xFF;
+@@ -76,7 +74,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, long[] values, int valuesOffset, int iterations) {
+-    for (int i = 0; i < 8 * iterations; ++i) {
++    for (int i = 0; i < iterations; ++i) {
+       final long byte0 = blocks[blocksOffset++] & 0xFF;
+       final long byte1 = blocks[blocksOffset++] & 0xFF;
+       final long byte2 = blocks[blocksOffset++] & 0xFF;
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked16.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked16.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked16.java	(copie de travail)
+@@ -26,8 +26,6 @@
+ 
+   public BulkOperationPacked16() {
+     super(16);
+-    assert blockCount() == 1;
+-    assert valueCount() == 4;
+   }
+ 
+   @Override
+@@ -42,7 +40,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, int[] values, int valuesOffset, int iterations) {
+-    for (int j = 0; j < 4 * iterations; ++j) {
++    for (int j = 0; j < iterations; ++j) {
+       values[valuesOffset++] = ((blocks[blocksOffset++] & 0xFF) << 8) | (blocks[blocksOffset++] & 0xFF);
+     }
+   }
+@@ -59,7 +57,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, long[] values, int valuesOffset, int iterations) {
+-    for (int j = 0; j < 4 * iterations; ++j) {
++    for (int j = 0; j < iterations; ++j) {
+       values[valuesOffset++] = ((blocks[blocksOffset++] & 0xFFL) << 8) | (blocks[blocksOffset++] & 0xFFL);
+     }
+   }
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BlockPackedWriter.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BlockPackedWriter.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BlockPackedWriter.java	(copie de travail)
+@@ -147,8 +147,8 @@
+         }
+       }
+       final PackedInts.Encoder encoder = PackedInts.getEncoder(PackedInts.Format.PACKED, PackedInts.VERSION_CURRENT, bitsRequired);
+-      final int iterations = values.length / encoder.valueCount();
+-      final int blockSize = encoder.blockCount() * 8 * iterations;
++      final int iterations = values.length / encoder.byteValueCount();
++      final int blockSize = encoder.byteBlockCount() * iterations;
+       if (blocks == null || blocks.length < blockSize) {
+         blocks = new byte[blockSize];
+       }
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPackedSingleBlock.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPackedSingleBlock.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPackedSingleBlock.java	(copie de travail)
+@@ -35,15 +35,25 @@
+   }
+ 
+   @Override
+-  public final int blockCount() {
++  public final int longBlockCount() {
+     return BLOCK_COUNT;
+   }
+ 
+   @Override
+-  public int valueCount() {
++  public final int byteBlockCount() {
++    return BLOCK_COUNT * 8;
++  }
++
++  @Override
++  public int longValueCount() {
+     return valueCount;
+   }
+ 
++  @Override
++  public final int byteValueCount() {
++    return valueCount;
++  }
++
+   private static long readLong(byte[] blocks, int blocksOffset) {
+     return (blocks[blocksOffset++] & 0xFFL) << 56
+         | (blocks[blocksOffset++] & 0xFFL) << 48
+Index: lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked4.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked4.java	(révision 1438948)
++++ lucene/core/src/java/org/apache/lucene/util/packed/BulkOperationPacked4.java	(copie de travail)
+@@ -26,8 +26,6 @@
+ 
+   public BulkOperationPacked4() {
+     super(4);
+-    assert blockCount() == 1;
+-    assert valueCount() == 16;
+   }
+ 
+   @Override
+@@ -42,7 +40,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, int[] values, int valuesOffset, int iterations) {
+-    for (int j = 0; j < 8 * iterations; ++j) {
++    for (int j = 0; j < iterations; ++j) {
+       final byte block = blocks[blocksOffset++];
+       values[valuesOffset++] = (block >>> 4) & 15;
+       values[valuesOffset++] = block & 15;
+@@ -61,7 +59,7 @@
+ 
+   @Override
+   public void decode(byte[] blocks, int blocksOffset, long[] values, int valuesOffset, int iterations) {
+-    for (int j = 0; j < 8 * iterations; ++j) {
++    for (int j = 0; j < iterations; ++j) {
+       final byte block = blocks[blocksOffset++];
+       values[valuesOffset++] = (block >>> 4) & 15;
+       values[valuesOffset++] = block & 15;

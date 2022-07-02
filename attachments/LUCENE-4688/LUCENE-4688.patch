@@ -1,0 +1,3818 @@
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/BlockTreeTermsReader.java b/lucene/core/src/java/org/apache/lucene/codecs/BlockTreeTermsReader.java
+index 32324bb..7e04f81 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/BlockTreeTermsReader.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/BlockTreeTermsReader.java
+@@ -38,6 +38,7 @@ import org.apache.lucene.index.SegmentInfo;
+ import org.apache.lucene.index.TermState;
+ import org.apache.lucene.index.Terms;
+ import org.apache.lucene.index.TermsEnum;
++import org.apache.lucene.index.TermsEnum.SeekStatus;
+ import org.apache.lucene.store.ByteArrayDataInput;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.IOContext;
+@@ -343,7 +344,7 @@ public class BlockTreeTermsReader extends FieldsProducer {
+       this.field = field;
+     }
+ 
+-    void startBlock(FieldReader.SegmentTermsEnum.Frame frame, boolean isFloor) {
++    void startBlock(Frame frame, boolean isFloor) {
+       totalBlockCount++;
+       if (isFloor) {
+         if (frame.fp == frame.fpOrig) {
+@@ -363,7 +364,7 @@ public class BlockTreeTermsReader extends FieldsProducer {
+       totalBlockStatsBytes += frame.statsReader.length();
+     }
+ 
+-    void endBlock(FieldReader.SegmentTermsEnum.Frame frame) {
++    void endBlock(Frame frame) {
+       final int termCount = frame.isLeafBlock ? frame.entCount : frame.state.termBlockOrd;
+       final int subBlockCount = frame.entCount - termCount;
+       totalTermCount += termCount;
+@@ -441,8 +442,8 @@ public class BlockTreeTermsReader extends FieldsProducer {
+     }
+   }
+ 
+-  final Outputs<BytesRef> fstOutputs = ByteSequenceOutputs.getSingleton();
+-  final BytesRef NO_OUTPUT = fstOutputs.getNoOutput();
++  static final Outputs<BytesRef> FST_OUTPUTS = ByteSequenceOutputs.getSingleton();
++  static final BytesRef NO_OUTPUT = FST_OUTPUTS.getNoOutput();
+ 
+   /** BlockTree's implementation of {@link Terms}. */
+   public final class FieldReader extends Terms {
+@@ -455,12 +456,14 @@ public class BlockTreeTermsReader extends FieldsProducer {
+     final long rootBlockFP;
+     final BytesRef rootCode;
+     private final FST<BytesRef> index;
++    final String segment;
+ 
+     //private boolean DEBUG;
+ 
+     FieldReader(FieldInfo fieldInfo, long numTerms, BytesRef rootCode, long sumTotalTermFreq, long sumDocFreq, int docCount, long indexStartFP, IndexInput indexIn) throws IOException {
+       assert numTerms > 0;
+       this.fieldInfo = fieldInfo;
++      this.segment = BlockTreeTermsReader.this.segment;
+       //DEBUG = BlockTreeTermsReader.DEBUG && fieldInfo.name.equals("id");
+       this.numTerms = numTerms;
+       this.sumTotalTermFreq = sumTotalTermFreq; 
+@@ -497,7 +500,11 @@ public class BlockTreeTermsReader extends FieldsProducer {
+     /** For debugging -- used by CheckIndex too*/
+     // TODO: maybe push this into Terms?
+     public Stats computeStats() throws IOException {
+-      return new SegmentTermsEnum().computeBlockStats();
++      return new SegmentTermsEnum(FieldReader.this).computeBlockStats();
++    }
++    
++    private PostingsReaderBase postingsReader() {
++      return postingsReader;
+     }
+ 
+     @Override
+@@ -522,7 +529,12 @@ public class BlockTreeTermsReader extends FieldsProducer {
+ 
+     @Override
+     public TermsEnum iterator(TermsEnum reuse) throws IOException {
+-      return new SegmentTermsEnum();
++      if (reuse != null && reuse instanceof SegmentTermsEnum) {
++        final SegmentTermsEnum ste = (SegmentTermsEnum) reuse;
++        ste.reset(FieldReader.this);
++        return ste;
++      }
++      return new SegmentTermsEnum(FieldReader.this);
+     }
+ 
+     @Override
+@@ -926,14 +938,14 @@ public class BlockTreeTermsReader extends FieldsProducer {
+           // passed to findTargetArc
+           arc = index.findTargetArc(target, arc, getArc(1+idx), fstReader);
+           assert arc != null;
+-          output = fstOutputs.add(output, arc.output);
++          output = FST_OUTPUTS.add(output, arc.output);
+           idx++;
+         }
+ 
+         f.arc = arc;
+         f.outputPrefix = output;
+         assert arc.isFinal();
+-        f.load(fstOutputs.add(output, arc.nextFinalOutput));
++        f.load(FST_OUTPUTS.add(output, arc.nextFinalOutput));
+         return f;
+       }
+ 
+@@ -1242,52 +1254,65 @@ public class BlockTreeTermsReader extends FieldsProducer {
+       }
+     }
+ 
+-    // Iterates through terms in this field
+-    private final class SegmentTermsEnum extends TermsEnum {
+-      private IndexInput in;
+-
+-      private Frame[] stack;
+-      private final Frame staticFrame;
+-      private Frame currentFrame;
+-      private boolean termExists;
++    public IndexInput cloneInput() {
++      return in.clone();
++    }
+ 
+-      private int targetBeforeCurrentLength;
++    // Iterates through terms in this field
+ 
+-      private final ByteArrayDataInput scratchReader = new ByteArrayDataInput();
++    
++    
++  }
++  
++  private static final class SegmentTermsEnum extends TermsEnum {
++    private IndexInput in;
++    private FieldReader reader;
++    private Frame[] stack;
++    private final Frame staticFrame;
++    private Frame currentFrame;
++    private boolean termExists;
+ 
+-      // What prefix of the current term was present in the index:
+-      private int validIndexPrefix;
++    private int targetBeforeCurrentLength;
+ 
+-      // assert only:
+-      private boolean eof;
++    private final ByteArrayDataInput scratchReader = new ByteArrayDataInput();
+ 
+-      final BytesRef term = new BytesRef();
+-      private final FST.BytesReader fstReader;
++    // What prefix of the current term was present in the index:
++    private int validIndexPrefix;
+ 
+-      @SuppressWarnings({"rawtypes","unchecked"}) private FST.Arc<BytesRef>[] arcs =
+-          new FST.Arc[1];
++    // assert only:
++    private boolean eof;
++    
++    final BytesRef term = new BytesRef();
++    private FST.BytesReader fstReader;
++    private FST<BytesRef> index;
+ 
+-      public SegmentTermsEnum() throws IOException {
+-        //if (DEBUG) System.out.println("BTTR.init seg=" + segment);
+-        stack = new Frame[0];
+-        
+-        // Used to hold seek by TermState, or cached seek
+-        staticFrame = new Frame(-1);
++    @SuppressWarnings({"rawtypes","unchecked"}) private FST.Arc<BytesRef>[] arcs =
++        new FST.Arc[1];
+ 
++    
++    private void reset(FieldReader reader) throws IOException {
++        this.reader = reader;
++        this.index = reader.index;
++        for (int i = 0; i < stack.length; i++) {
++          stack[i].reset(this);
++        }
++//        stack = new Frame[0];
+         if (index == null) {
+           fstReader = null;
+         } else {
+           fstReader = index.getBytesReader();
+-        }
+-
+-        // Init w/ root block; don't use index since it may
+-        // not (and need not) have been loaded
+-        for(int arcIdx=0;arcIdx<arcs.length;arcIdx++) {
+-          arcs[arcIdx] = new FST.Arc<BytesRef>();
+-        }
+-
++        }       
++        staticFrame.reset(this);
+         currentFrame = staticFrame;
++        validIndexPrefix = 0;
++        eof = false;
++        termExists = false;
++        targetBeforeCurrentLength = 0;
++        term.length = 0;
++        term.offset = 0;
++        assert clearEOF();
+         final FST.Arc<BytesRef> arc;
++        currentFrame = staticFrame;
+         if (index != null) {
+           arc = index.getFirstArc(arcs[0]);
+           // Empty string prefix must have an output in the index!
+@@ -1295,1645 +1320,1715 @@ public class BlockTreeTermsReader extends FieldsProducer {
+         } else {
+           arc = null;
+         }
++        in = null;
+         currentFrame = staticFrame;
+-        //currentFrame = pushFrame(arc, rootCode, 0);
+-        //currentFrame.loadBlock();
+-        validIndexPrefix = 0;
+-        // if (DEBUG) {
+-        //   System.out.println("init frame state " + currentFrame.ord);
+-        //   printSeekState();
+-        // }
++   }
+ 
+-        //System.out.println();
+-        // computeBlockStats().print(System.out);
+-      }
++
++    public SegmentTermsEnum(FieldReader reader) throws IOException {
++      this.reader = reader;
++      this.index = reader.index;
++      //if (DEBUG) System.out.println("BTTR.init seg=" + segment);
++      stack = new Frame[0];
+       
+-      // Not private to avoid synthetic access$NNN methods
+-      void initIndexInput() {
+-        if (this.in == null) {
+-          this.in = BlockTreeTermsReader.this.in.clone();
+-        }
++      // Used to hold seek by TermState, or cached seek
++      staticFrame = new Frame(-1, this);
++
++      if (index == null) {
++        fstReader = null;
++      } else {
++        fstReader = index.getBytesReader();
+       }
+ 
+-      /** Runs next() through the entire terms dict,
+-       *  computing aggregate statistics. */
+-      public Stats computeBlockStats() throws IOException {
++      // Init w/ root block; don't use index since it may
++      // not (and need not) have been loaded
++      for(int arcIdx=0;arcIdx<arcs.length;arcIdx++) {
++        arcs[arcIdx] = new FST.Arc<BytesRef>();
++      }
+ 
+-        Stats stats = new Stats(segment, fieldInfo.name);
+-        if (index != null) {
+-          stats.indexNodeCount = index.getNodeCount();
+-          stats.indexArcCount = index.getArcCount();
+-          stats.indexNumBytes = index.sizeInBytes();
+-        }
+-        
+-        currentFrame = staticFrame;
+-        FST.Arc<BytesRef> arc;
+-        if (index != null) {
+-          arc = index.getFirstArc(arcs[0]);
+-          // Empty string prefix must have an output in the index!
+-          assert arc.isFinal();
+-        } else {
+-          arc = null;
+-        }
++      currentFrame = staticFrame;
++      final FST.Arc<BytesRef> arc;
++      if (index != null) {
++        arc = index.getFirstArc(arcs[0]);
++        // Empty string prefix must have an output in the index!
++        assert arc.isFinal();
++      } else {
++        arc = null;
++      }
++      currentFrame = staticFrame;
++      //currentFrame = pushFrame(arc, rootCode, 0);
++      //currentFrame.loadBlock();
++      validIndexPrefix = 0;
++      // if (DEBUG) {
++      //   System.out.println("init frame state " + currentFrame.ord);
++      //   printSeekState();
++      // }
+ 
+-        // Empty string prefix must have an output in the
+-        // index!
+-        currentFrame = pushFrame(arc, rootCode, 0);
+-        currentFrame.fpOrig = currentFrame.fp;
+-        currentFrame.loadBlock();
+-        validIndexPrefix = 0;
++      //System.out.println();
++      // computeBlockStats().print(System.out);
++    }
++    
++    // Not private to avoid synthetic access$NNN methods
++    IndexInput initIndexInput() {
++      if (this.in == null) {
++        this.in = reader.cloneInput();
++      }
++      return this.in;
++    }
++
++    /** Runs next() through the entire terms dict,
++     *  computing aggregate statistics. */
++    public Stats computeBlockStats() throws IOException {
++
++      Stats stats = new Stats(reader.segment, reader.fieldInfo.name);
++      if (index != null) {
++        stats.indexNodeCount = index.getNodeCount();
++        stats.indexArcCount = index.getArcCount();
++        stats.indexNumBytes = index.sizeInBytes();
++      }
++      
++      currentFrame = staticFrame;
++      FST.Arc<BytesRef> arc;
++      if (index != null) {
++        arc = index.getFirstArc(arcs[0]);
++        // Empty string prefix must have an output in the index!
++        assert arc.isFinal();
++      } else {
++        arc = null;
++      }
+ 
+-        stats.startBlock(currentFrame, !currentFrame.isLastInFloor);
++      // Empty string prefix must have an output in the
++      // index!
++      currentFrame = pushFrame(arc, reader.rootCode, 0);
++      currentFrame.fpOrig = currentFrame.fp;
++      currentFrame.loadBlock();
++      validIndexPrefix = 0;
+ 
+-        allTerms:
+-        while (true) {
++      stats.startBlock(currentFrame, !currentFrame.isLastInFloor);
+ 
+-          // Pop finished blocks
+-          while (currentFrame.nextEnt == currentFrame.entCount) {
+-            stats.endBlock(currentFrame);
+-            if (!currentFrame.isLastInFloor) {
+-              currentFrame.loadNextFloorBlock();
+-              stats.startBlock(currentFrame, true);
+-            } else {
+-              if (currentFrame.ord == 0) {
+-                break allTerms;
+-              }
+-              final long lastFP = currentFrame.fpOrig;
+-              currentFrame = stack[currentFrame.ord-1];
+-              assert lastFP == currentFrame.lastSubFP;
+-              // if (DEBUG) {
+-              //   System.out.println("  reset validIndexPrefix=" + validIndexPrefix);
+-              // }
+-            }
+-          }
++      allTerms:
++      while (true) {
+ 
+-          while(true) {
+-            if (currentFrame.next()) {
+-              // Push to new block:
+-              currentFrame = pushFrame(null, currentFrame.lastSubFP, term.length);
+-              currentFrame.fpOrig = currentFrame.fp;
+-              // This is a "next" frame -- even if it's
+-              // floor'd we must pretend it isn't so we don't
+-              // try to scan to the right floor frame:
+-              currentFrame.isFloor = false;
+-              //currentFrame.hasTerms = true;
+-              currentFrame.loadBlock();
+-              stats.startBlock(currentFrame, !currentFrame.isLastInFloor);
+-            } else {
+-              stats.term(term);
+-              break;
++        // Pop finished blocks
++        while (currentFrame.nextEnt == currentFrame.entCount) {
++          stats.endBlock(currentFrame);
++          if (!currentFrame.isLastInFloor) {
++            currentFrame.loadNextFloorBlock();
++            stats.startBlock(currentFrame, true);
++          } else {
++            if (currentFrame.ord == 0) {
++              break allTerms;
+             }
++            final long lastFP = currentFrame.fpOrig;
++            currentFrame = stack[currentFrame.ord-1];
++            assert lastFP == currentFrame.lastSubFP;
++            // if (DEBUG) {
++            //   System.out.println("  reset validIndexPrefix=" + validIndexPrefix);
++            // }
+           }
+         }
+ 
+-        stats.finish();
+-
+-        // Put root frame back:
+-        currentFrame = staticFrame;
+-        if (index != null) {
+-          arc = index.getFirstArc(arcs[0]);
+-          // Empty string prefix must have an output in the index!
+-          assert arc.isFinal();
+-        } else {
+-          arc = null;
+-        }
+-        currentFrame = pushFrame(arc, rootCode, 0);
+-        currentFrame.rewind();
+-        currentFrame.loadBlock();
+-        validIndexPrefix = 0;
+-        term.length = 0;
+-
+-        return stats;
+-      }
+-
+-      private Frame getFrame(int ord) throws IOException {
+-        if (ord >= stack.length) {
+-          final Frame[] next = new Frame[ArrayUtil.oversize(1+ord, RamUsageEstimator.NUM_BYTES_OBJECT_REF)];
+-          System.arraycopy(stack, 0, next, 0, stack.length);
+-          for(int stackOrd=stack.length;stackOrd<next.length;stackOrd++) {
+-            next[stackOrd] = new Frame(stackOrd);
++        while(true) {
++          if (currentFrame.next()) {
++            // Push to new block:
++            currentFrame = pushFrame(null, currentFrame.lastSubFP, term.length);
++            currentFrame.fpOrig = currentFrame.fp;
++            // This is a "next" frame -- even if it's
++            // floor'd we must pretend it isn't so we don't
++            // try to scan to the right floor frame:
++            currentFrame.isFloor = false;
++            //currentFrame.hasTerms = true;
++            currentFrame.loadBlock();
++            stats.startBlock(currentFrame, !currentFrame.isLastInFloor);
++          } else {
++            stats.term(term);
++            break;
+           }
+-          stack = next;
+         }
+-        assert stack[ord].ord == ord;
+-        return stack[ord];
+       }
+ 
+-      private FST.Arc<BytesRef> getArc(int ord) {
+-        if (ord >= arcs.length) {
+-          @SuppressWarnings({"rawtypes","unchecked"}) final FST.Arc<BytesRef>[] next =
+-              new FST.Arc[ArrayUtil.oversize(1+ord, RamUsageEstimator.NUM_BYTES_OBJECT_REF)];
+-          System.arraycopy(arcs, 0, next, 0, arcs.length);
+-          for(int arcOrd=arcs.length;arcOrd<next.length;arcOrd++) {
+-            next[arcOrd] = new FST.Arc<BytesRef>();
+-          }
+-          arcs = next;
+-        }
+-        return arcs[ord];
++      stats.finish();
++
++      // Put root frame back:
++      currentFrame = staticFrame;
++      if (index != null) {
++        arc = index.getFirstArc(arcs[0]);
++        // Empty string prefix must have an output in the index!
++        assert arc.isFinal();
++      } else {
++        arc = null;
+       }
++      currentFrame = pushFrame(arc, reader.rootCode, 0);
++      currentFrame.rewind();
++      currentFrame.loadBlock();
++      validIndexPrefix = 0;
++      term.length = 0;
+ 
+-      @Override
+-      public Comparator<BytesRef> getComparator() {
+-        return BytesRef.getUTF8SortedAsUnicodeComparator();
++      return stats;
++    }
++    
++    
++    private Frame getFrame(int ord) throws IOException {
++      if (ord >= stack.length) {
++        final Frame[] next = new Frame[ArrayUtil.oversize(1+ord, RamUsageEstimator.NUM_BYTES_OBJECT_REF)];
++        System.arraycopy(stack, 0, next, 0, stack.length);
++        for(int stackOrd=stack.length;stackOrd<next.length;stackOrd++) {
++          next[stackOrd] = new Frame(stackOrd, this);
++        }
++        stack = next;
+       }
++      assert stack[ord].ord == ord;
++      return stack[ord];
++    }
+ 
+-      // Pushes a frame we seek'd to
+-      Frame pushFrame(FST.Arc<BytesRef> arc, BytesRef frameData, int length) throws IOException {
+-        scratchReader.reset(frameData.bytes, frameData.offset, frameData.length);
+-        final long code = scratchReader.readVLong();
+-        final long fpSeek = code >>> BlockTreeTermsWriter.OUTPUT_FLAGS_NUM_BITS;
+-        final Frame f = getFrame(1+currentFrame.ord);
+-        f.hasTerms = (code & BlockTreeTermsWriter.OUTPUT_FLAG_HAS_TERMS) != 0;
+-        f.hasTermsOrig = f.hasTerms;
+-        f.isFloor = (code & BlockTreeTermsWriter.OUTPUT_FLAG_IS_FLOOR) != 0;
+-        if (f.isFloor) {
+-          f.setFloorData(scratchReader, frameData);
++    private FST.Arc<BytesRef> getArc(int ord) {
++      if (ord >= arcs.length) {
++        @SuppressWarnings({"rawtypes","unchecked"}) final FST.Arc<BytesRef>[] next =
++            new FST.Arc[ArrayUtil.oversize(1+ord, RamUsageEstimator.NUM_BYTES_OBJECT_REF)];
++        System.arraycopy(arcs, 0, next, 0, arcs.length);
++        for(int arcOrd=arcs.length;arcOrd<next.length;arcOrd++) {
++          next[arcOrd] = new FST.Arc<BytesRef>();
+         }
+-        pushFrame(arc, fpSeek, length);
++        arcs = next;
++      }
++      return arcs[ord];
++    }
+ 
+-        return f;
++    @Override
++    public Comparator<BytesRef> getComparator() {
++      return BytesRef.getUTF8SortedAsUnicodeComparator();
++    }
++
++    // Pushes a frame we seek'd to
++    Frame pushFrame(FST.Arc<BytesRef> arc, BytesRef frameData, int length) throws IOException {
++      scratchReader.reset(frameData.bytes, frameData.offset, frameData.length);
++      final long code = scratchReader.readVLong();
++      final long fpSeek = code >>> BlockTreeTermsWriter.OUTPUT_FLAGS_NUM_BITS;
++      final Frame f = getFrame(1+currentFrame.ord);
++      f.hasTerms = (code & BlockTreeTermsWriter.OUTPUT_FLAG_HAS_TERMS) != 0;
++      f.hasTermsOrig = f.hasTerms;
++      f.isFloor = (code & BlockTreeTermsWriter.OUTPUT_FLAG_IS_FLOOR) != 0;
++      if (f.isFloor) {
++        f.setFloorData(scratchReader, frameData);
+       }
++      pushFrame(arc, fpSeek, length);
+ 
+-      // Pushes next'd frame or seek'd frame; we later
+-      // lazy-load the frame only when needed
+-      Frame pushFrame(FST.Arc<BytesRef> arc, long fp, int length) throws IOException {
+-        final Frame f = getFrame(1+currentFrame.ord);
+-        f.arc = arc;
+-        if (f.fpOrig == fp && f.nextEnt != -1) {
+-          //if (DEBUG) System.out.println("      push reused frame ord=" + f.ord + " fp=" + f.fp + " isFloor?=" + f.isFloor + " hasTerms=" + f.hasTerms + " pref=" + term + " nextEnt=" + f.nextEnt + " targetBeforeCurrentLength=" + targetBeforeCurrentLength + " term.length=" + term.length + " vs prefix=" + f.prefix);
+-          if (f.prefix > targetBeforeCurrentLength) {
+-            f.rewind();
+-          } else {
+-            // if (DEBUG) {
+-            //   System.out.println("        skip rewind!");
+-            // }
+-          }
+-          assert length == f.prefix;
++      return f;
++    }
++
++    // Pushes next'd frame or seek'd frame; we later
++    // lazy-load the frame only when needed
++    Frame pushFrame(FST.Arc<BytesRef> arc, long fp, int length) throws IOException {
++      final Frame f = getFrame(1+currentFrame.ord);
++      f.arc = arc;
++      if (f.fpOrig == fp && f.nextEnt != -1) {
++        //if (DEBUG) System.out.println("      push reused frame ord=" + f.ord + " fp=" + f.fp + " isFloor?=" + f.isFloor + " hasTerms=" + f.hasTerms + " pref=" + term + " nextEnt=" + f.nextEnt + " targetBeforeCurrentLength=" + targetBeforeCurrentLength + " term.length=" + term.length + " vs prefix=" + f.prefix);
++        if (f.prefix > targetBeforeCurrentLength) {
++          f.rewind();
+         } else {
+-          f.nextEnt = -1;
+-          f.prefix = length;
+-          f.state.termBlockOrd = 0;
+-          f.fpOrig = f.fp = fp;
+-          f.lastSubFP = -1;
+           // if (DEBUG) {
+-          //   final int sav = term.length;
+-          //   term.length = length;
+-          //   System.out.println("      push new frame ord=" + f.ord + " fp=" + f.fp + " hasTerms=" + f.hasTerms + " isFloor=" + f.isFloor + " pref=" + brToString(term));
+-          //   term.length = sav;
++          //   System.out.println("        skip rewind!");
+           // }
+         }
+-
+-        return f;
++        assert length == f.prefix;
++      } else {
++        f.nextEnt = -1;
++        f.prefix = length;
++        f.state.termBlockOrd = 0;
++        f.fpOrig = f.fp = fp;
++        f.lastSubFP = -1;
++        // if (DEBUG) {
++        //   final int sav = term.length;
++        //   term.length = length;
++        //   System.out.println("      push new frame ord=" + f.ord + " fp=" + f.fp + " hasTerms=" + f.hasTerms + " isFloor=" + f.isFloor + " pref=" + brToString(term));
++        //   term.length = sav;
++        // }
+       }
+ 
+-      // asserts only
+-      private boolean clearEOF() {
+-        eof = false;
+-        return true;
++      return f;
++    }
++
++    // asserts only
++    private boolean clearEOF() {
++      eof = false;
++      return true;
++    }
++
++    // asserts only
++    private boolean setEOF() {
++      eof = true;
++      return true;
++    }
++
++    @Override
++    public boolean seekExact(final BytesRef target, final boolean useCache) throws IOException {
++
++      if (index == null) {
++        throw new IllegalStateException("terms index was not loaded");
+       }
+ 
+-      // asserts only
+-      private boolean setEOF() {
+-        eof = true;
+-        return true;
++      if (term.bytes.length <= target.length) {
++        term.bytes = ArrayUtil.grow(term.bytes, 1+target.length);
+       }
+ 
+-      @Override
+-      public boolean seekExact(final BytesRef target, final boolean useCache) throws IOException {
++      assert clearEOF();
+ 
+-        if (index == null) {
+-          throw new IllegalStateException("terms index was not loaded");
+-        }
++      // if (DEBUG) {
++      //   System.out.println("\nBTTR.seekExact seg=" + segment + " target=" + fieldInfo.name + ":" + brToString(target) + " current=" + brToString(term) + " (exists?=" + termExists + ") validIndexPrefix=" + validIndexPrefix);
++      //   printSeekState();
++      // }
+ 
+-        if (term.bytes.length <= target.length) {
+-          term.bytes = ArrayUtil.grow(term.bytes, 1+target.length);
+-        }
++      FST.Arc<BytesRef> arc;
++      int targetUpto;
++      BytesRef output;
+ 
+-        assert clearEOF();
++      targetBeforeCurrentLength = currentFrame.ord;
++
++      if (currentFrame != staticFrame) {
++
++        // We are already seek'd; find the common
++        // prefix of new seek term vs current term and
++        // re-use the corresponding seek state.  For
++        // example, if app first seeks to foobar, then
++        // seeks to foobaz, we can re-use the seek state
++        // for the first 5 bytes.
+ 
+         // if (DEBUG) {
+-        //   System.out.println("\nBTTR.seekExact seg=" + segment + " target=" + fieldInfo.name + ":" + brToString(target) + " current=" + brToString(term) + " (exists?=" + termExists + ") validIndexPrefix=" + validIndexPrefix);
+-        //   printSeekState();
++        //   System.out.println("  re-use current seek state validIndexPrefix=" + validIndexPrefix);
+         // }
+ 
+-        FST.Arc<BytesRef> arc;
+-        int targetUpto;
+-        BytesRef output;
++        arc = arcs[0];
++        assert arc.isFinal();
++        output = arc.output;
++        targetUpto = 0;
++        
++        Frame lastFrame = stack[0];
++        assert validIndexPrefix <= term.length;
+ 
+-        targetBeforeCurrentLength = currentFrame.ord;
++        final int targetLimit = Math.min(target.length, validIndexPrefix);
+ 
+-        if (currentFrame != staticFrame) {
++        int cmp = 0;
+ 
+-          // We are already seek'd; find the common
+-          // prefix of new seek term vs current term and
+-          // re-use the corresponding seek state.  For
+-          // example, if app first seeks to foobar, then
+-          // seeks to foobaz, we can re-use the seek state
+-          // for the first 5 bytes.
++        // TODO: reverse vLong byte order for better FST
++        // prefix output sharing
+ 
++        // First compare up to valid seek frames:
++        while (targetUpto < targetLimit) {
++          cmp = (term.bytes[targetUpto]&0xFF) - (target.bytes[target.offset + targetUpto]&0xFF);
+           // if (DEBUG) {
+-          //   System.out.println("  re-use current seek state validIndexPrefix=" + validIndexPrefix);
++          //   System.out.println("    cycle targetUpto=" + targetUpto + " (vs limit=" + targetLimit + ") cmp=" + cmp + " (targetLabel=" + (char) (target.bytes[target.offset + targetUpto]) + " vs termLabel=" + (char) (term.bytes[targetUpto]) + ")"   + " arc.output=" + arc.output + " output=" + output);
+           // }
++          if (cmp != 0) {
++            break;
++          }
++          arc = arcs[1+targetUpto];
++          //if (arc.label != (target.bytes[target.offset + targetUpto] & 0xFF)) {
++          //System.out.println("FAIL: arc.label=" + (char) arc.label + " targetLabel=" + (char) (target.bytes[target.offset + targetUpto] & 0xFF));
++          //}
++          assert arc.label == (target.bytes[target.offset + targetUpto] & 0xFF): "arc.label=" + (char) arc.label + " targetLabel=" + (char) (target.bytes[target.offset + targetUpto] & 0xFF);
++          if (arc.output != NO_OUTPUT) {
++            output = FST_OUTPUTS.add(output, arc.output);
++          }
++          if (arc.isFinal()) {
++            lastFrame = stack[1+lastFrame.ord];
++          }
++          targetUpto++;
++        }
+ 
+-          arc = arcs[0];
+-          assert arc.isFinal();
+-          output = arc.output;
+-          targetUpto = 0;
+-          
+-          Frame lastFrame = stack[0];
+-          assert validIndexPrefix <= term.length;
+-
+-          final int targetLimit = Math.min(target.length, validIndexPrefix);
+-
+-          int cmp = 0;
+-
+-          // TODO: reverse vLong byte order for better FST
+-          // prefix output sharing
++        if (cmp == 0) {
++          final int targetUptoMid = targetUpto;
+ 
+-          // First compare up to valid seek frames:
+-          while (targetUpto < targetLimit) {
++          // Second compare the rest of the term, but
++          // don't save arc/output/frame; we only do this
++          // to find out if the target term is before,
++          // equal or after the current term
++          final int targetLimit2 = Math.min(target.length, term.length);
++          while (targetUpto < targetLimit2) {
+             cmp = (term.bytes[targetUpto]&0xFF) - (target.bytes[target.offset + targetUpto]&0xFF);
+             // if (DEBUG) {
+-            //   System.out.println("    cycle targetUpto=" + targetUpto + " (vs limit=" + targetLimit + ") cmp=" + cmp + " (targetLabel=" + (char) (target.bytes[target.offset + targetUpto]) + " vs termLabel=" + (char) (term.bytes[targetUpto]) + ")"   + " arc.output=" + arc.output + " output=" + output);
++            //   System.out.println("    cycle2 targetUpto=" + targetUpto + " (vs limit=" + targetLimit + ") cmp=" + cmp + " (targetLabel=" + (char) (target.bytes[target.offset + targetUpto]) + " vs termLabel=" + (char) (term.bytes[targetUpto]) + ")");
+             // }
+             if (cmp != 0) {
+               break;
+             }
+-            arc = arcs[1+targetUpto];
+-            //if (arc.label != (target.bytes[target.offset + targetUpto] & 0xFF)) {
+-            //System.out.println("FAIL: arc.label=" + (char) arc.label + " targetLabel=" + (char) (target.bytes[target.offset + targetUpto] & 0xFF));
+-            //}
+-            assert arc.label == (target.bytes[target.offset + targetUpto] & 0xFF): "arc.label=" + (char) arc.label + " targetLabel=" + (char) (target.bytes[target.offset + targetUpto] & 0xFF);
+-            if (arc.output != NO_OUTPUT) {
+-              output = fstOutputs.add(output, arc.output);
+-            }
+-            if (arc.isFinal()) {
+-              lastFrame = stack[1+lastFrame.ord];
+-            }
+             targetUpto++;
+           }
+ 
+           if (cmp == 0) {
+-            final int targetUptoMid = targetUpto;
+-
+-            // Second compare the rest of the term, but
+-            // don't save arc/output/frame; we only do this
+-            // to find out if the target term is before,
+-            // equal or after the current term
+-            final int targetLimit2 = Math.min(target.length, term.length);
+-            while (targetUpto < targetLimit2) {
+-              cmp = (term.bytes[targetUpto]&0xFF) - (target.bytes[target.offset + targetUpto]&0xFF);
+-              // if (DEBUG) {
+-              //   System.out.println("    cycle2 targetUpto=" + targetUpto + " (vs limit=" + targetLimit + ") cmp=" + cmp + " (targetLabel=" + (char) (target.bytes[target.offset + targetUpto]) + " vs termLabel=" + (char) (term.bytes[targetUpto]) + ")");
+-              // }
+-              if (cmp != 0) {
+-                break;
+-              }
+-              targetUpto++;
+-            }
+-
+-            if (cmp == 0) {
+-              cmp = term.length - target.length;
+-            }
+-            targetUpto = targetUptoMid;
++            cmp = term.length - target.length;
+           }
++          targetUpto = targetUptoMid;
++        }
+ 
+-          if (cmp < 0) {
+-            // Common case: target term is after current
+-            // term, ie, app is seeking multiple terms
+-            // in sorted order
++        if (cmp < 0) {
++          // Common case: target term is after current
++          // term, ie, app is seeking multiple terms
++          // in sorted order
++          // if (DEBUG) {
++          //   System.out.println("  target is after current (shares prefixLen=" + targetUpto + "); frame.ord=" + lastFrame.ord);
++          // }
++          currentFrame = lastFrame;
++
++        } else if (cmp > 0) {
++          // Uncommon case: target term
++          // is before current term; this means we can
++          // keep the currentFrame but we must rewind it
++          // (so we scan from the start)
++          targetBeforeCurrentLength = 0;
++          // if (DEBUG) {
++          //   System.out.println("  target is before current (shares prefixLen=" + targetUpto + "); rewind frame ord=" + lastFrame.ord);
++          // }
++          currentFrame = lastFrame;
++          currentFrame.rewind();
++        } else {
++          // Target is exactly the same as current term
++          assert term.length == target.length;
++          if (termExists) {
+             // if (DEBUG) {
+-            //   System.out.println("  target is after current (shares prefixLen=" + targetUpto + "); frame.ord=" + lastFrame.ord);
++            //   System.out.println("  target is same as current; return true");
+             // }
+-            currentFrame = lastFrame;
+-
+-          } else if (cmp > 0) {
+-            // Uncommon case: target term
+-            // is before current term; this means we can
+-            // keep the currentFrame but we must rewind it
+-            // (so we scan from the start)
+-            targetBeforeCurrentLength = 0;
++            return true;
++          } else {
+             // if (DEBUG) {
+-            //   System.out.println("  target is before current (shares prefixLen=" + targetUpto + "); rewind frame ord=" + lastFrame.ord);
++            //   System.out.println("  target is same as current but term doesn't exist");
+             // }
+-            currentFrame = lastFrame;
+-            currentFrame.rewind();
+-          } else {
+-            // Target is exactly the same as current term
+-            assert term.length == target.length;
+-            if (termExists) {
+-              // if (DEBUG) {
+-              //   System.out.println("  target is same as current; return true");
+-              // }
+-              return true;
+-            } else {
+-              // if (DEBUG) {
+-              //   System.out.println("  target is same as current but term doesn't exist");
+-              // }
+-            }
+-            //validIndexPrefix = currentFrame.depth;
+-            //term.length = target.length;
+-            //return termExists;
+           }
++          //validIndexPrefix = currentFrame.depth;
++          //term.length = target.length;
++          //return termExists;
++        }
+ 
+-        } else {
++      } else {
+ 
+-          targetBeforeCurrentLength = -1;
+-          arc = index.getFirstArc(arcs[0]);
++        targetBeforeCurrentLength = -1;
++        arc = index.getFirstArc(arcs[0]);
+ 
+-          // Empty string prefix must have an output (block) in the index!
+-          assert arc.isFinal();
+-          assert arc.output != null;
++        // Empty string prefix must have an output (block) in the index!
++        assert arc.isFinal();
++        assert arc.output != null;
+ 
+-          // if (DEBUG) {
+-          //   System.out.println("    no seek state; push root frame");
+-          // }
++        // if (DEBUG) {
++        //   System.out.println("    no seek state; push root frame");
++        // }
+ 
+-          output = arc.output;
++        output = arc.output;
+ 
+-          currentFrame = staticFrame;
++        currentFrame = staticFrame;
+ 
+-          //term.length = 0;
+-          targetUpto = 0;
+-          currentFrame = pushFrame(arc, fstOutputs.add(output, arc.nextFinalOutput), 0);
+-        }
++        //term.length = 0;
++        targetUpto = 0;
++        currentFrame = pushFrame(arc, FST_OUTPUTS.add(output, arc.nextFinalOutput), 0);
++      }
+ 
+-        // if (DEBUG) {
+-        //   System.out.println("  start index loop targetUpto=" + targetUpto + " output=" + output + " currentFrame.ord=" + currentFrame.ord + " targetBeforeCurrentLength=" + targetBeforeCurrentLength);
+-        // }
++      // if (DEBUG) {
++      //   System.out.println("  start index loop targetUpto=" + targetUpto + " output=" + output + " currentFrame.ord=" + currentFrame.ord + " targetBeforeCurrentLength=" + targetBeforeCurrentLength);
++      // }
+ 
+-        while (targetUpto < target.length) {
++      while (targetUpto < target.length) {
+ 
+-          final int targetLabel = target.bytes[target.offset + targetUpto] & 0xFF;
++        final int targetLabel = target.bytes[target.offset + targetUpto] & 0xFF;
+ 
+-          final FST.Arc<BytesRef> nextArc = index.findTargetArc(targetLabel, arc, getArc(1+targetUpto), fstReader);
++        final FST.Arc<BytesRef> nextArc = index.findTargetArc(targetLabel, arc, getArc(1+targetUpto), fstReader);
+ 
+-          if (nextArc == null) {
++        if (nextArc == null) {
+ 
+-            // Index is exhausted
+-            // if (DEBUG) {
+-            //   System.out.println("    index: index exhausted label=" + ((char) targetLabel) + " " + toHex(targetLabel));
+-            // }
+-            
+-            validIndexPrefix = currentFrame.prefix;
+-            //validIndexPrefix = targetUpto;
++          // Index is exhausted
++          // if (DEBUG) {
++          //   System.out.println("    index: index exhausted label=" + ((char) targetLabel) + " " + toHex(targetLabel));
++          // }
++          
++          validIndexPrefix = currentFrame.prefix;
++          //validIndexPrefix = targetUpto;
+ 
+-            currentFrame.scanToFloorFrame(target);
++          currentFrame.scanToFloorFrame(target);
+ 
+-            if (!currentFrame.hasTerms) {
+-              termExists = false;
+-              term.bytes[targetUpto] = (byte) targetLabel;
+-              term.length = 1+targetUpto;
+-              // if (DEBUG) {
+-              //   System.out.println("  FAST NOT_FOUND term=" + brToString(term));
+-              // }
+-              return false;
+-            }
++          if (!currentFrame.hasTerms) {
++            termExists = false;
++            term.bytes[targetUpto] = (byte) targetLabel;
++            term.length = 1+targetUpto;
++            // if (DEBUG) {
++            //   System.out.println("  FAST NOT_FOUND term=" + brToString(term));
++            // }
++            return false;
++          }
+ 
+-            currentFrame.loadBlock();
++          currentFrame.loadBlock();
+ 
+-            final SeekStatus result = currentFrame.scanToTerm(target, true);            
+-            if (result == SeekStatus.FOUND) {
+-              // if (DEBUG) {
+-              //   System.out.println("  return FOUND term=" + term.utf8ToString() + " " + term);
+-              // }
+-              return true;
+-            } else {
+-              // if (DEBUG) {
+-              //   System.out.println("  got " + result + "; return NOT_FOUND term=" + brToString(term));
+-              // }
+-              return false;
+-            }
++          final SeekStatus result = currentFrame.scanToTerm(target, true);            
++          if (result == SeekStatus.FOUND) {
++            // if (DEBUG) {
++            //   System.out.println("  return FOUND term=" + term.utf8ToString() + " " + term);
++            // }
++            return true;
+           } else {
+-            // Follow this arc
+-            arc = nextArc;
+-            term.bytes[targetUpto] = (byte) targetLabel;
+-            // Aggregate output as we go:
+-            assert arc.output != null;
+-            if (arc.output != NO_OUTPUT) {
+-              output = fstOutputs.add(output, arc.output);
+-            }
+-
+             // if (DEBUG) {
+-            //   System.out.println("    index: follow label=" + toHex(target.bytes[target.offset + targetUpto]&0xff) + " arc.output=" + arc.output + " arc.nfo=" + arc.nextFinalOutput);
++            //   System.out.println("  got " + result + "; return NOT_FOUND term=" + brToString(term));
+             // }
+-            targetUpto++;
++            return false;
++          }
++        } else {
++          // Follow this arc
++          arc = nextArc;
++          term.bytes[targetUpto] = (byte) targetLabel;
++          // Aggregate output as we go:
++          assert arc.output != null;
++          if (arc.output != NO_OUTPUT) {
++            output = FST_OUTPUTS.add(output, arc.output);
++          }
+ 
+-            if (arc.isFinal()) {
+-              //if (DEBUG) System.out.println("    arc is final!");
+-              currentFrame = pushFrame(arc, fstOutputs.add(output, arc.nextFinalOutput), targetUpto);
+-              //if (DEBUG) System.out.println("    curFrame.ord=" + currentFrame.ord + " hasTerms=" + currentFrame.hasTerms);
+-            }
++          // if (DEBUG) {
++          //   System.out.println("    index: follow label=" + toHex(target.bytes[target.offset + targetUpto]&0xff) + " arc.output=" + arc.output + " arc.nfo=" + arc.nextFinalOutput);
++          // }
++          targetUpto++;
++
++          if (arc.isFinal()) {
++            //if (DEBUG) System.out.println("    arc is final!");
++            currentFrame = pushFrame(arc, FST_OUTPUTS.add(output, arc.nextFinalOutput), targetUpto);
++            //if (DEBUG) System.out.println("    curFrame.ord=" + currentFrame.ord + " hasTerms=" + currentFrame.hasTerms);
+           }
+         }
++      }
+ 
+-        //validIndexPrefix = targetUpto;
+-        validIndexPrefix = currentFrame.prefix;
++      //validIndexPrefix = targetUpto;
++      validIndexPrefix = currentFrame.prefix;
+ 
+-        currentFrame.scanToFloorFrame(target);
++      currentFrame.scanToFloorFrame(target);
+ 
+-        // Target term is entirely contained in the index:
+-        if (!currentFrame.hasTerms) {
+-          termExists = false;
+-          term.length = targetUpto;
+-          // if (DEBUG) {
+-          //   System.out.println("  FAST NOT_FOUND term=" + brToString(term));
+-          // }
+-          return false;
+-        }
++      // Target term is entirely contained in the index:
++      if (!currentFrame.hasTerms) {
++        termExists = false;
++        term.length = targetUpto;
++        // if (DEBUG) {
++        //   System.out.println("  FAST NOT_FOUND term=" + brToString(term));
++        // }
++        return false;
++      }
+ 
+-        currentFrame.loadBlock();
++      currentFrame.loadBlock();
+ 
+-        final SeekStatus result = currentFrame.scanToTerm(target, true);            
+-        if (result == SeekStatus.FOUND) {
+-          // if (DEBUG) {
+-          //   System.out.println("  return FOUND term=" + term.utf8ToString() + " " + term);
+-          // }
+-          return true;
+-        } else {
+-          // if (DEBUG) {
+-          //   System.out.println("  got result " + result + "; return NOT_FOUND term=" + term.utf8ToString());
+-          // }
++      final SeekStatus result = currentFrame.scanToTerm(target, true);            
++      if (result == SeekStatus.FOUND) {
++        // if (DEBUG) {
++        //   System.out.println("  return FOUND term=" + term.utf8ToString() + " " + term);
++        // }
++        return true;
++      } else {
++        // if (DEBUG) {
++        //   System.out.println("  got result " + result + "; return NOT_FOUND term=" + term.utf8ToString());
++        // }
+ 
+-          return false;
+-        }
++        return false;
+       }
++    }
+ 
+-      @Override
+-      public SeekStatus seekCeil(final BytesRef target, final boolean useCache) throws IOException {
+-        if (index == null) {
+-          throw new IllegalStateException("terms index was not loaded");
+-        }
+-   
+-        if (term.bytes.length <= target.length) {
+-          term.bytes = ArrayUtil.grow(term.bytes, 1+target.length);
+-        }
++    @Override
++    public SeekStatus seekCeil(final BytesRef target, final boolean useCache) throws IOException {
++      if (index == null) {
++        throw new IllegalStateException("terms index was not loaded");
++      }
++ 
++      if (term.bytes.length <= target.length) {
++        term.bytes = ArrayUtil.grow(term.bytes, 1+target.length);
++      }
+ 
+-        assert clearEOF();
++      assert clearEOF();
++
++      //if (DEBUG) {
++      //System.out.println("\nBTTR.seekCeil seg=" + segment + " target=" + fieldInfo.name + ":" + target.utf8ToString() + " " + target + " current=" + brToString(term) + " (exists?=" + termExists + ") validIndexPrefix=  " + validIndexPrefix);
++      //printSeekState();
++      //}
++
++      FST.Arc<BytesRef> arc;
++      int targetUpto;
++      BytesRef output;
++
++      targetBeforeCurrentLength = currentFrame.ord;
++
++      if (currentFrame != staticFrame) {
++
++        // We are already seek'd; find the common
++        // prefix of new seek term vs current term and
++        // re-use the corresponding seek state.  For
++        // example, if app first seeks to foobar, then
++        // seeks to foobaz, we can re-use the seek state
++        // for the first 5 bytes.
+ 
+         //if (DEBUG) {
+-        //System.out.println("\nBTTR.seekCeil seg=" + segment + " target=" + fieldInfo.name + ":" + target.utf8ToString() + " " + target + " current=" + brToString(term) + " (exists?=" + termExists + ") validIndexPrefix=  " + validIndexPrefix);
+-        //printSeekState();
++        //System.out.println("  re-use current seek state validIndexPrefix=" + validIndexPrefix);
+         //}
+ 
+-        FST.Arc<BytesRef> arc;
+-        int targetUpto;
+-        BytesRef output;
++        arc = arcs[0];
++        assert arc.isFinal();
++        output = arc.output;
++        targetUpto = 0;
++        
++        Frame lastFrame = stack[0];
++        assert validIndexPrefix <= term.length;
+ 
+-        targetBeforeCurrentLength = currentFrame.ord;
++        final int targetLimit = Math.min(target.length, validIndexPrefix);
+ 
+-        if (currentFrame != staticFrame) {
++        int cmp = 0;
+ 
+-          // We are already seek'd; find the common
+-          // prefix of new seek term vs current term and
+-          // re-use the corresponding seek state.  For
+-          // example, if app first seeks to foobar, then
+-          // seeks to foobaz, we can re-use the seek state
+-          // for the first 5 bytes.
++        // TOOD: we should write our vLong backwards (MSB
++        // first) to get better sharing from the FST
+ 
++        // First compare up to valid seek frames:
++        while (targetUpto < targetLimit) {
++          cmp = (term.bytes[targetUpto]&0xFF) - (target.bytes[target.offset + targetUpto]&0xFF);
+           //if (DEBUG) {
+-          //System.out.println("  re-use current seek state validIndexPrefix=" + validIndexPrefix);
++          //System.out.println("    cycle targetUpto=" + targetUpto + " (vs limit=" + targetLimit + ") cmp=" + cmp + " (targetLabel=" + (char) (target.bytes[target.offset + targetUpto]) + " vs termLabel=" + (char) (term.bytes[targetUpto]) + ")"   + " arc.output=" + arc.output + " output=" + output);
+           //}
++          if (cmp != 0) {
++            break;
++          }
++          arc = arcs[1+targetUpto];
++          assert arc.label == (target.bytes[target.offset + targetUpto] & 0xFF): "arc.label=" + (char) arc.label + " targetLabel=" + (char) (target.bytes[target.offset + targetUpto] & 0xFF);
++          // TOOD: we could save the outputs in local
++          // byte[][] instead of making new objs ever
++          // seek; but, often the FST doesn't have any
++          // shared bytes (but this could change if we
++          // reverse vLong byte order)
++          if (arc.output != NO_OUTPUT) {
++            output = FST_OUTPUTS.add(output, arc.output);
++          }
++          if (arc.isFinal()) {
++            lastFrame = stack[1+lastFrame.ord];
++          }
++          targetUpto++;
++        }
+ 
+-          arc = arcs[0];
+-          assert arc.isFinal();
+-          output = arc.output;
+-          targetUpto = 0;
+-          
+-          Frame lastFrame = stack[0];
+-          assert validIndexPrefix <= term.length;
+-
+-          final int targetLimit = Math.min(target.length, validIndexPrefix);
+-
+-          int cmp = 0;
+-
+-          // TOOD: we should write our vLong backwards (MSB
+-          // first) to get better sharing from the FST
+ 
+-          // First compare up to valid seek frames:
+-          while (targetUpto < targetLimit) {
++        if (cmp == 0) {
++          final int targetUptoMid = targetUpto;
++          // Second compare the rest of the term, but
++          // don't save arc/output/frame:
++          final int targetLimit2 = Math.min(target.length, term.length);
++          while (targetUpto < targetLimit2) {
+             cmp = (term.bytes[targetUpto]&0xFF) - (target.bytes[target.offset + targetUpto]&0xFF);
+             //if (DEBUG) {
+-            //System.out.println("    cycle targetUpto=" + targetUpto + " (vs limit=" + targetLimit + ") cmp=" + cmp + " (targetLabel=" + (char) (target.bytes[target.offset + targetUpto]) + " vs termLabel=" + (char) (term.bytes[targetUpto]) + ")"   + " arc.output=" + arc.output + " output=" + output);
++            //System.out.println("    cycle2 targetUpto=" + targetUpto + " (vs limit=" + targetLimit + ") cmp=" + cmp + " (targetLabel=" + (char) (target.bytes[target.offset + targetUpto]) + " vs termLabel=" + (char) (term.bytes[targetUpto]) + ")");
+             //}
+             if (cmp != 0) {
+               break;
+             }
+-            arc = arcs[1+targetUpto];
+-            assert arc.label == (target.bytes[target.offset + targetUpto] & 0xFF): "arc.label=" + (char) arc.label + " targetLabel=" + (char) (target.bytes[target.offset + targetUpto] & 0xFF);
+-            // TOOD: we could save the outputs in local
+-            // byte[][] instead of making new objs ever
+-            // seek; but, often the FST doesn't have any
+-            // shared bytes (but this could change if we
+-            // reverse vLong byte order)
+-            if (arc.output != NO_OUTPUT) {
+-              output = fstOutputs.add(output, arc.output);
+-            }
+-            if (arc.isFinal()) {
+-              lastFrame = stack[1+lastFrame.ord];
+-            }
+             targetUpto++;
+           }
+ 
+-
+           if (cmp == 0) {
+-            final int targetUptoMid = targetUpto;
+-            // Second compare the rest of the term, but
+-            // don't save arc/output/frame:
+-            final int targetLimit2 = Math.min(target.length, term.length);
+-            while (targetUpto < targetLimit2) {
+-              cmp = (term.bytes[targetUpto]&0xFF) - (target.bytes[target.offset + targetUpto]&0xFF);
+-              //if (DEBUG) {
+-              //System.out.println("    cycle2 targetUpto=" + targetUpto + " (vs limit=" + targetLimit + ") cmp=" + cmp + " (targetLabel=" + (char) (target.bytes[target.offset + targetUpto]) + " vs termLabel=" + (char) (term.bytes[targetUpto]) + ")");
+-              //}
+-              if (cmp != 0) {
+-                break;
+-              }
+-              targetUpto++;
+-            }
+-
+-            if (cmp == 0) {
+-              cmp = term.length - target.length;
+-            }
+-            targetUpto = targetUptoMid;
++            cmp = term.length - target.length;
+           }
++          targetUpto = targetUptoMid;
++        }
+ 
+-          if (cmp < 0) {
+-            // Common case: target term is after current
+-            // term, ie, app is seeking multiple terms
+-            // in sorted order
++        if (cmp < 0) {
++          // Common case: target term is after current
++          // term, ie, app is seeking multiple terms
++          // in sorted order
++          //if (DEBUG) {
++          //System.out.println("  target is after current (shares prefixLen=" + targetUpto + "); clear frame.scanned ord=" + lastFrame.ord);
++          //}
++          currentFrame = lastFrame;
++
++        } else if (cmp > 0) {
++          // Uncommon case: target term
++          // is before current term; this means we can
++          // keep the currentFrame but we must rewind it
++          // (so we scan from the start)
++          targetBeforeCurrentLength = 0;
++          //if (DEBUG) {
++          //System.out.println("  target is before current (shares prefixLen=" + targetUpto + "); rewind frame ord=" + lastFrame.ord);
++          //}
++          currentFrame = lastFrame;
++          currentFrame.rewind();
++        } else {
++          // Target is exactly the same as current term
++          assert term.length == target.length;
++          if (termExists) {
+             //if (DEBUG) {
+-            //System.out.println("  target is after current (shares prefixLen=" + targetUpto + "); clear frame.scanned ord=" + lastFrame.ord);
++            //System.out.println("  target is same as current; return FOUND");
+             //}
+-            currentFrame = lastFrame;
+-
+-          } else if (cmp > 0) {
+-            // Uncommon case: target term
+-            // is before current term; this means we can
+-            // keep the currentFrame but we must rewind it
+-            // (so we scan from the start)
+-            targetBeforeCurrentLength = 0;
++            return SeekStatus.FOUND;
++          } else {
+             //if (DEBUG) {
+-            //System.out.println("  target is before current (shares prefixLen=" + targetUpto + "); rewind frame ord=" + lastFrame.ord);
++            //System.out.println("  target is same as current but term doesn't exist");
+             //}
+-            currentFrame = lastFrame;
+-            currentFrame.rewind();
+-          } else {
+-            // Target is exactly the same as current term
+-            assert term.length == target.length;
+-            if (termExists) {
+-              //if (DEBUG) {
+-              //System.out.println("  target is same as current; return FOUND");
+-              //}
+-              return SeekStatus.FOUND;
+-            } else {
+-              //if (DEBUG) {
+-              //System.out.println("  target is same as current but term doesn't exist");
+-              //}
+-            }
+           }
++        }
+ 
+-        } else {
++      } else {
+ 
+-          targetBeforeCurrentLength = -1;
+-          arc = index.getFirstArc(arcs[0]);
++        targetBeforeCurrentLength = -1;
++        arc = index.getFirstArc(arcs[0]);
+ 
+-          // Empty string prefix must have an output (block) in the index!
+-          assert arc.isFinal();
+-          assert arc.output != null;
++        // Empty string prefix must have an output (block) in the index!
++        assert arc.isFinal();
++        assert arc.output != null;
+ 
+-          //if (DEBUG) {
+-          //System.out.println("    no seek state; push root frame");
+-          //}
++        //if (DEBUG) {
++        //System.out.println("    no seek state; push root frame");
++        //}
+ 
+-          output = arc.output;
++        output = arc.output;
+ 
+-          currentFrame = staticFrame;
++        currentFrame = staticFrame;
+ 
+-          //term.length = 0;
+-          targetUpto = 0;
+-          currentFrame = pushFrame(arc, fstOutputs.add(output, arc.nextFinalOutput), 0);
+-        }
++        //term.length = 0;
++        targetUpto = 0;
++        currentFrame = pushFrame(arc, FST_OUTPUTS.add(output, arc.nextFinalOutput), 0);
++      }
+ 
+-        //if (DEBUG) {
+-        //System.out.println("  start index loop targetUpto=" + targetUpto + " output=" + output + " currentFrame.ord+1=" + currentFrame.ord + " targetBeforeCurrentLength=" + targetBeforeCurrentLength);
+-        //}
++      //if (DEBUG) {
++      //System.out.println("  start index loop targetUpto=" + targetUpto + " output=" + output + " currentFrame.ord+1=" + currentFrame.ord + " targetBeforeCurrentLength=" + targetBeforeCurrentLength);
++      //}
+ 
+-        while (targetUpto < target.length) {
++      while (targetUpto < target.length) {
+ 
+-          final int targetLabel = target.bytes[target.offset + targetUpto] & 0xFF;
++        final int targetLabel = target.bytes[target.offset + targetUpto] & 0xFF;
+ 
+-          final FST.Arc<BytesRef> nextArc = index.findTargetArc(targetLabel, arc, getArc(1+targetUpto), fstReader);
++        final FST.Arc<BytesRef> nextArc = index.findTargetArc(targetLabel, arc, getArc(1+targetUpto), fstReader);
+ 
+-          if (nextArc == null) {
++        if (nextArc == null) {
+ 
+-            // Index is exhausted
+-            // if (DEBUG) {
+-            //   System.out.println("    index: index exhausted label=" + ((char) targetLabel) + " " + toHex(targetLabel));
+-            // }
+-            
+-            validIndexPrefix = currentFrame.prefix;
+-            //validIndexPrefix = targetUpto;
++          // Index is exhausted
++          // if (DEBUG) {
++          //   System.out.println("    index: index exhausted label=" + ((char) targetLabel) + " " + toHex(targetLabel));
++          // }
++          
++          validIndexPrefix = currentFrame.prefix;
++          //validIndexPrefix = targetUpto;
+ 
+-            currentFrame.scanToFloorFrame(target);
++          currentFrame.scanToFloorFrame(target);
+ 
+-            currentFrame.loadBlock();
++          currentFrame.loadBlock();
+ 
+-            final SeekStatus result = currentFrame.scanToTerm(target, false);
+-            if (result == SeekStatus.END) {
+-              term.copyBytes(target);
+-              termExists = false;
++          final SeekStatus result = currentFrame.scanToTerm(target, false);
++          if (result == SeekStatus.END) {
++            term.copyBytes(target);
++            termExists = false;
+ 
+-              if (next() != null) {
+-                //if (DEBUG) {
+-                //System.out.println("  return NOT_FOUND term=" + brToString(term) + " " + term);
+-                //}
+-                return SeekStatus.NOT_FOUND;
+-              } else {
+-                //if (DEBUG) {
+-                //System.out.println("  return END");
+-                //}
+-                return SeekStatus.END;
+-              }
++            if (next() != null) {
++              //if (DEBUG) {
++              //System.out.println("  return NOT_FOUND term=" + brToString(term) + " " + term);
++              //}
++              return SeekStatus.NOT_FOUND;
+             } else {
+               //if (DEBUG) {
+-              //System.out.println("  return " + result + " term=" + brToString(term) + " " + term);
++              //System.out.println("  return END");
+               //}
+-              return result;
++              return SeekStatus.END;
+             }
+           } else {
+-            // Follow this arc
+-            term.bytes[targetUpto] = (byte) targetLabel;
+-            arc = nextArc;
+-            // Aggregate output as we go:
+-            assert arc.output != null;
+-            if (arc.output != NO_OUTPUT) {
+-              output = fstOutputs.add(output, arc.output);
+-            }
+-
+             //if (DEBUG) {
+-            //System.out.println("    index: follow label=" + toHex(target.bytes[target.offset + targetUpto]&0xff) + " arc.output=" + arc.output + " arc.nfo=" + arc.nextFinalOutput);
++            //System.out.println("  return " + result + " term=" + brToString(term) + " " + term);
+             //}
+-            targetUpto++;
++            return result;
++          }
++        } else {
++          // Follow this arc
++          term.bytes[targetUpto] = (byte) targetLabel;
++          arc = nextArc;
++          // Aggregate output as we go:
++          assert arc.output != null;
++          if (arc.output != NO_OUTPUT) {
++            output = FST_OUTPUTS.add(output, arc.output);
++          }
+ 
+-            if (arc.isFinal()) {
+-              //if (DEBUG) System.out.println("    arc is final!");
+-              currentFrame = pushFrame(arc, fstOutputs.add(output, arc.nextFinalOutput), targetUpto);
+-              //if (DEBUG) System.out.println("    curFrame.ord=" + currentFrame.ord + " hasTerms=" + currentFrame.hasTerms);
+-            }
++          //if (DEBUG) {
++          //System.out.println("    index: follow label=" + toHex(target.bytes[target.offset + targetUpto]&0xff) + " arc.output=" + arc.output + " arc.nfo=" + arc.nextFinalOutput);
++          //}
++          targetUpto++;
++
++          if (arc.isFinal()) {
++            //if (DEBUG) System.out.println("    arc is final!");
++            currentFrame = pushFrame(arc, FST_OUTPUTS.add(output, arc.nextFinalOutput), targetUpto);
++            //if (DEBUG) System.out.println("    curFrame.ord=" + currentFrame.ord + " hasTerms=" + currentFrame.hasTerms);
+           }
+         }
++      }
+ 
+-        //validIndexPrefix = targetUpto;
+-        validIndexPrefix = currentFrame.prefix;
++      //validIndexPrefix = targetUpto;
++      validIndexPrefix = currentFrame.prefix;
+ 
+-        currentFrame.scanToFloorFrame(target);
++      currentFrame.scanToFloorFrame(target);
+ 
+-        currentFrame.loadBlock();
++      currentFrame.loadBlock();
+ 
+-        final SeekStatus result = currentFrame.scanToTerm(target, false);
++      final SeekStatus result = currentFrame.scanToTerm(target, false);
+ 
+-        if (result == SeekStatus.END) {
+-          term.copyBytes(target);
+-          termExists = false;
+-          if (next() != null) {
+-            //if (DEBUG) {
+-            //System.out.println("  return NOT_FOUND term=" + term.utf8ToString() + " " + term);
+-            //}
+-            return SeekStatus.NOT_FOUND;
+-          } else {
+-            //if (DEBUG) {
+-            //System.out.println("  return END");
+-            //}
+-            return SeekStatus.END;
+-          }
++      if (result == SeekStatus.END) {
++        term.copyBytes(target);
++        termExists = false;
++        if (next() != null) {
++          //if (DEBUG) {
++          //System.out.println("  return NOT_FOUND term=" + term.utf8ToString() + " " + term);
++          //}
++          return SeekStatus.NOT_FOUND;
+         } else {
+-          return result;
++          //if (DEBUG) {
++          //System.out.println("  return END");
++          //}
++          return SeekStatus.END;
+         }
++      } else {
++        return result;
+       }
++    }
+ 
+-      @SuppressWarnings("unused")
+-      private void printSeekState(PrintStream out) throws IOException {
+-        if (currentFrame == staticFrame) {
+-          out.println("  no prior seek");
+-        } else {
+-          out.println("  prior seek state:");
+-          int ord = 0;
+-          boolean isSeekFrame = true;
+-          while(true) {
+-            Frame f = getFrame(ord);
+-            assert f != null;
+-            final BytesRef prefix = new BytesRef(term.bytes, 0, f.prefix);
+-            if (f.nextEnt == -1) {
+-              out.println("    frame " + (isSeekFrame ? "(seek)" : "(next)") + " ord=" + ord + " fp=" + f.fp + (f.isFloor ? (" (fpOrig=" + f.fpOrig + ")") : "") + " prefixLen=" + f.prefix + " prefix=" + prefix + (f.nextEnt == -1 ? "" : (" (of " + f.entCount + ")")) + " hasTerms=" + f.hasTerms + " isFloor=" + f.isFloor + " code=" + ((f.fp<<BlockTreeTermsWriter.OUTPUT_FLAGS_NUM_BITS) + (f.hasTerms ? BlockTreeTermsWriter.OUTPUT_FLAG_HAS_TERMS:0) + (f.isFloor ? BlockTreeTermsWriter.OUTPUT_FLAG_IS_FLOOR:0)) + " isLastInFloor=" + f.isLastInFloor + " mdUpto=" + f.metaDataUpto + " tbOrd=" + f.getTermBlockOrd());
+-            } else {
+-              out.println("    frame " + (isSeekFrame ? "(seek, loaded)" : "(next, loaded)") + " ord=" + ord + " fp=" + f.fp + (f.isFloor ? (" (fpOrig=" + f.fpOrig + ")") : "") + " prefixLen=" + f.prefix + " prefix=" + prefix + " nextEnt=" + f.nextEnt + (f.nextEnt == -1 ? "" : (" (of " + f.entCount + ")")) + " hasTerms=" + f.hasTerms + " isFloor=" + f.isFloor + " code=" + ((f.fp<<BlockTreeTermsWriter.OUTPUT_FLAGS_NUM_BITS) + (f.hasTerms ? BlockTreeTermsWriter.OUTPUT_FLAG_HAS_TERMS:0) + (f.isFloor ? BlockTreeTermsWriter.OUTPUT_FLAG_IS_FLOOR:0)) + " lastSubFP=" + f.lastSubFP + " isLastInFloor=" + f.isLastInFloor + " mdUpto=" + f.metaDataUpto + " tbOrd=" + f.getTermBlockOrd());
++    @SuppressWarnings("unused")
++    private void printSeekState(PrintStream out) throws IOException {
++      if (currentFrame == staticFrame) {
++        out.println("  no prior seek");
++      } else {
++        out.println("  prior seek state:");
++        int ord = 0;
++        boolean isSeekFrame = true;
++        while(true) {
++          Frame f = getFrame(ord);
++          assert f != null;
++          final BytesRef prefix = new BytesRef(term.bytes, 0, f.prefix);
++          if (f.nextEnt == -1) {
++            out.println("    frame " + (isSeekFrame ? "(seek)" : "(next)") + " ord=" + ord + " fp=" + f.fp + (f.isFloor ? (" (fpOrig=" + f.fpOrig + ")") : "") + " prefixLen=" + f.prefix + " prefix=" + prefix + (f.nextEnt == -1 ? "" : (" (of " + f.entCount + ")")) + " hasTerms=" + f.hasTerms + " isFloor=" + f.isFloor + " code=" + ((f.fp<<BlockTreeTermsWriter.OUTPUT_FLAGS_NUM_BITS) + (f.hasTerms ? BlockTreeTermsWriter.OUTPUT_FLAG_HAS_TERMS:0) + (f.isFloor ? BlockTreeTermsWriter.OUTPUT_FLAG_IS_FLOOR:0)) + " isLastInFloor=" + f.isLastInFloor + " mdUpto=" + f.metaDataUpto + " tbOrd=" + f.getTermBlockOrd());
++          } else {
++            out.println("    frame " + (isSeekFrame ? "(seek, loaded)" : "(next, loaded)") + " ord=" + ord + " fp=" + f.fp + (f.isFloor ? (" (fpOrig=" + f.fpOrig + ")") : "") + " prefixLen=" + f.prefix + " prefix=" + prefix + " nextEnt=" + f.nextEnt + (f.nextEnt == -1 ? "" : (" (of " + f.entCount + ")")) + " hasTerms=" + f.hasTerms + " isFloor=" + f.isFloor + " code=" + ((f.fp<<BlockTreeTermsWriter.OUTPUT_FLAGS_NUM_BITS) + (f.hasTerms ? BlockTreeTermsWriter.OUTPUT_FLAG_HAS_TERMS:0) + (f.isFloor ? BlockTreeTermsWriter.OUTPUT_FLAG_IS_FLOOR:0)) + " lastSubFP=" + f.lastSubFP + " isLastInFloor=" + f.isLastInFloor + " mdUpto=" + f.metaDataUpto + " tbOrd=" + f.getTermBlockOrd());
++          }
++          if (index != null) {
++            assert !isSeekFrame || f.arc != null: "isSeekFrame=" + isSeekFrame + " f.arc=" + f.arc;
++            if (f.prefix > 0 && isSeekFrame && f.arc.label != (term.bytes[f.prefix-1]&0xFF)) {
++              out.println("      broken seek state: arc.label=" + (char) f.arc.label + " vs term byte=" + (char) (term.bytes[f.prefix-1]&0xFF));
++              throw new RuntimeException("seek state is broken");
+             }
+-            if (index != null) {
+-              assert !isSeekFrame || f.arc != null: "isSeekFrame=" + isSeekFrame + " f.arc=" + f.arc;
+-              if (f.prefix > 0 && isSeekFrame && f.arc.label != (term.bytes[f.prefix-1]&0xFF)) {
+-                out.println("      broken seek state: arc.label=" + (char) f.arc.label + " vs term byte=" + (char) (term.bytes[f.prefix-1]&0xFF));
++            BytesRef output = Util.get(index, prefix);
++            if (output == null) {
++              out.println("      broken seek state: prefix is not final in index");
++              throw new RuntimeException("seek state is broken");
++            } else if (isSeekFrame && !f.isFloor) {
++              final ByteArrayDataInput reader = new ByteArrayDataInput(output.bytes, output.offset, output.length);
++              final long codeOrig = reader.readVLong();
++              final long code = (f.fp << BlockTreeTermsWriter.OUTPUT_FLAGS_NUM_BITS) | (f.hasTerms ? BlockTreeTermsWriter.OUTPUT_FLAG_HAS_TERMS:0) | (f.isFloor ? BlockTreeTermsWriter.OUTPUT_FLAG_IS_FLOOR:0);
++              if (codeOrig != code) {
++                out.println("      broken seek state: output code=" + codeOrig + " doesn't match frame code=" + code);
+                 throw new RuntimeException("seek state is broken");
+               }
+-              BytesRef output = Util.get(index, prefix);
+-              if (output == null) {
+-                out.println("      broken seek state: prefix is not final in index");
+-                throw new RuntimeException("seek state is broken");
+-              } else if (isSeekFrame && !f.isFloor) {
+-                final ByteArrayDataInput reader = new ByteArrayDataInput(output.bytes, output.offset, output.length);
+-                final long codeOrig = reader.readVLong();
+-                final long code = (f.fp << BlockTreeTermsWriter.OUTPUT_FLAGS_NUM_BITS) | (f.hasTerms ? BlockTreeTermsWriter.OUTPUT_FLAG_HAS_TERMS:0) | (f.isFloor ? BlockTreeTermsWriter.OUTPUT_FLAG_IS_FLOOR:0);
+-                if (codeOrig != code) {
+-                  out.println("      broken seek state: output code=" + codeOrig + " doesn't match frame code=" + code);
+-                  throw new RuntimeException("seek state is broken");
+-                }
+-              }
+-            }
+-            if (f == currentFrame) {
+-              break;
+-            }
+-            if (f.prefix == validIndexPrefix) {
+-              isSeekFrame = false;
+             }
+-            ord++;
+           }
+-        }
+-      }
+-
+-      /* Decodes only the term bytes of the next term.  If caller then asks for
+-         metadata, ie docFreq, totalTermFreq or pulls a D/&PEnum, we then (lazily)
+-         decode all metadata up to the current term. */
+-      @Override
+-      public BytesRef next() throws IOException {
+-
+-        if (in == null) {
+-          // Fresh TermsEnum; seek to first term:
+-          final FST.Arc<BytesRef> arc;
+-          if (index != null) {
+-            arc = index.getFirstArc(arcs[0]);
+-            // Empty string prefix must have an output in the index!
+-            assert arc.isFinal();
+-          } else {
+-            arc = null;
++          if (f == currentFrame) {
++            break;
+           }
+-          currentFrame = pushFrame(arc, rootCode, 0);
+-          currentFrame.loadBlock();
++          if (f.prefix == validIndexPrefix) {
++            isSeekFrame = false;
++          }
++          ord++;
+         }
++      }
++    }
+ 
+-        targetBeforeCurrentLength = currentFrame.ord;
+-
+-        assert !eof;
+-        //if (DEBUG) {
+-        //System.out.println("\nBTTR.next seg=" + segment + " term=" + brToString(term) + " termExists?=" + termExists + " field=" + fieldInfo.name + " termBlockOrd=" + currentFrame.state.termBlockOrd + " validIndexPrefix=" + validIndexPrefix);
+-        //printSeekState();
+-        //}
++    /* Decodes only the term bytes of the next term.  If caller then asks for
++       metadata, ie docFreq, totalTermFreq or pulls a D/&PEnum, we then (lazily)
++       decode all metadata up to the current term. */
++    @Override
++    public BytesRef next() throws IOException {
+ 
+-        if (currentFrame == staticFrame) {
+-          // If seek was previously called and the term was
+-          // cached, or seek(TermState) was called, usually
+-          // caller is just going to pull a D/&PEnum or get
+-          // docFreq, etc.  But, if they then call next(),
+-          // this method catches up all internal state so next()
+-          // works properly:
+-          //if (DEBUG) System.out.println("  re-seek to pending term=" + term.utf8ToString() + " " + term);
+-          final boolean result = seekExact(term, false);
+-          assert result;
++      if (in == null) {
++        // Fresh TermsEnum; seek to first term:
++        final FST.Arc<BytesRef> arc;
++        if (index != null) {
++          arc = index.getFirstArc(arcs[0]);
++          // Empty string prefix must have an output in the index!
++          assert arc.isFinal();
++        } else {
++          arc = null;
+         }
++        currentFrame = pushFrame(arc, reader.rootCode, 0);
++        currentFrame.loadBlock();
++      }
+ 
+-        // Pop finished blocks
+-        while (currentFrame.nextEnt == currentFrame.entCount) {
+-          if (!currentFrame.isLastInFloor) {
+-            currentFrame.loadNextFloorBlock();
+-          } else {
+-            //if (DEBUG) System.out.println("  pop frame");
+-            if (currentFrame.ord == 0) {
+-              //if (DEBUG) System.out.println("  return null");
+-              assert setEOF();
+-              term.length = 0;
+-              validIndexPrefix = 0;
+-              currentFrame.rewind();
+-              termExists = false;
+-              return null;
+-            }
+-            final long lastFP = currentFrame.fpOrig;
+-            currentFrame = stack[currentFrame.ord-1];
+-
+-            if (currentFrame.nextEnt == -1 || currentFrame.lastSubFP != lastFP) {
+-              // We popped into a frame that's not loaded
+-              // yet or not scan'd to the right entry
+-              currentFrame.scanToFloorFrame(term);
+-              currentFrame.loadBlock();
+-              currentFrame.scanToSubBlock(lastFP);
+-            }
++      targetBeforeCurrentLength = currentFrame.ord;
++
++      assert !eof;
++      //if (DEBUG) {
++      //System.out.println("\nBTTR.next seg=" + segment + " term=" + brToString(term) + " termExists?=" + termExists + " field=" + fieldInfo.name + " termBlockOrd=" + currentFrame.state.termBlockOrd + " validIndexPrefix=" + validIndexPrefix);
++      //printSeekState();
++      //}
++
++      if (currentFrame == staticFrame) {
++        // If seek was previously called and the term was
++        // cached, or seek(TermState) was called, usually
++        // caller is just going to pull a D/&PEnum or get
++        // docFreq, etc.  But, if they then call next(),
++        // this method catches up all internal state so next()
++        // works properly:
++        //if (DEBUG) System.out.println("  re-seek to pending term=" + term.utf8ToString() + " " + term);
++        final boolean result = seekExact(term, false);
++        assert result;
++      }
+ 
+-            // Note that the seek state (last seek) has been
+-            // invalidated beyond this depth
+-            validIndexPrefix = Math.min(validIndexPrefix, currentFrame.prefix);
+-            //if (DEBUG) {
+-            //System.out.println("  reset validIndexPrefix=" + validIndexPrefix);
+-            //}
++      // Pop finished blocks
++      while (currentFrame.nextEnt == currentFrame.entCount) {
++        if (!currentFrame.isLastInFloor) {
++          currentFrame.loadNextFloorBlock();
++        } else {
++          //if (DEBUG) System.out.println("  pop frame");
++          if (currentFrame.ord == 0) {
++            //if (DEBUG) System.out.println("  return null");
++            assert setEOF();
++            term.length = 0;
++            validIndexPrefix = 0;
++            currentFrame.rewind();
++            termExists = false;
++            return null;
+           }
+-        }
++          final long lastFP = currentFrame.fpOrig;
++          currentFrame = stack[currentFrame.ord-1];
+ 
+-        while(true) {
+-          if (currentFrame.next()) {
+-            // Push to new block:
+-            //if (DEBUG) System.out.println("  push frame");
+-            currentFrame = pushFrame(null, currentFrame.lastSubFP, term.length);
+-            // This is a "next" frame -- even if it's
+-            // floor'd we must pretend it isn't so we don't
+-            // try to scan to the right floor frame:
+-            currentFrame.isFloor = false;
+-            //currentFrame.hasTerms = true;
++          if (currentFrame.nextEnt == -1 || currentFrame.lastSubFP != lastFP) {
++            // We popped into a frame that's not loaded
++            // yet or not scan'd to the right entry
++            currentFrame.scanToFloorFrame(term);
+             currentFrame.loadBlock();
+-          } else {
+-            //if (DEBUG) System.out.println("  return term=" + term.utf8ToString() + " " + term + " currentFrame.ord=" + currentFrame.ord);
+-            return term;
++            currentFrame.scanToSubBlock(lastFP);
+           }
++
++          // Note that the seek state (last seek) has been
++          // invalidated beyond this depth
++          validIndexPrefix = Math.min(validIndexPrefix, currentFrame.prefix);
++          //if (DEBUG) {
++          //System.out.println("  reset validIndexPrefix=" + validIndexPrefix);
++          //}
+         }
+       }
+ 
+-      @Override
+-      public BytesRef term() {
+-        assert !eof;
+-        return term;
++      while(true) {
++        if (currentFrame.next()) {
++          // Push to new block:
++          //if (DEBUG) System.out.println("  push frame");
++          currentFrame = pushFrame(null, currentFrame.lastSubFP, term.length);
++          // This is a "next" frame -- even if it's
++          // floor'd we must pretend it isn't so we don't
++          // try to scan to the right floor frame:
++          currentFrame.isFloor = false;
++          //currentFrame.hasTerms = true;
++          currentFrame.loadBlock();
++        } else {
++          //if (DEBUG) System.out.println("  return term=" + term.utf8ToString() + " " + term + " currentFrame.ord=" + currentFrame.ord);
++          return term;
++        }
+       }
++    }
+ 
+-      @Override
+-      public int docFreq() throws IOException {
+-        assert !eof;
+-        //if (DEBUG) System.out.println("BTR.docFreq");
+-        currentFrame.decodeMetaData();
+-        //if (DEBUG) System.out.println("  return " + currentFrame.state.docFreq);
+-        return currentFrame.state.docFreq;
+-      }
++    @Override
++    public BytesRef term() {
++      assert !eof;
++      return term;
++    }
+ 
+-      @Override
+-      public long totalTermFreq() throws IOException {
+-        assert !eof;
+-        currentFrame.decodeMetaData();
+-        return currentFrame.state.totalTermFreq;
+-      }
++    @Override
++    public int docFreq() throws IOException {
++      assert !eof;
++      //if (DEBUG) System.out.println("BTR.docFreq");
++      currentFrame.decodeMetaData();
++      //if (DEBUG) System.out.println("  return " + currentFrame.state.docFreq);
++      return currentFrame.state.docFreq;
++    }
+ 
+-      @Override
+-      public DocsEnum docs(Bits skipDocs, DocsEnum reuse, int flags) throws IOException {
+-        assert !eof;
+-        //if (DEBUG) {
+-        //System.out.println("BTTR.docs seg=" + segment);
+-        //}
+-        currentFrame.decodeMetaData();
+-        //if (DEBUG) {
+-        //System.out.println("  state=" + currentFrame.state);
+-        //}
+-        return postingsReader.docs(fieldInfo, currentFrame.state, skipDocs, reuse, flags);
+-      }
++    @Override
++    public long totalTermFreq() throws IOException {
++      assert !eof;
++      currentFrame.decodeMetaData();
++      return currentFrame.state.totalTermFreq;
++    }
+ 
+-      @Override
+-      public DocsAndPositionsEnum docsAndPositions(Bits skipDocs, DocsAndPositionsEnum reuse, int flags) throws IOException {
+-        if (fieldInfo.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) < 0) {
+-          // Positions were not indexed:
+-          return null;
+-        }
++    @Override
++    public DocsEnum docs(Bits skipDocs, DocsEnum reuse, int flags) throws IOException {
++      assert !eof;
++      //if (DEBUG) {
++      //System.out.println("BTTR.docs seg=" + segment);
++      //}
++      currentFrame.decodeMetaData();
++      //if (DEBUG) {
++      //System.out.println("  state=" + currentFrame.state);
++      //}
++      return reader.postingsReader().docs(reader.fieldInfo, currentFrame.state, skipDocs, reuse, flags);
++    }
+ 
+-        assert !eof;
+-        currentFrame.decodeMetaData();
+-        return postingsReader.docsAndPositions(fieldInfo, currentFrame.state, skipDocs, reuse, flags);
++    @Override
++    public DocsAndPositionsEnum docsAndPositions(Bits skipDocs, DocsAndPositionsEnum reuse, int flags) throws IOException {
++      if (reader.fieldInfo.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) < 0) {
++        // Positions were not indexed:
++        return null;
+       }
+ 
+-      @Override
+-      public void seekExact(BytesRef target, TermState otherState) {
++      assert !eof;
++      currentFrame.decodeMetaData();
++      return reader.postingsReader().docsAndPositions(reader.fieldInfo, currentFrame.state, skipDocs, reuse, flags);
++    }
++
++    @Override
++    public void seekExact(BytesRef target, TermState otherState) {
++      // if (DEBUG) {
++      //   System.out.println("BTTR.seekExact termState seg=" + segment + " target=" + target.utf8ToString() + " " + target + " state=" + otherState);
++      // }
++      assert clearEOF();
++      if (target.compareTo(term) != 0 || !termExists) {
++        assert otherState != null && otherState instanceof BlockTermState;
++        currentFrame = staticFrame;
++        currentFrame.state.copyFrom(otherState);
++        term.copyBytes(target);
++        currentFrame.metaDataUpto = currentFrame.getTermBlockOrd();
++        assert currentFrame.metaDataUpto > 0;
++        validIndexPrefix = 0;
++      } else {
+         // if (DEBUG) {
+-        //   System.out.println("BTTR.seekExact termState seg=" + segment + " target=" + target.utf8ToString() + " " + target + " state=" + otherState);
++        //   System.out.println("  skip seek: already on target state=" + currentFrame.state);
+         // }
+-        assert clearEOF();
+-        if (target.compareTo(term) != 0 || !termExists) {
+-          assert otherState != null && otherState instanceof BlockTermState;
+-          currentFrame = staticFrame;
+-          currentFrame.state.copyFrom(otherState);
+-          term.copyBytes(target);
+-          currentFrame.metaDataUpto = currentFrame.getTermBlockOrd();
+-          assert currentFrame.metaDataUpto > 0;
+-          validIndexPrefix = 0;
+-        } else {
+-          // if (DEBUG) {
+-          //   System.out.println("  skip seek: already on target state=" + currentFrame.state);
+-          // }
+-        }
+-      }
+-      
+-      @Override
+-      public TermState termState() throws IOException {
+-        assert !eof;
+-        currentFrame.decodeMetaData();
+-        TermState ts = currentFrame.state.clone();
+-        //if (DEBUG) System.out.println("BTTR.termState seg=" + segment + " state=" + ts);
+-        return ts;
+       }
++    }
++    
++    @Override
++    public TermState termState() throws IOException {
++      assert !eof;
++      currentFrame.decodeMetaData();
++      TermState ts = currentFrame.state.clone();
++      //if (DEBUG) System.out.println("BTTR.termState seg=" + segment + " state=" + ts);
++      return ts;
++    }
+ 
+-      @Override
+-      public void seekExact(long ord) {
+-        throw new UnsupportedOperationException();
+-      }
++    @Override
++    public void seekExact(long ord) {
++      throw new UnsupportedOperationException();
++    }
+ 
+-      @Override
+-      public long ord() {
+-        throw new UnsupportedOperationException();
+-      }
++    @Override
++    public long ord() {
++      throw new UnsupportedOperationException();
++    }
+ 
+-      // Not static -- references term, postingsReader,
+-      // fieldInfo, in
+-      private final class Frame {
+-        // Our index in stack[]:
+-        final int ord;
+ 
+-        boolean hasTerms;
+-        boolean hasTermsOrig;
+-        boolean isFloor;
++    final void recurseSubFrames(int termLen) throws IOException {
++      currentFrame = pushFrame(null, currentFrame.lastSubFP, termLen);
++      currentFrame.loadBlock();
++      while (currentFrame.next()) {
++        currentFrame = pushFrame(null, currentFrame.lastSubFP, term.length);
++        currentFrame.loadBlock();
++      }
++    }
+ 
+-        FST.Arc<BytesRef> arc;
++  }
++  
++  
++  // Not static -- references term, postingsReader,
++  // fieldInfo, in
++  private static final class Frame {
++    // Our index in stack[]:
++    final int ord;
++    boolean hasTerms;
++    boolean hasTermsOrig;
++    boolean isFloor;
+ 
+-        // File pointer where this block was loaded from
+-        long fp;
+-        long fpOrig;
+-        long fpEnd;
++    FST.Arc<BytesRef> arc;
+ 
+-        byte[] suffixBytes = new byte[128];
+-        final ByteArrayDataInput suffixesReader = new ByteArrayDataInput();
++    // File pointer where this block was loaded from
++    long fp;
++    long fpOrig;
++    long fpEnd;
+ 
+-        byte[] statBytes = new byte[64];
+-        final ByteArrayDataInput statsReader = new ByteArrayDataInput();
++    byte[] suffixBytes = new byte[128];
++    final ByteArrayDataInput suffixesReader = new ByteArrayDataInput();
+ 
+-        byte[] floorData = new byte[32];
+-        final ByteArrayDataInput floorDataReader = new ByteArrayDataInput();
++    byte[] statBytes = new byte[64];
++    final ByteArrayDataInput statsReader = new ByteArrayDataInput();
+ 
+-        // Length of prefix shared by all terms in this block
+-        int prefix;
++    byte[] floorData = new byte[32];
++    final ByteArrayDataInput floorDataReader = new ByteArrayDataInput();
+ 
+-        // Number of entries (term or sub-block) in this block
+-        int entCount;
++    // Length of prefix shared by all terms in this block
++    int prefix;
+ 
+-        // Which term we will next read, or -1 if the block
+-        // isn't loaded yet
+-        int nextEnt;
++    // Number of entries (term or sub-block) in this block
++    int entCount;
+ 
+-        // True if this block is either not a floor block,
+-        // or, it's the last sub-block of a floor block
+-        boolean isLastInFloor;
++    // Which term we will next read, or -1 if the block
++    // isn't loaded yet
++    int nextEnt;
+ 
+-        // True if all entries are terms
+-        boolean isLeafBlock;
++    // True if this block is either not a floor block,
++    // or, it's the last sub-block of a floor block
++    boolean isLastInFloor;
+ 
+-        long lastSubFP;
++    // True if all entries are terms
++    boolean isLeafBlock;
+ 
+-        int nextFloorLabel;
+-        int numFollowFloorBlocks;
++    long lastSubFP;
+ 
+-        // Next term to decode metaData; we decode metaData
+-        // lazily so that scanning to find the matching term is
+-        // fast and only if you find a match and app wants the
+-        // stats or docs/positions enums, will we decode the
+-        // metaData
+-        int metaDataUpto;
++    int nextFloorLabel;
++    int numFollowFloorBlocks;
+ 
+-        final BlockTermState state;
++    // Next term to decode metaData; we decode metaData
++    // lazily so that scanning to find the matching term is
++    // fast and only if you find a match and app wants the
++    // stats or docs/positions enums, will we decode the
++    // metaData
++    int metaDataUpto;
+ 
+-        public Frame(int ord) throws IOException {
+-          this.ord = ord;
+-          state = postingsReader.newTermState();
+-          state.totalTermFreq = -1;
+-        }
++    BlockTermState state;
++    FieldInfo info;
++    PostingsReaderBase postingsReader;
++    SegmentTermsEnum ste;
+ 
+-        public void setFloorData(ByteArrayDataInput in, BytesRef source) {
+-          final int numBytes = source.length - (in.getPosition() - source.offset);
+-          if (numBytes > floorData.length) {
+-            floorData = new byte[ArrayUtil.oversize(numBytes, 1)];
+-          }
+-          System.arraycopy(source.bytes, source.offset+in.getPosition(), floorData, 0, numBytes);
+-          floorDataReader.reset(floorData, 0, numBytes);
+-          numFollowFloorBlocks = floorDataReader.readVInt();
+-          nextFloorLabel = floorDataReader.readByte() & 0xff;
+-          //if (DEBUG) {
+-          //System.out.println("    setFloorData fpOrig=" + fpOrig + " bytes=" + new BytesRef(source.bytes, source.offset + in.getPosition(), numBytes) + " numFollowFloorBlocks=" + numFollowFloorBlocks + " nextFloorLabel=" + toHex(nextFloorLabel));
+-          //}
+-        }
+ 
+-        public int getTermBlockOrd() {
+-          return isLeafBlock ? nextEnt : state.termBlockOrd;
+-        }
++    public Frame(int ord, SegmentTermsEnum ste) throws IOException {
++      this.ord = ord;
++      this.ste = ste;
++      this.postingsReader = ste.reader.postingsReader();
++      this.info = ste.reader.fieldInfo;
++      state = postingsReader.newTermState();
++      state.totalTermFreq = -1;
++    }
+ 
+-        void loadNextFloorBlock() throws IOException {
+-          //if (DEBUG) {
+-          //System.out.println("    loadNextFloorBlock fp=" + fp + " fpEnd=" + fpEnd);
+-          //}
+-          assert arc == null || isFloor: "arc=" + arc + " isFloor=" + isFloor;
+-          fp = fpEnd;
+-          nextEnt = -1;
+-          loadBlock();
+-        }
++    public void reset(SegmentTermsEnum ste) throws IOException {
++      this.ste = ste;
++      this.postingsReader = ste.reader.postingsReader();
++      this.info = ste.reader.fieldInfo;
++
++      state = postingsReader.newTermState();
++      state.totalTermFreq = -1;
++      isLeafBlock = false;
++      metaDataUpto = 0;
++      nextFloorLabel = 0;
++      lastSubFP = fp = fpOrig = 0;
++      nextEnt = 0;
++      entCount = 0;
++      prefix = 0;
++      hasTerms = false;
++      hasTermsOrig = false;
++      isFloor = false;
++      
++      // nocommit maybe I can just call rewind()? - all tests seem to pass
++    }
+ 
+-        /* Does initial decode of next block of terms; this
+-           doesn't actually decode the docFreq, totalTermFreq,
+-           postings details (frq/prx offset, etc.) metadata;
+-           it just loads them as byte[] blobs which are then      
+-           decoded on-demand if the metadata is ever requested
+-           for any term in this block.  This enables terms-only
+-           intensive consumes (eg certain MTQs, respelling) to
+-           not pay the price of decoding metadata they won't
+-           use. */
+-        void loadBlock() throws IOException {
+-
+-          // Clone the IndexInput lazily, so that consumers
+-          // that just pull a TermsEnum to
+-          // seekExact(TermState) don't pay this cost:
+-          initIndexInput();
+-
+-          if (nextEnt != -1) {
+-            // Already loaded
+-            return;
+-          }
+-          //System.out.println("blc=" + blockLoadCount);
++    public void setFloorData(ByteArrayDataInput in, BytesRef source) {
++      final int numBytes = source.length - (in.getPosition() - source.offset);
++      if (numBytes > floorData.length) {
++        floorData = new byte[ArrayUtil.oversize(numBytes, 1)];
++      }
++      System.arraycopy(source.bytes, source.offset+in.getPosition(), floorData, 0, numBytes);
++      floorDataReader.reset(floorData, 0, numBytes);
++      numFollowFloorBlocks = floorDataReader.readVInt();
++      nextFloorLabel = floorDataReader.readByte() & 0xff;
++      //if (DEBUG) {
++      //System.out.println("    setFloorData fpOrig=" + fpOrig + " bytes=" + new BytesRef(source.bytes, source.offset + in.getPosition(), numBytes) + " numFollowFloorBlocks=" + numFollowFloorBlocks + " nextFloorLabel=" + toHex(nextFloorLabel));
++      //}
++    }
+ 
+-          in.seek(fp);
+-          int code = in.readVInt();
+-          entCount = code >>> 1;
+-          assert entCount > 0;
+-          isLastInFloor = (code & 1) != 0;
+-          assert arc == null || (isLastInFloor || isFloor);
++    public int getTermBlockOrd() {
++      return isLeafBlock ? nextEnt : state.termBlockOrd;
++    }
+ 
+-          // TODO: if suffixes were stored in random-access
+-          // array structure, then we could do binary search
+-          // instead of linear scan to find target term; eg
+-          // we could have simple array of offsets
++    void loadNextFloorBlock() throws IOException {
++      //if (DEBUG) {
++      //System.out.println("    loadNextFloorBlock fp=" + fp + " fpEnd=" + fpEnd);
++      //}
++      assert arc == null || isFloor: "arc=" + arc + " isFloor=" + isFloor;
++      fp = fpEnd;
++      nextEnt = -1;
++      loadBlock();
++    }
+ 
+-          // term suffixes:
+-          code = in.readVInt();
+-          isLeafBlock = (code & 1) != 0;
+-          int numBytes = code >>> 1;
+-          if (suffixBytes.length < numBytes) {
+-            suffixBytes = new byte[ArrayUtil.oversize(numBytes, 1)];
+-          }
+-          in.readBytes(suffixBytes, 0, numBytes);
+-          suffixesReader.reset(suffixBytes, 0, numBytes);
++    /* Does initial decode of next block of terms; this
++       doesn't actually decode the docFreq, totalTermFreq,
++       postings details (frq/prx offset, etc.) metadata;
++       it just loads them as byte[] blobs which are then      
++       decoded on-demand if the metadata is ever requested
++       for any term in this block.  This enables terms-only
++       intensive consumes (eg certain MTQs, respelling) to
++       not pay the price of decoding metadata they won't
++       use. */
++    void loadBlock() throws IOException {
++
++      // Clone the IndexInput lazily, so that consumers
++      // that just pull a TermsEnum to
++      // seekExact(TermState) don't pay this cost:
++      final IndexInput in = ste.initIndexInput();
++
++      if (nextEnt != -1) {
++        // Already loaded
++        return;
++      }
++      //System.out.println("blc=" + blockLoadCount);
++
++      in.seek(fp);
++      int code = in.readVInt();
++      entCount = code >>> 1;
++      assert entCount > 0;
++      isLastInFloor = (code & 1) != 0;
++      assert arc == null || (isLastInFloor || isFloor);
++
++      // TODO: if suffixes were stored in random-access
++      // array structure, then we could do binary search
++      // instead of linear scan to find target term; eg
++      // we could have simple array of offsets
++
++      // term suffixes:
++      code = in.readVInt();
++      isLeafBlock = (code & 1) != 0;
++      int numBytes = code >>> 1;
++      if (suffixBytes.length < numBytes) {
++        suffixBytes = new byte[ArrayUtil.oversize(numBytes, 1)];
++      }
++      in.readBytes(suffixBytes, 0, numBytes);
++      suffixesReader.reset(suffixBytes, 0, numBytes);
+ 
+-          /*if (DEBUG) {
+-            if (arc == null) {
+-              System.out.println("    loadBlock (next) fp=" + fp + " entCount=" + entCount + " prefixLen=" + prefix + " isLastInFloor=" + isLastInFloor + " leaf?=" + isLeafBlock);
+-            } else {
+-              System.out.println("    loadBlock (seek) fp=" + fp + " entCount=" + entCount + " prefixLen=" + prefix + " hasTerms?=" + hasTerms + " isFloor?=" + isFloor + " isLastInFloor=" + isLastInFloor + " leaf?=" + isLeafBlock);
+-            }
+-            }*/
++      /*if (DEBUG) {
++        if (arc == null) {
++          System.out.println("    loadBlock (next) fp=" + fp + " entCount=" + entCount + " prefixLen=" + prefix + " isLastInFloor=" + isLastInFloor + " leaf?=" + isLeafBlock);
++        } else {
++          System.out.println("    loadBlock (seek) fp=" + fp + " entCount=" + entCount + " prefixLen=" + prefix + " hasTerms?=" + hasTerms + " isFloor?=" + isFloor + " isLastInFloor=" + isLastInFloor + " leaf?=" + isLeafBlock);
++        }
++        }*/
+ 
+-          // stats
+-          numBytes = in.readVInt();
+-          if (statBytes.length < numBytes) {
+-            statBytes = new byte[ArrayUtil.oversize(numBytes, 1)];
+-          }
+-          in.readBytes(statBytes, 0, numBytes);
+-          statsReader.reset(statBytes, 0, numBytes);
+-          metaDataUpto = 0;
++      // stats
++      numBytes = in.readVInt();
++      if (statBytes.length < numBytes) {
++        statBytes = new byte[ArrayUtil.oversize(numBytes, 1)];
++      }
++      in.readBytes(statBytes, 0, numBytes);
++      statsReader.reset(statBytes, 0, numBytes);
++      metaDataUpto = 0;
+ 
+-          state.termBlockOrd = 0;
+-          nextEnt = 0;
+-          lastSubFP = -1;
++      state.termBlockOrd = 0;
++      nextEnt = 0;
++      lastSubFP = -1;
+ 
+-          // TODO: we could skip this if !hasTerms; but
+-          // that's rare so won't help much
+-          postingsReader.readTermsBlock(in, fieldInfo, state);
++      // TODO: we could skip this if !hasTerms; but
++      // that's rare so won't help much
++      postingsReader.readTermsBlock(in, info, state);
+ 
+-          // Sub-blocks of a single floor block are always
+-          // written one after another -- tail recurse:
+-          fpEnd = in.getFilePointer();
+-          // if (DEBUG) {
+-          //   System.out.println("      fpEnd=" + fpEnd);
+-          // }
+-        }
++      // Sub-blocks of a single floor block are always
++      // written one after another -- tail recurse:
++      fpEnd = in.getFilePointer();
++      // if (DEBUG) {
++      //   System.out.println("      fpEnd=" + fpEnd);
++      // }
++    }
+ 
+-        void rewind() {
++    void rewind() {
++
++      // Force reload:
++      fp = fpOrig;
++      nextEnt = -1;
++      hasTerms = hasTermsOrig;
++      if (isFloor) {
++        floorDataReader.rewind();
++        numFollowFloorBlocks = floorDataReader.readVInt();
++        nextFloorLabel = floorDataReader.readByte() & 0xff;
++      }
+ 
+-          // Force reload:
++      /*
++      //System.out.println("rewind");
++      // Keeps the block loaded, but rewinds its state:
++      if (nextEnt > 0 || fp != fpOrig) {
++        if (DEBUG) {
++          System.out.println("      rewind frame ord=" + ord + " fpOrig=" + fpOrig + " fp=" + fp + " hasTerms?=" + hasTerms + " isFloor?=" + isFloor + " nextEnt=" + nextEnt + " prefixLen=" + prefix);
++        }
++        if (fp != fpOrig) {
+           fp = fpOrig;
+           nextEnt = -1;
+-          hasTerms = hasTermsOrig;
+-          if (isFloor) {
+-            floorDataReader.rewind();
+-            numFollowFloorBlocks = floorDataReader.readVInt();
+-            nextFloorLabel = floorDataReader.readByte() & 0xff;
+-          }
+-
+-          /*
+-          //System.out.println("rewind");
+-          // Keeps the block loaded, but rewinds its state:
+-          if (nextEnt > 0 || fp != fpOrig) {
+-            if (DEBUG) {
+-              System.out.println("      rewind frame ord=" + ord + " fpOrig=" + fpOrig + " fp=" + fp + " hasTerms?=" + hasTerms + " isFloor?=" + isFloor + " nextEnt=" + nextEnt + " prefixLen=" + prefix);
+-            }
+-            if (fp != fpOrig) {
+-              fp = fpOrig;
+-              nextEnt = -1;
+-            } else {
+-              nextEnt = 0;
+-            }
+-            hasTerms = hasTermsOrig;
+-            if (isFloor) {
+-              floorDataReader.rewind();
+-              numFollowFloorBlocks = floorDataReader.readVInt();
+-              nextFloorLabel = floorDataReader.readByte() & 0xff;
+-            }
+-            assert suffixBytes != null;
+-            suffixesReader.rewind();
+-            assert statBytes != null;
+-            statsReader.rewind();
+-            metaDataUpto = 0;
+-            state.termBlockOrd = 0;
+-            // TODO: skip this if !hasTerms?  Then postings
+-            // impl wouldn't have to write useless 0 byte
+-            postingsReader.resetTermsBlock(fieldInfo, state);
+-            lastSubFP = -1;
+-          } else if (DEBUG) {
+-            System.out.println("      skip rewind fp=" + fp + " fpOrig=" + fpOrig + " nextEnt=" + nextEnt + " ord=" + ord);
+-          }
+-          */
++        } else {
++          nextEnt = 0;
+         }
+-
+-        public boolean next() {
+-          return isLeafBlock ? nextLeaf() : nextNonLeaf();
++        hasTerms = hasTermsOrig;
++        if (isFloor) {
++          floorDataReader.rewind();
++          numFollowFloorBlocks = floorDataReader.readVInt();
++          nextFloorLabel = floorDataReader.readByte() & 0xff;
+         }
++        assert suffixBytes != null;
++        suffixesReader.rewind();
++        assert statBytes != null;
++        statsReader.rewind();
++        metaDataUpto = 0;
++        state.termBlockOrd = 0;
++        // TODO: skip this if !hasTerms?  Then postings
++        // impl wouldn't have to write useless 0 byte
++        postingsReader.resetTermsBlock(fieldInfo, state);
++        lastSubFP = -1;
++      } else if (DEBUG) {
++        System.out.println("      skip rewind fp=" + fp + " fpOrig=" + fpOrig + " nextEnt=" + nextEnt + " ord=" + ord);
++      }
++      */
++    }
+ 
+-        // Decodes next entry; returns true if it's a sub-block
+-        public boolean nextLeaf() {
+-          //if (DEBUG) System.out.println("  frame.next ord=" + ord + " nextEnt=" + nextEnt + " entCount=" + entCount);
+-          assert nextEnt != -1 && nextEnt < entCount: "nextEnt=" + nextEnt + " entCount=" + entCount + " fp=" + fp;
+-          nextEnt++;
+-          suffix = suffixesReader.readVInt();
+-          startBytePos = suffixesReader.getPosition();
+-          term.length = prefix + suffix;
+-          if (term.bytes.length < term.length) {
+-            term.grow(term.length);
+-          }
+-          suffixesReader.readBytes(term.bytes, prefix, suffix);
+-          // A normal term
+-          termExists = true;
+-          return false;
+-        }
++    public boolean next() {
++      return isLeafBlock ? nextLeaf() : nextNonLeaf();
++    }
+ 
+-        public boolean nextNonLeaf() {
+-          //if (DEBUG) System.out.println("  frame.next ord=" + ord + " nextEnt=" + nextEnt + " entCount=" + entCount);
+-          assert nextEnt != -1 && nextEnt < entCount: "nextEnt=" + nextEnt + " entCount=" + entCount + " fp=" + fp;
+-          nextEnt++;
+-          final int code = suffixesReader.readVInt();
+-          suffix = code >>> 1;
+-          startBytePos = suffixesReader.getPosition();
+-          term.length = prefix + suffix;
+-          if (term.bytes.length < term.length) {
+-            term.grow(term.length);
+-          }
+-          suffixesReader.readBytes(term.bytes, prefix, suffix);
+-          if ((code & 1) == 0) {
+-            // A normal term
+-            termExists = true;
+-            subCode = 0;
+-            state.termBlockOrd++;
+-            return false;
+-          } else {
+-            // A sub-block; make sub-FP absolute:
+-            termExists = false;
+-            subCode = suffixesReader.readVLong();
+-            lastSubFP = fp - subCode;
+-            //if (DEBUG) {
+-            //System.out.println("    lastSubFP=" + lastSubFP);
+-            //}
+-            return true;
+-          }
+-        }
+-        
+-        // TODO: make this array'd so we can do bin search?
+-        // likely not worth it?  need to measure how many
+-        // floor blocks we "typically" get
+-        public void scanToFloorFrame(BytesRef target) {
++    // Decodes next entry; returns true if it's a sub-block
++    public boolean nextLeaf() {
++      //if (DEBUG) System.out.println("  frame.next ord=" + ord + " nextEnt=" + nextEnt + " entCount=" + entCount);
++      assert nextEnt != -1 && nextEnt < entCount: "nextEnt=" + nextEnt + " entCount=" + entCount + " fp=" + fp;
++      nextEnt++;
++      suffix = suffixesReader.readVInt();
++      startBytePos = suffixesReader.getPosition();
++      BytesRef term = ste.term;
++      term.length = prefix + suffix;
++      if (term.bytes.length < term.length) {
++        term.grow(term.length);
++      }
++      suffixesReader.readBytes(term.bytes, prefix, suffix);
++      // A normal term
++      ste.termExists = true;
++      return false;
++    }
+ 
+-          if (!isFloor || target.length <= prefix) {
+-            // if (DEBUG) {
+-            //   System.out.println("    scanToFloorFrame skip: isFloor=" + isFloor + " target.length=" + target.length + " vs prefix=" + prefix);
+-            // }
+-            return;
+-          }
++    public boolean nextNonLeaf() {
++      //if (DEBUG) System.out.println("  frame.next ord=" + ord + " nextEnt=" + nextEnt + " entCount=" + entCount);
++      assert nextEnt != -1 && nextEnt < entCount: "nextEnt=" + nextEnt + " entCount=" + entCount + " fp=" + fp;
++      nextEnt++;
++      final int code = suffixesReader.readVInt();
++      suffix = code >>> 1;
++      startBytePos = suffixesReader.getPosition();
++      BytesRef term = ste.term;
++
++      term.length = prefix + suffix;
++      if (term.bytes.length < term.length) {
++        term.grow(term.length);
++      }
++      suffixesReader.readBytes(term.bytes, prefix, suffix);
++      if ((code & 1) == 0) {
++        // A normal term
++        ste.termExists = true;
++        subCode = 0;
++        state.termBlockOrd++;
++        return false;
++      } else {
++        // A sub-block; make sub-FP absolute:
++        ste.termExists = false;
++        subCode = suffixesReader.readVLong();
++        lastSubFP = fp - subCode;
++        //if (DEBUG) {
++        //System.out.println("    lastSubFP=" + lastSubFP);
++        //}
++        return true;
++      }
++    }
++    
++    // TODO: make this array'd so we can do bin search?
++    // likely not worth it?  need to measure how many
++    // floor blocks we "typically" get
++    public void scanToFloorFrame(BytesRef target) {
+ 
+-          final int targetLabel = target.bytes[target.offset + prefix] & 0xFF;
++      if (!isFloor || target.length <= prefix) {
++        // if (DEBUG) {
++        //   System.out.println("    scanToFloorFrame skip: isFloor=" + isFloor + " target.length=" + target.length + " vs prefix=" + prefix);
++        // }
++        return;
++      }
+ 
+-          // if (DEBUG) {
+-          //   System.out.println("    scanToFloorFrame fpOrig=" + fpOrig + " targetLabel=" + toHex(targetLabel) + " vs nextFloorLabel=" + toHex(nextFloorLabel) + " numFollowFloorBlocks=" + numFollowFloorBlocks);
+-          // }
++      final int targetLabel = target.bytes[target.offset + prefix] & 0xFF;
+ 
+-          if (targetLabel < nextFloorLabel) {
+-            // if (DEBUG) {
+-            //   System.out.println("      already on correct block");
+-            // }
+-            return;
+-          }
++      // if (DEBUG) {
++      //   System.out.println("    scanToFloorFrame fpOrig=" + fpOrig + " targetLabel=" + toHex(targetLabel) + " vs nextFloorLabel=" + toHex(nextFloorLabel) + " numFollowFloorBlocks=" + numFollowFloorBlocks);
++      // }
+ 
+-          assert numFollowFloorBlocks != 0;
++      if (targetLabel < nextFloorLabel) {
++        // if (DEBUG) {
++        //   System.out.println("      already on correct block");
++        // }
++        return;
++      }
+ 
+-          long newFP = fpOrig;
+-          while (true) {
+-            final long code = floorDataReader.readVLong();
+-            newFP = fpOrig + (code >>> 1);
+-            hasTerms = (code & 1) != 0;
+-            // if (DEBUG) {
+-            //   System.out.println("      label=" + toHex(nextFloorLabel) + " fp=" + newFP + " hasTerms?=" + hasTerms + " numFollowFloor=" + numFollowFloorBlocks);
+-            // }
+-            
+-            isLastInFloor = numFollowFloorBlocks == 1;
+-            numFollowFloorBlocks--;
++      assert numFollowFloorBlocks != 0;
+ 
+-            if (isLastInFloor) {
+-              nextFloorLabel = 256;
+-              // if (DEBUG) {
+-              //   System.out.println("        stop!  last block nextFloorLabel=" + toHex(nextFloorLabel));
+-              // }
+-              break;
+-            } else {
+-              nextFloorLabel = floorDataReader.readByte() & 0xff;
+-              if (targetLabel < nextFloorLabel) {
+-                // if (DEBUG) {
+-                //   System.out.println("        stop!  nextFloorLabel=" + toHex(nextFloorLabel));
+-                // }
+-                break;
+-              }
+-            }
+-          }
++      long newFP = fpOrig;
++      while (true) {
++        final long code = floorDataReader.readVLong();
++        newFP = fpOrig + (code >>> 1);
++        hasTerms = (code & 1) != 0;
++        // if (DEBUG) {
++        //   System.out.println("      label=" + toHex(nextFloorLabel) + " fp=" + newFP + " hasTerms?=" + hasTerms + " numFollowFloor=" + numFollowFloorBlocks);
++        // }
++        
++        isLastInFloor = numFollowFloorBlocks == 1;
++        numFollowFloorBlocks--;
+ 
+-          if (newFP != fp) {
+-            // Force re-load of the block:
+-            // if (DEBUG) {
+-            //   System.out.println("      force switch to fp=" + newFP + " oldFP=" + fp);
+-            // }
+-            nextEnt = -1;
+-            fp = newFP;
+-          } else {
++        if (isLastInFloor) {
++          nextFloorLabel = 256;
++          // if (DEBUG) {
++          //   System.out.println("        stop!  last block nextFloorLabel=" + toHex(nextFloorLabel));
++          // }
++          break;
++        } else {
++          nextFloorLabel = floorDataReader.readByte() & 0xff;
++          if (targetLabel < nextFloorLabel) {
+             // if (DEBUG) {
+-            //   System.out.println("      stay on same fp=" + newFP);
++            //   System.out.println("        stop!  nextFloorLabel=" + toHex(nextFloorLabel));
+             // }
++            break;
+           }
+         }
+-    
+-        public void decodeMetaData() throws IOException {
++      }
+ 
+-          //if (DEBUG) System.out.println("\nBTTR.decodeMetadata seg=" + segment + " mdUpto=" + metaDataUpto + " vs termBlockOrd=" + state.termBlockOrd);
++      if (newFP != fp) {
++        // Force re-load of the block:
++        // if (DEBUG) {
++        //   System.out.println("      force switch to fp=" + newFP + " oldFP=" + fp);
++        // }
++        nextEnt = -1;
++        fp = newFP;
++      } else {
++        // if (DEBUG) {
++        //   System.out.println("      stay on same fp=" + newFP);
++        // }
++      }
++    }
+ 
+-          // lazily catch up on metadata decode:
+-          final int limit = getTermBlockOrd();
+-          assert limit > 0;
++    public void decodeMetaData() throws IOException {
+ 
+-          // We must set/incr state.termCount because
+-          // postings impl can look at this
+-          state.termBlockOrd = metaDataUpto;
+-      
+-          // TODO: better API would be "jump straight to term=N"???
+-          while (metaDataUpto < limit) {
++      //if (DEBUG) System.out.println("\nBTTR.decodeMetadata seg=" + segment + " mdUpto=" + metaDataUpto + " vs termBlockOrd=" + state.termBlockOrd);
+ 
+-            // TODO: we could make "tiers" of metadata, ie,
+-            // decode docFreq/totalTF but don't decode postings
+-            // metadata; this way caller could get
+-            // docFreq/totalTF w/o paying decode cost for
+-            // postings
++      // lazily catch up on metadata decode:
++      final int limit = getTermBlockOrd();
++      assert limit > 0;
+ 
+-            // TODO: if docFreq were bulk decoded we could
+-            // just skipN here:
+-            state.docFreq = statsReader.readVInt();
+-            //if (DEBUG) System.out.println("    dF=" + state.docFreq);
+-            if (fieldInfo.getIndexOptions() != IndexOptions.DOCS_ONLY) {
+-              state.totalTermFreq = state.docFreq + statsReader.readVLong();
+-              //if (DEBUG) System.out.println("    totTF=" + state.totalTermFreq);
+-            }
++      // We must set/incr state.termCount because
++      // postings impl can look at this
++      state.termBlockOrd = metaDataUpto;
++  
++      // TODO: better API would be "jump straight to term=N"???
++      while (metaDataUpto < limit) {
++
++        // TODO: we could make "tiers" of metadata, ie,
++        // decode docFreq/totalTF but don't decode postings
++        // metadata; this way caller could get
++        // docFreq/totalTF w/o paying decode cost for
++        // postings
++
++        // TODO: if docFreq were bulk decoded we could
++        // just skipN here:
++        state.docFreq = statsReader.readVInt();
++        //if (DEBUG) System.out.println("    dF=" + state.docFreq);
++        if (info.getIndexOptions() != IndexOptions.DOCS_ONLY) {
++          state.totalTermFreq = state.docFreq + statsReader.readVLong();
++          //if (DEBUG) System.out.println("    totTF=" + state.totalTermFreq);
++        }
++
++       postingsReader.nextTerm(info, state);
++        metaDataUpto++;
++        state.termBlockOrd++;
++      }
++    }
+ 
+-            postingsReader.nextTerm(fieldInfo, state);
+-            metaDataUpto++;
+-            state.termBlockOrd++;
+-          }
++    // Used only by assert
++    private boolean prefixMatches(BytesRef target) {
++      final BytesRef term = ste.term;
++      for(int bytePos=0;bytePos<prefix;bytePos++) {
++        if (target.bytes[target.offset + bytePos] != term.bytes[bytePos]) {
++          return false;
+         }
++      }
+ 
+-        // Used only by assert
+-        private boolean prefixMatches(BytesRef target) {
+-          for(int bytePos=0;bytePos<prefix;bytePos++) {
+-            if (target.bytes[target.offset + bytePos] != term.bytes[bytePos]) {
+-              return false;
+-            }
+-          }
+-
+-          return true;
+-        }
++      return true;
++    }
+ 
+-        // Scans to sub-block that has this target fp; only
+-        // called by next(); NOTE: does not set
+-        // startBytePos/suffix as a side effect
+-        public void scanToSubBlock(long subFP) {
+-          assert !isLeafBlock;
+-          //if (DEBUG) System.out.println("  scanToSubBlock fp=" + fp + " subFP=" + subFP + " entCount=" + entCount + " lastSubFP=" + lastSubFP);
+-          //assert nextEnt == 0;
+-          if (lastSubFP == subFP) {
+-            //if (DEBUG) System.out.println("    already positioned");
++    // Scans to sub-block that has this target fp; only
++    // called by next(); NOTE: does not set
++    // startBytePos/suffix as a side effect
++    public void scanToSubBlock(long subFP) {
++      assert !isLeafBlock;
++      //if (DEBUG) System.out.println("  scanToSubBlock fp=" + fp + " subFP=" + subFP + " entCount=" + entCount + " lastSubFP=" + lastSubFP);
++      //assert nextEnt == 0;
++      if (lastSubFP == subFP) {
++        //if (DEBUG) System.out.println("    already positioned");
++        return;
++      }
++      assert subFP < fp : "fp=" + fp + " subFP=" + subFP;
++      final long targetSubCode = fp - subFP;
++      //if (DEBUG) System.out.println("    targetSubCode=" + targetSubCode);
++      while(true) {
++        assert nextEnt < entCount;
++        nextEnt++;
++        final int code = suffixesReader.readVInt();
++        suffixesReader.skipBytes(isLeafBlock ? code : code >>> 1);
++        //if (DEBUG) System.out.println("    " + nextEnt + " (of " + entCount + ") ent isSubBlock=" + ((code&1)==1));
++        if ((code & 1) != 0) {
++          final long subCode = suffixesReader.readVLong();
++          //if (DEBUG) System.out.println("      subCode=" + subCode);
++          if (targetSubCode == subCode) {
++            //if (DEBUG) System.out.println("        match!");
++            lastSubFP = subFP;
+             return;
+           }
+-          assert subFP < fp : "fp=" + fp + " subFP=" + subFP;
+-          final long targetSubCode = fp - subFP;
+-          //if (DEBUG) System.out.println("    targetSubCode=" + targetSubCode);
+-          while(true) {
+-            assert nextEnt < entCount;
+-            nextEnt++;
+-            final int code = suffixesReader.readVInt();
+-            suffixesReader.skipBytes(isLeafBlock ? code : code >>> 1);
+-            //if (DEBUG) System.out.println("    " + nextEnt + " (of " + entCount + ") ent isSubBlock=" + ((code&1)==1));
+-            if ((code & 1) != 0) {
+-              final long subCode = suffixesReader.readVLong();
+-              //if (DEBUG) System.out.println("      subCode=" + subCode);
+-              if (targetSubCode == subCode) {
+-                //if (DEBUG) System.out.println("        match!");
+-                lastSubFP = subFP;
+-                return;
+-              }
+-            } else {
+-              state.termBlockOrd++;
+-            }
+-          }
+-        }
+-
+-        // NOTE: sets startBytePos/suffix as a side effect
+-        public SeekStatus scanToTerm(BytesRef target, boolean exactOnly) throws IOException {
+-          return isLeafBlock ? scanToTermLeaf(target, exactOnly) : scanToTermNonLeaf(target, exactOnly);
++        } else {
++          state.termBlockOrd++;
+         }
++      }
++    }
+ 
+-        private int startBytePos;
+-        private int suffix;
+-        private long subCode;
+-
+-        // Target's prefix matches this block's prefix; we
+-        // scan the entries check if the suffix matches.
+-        public SeekStatus scanToTermLeaf(BytesRef target, boolean exactOnly) throws IOException {
++    // NOTE: sets startBytePos/suffix as a side effect
++    public SeekStatus scanToTerm(BytesRef target, boolean exactOnly) throws IOException {
++      return isLeafBlock ? scanToTermLeaf(target, exactOnly) : scanToTermNonLeaf(target, exactOnly);
++    }
+ 
+-          // if (DEBUG) System.out.println("    scanToTermLeaf: block fp=" + fp + " prefix=" + prefix + " nextEnt=" + nextEnt + " (of " + entCount + ") target=" + brToString(target) + " term=" + brToString(term));
++    private int startBytePos;
++    private int suffix;
++    private long subCode;
+ 
+-          assert nextEnt != -1;
++    // Target's prefix matches this block's prefix; we
++    // scan the entries check if the suffix matches.
++    public SeekStatus scanToTermLeaf(BytesRef target, boolean exactOnly) throws IOException {
+ 
+-          termExists = true;
+-          subCode = 0;
++      // if (DEBUG) System.out.println("    scanToTermLeaf: block fp=" + fp + " prefix=" + prefix + " nextEnt=" + nextEnt + " (of " + entCount + ") target=" + brToString(target) + " term=" + brToString(term));
+ 
+-          if (nextEnt == entCount) {
+-            if (exactOnly) {
+-              fillTerm();
+-            }
+-            return SeekStatus.END;
+-          }
++      assert nextEnt != -1;
+ 
+-          assert prefixMatches(target);
++      ste.termExists = true;
++      subCode = 0;
+ 
+-          // Loop over each entry (term or sub-block) in this block:
+-          //nextTerm: while(nextEnt < entCount) {
+-          nextTerm: while (true) {
+-            nextEnt++;
++      if (nextEnt == entCount) {
++        if (exactOnly) {
++          fillTerm();
++        }
++        return SeekStatus.END;
++      }
+ 
+-            suffix = suffixesReader.readVInt();
++      assert prefixMatches(target);
+ 
+-            // if (DEBUG) {
+-            //   BytesRef suffixBytesRef = new BytesRef();
+-            //   suffixBytesRef.bytes = suffixBytes;
+-            //   suffixBytesRef.offset = suffixesReader.getPosition();
+-            //   suffixBytesRef.length = suffix;
+-            //   System.out.println("      cycle: term " + (nextEnt-1) + " (of " + entCount + ") suffix=" + brToString(suffixBytesRef));
+-            // }
++      // Loop over each entry (term or sub-block) in this block:
++      //nextTerm: while(nextEnt < entCount) {
++      nextTerm: while (true) {
++        nextEnt++;
+ 
+-            final int termLen = prefix + suffix;
+-            startBytePos = suffixesReader.getPosition();
+-            suffixesReader.skipBytes(suffix);
+-
+-            final int targetLimit = target.offset + (target.length < termLen ? target.length : termLen);
+-            int targetPos = target.offset + prefix;
+-
+-            // Loop over bytes in the suffix, comparing to
+-            // the target
+-            int bytePos = startBytePos;
+-            while(true) {
+-              final int cmp;
+-              final boolean stop;
+-              if (targetPos < targetLimit) {
+-                cmp = (suffixBytes[bytePos++]&0xFF) - (target.bytes[targetPos++]&0xFF);
+-                stop = false;
+-              } else {
+-                assert targetPos == targetLimit;
+-                cmp = termLen - target.length;
+-                stop = true;
+-              }
++        suffix = suffixesReader.readVInt();
+ 
+-              if (cmp < 0) {
+-                // Current entry is still before the target;
+-                // keep scanning
++        // if (DEBUG) {
++        //   BytesRef suffixBytesRef = new BytesRef();
++        //   suffixBytesRef.bytes = suffixBytes;
++        //   suffixBytesRef.offset = suffixesReader.getPosition();
++        //   suffixBytesRef.length = suffix;
++        //   System.out.println("      cycle: term " + (nextEnt-1) + " (of " + entCount + ") suffix=" + brToString(suffixBytesRef));
++        // }
+ 
+-                if (nextEnt == entCount) {
+-                  if (exactOnly) {
+-                    fillTerm();
+-                  }
+-                  // We are done scanning this block
+-                  break nextTerm;
+-                } else {
+-                  continue nextTerm;
+-                }
+-              } else if (cmp > 0) {
++        final int termLen = prefix + suffix;
++        startBytePos = suffixesReader.getPosition();
++        suffixesReader.skipBytes(suffix);
+ 
+-                // Done!  Current entry is after target --
+-                // return NOT_FOUND:
+-                fillTerm();
++        final int targetLimit = target.offset + (target.length < termLen ? target.length : termLen);
++        int targetPos = target.offset + prefix;
+ 
+-                if (!exactOnly && !termExists) {
+-                  // We are on a sub-block, and caller wants
+-                  // us to position to the next term after
+-                  // the target, so we must recurse into the
+-                  // sub-frame(s):
+-                  currentFrame = pushFrame(null, currentFrame.lastSubFP, termLen);
+-                  currentFrame.loadBlock();
+-                  while (currentFrame.next()) {
+-                    currentFrame = pushFrame(null, currentFrame.lastSubFP, term.length);
+-                    currentFrame.loadBlock();
+-                  }
+-                }
+-                
+-                //if (DEBUG) System.out.println("        not found");
+-                return SeekStatus.NOT_FOUND;
+-              } else if (stop) {
+-                // Exact match!
++        // Loop over bytes in the suffix, comparing to
++        // the target
++        int bytePos = startBytePos;
++        while(true) {
++          final int cmp;
++          final boolean stop;
++          if (targetPos < targetLimit) {
++            cmp = (suffixBytes[bytePos++]&0xFF) - (target.bytes[targetPos++]&0xFF);
++            stop = false;
++          } else {
++            assert targetPos == targetLimit;
++            cmp = termLen - target.length;
++            stop = true;
++          }
+ 
+-                // This cannot be a sub-block because we
+-                // would have followed the index to this
+-                // sub-block from the start:
++          if (cmp < 0) {
++            // Current entry is still before the target;
++            // keep scanning
+ 
+-                assert termExists;
++            if (nextEnt == entCount) {
++              if (exactOnly) {
+                 fillTerm();
+-                //if (DEBUG) System.out.println("        found!");
+-                return SeekStatus.FOUND;
+               }
++              // We are done scanning this block
++              break nextTerm;
++            } else {
++              continue nextTerm;
+             }
+-          }
++          } else if (cmp > 0) {
+ 
+-          // It is possible (and OK) that terms index pointed us
+-          // at this block, but, we scanned the entire block and
+-          // did not find the term to position to.  This happens
+-          // when the target is after the last term in the block
+-          // (but, before the next term in the index).  EG
+-          // target could be foozzz, and terms index pointed us
+-          // to the foo* block, but the last term in this block
+-          // was fooz (and, eg, first term in the next block will
+-          // bee fop).
+-          //if (DEBUG) System.out.println("      block end");
+-          if (exactOnly) {
++            // Done!  Current entry is after target --
++            // return NOT_FOUND:
+             fillTerm();
+-          }
++            
++            if (!exactOnly && !ste.termExists) {
++              // We are on a sub-block, and caller wants
++              // us to position to the next term after
++              // the target, so we must recurse into the
++              // sub-frame(s):
++              ste.recurseSubFrames(termLen);
++            }
++            
++            //if (DEBUG) System.out.println("        not found");
++            return SeekStatus.NOT_FOUND;
++          } else if (stop) {
++            // Exact match!
+ 
+-          // TODO: not consistent that in the
+-          // not-exact case we don't next() into the next
+-          // frame here
+-          return SeekStatus.END;
+-        }
++            // This cannot be a sub-block because we
++            // would have followed the index to this
++            // sub-block from the start:
+ 
+-        // Target's prefix matches this block's prefix; we
+-        // scan the entries check if the suffix matches.
+-        public SeekStatus scanToTermNonLeaf(BytesRef target, boolean exactOnly) throws IOException {
++            assert ste.termExists;
++            fillTerm();
++            //if (DEBUG) System.out.println("        found!");
++            return SeekStatus.FOUND;
++          }
++        }
++      }
+ 
+-          //if (DEBUG) System.out.println("    scanToTermNonLeaf: block fp=" + fp + " prefix=" + prefix + " nextEnt=" + nextEnt + " (of " + entCount + ") target=" + brToString(target) + " term=" + brToString(term));
++      // It is possible (and OK) that terms index pointed us
++      // at this block, but, we scanned the entire block and
++      // did not find the term to position to.  This happens
++      // when the target is after the last term in the block
++      // (but, before the next term in the index).  EG
++      // target could be foozzz, and terms index pointed us
++      // to the foo* block, but the last term in this block
++      // was fooz (and, eg, first term in the next block will
++      // bee fop).
++      //if (DEBUG) System.out.println("      block end");
++      if (exactOnly) {
++        fillTerm();
++      }
+ 
+-          assert nextEnt != -1;
++      // TODO: not consistent that in the
++      // not-exact case we don't next() into the next
++      // frame here
++      return SeekStatus.END;
++    }
+ 
+-          if (nextEnt == entCount) {
+-            if (exactOnly) {
+-              fillTerm();
+-              termExists = subCode == 0;
+-            }
+-            return SeekStatus.END;
+-          }
++    // Target's prefix matches this block's prefix; we
++    // scan the entries check if the suffix matches.
++    public SeekStatus scanToTermNonLeaf(BytesRef target, boolean exactOnly) throws IOException {
+ 
+-          assert prefixMatches(target);
++      //if (DEBUG) System.out.println("    scanToTermNonLeaf: block fp=" + fp + " prefix=" + prefix + " nextEnt=" + nextEnt + " (of " + entCount + ") target=" + brToString(target) + " term=" + brToString(term));
+ 
+-          // Loop over each entry (term or sub-block) in this block:
+-          //nextTerm: while(nextEnt < entCount) {
+-          nextTerm: while (true) {
+-            nextEnt++;
++      assert nextEnt != -1;
+ 
+-            final int code = suffixesReader.readVInt();
+-            suffix = code >>> 1;
+-            // if (DEBUG) {
+-            //   BytesRef suffixBytesRef = new BytesRef();
+-            //   suffixBytesRef.bytes = suffixBytes;
+-            //   suffixBytesRef.offset = suffixesReader.getPosition();
+-            //   suffixBytesRef.length = suffix;
+-            //   System.out.println("      cycle: " + ((code&1)==1 ? "sub-block" : "term") + " " + (nextEnt-1) + " (of " + entCount + ") suffix=" + brToString(suffixBytesRef));
+-            // }
++      if (nextEnt == entCount) {
++        if (exactOnly) {
++          fillTerm();
++          ste.termExists = subCode == 0;
++        }
++        return SeekStatus.END;
++      }
+ 
+-            termExists = (code & 1) == 0;
+-            final int termLen = prefix + suffix;
+-            startBytePos = suffixesReader.getPosition();
+-            suffixesReader.skipBytes(suffix);
+-            if (termExists) {
+-              state.termBlockOrd++;
+-              subCode = 0;
+-            } else {
+-              subCode = suffixesReader.readVLong();
+-              lastSubFP = fp - subCode;
+-            }
++      assert prefixMatches(target);
+ 
+-            final int targetLimit = target.offset + (target.length < termLen ? target.length : termLen);
+-            int targetPos = target.offset + prefix;
+-
+-            // Loop over bytes in the suffix, comparing to
+-            // the target
+-            int bytePos = startBytePos;
+-            while(true) {
+-              final int cmp;
+-              final boolean stop;
+-              if (targetPos < targetLimit) {
+-                cmp = (suffixBytes[bytePos++]&0xFF) - (target.bytes[targetPos++]&0xFF);
+-                stop = false;
+-              } else {
+-                assert targetPos == targetLimit;
+-                cmp = termLen - target.length;
+-                stop = true;
+-              }
++      // Loop over each entry (term or sub-block) in this block:
++      //nextTerm: while(nextEnt < entCount) {
++      nextTerm: while (true) {
++        nextEnt++;
+ 
+-              if (cmp < 0) {
+-                // Current entry is still before the target;
+-                // keep scanning
++        final int code = suffixesReader.readVInt();
++        suffix = code >>> 1;
++        // if (DEBUG) {
++        //   BytesRef suffixBytesRef = new BytesRef();
++        //   suffixBytesRef.bytes = suffixBytes;
++        //   suffixBytesRef.offset = suffixesReader.getPosition();
++        //   suffixBytesRef.length = suffix;
++        //   System.out.println("      cycle: " + ((code&1)==1 ? "sub-block" : "term") + " " + (nextEnt-1) + " (of " + entCount + ") suffix=" + brToString(suffixBytesRef));
++        // }
+ 
+-                if (nextEnt == entCount) {
+-                  if (exactOnly) {
+-                    fillTerm();
+-                    //termExists = true;
+-                  }
+-                  // We are done scanning this block
+-                  break nextTerm;
+-                } else {
+-                  continue nextTerm;
+-                }
+-              } else if (cmp > 0) {
++        ste.termExists = (code & 1) == 0;
++        final int termLen = prefix + suffix;
++        startBytePos = suffixesReader.getPosition();
++        suffixesReader.skipBytes(suffix);
++        if (ste.termExists) {
++          state.termBlockOrd++;
++          subCode = 0;
++        } else {
++          subCode = suffixesReader.readVLong();
++          lastSubFP = fp - subCode;
++        }
+ 
+-                // Done!  Current entry is after target --
+-                // return NOT_FOUND:
+-                fillTerm();
++        final int targetLimit = target.offset + (target.length < termLen ? target.length : termLen);
++        int targetPos = target.offset + prefix;
+ 
+-                if (!exactOnly && !termExists) {
+-                  // We are on a sub-block, and caller wants
+-                  // us to position to the next term after
+-                  // the target, so we must recurse into the
+-                  // sub-frame(s):
+-                  currentFrame = pushFrame(null, currentFrame.lastSubFP, termLen);
+-                  currentFrame.loadBlock();
+-                  while (currentFrame.next()) {
+-                    currentFrame = pushFrame(null, currentFrame.lastSubFP, term.length);
+-                    currentFrame.loadBlock();
+-                  }
+-                }
+-                
+-                //if (DEBUG) System.out.println("        not found");
+-                return SeekStatus.NOT_FOUND;
+-              } else if (stop) {
+-                // Exact match!
++        // Loop over bytes in the suffix, comparing to
++        // the target
++        int bytePos = startBytePos;
++        while(true) {
++          final int cmp;
++          final boolean stop;
++          if (targetPos < targetLimit) {
++            cmp = (suffixBytes[bytePos++]&0xFF) - (target.bytes[targetPos++]&0xFF);
++            stop = false;
++          } else {
++            assert targetPos == targetLimit;
++            cmp = termLen - target.length;
++            stop = true;
++          }
+ 
+-                // This cannot be a sub-block because we
+-                // would have followed the index to this
+-                // sub-block from the start:
++          if (cmp < 0) {
++            // Current entry is still before the target;
++            // keep scanning
+ 
+-                assert termExists;
++            if (nextEnt == entCount) {
++              if (exactOnly) {
+                 fillTerm();
+-                //if (DEBUG) System.out.println("        found!");
+-                return SeekStatus.FOUND;
++                //termExists = true;
+               }
++              // We are done scanning this block
++              break nextTerm;
++            } else {
++              continue nextTerm;
+             }
+-          }
++          } else if (cmp > 0) {
+ 
+-          // It is possible (and OK) that terms index pointed us
+-          // at this block, but, we scanned the entire block and
+-          // did not find the term to position to.  This happens
+-          // when the target is after the last term in the block
+-          // (but, before the next term in the index).  EG
+-          // target could be foozzz, and terms index pointed us
+-          // to the foo* block, but the last term in this block
+-          // was fooz (and, eg, first term in the next block will
+-          // bee fop).
+-          //if (DEBUG) System.out.println("      block end");
+-          if (exactOnly) {
++            // Done!  Current entry is after target --
++            // return NOT_FOUND:
+             fillTerm();
+-          }
+ 
+-          // TODO: not consistent that in the
+-          // not-exact case we don't next() into the next
+-          // frame here
+-          return SeekStatus.END;
+-        }
++            if (!exactOnly && !ste.termExists) {
++              // We are on a sub-block, and caller wants
++              // us to position to the next term after
++              // the target, so we must recurse into the
++              // sub-frame(s):
++              ste.recurseSubFrames(termLen);
++            }
++            
++            //if (DEBUG) System.out.println("        not found");
++            return SeekStatus.NOT_FOUND;
++          } else if (stop) {
++            // Exact match!
++
++            // This cannot be a sub-block because we
++            // would have followed the index to this
++            // sub-block from the start:
+ 
+-        private void fillTerm() {
+-          final int termLength = prefix + suffix;
+-          term.length = prefix + suffix;
+-          if (term.bytes.length < termLength) {
+-            term.grow(termLength);
++            assert ste.termExists;
++            fillTerm();
++            //if (DEBUG) System.out.println("        found!");
++            return SeekStatus.FOUND;
+           }
+-          System.arraycopy(suffixBytes, startBytePos, term.bytes, prefix, suffix);
+         }
+       }
++
++      // It is possible (and OK) that terms index pointed us
++      // at this block, but, we scanned the entire block and
++      // did not find the term to position to.  This happens
++      // when the target is after the last term in the block
++      // (but, before the next term in the index).  EG
++      // target could be foozzz, and terms index pointed us
++      // to the foo* block, but the last term in this block
++      // was fooz (and, eg, first term in the next block will
++      // bee fop).
++      //if (DEBUG) System.out.println("      block end");
++      if (exactOnly) {
++        fillTerm();
++      }
++
++      // TODO: not consistent that in the
++      // not-exact case we don't next() into the next
++      // frame here
++      return SeekStatus.END;
++    }
++
++    private void fillTerm() {
++      final int termLength = prefix + suffix;
++      final BytesRef term = ste.term;
++      term.length = prefix + suffix;
++      if (term.bytes.length < termLength) {
++        term.grow(termLength);
++      }
++      System.arraycopy(suffixBytes, startBytePos, term.bytes, prefix, suffix);
+     }
+   }
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/index/CheckIndex.java b/lucene/core/src/java/org/apache/lucene/index/CheckIndex.java
+index 769d3d6..c16f819 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/CheckIndex.java
++++ b/lucene/core/src/java/org/apache/lucene/index/CheckIndex.java
+@@ -715,7 +715,7 @@ public class CheckIndex {
+     DocsEnum docs = null;
+     DocsEnum docsAndFreqs = null;
+     DocsAndPositionsEnum postings = null;
+-    
++    TermsEnum termsEnum = null; 
+     String lastField = null;
+     for (String field : fields) {
+       // MultiFieldsEnum relies upon this order...
+@@ -750,7 +750,7 @@ public class CheckIndex {
+       // term vectors cannot omit TF
+       final boolean hasFreqs = isVectors || fieldInfo.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS) >= 0;
+ 
+-      final TermsEnum termsEnum = terms.iterator(null);
++      termsEnum = terms.iterator(termsEnum);
+       
+       boolean hasOrd = true;
+       final long termCountStart = status.delTermCount + status.termCount;
+diff --git a/lucene/core/src/java/org/apache/lucene/index/TermContext.java b/lucene/core/src/java/org/apache/lucene/index/TermContext.java
+index ec7ef8f..3fe30fd 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/TermContext.java
++++ b/lucene/core/src/java/org/apache/lucene/index/TermContext.java
+@@ -85,13 +85,14 @@ public final class TermContext {
+     final BytesRef bytes = term.bytes();
+     final TermContext perReaderTermState = new TermContext(context);
+     //if (DEBUG) System.out.println("prts.build term=" + term);
++    TermsEnum termsEnum = null;
+     for (final AtomicReaderContext ctx : context.leaves()) {
+       //if (DEBUG) System.out.println("  r=" + leaves[i].reader);
+       final Fields fields = ctx.reader().fields();
+       if (fields != null) {
+         final Terms terms = fields.terms(field);
+         if (terms != null) {
+-          final TermsEnum termsEnum = terms.iterator(null);
++          termsEnum = terms.iterator(termsEnum);
+           if (termsEnum.seekExact(bytes, cache)) { 
+             final TermState termState = termsEnum.termState();
+             //if (DEBUG) System.out.println("    found");
+diff --git a/lucene/core/src/java/org/apache/lucene/search/AutomatonQuery.java b/lucene/core/src/java/org/apache/lucene/search/AutomatonQuery.java
+index 41f1503..ba1e6dd 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/AutomatonQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/AutomatonQuery.java
+@@ -69,8 +69,8 @@ public class AutomatonQuery extends MultiTermQuery {
+   }
+ 
+   @Override
+-  protected TermsEnum getTermsEnum(Terms terms, AttributeSource atts) throws IOException {
+-    return compiled.getTermsEnum(terms);
++  protected TermsEnum getTermsEnum(Terms terms, TermsEnum reuse, AttributeSource atts) throws IOException {
++    return compiled.getTermsEnum(terms, reuse);
+   }
+ 
+   @Override
+diff --git a/lucene/core/src/java/org/apache/lucene/search/BoostAttribute.java b/lucene/core/src/java/org/apache/lucene/search/BoostAttribute.java
+index b60db85..2ae28f1 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/BoostAttribute.java
++++ b/lucene/core/src/java/org/apache/lucene/search/BoostAttribute.java
+@@ -22,7 +22,7 @@ import org.apache.lucene.util.AttributeSource; // javadocs only
+ import org.apache.lucene.index.TermsEnum; // javadocs only
+ import org.apache.lucene.index.Terms; // javadocs only
+ 
+-/** Add this {@link Attribute} to a {@link TermsEnum} returned by {@link MultiTermQuery#getTermsEnum(Terms,AttributeSource)}
++/** Add this {@link Attribute} to a {@link TermsEnum} returned by {@link MultiTermQuery#getTermsEnum(Terms,TermsEnum,AttributeSource)}
+  * and update the boost on each returned term. This enables to control the boost factor
+  * for each matching term in {@link MultiTermQuery#SCORING_BOOLEAN_QUERY_REWRITE} or
+  * {@link TopTermsRewrite} mode.
+diff --git a/lucene/core/src/java/org/apache/lucene/search/FuzzyQuery.java b/lucene/core/src/java/org/apache/lucene/search/FuzzyQuery.java
+index 6e00254..7f96968 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/FuzzyQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/FuzzyQuery.java
+@@ -133,9 +133,9 @@ public class FuzzyQuery extends MultiTermQuery {
+   }
+ 
+   @Override
+-  protected TermsEnum getTermsEnum(Terms terms, AttributeSource atts) throws IOException {
++  protected TermsEnum getTermsEnum(Terms terms, TermsEnum reuse, AttributeSource atts) throws IOException {
+     if (maxEdits == 0 || prefixLength >= term.text().length()) {  // can only match if it's exact
+-      return new SingleTermsEnum(terms.iterator(null), term.bytes());
++      return new SingleTermsEnum(terms.iterator(reuse), term.bytes());
+     }
+     return new FuzzyTermsEnum(terms, atts, getTerm(), maxEdits, prefixLength, transpositions);
+   }
+diff --git a/lucene/core/src/java/org/apache/lucene/search/MaxNonCompetitiveBoostAttribute.java b/lucene/core/src/java/org/apache/lucene/search/MaxNonCompetitiveBoostAttribute.java
+index 34e431e..75fcb56 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/MaxNonCompetitiveBoostAttribute.java
++++ b/lucene/core/src/java/org/apache/lucene/search/MaxNonCompetitiveBoostAttribute.java
+@@ -21,15 +21,16 @@ import org.apache.lucene.util.Attribute;
+ import org.apache.lucene.util.AttributeSource; // javadocs only
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.index.Terms; // javadocs only
++import org.apache.lucene.index.TermsEnum; // javadocs only
+ 
+ /** Add this {@link Attribute} to a fresh {@link AttributeSource} before calling
+- * {@link MultiTermQuery#getTermsEnum(Terms,AttributeSource)}.
++ * {@link MultiTermQuery#getTermsEnum(Terms,TermsEnum,AttributeSource)}.
+  * {@link FuzzyQuery} is using this to control its internal behaviour
+  * to only return competitive terms.
+  * <p><b>Please note:</b> This attribute is intended to be added by the {@link MultiTermQuery.RewriteMethod}
+  * to an empty {@link AttributeSource} that is shared for all segments
+  * during query rewrite. This attribute source is passed to all segment enums
+- * on {@link MultiTermQuery#getTermsEnum(Terms,AttributeSource)}.
++ * on {@link MultiTermQuery#getTermsEnum(Terms,TermsEnum,AttributeSource)}.
+  * {@link TopTermsRewrite} uses this attribute to
+  * inform all enums about the current boost, that is not competitive.
+  * @lucene.internal
+diff --git a/lucene/core/src/java/org/apache/lucene/search/MultiTermQuery.java b/lucene/core/src/java/org/apache/lucene/search/MultiTermQuery.java
+index e8c24bd..b2090b0 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/MultiTermQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/MultiTermQuery.java
+@@ -34,7 +34,7 @@ import org.apache.lucene.util.AttributeSource;
+  * FilteredTermsEnum} enumeration.
+  *
+  * <p>This query cannot be used directly; you must subclass
+- * it and define {@link #getTermsEnum(Terms,AttributeSource)} to provide a {@link
++ * it and define {@link #getTermsEnum(Terms, TermsEnum, AttributeSource)} to provide a {@link
+  * FilteredTermsEnum} that iterates through the terms to be
+  * matched.
+  *
+@@ -70,10 +70,10 @@ public abstract class MultiTermQuery extends Query {
+     public abstract Query rewrite(IndexReader reader, MultiTermQuery query) throws IOException;
+     /**
+      * Returns the {@link MultiTermQuery}s {@link TermsEnum}
+-     * @see MultiTermQuery#getTermsEnum(Terms, AttributeSource)
++     * @see MultiTermQuery#getTermsEnum(Terms, TermsEnum, AttributeSource)
+      */
+-    protected TermsEnum getTermsEnum(MultiTermQuery query, Terms terms, AttributeSource atts) throws IOException {
+-      return query.getTermsEnum(terms, atts); // allow RewriteMethod subclasses to pull a TermsEnum from the MTQ 
++    protected TermsEnum getTermsEnum(MultiTermQuery query, Terms terms, TermsEnum reuse, AttributeSource atts) throws IOException {
++      return query.getTermsEnum(terms, reuse, atts); // allow RewriteMethod subclasses to pull a TermsEnum from the MTQ 
+     }
+   }
+ 
+@@ -266,19 +266,19 @@ public abstract class MultiTermQuery extends Query {
+    * provide attributes, the rewrite method uses to inform about e.g. maximum competitive boosts.
+    * This is currently only used by {@link TopTermsRewrite}
+    */
+-  protected abstract TermsEnum getTermsEnum(Terms terms, AttributeSource atts) throws IOException;
++  protected abstract TermsEnum getTermsEnum(Terms terms, TermsEnum reuse, AttributeSource atts) throws IOException;
+ 
+   /** Convenience method, if no attributes are needed:
+    * This simply passes empty attributes and is equal to:
+    * <code>getTermsEnum(terms, new AttributeSource())</code>
+    */
+   protected final TermsEnum getTermsEnum(Terms terms) throws IOException {
+-    return getTermsEnum(terms, new AttributeSource());
++    return getTermsEnum(terms, null, new AttributeSource());
+   }
+ 
+   /**
+    * To rewrite to a simpler form, instead return a simpler
+-   * enum from {@link #getTermsEnum(Terms, AttributeSource)}.  For example,
++   * enum from {@link #getTermsEnum(Terms, TermsEnum, AttributeSource)}.  For example,
+    * to rewrite to a single term, return a {@link SingleTermsEnum}
+    */
+   @Override
+diff --git a/lucene/core/src/java/org/apache/lucene/search/NumericRangeQuery.java b/lucene/core/src/java/org/apache/lucene/search/NumericRangeQuery.java
+index 2d7cbe4..99fad22 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/NumericRangeQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/NumericRangeQuery.java
+@@ -295,12 +295,12 @@ public final class NumericRangeQuery<T extends Number> extends MultiTermQuery {
+   }
+ 
+   @Override @SuppressWarnings("unchecked")
+-  protected TermsEnum getTermsEnum(final Terms terms, AttributeSource atts) throws IOException {
++  protected TermsEnum getTermsEnum(final Terms terms, TermsEnum reuse, AttributeSource atts) throws IOException {
+     // very strange: java.lang.Number itself is not Comparable, but all subclasses used here are
+     if (min != null && max != null && ((Comparable<T>) min).compareTo(max) > 0) {
+       return TermsEnum.EMPTY;
+     }
+-    return new NumericRangeTermsEnum(terms.iterator(null));
++    return new NumericRangeTermsEnum(terms.iterator(reuse));
+   }
+ 
+   /** Returns <code>true</code> if the lower endpoint is inclusive */
+diff --git a/lucene/core/src/java/org/apache/lucene/search/PrefixQuery.java b/lucene/core/src/java/org/apache/lucene/search/PrefixQuery.java
+index e1aaa0c..dc50889 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/PrefixQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/PrefixQuery.java
+@@ -44,8 +44,8 @@ public class PrefixQuery extends MultiTermQuery {
+   public Term getPrefix() { return prefix; }
+   
+   @Override  
+-  protected TermsEnum getTermsEnum(Terms terms, AttributeSource atts) throws IOException {
+-    TermsEnum tenum = terms.iterator(null);
++  protected TermsEnum getTermsEnum(Terms terms, TermsEnum reuse, AttributeSource atts) throws IOException {
++    TermsEnum tenum = terms.iterator(reuse);
+     
+     if (prefix.bytes().length == 0) {
+       // no prefix -- match all terms for this field:
+diff --git a/lucene/core/src/java/org/apache/lucene/search/TermCollectingRewrite.java b/lucene/core/src/java/org/apache/lucene/search/TermCollectingRewrite.java
+index a053411..0d00c18 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/TermCollectingRewrite.java
++++ b/lucene/core/src/java/org/apache/lucene/search/TermCollectingRewrite.java
+@@ -47,7 +47,9 @@ abstract class TermCollectingRewrite<Q extends Query> extends MultiTermQuery.Rew
+   
+   final void collectTerms(IndexReader reader, MultiTermQuery query, TermCollector collector) throws IOException {
+     IndexReaderContext topReaderContext = reader.getContext();
++    
+     Comparator<BytesRef> lastTermComp = null;
++    TermsEnum termsEnum = null;
+     for (AtomicReaderContext context : topReaderContext.leaves()) {
+       final Fields fields = context.reader().fields();
+       if (fields == null) {
+@@ -61,7 +63,7 @@ abstract class TermCollectingRewrite<Q extends Query> extends MultiTermQuery.Rew
+         continue;
+       }
+ 
+-      final TermsEnum termsEnum = getTermsEnum(query, terms, collector.attributes);
++      termsEnum = getTermsEnum(query, terms, termsEnum, collector.attributes);
+       assert termsEnum != null;
+ 
+       if (termsEnum == TermsEnum.EMPTY)
+diff --git a/lucene/core/src/java/org/apache/lucene/search/TermQuery.java b/lucene/core/src/java/org/apache/lucene/search/TermQuery.java
+index 7f854f8..074c923 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/TermQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/TermQuery.java
+@@ -32,7 +32,6 @@ import org.apache.lucene.index.TermsEnum;
+ import org.apache.lucene.search.similarities.Similarity.ExactSimScorer;
+ import org.apache.lucene.search.similarities.Similarity;
+ import org.apache.lucene.util.Bits;
+-import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.ToStringUtils;
+ 
+ /** A Query that matches documents containing a term.
+@@ -74,12 +73,11 @@ public class TermQuery extends Query {
+     public void normalize(float queryNorm, float topLevelBoost) {
+       stats.normalize(queryNorm, topLevelBoost);
+     }
+-
+     @Override
+     public Scorer scorer(AtomicReaderContext context, boolean scoreDocsInOrder,
+         boolean topScorer, Bits acceptDocs) throws IOException {
+       assert termStates.topReaderContext == ReaderUtil.getTopLevelContext(context) : "The top-reader used to create Weight (" + termStates.topReaderContext + ") is not the same as the current reader's top-reader (" + ReaderUtil.getTopLevelContext(context);
+-      final TermsEnum termsEnum = getTermsEnum(context);
++      TermsEnum termsEnum = getTermsEnum(context);
+       if (termsEnum == null) {
+         return null;
+       }
+diff --git a/lucene/core/src/java/org/apache/lucene/search/TermRangeQuery.java b/lucene/core/src/java/org/apache/lucene/search/TermRangeQuery.java
+index 895dd00..d290f75 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/TermRangeQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/TermRangeQuery.java
+@@ -98,12 +98,12 @@ public class TermRangeQuery extends MultiTermQuery {
+   public boolean includesUpper() { return includeUpper; }
+   
+   @Override
+-  protected TermsEnum getTermsEnum(Terms terms, AttributeSource atts) throws IOException {
++  protected TermsEnum getTermsEnum(Terms terms, TermsEnum reuse, AttributeSource atts) throws IOException {
+     if (lowerTerm != null && upperTerm != null && lowerTerm.compareTo(upperTerm) > 0) {
+       return TermsEnum.EMPTY;
+     }
+     
+-    TermsEnum tenum = terms.iterator(null);
++    TermsEnum tenum = terms.iterator(reuse);
+     
+     if ((lowerTerm == null || (includeLower && lowerTerm.length == 0)) && upperTerm == null) {
+       return tenum;
+diff --git a/lucene/core/src/java/org/apache/lucene/util/automaton/CompiledAutomaton.java b/lucene/core/src/java/org/apache/lucene/util/automaton/CompiledAutomaton.java
+index d606116..43c41da 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/automaton/CompiledAutomaton.java
++++ b/lucene/core/src/java/org/apache/lucene/util/automaton/CompiledAutomaton.java
+@@ -228,18 +228,18 @@ public class CompiledAutomaton {
+   // TODO: should this take startTerm too?  This way
+   // Terms.intersect could forward to this method if type !=
+   // NORMAL:
+-  public TermsEnum getTermsEnum(Terms terms) throws IOException {
++  public TermsEnum getTermsEnum(Terms terms, TermsEnum reuse) throws IOException {
+     switch(type) {
+     case NONE:
+       return TermsEnum.EMPTY;
+     case ALL:
+-      return terms.iterator(null);
++      return terms.iterator(reuse);
+     case SINGLE:
+-      return new SingleTermsEnum(terms.iterator(null), term);
++      return new SingleTermsEnum(terms.iterator(reuse), term);
+     case PREFIX:
+       // TODO: this is very likely faster than .intersect,
+       // but we should test and maybe cutover
+-      return new PrefixTermsEnum(terms.iterator(null), term);
++      return new PrefixTermsEnum(terms.iterator(reuse), term);
+     case NORMAL:
+       return terms.intersect(this, null);
+     default:
+diff --git a/lucene/core/src/test/org/apache/lucene/BenchNRTTermsEnumLookups.java b/lucene/core/src/test/org/apache/lucene/BenchNRTTermsEnumLookups.java
+new file mode 100644
+index 0000000..af20ef3
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/BenchNRTTermsEnumLookups.java
+@@ -0,0 +1,142 @@
++package org.apache.lucene;
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++import java.io.File;
++import java.io.IOException;
++import java.util.List;
++import java.util.Random;
++import java.util.concurrent.TimeUnit;
++
++import org.apache.lucene.analysis.MockAnalyzer;
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.Field;
++import org.apache.lucene.document.FieldType;
++import org.apache.lucene.index.AtomicReader;
++import org.apache.lucene.index.AtomicReaderContext;
++import org.apache.lucene.index.DocsEnum;
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.IndexWriter;
++import org.apache.lucene.index.IndexWriterConfig;
++import org.apache.lucene.index.IndexWriterConfig.OpenMode;
++import org.apache.lucene.index.Term;
++import org.apache.lucene.index.TermsEnum;
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.NRTManager;
++import org.apache.lucene.search.NRTManagerReopenThread;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.store.FSDirectory;
++import org.apache.lucene.util.Version;
++import org.apache.lucene.util._TestUtil;
++
++public class BenchNRTTermsEnumLookups {
++  
++  public static void main(String[] args) throws IOException {
++    boolean VERBOSE = false;
++    run(true, VERBOSE, true);
++    run(false, VERBOSE, true);
++    
++    System.out.println("start benchmark");
++    System.out.println("run with reuse");
++    run(true, VERBOSE, false);
++    System.out.println("run without reuse");
++
++    run(false, VERBOSE, false);
++
++    
++  }
++
++  private static void run(boolean REUSE_TERMS_ENUM, boolean VERBOSE, boolean warmup) throws IOException {
++    File file = new File("/tmp/test");
++    if (!file.exists()) {
++      file.mkdir();
++    } else {
++      _TestUtil.rmDir(file);
++      file.mkdir();
++    }
++    Random random = new Random(1);
++
++    Directory dir = FSDirectory.open(file);
++    IndexWriterConfig iwc = new IndexWriterConfig(Version.LUCENE_50,
++        new MockAnalyzer(random));
++    iwc.setRAMBufferSizeMB(250);
++    
++    iwc.setOpenMode(OpenMode.CREATE);
++    IndexWriter _writer = new IndexWriter(dir, iwc);
++    final NRTManager.TrackingIndexWriter writer = new NRTManager.TrackingIndexWriter(
++        _writer);
++    final NRTManager manager = new NRTManager(writer, null, false);
++    NRTManagerReopenThread nrtDeletesThread = new NRTManagerReopenThread(
++        manager, 1, 1);
++    nrtDeletesThread.setName("NRTDeletes Reopen Thread");
++    nrtDeletesThread.setPriority(Math.min(
++        Thread.currentThread().getPriority() + 2, Thread.MAX_PRIORITY));
++    nrtDeletesThread.setDaemon(false);
++    nrtDeletesThread.start();
++    FieldType type = new FieldType();
++    type.setIndexed(true);
++    type.setTokenized(false);
++    type.setStored(false);
++    type.freeze();
++    
++    int num = warmup ? 100000 : 2000000;
++    TermsEnum termsEnum = null;
++    int[] ids = new int[num];
++    for (int i = 0; i < ids.length; i++) {
++      ids[i] = random.nextInt();
++    }
++    long time = System.currentTimeMillis();
++    long lastTime = time;
++    for (int i = 0; i < num; i++) {
++      Term t = new Term("_id", Integer.toString(ids[i]));
++      IndexSearcher acquire = manager.acquire();
++      try {
++        IndexReader indexReader = acquire.getIndexReader();
++        List<AtomicReaderContext> leaves = indexReader.leaves();
++        for (AtomicReaderContext atomicReaderContext : leaves) {
++          AtomicReader reader = atomicReaderContext.reader();
++          termsEnum = reader.fields().terms("_id").iterator(REUSE_TERMS_ENUM ? termsEnum : null);
++          if (termsEnum.seekExact(t.bytes(), false)) {
++            DocsEnum termDocsEnum = termsEnum.docs(reader.getLiveDocs(), null);
++            if (termDocsEnum != null) break;
++          }
++        }
++      } finally {
++        manager.release(acquire);
++      }
++      Document d = new Document();
++      Field f = new Field("_id", Integer.toString(i), type);
++      d.add(f);
++      _writer.updateDocument(t, d);
++      if (VERBOSE && i % 10000 == 0) {
++        long t1 = System.currentTimeMillis();
++        System.out.println(i + " " + (t1 - lastTime) + " ms");
++        lastTime = t1;
++        
++      }
++    }
++    if (!warmup) {
++      System.out.println("Run took: " + (TimeUnit.SECONDS.convert(System.currentTimeMillis()
++        - time, TimeUnit.MILLISECONDS) + " seconds with reuse terms enum = [" + REUSE_TERMS_ENUM + "]"));
++    }
++    nrtDeletesThread.close();
++    
++    manager.close();
++    _writer.close();
++    
++    dir.close();
++  }
++}
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestMultiTermQueryRewrites.java b/lucene/core/src/test/org/apache/lucene/search/TestMultiTermQueryRewrites.java
+index dc2754e..ac807ce 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestMultiTermQueryRewrites.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestMultiTermQueryRewrites.java
+@@ -157,8 +157,8 @@ public class TestMultiTermQueryRewrites extends LuceneTestCase {
+   private void checkBoosts(MultiTermQuery.RewriteMethod method) throws Exception {
+     final MultiTermQuery mtq = new MultiTermQuery("data") {
+       @Override
+-      protected TermsEnum getTermsEnum(Terms terms, AttributeSource atts) throws IOException {
+-        return new TermRangeTermsEnum(terms.iterator(null), new BytesRef("2"), new BytesRef("7"), true, true) {
++      protected TermsEnum getTermsEnum(Terms terms, TermsEnum reuse, AttributeSource atts) throws IOException {
++        return new TermRangeTermsEnum(terms.iterator(reuse), new BytesRef("2"), new BytesRef("7"), true, true) {
+           final BoostAttribute boostAtt =
+             attributes().addAttribute(BoostAttribute.class);
+         
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestPrefixRandom.java b/lucene/core/src/test/org/apache/lucene/search/TestPrefixRandom.java
+index 6a4228f..648898a 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestPrefixRandom.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestPrefixRandom.java
+@@ -84,8 +84,8 @@ public class TestPrefixRandom extends LuceneTestCase {
+     }
+     
+     @Override
+-    protected TermsEnum getTermsEnum(Terms terms, AttributeSource atts) throws IOException {
+-      return new SimplePrefixTermsEnum(terms.iterator(null), prefix);
++    protected TermsEnum getTermsEnum(Terms terms, TermsEnum reuse, AttributeSource atts) throws IOException {
++      return new SimplePrefixTermsEnum(terms.iterator(reuse), prefix);
+     }
+ 
+     private class SimplePrefixTermsEnum extends FilteredTermsEnum {
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestRegexpRandom2.java b/lucene/core/src/test/org/apache/lucene/search/TestRegexpRandom2.java
+index 54ab48a..231dd75 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestRegexpRandom2.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestRegexpRandom2.java
+@@ -108,8 +108,8 @@ public class TestRegexpRandom2 extends LuceneTestCase {
+     }
+     
+     @Override
+-    protected TermsEnum getTermsEnum(Terms terms, AttributeSource atts) throws IOException {
+-      return new SimpleAutomatonTermsEnum(terms.iterator(null));
++    protected TermsEnum getTermsEnum(Terms terms, TermsEnum reuse,  AttributeSource atts) throws IOException {
++      return new SimpleAutomatonTermsEnum(terms.iterator(reuse));
+     }
+ 
+     private class SimpleAutomatonTermsEnum extends FilteredTermsEnum {
+diff --git a/lucene/join/src/java/org/apache/lucene/search/join/TermsQuery.java b/lucene/join/src/java/org/apache/lucene/search/join/TermsQuery.java
+index daf5928..1113530 100644
+--- a/lucene/join/src/java/org/apache/lucene/search/join/TermsQuery.java
++++ b/lucene/join/src/java/org/apache/lucene/search/join/TermsQuery.java
+@@ -48,12 +48,12 @@ class TermsQuery extends MultiTermQuery {
+   }
+ 
+   @Override
+-  protected TermsEnum getTermsEnum(Terms terms, AttributeSource atts) throws IOException {
++  protected TermsEnum getTermsEnum(Terms terms, TermsEnum reuse, AttributeSource atts) throws IOException {
+     if (this.terms.size() == 0) {
+       return TermsEnum.EMPTY;
+     }
+ 
+-    return new SeekingTermSetTermsEnum(terms.iterator(null), this.terms);
++    return new SeekingTermSetTermsEnum(terms.iterator(reuse), this.terms);
+   }
+ 
+   @Override
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/sandbox/queries/SlowCollatedTermRangeQuery.java b/lucene/sandbox/src/java/org/apache/lucene/sandbox/queries/SlowCollatedTermRangeQuery.java
+index 407d380..cff4c45 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/sandbox/queries/SlowCollatedTermRangeQuery.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/sandbox/queries/SlowCollatedTermRangeQuery.java
+@@ -96,12 +96,12 @@ public class SlowCollatedTermRangeQuery extends MultiTermQuery {
+   public Collator getCollator() { return collator; }
+   
+   @Override
+-  protected TermsEnum getTermsEnum(Terms terms, AttributeSource atts) throws IOException {
++  protected TermsEnum getTermsEnum(Terms terms, TermsEnum reuse, AttributeSource atts) throws IOException {
+     if (lowerTerm != null && upperTerm != null && collator.compare(lowerTerm, upperTerm) > 0) {
+       return TermsEnum.EMPTY;
+     }
+     
+-    TermsEnum tenum = terms.iterator(null);
++    TermsEnum tenum = terms.iterator(reuse);
+ 
+     if (lowerTerm == null && upperTerm == null) {
+       return tenum;
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/sandbox/queries/SlowFuzzyQuery.java b/lucene/sandbox/src/java/org/apache/lucene/sandbox/queries/SlowFuzzyQuery.java
+index b09b045..01b594e 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/sandbox/queries/SlowFuzzyQuery.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/sandbox/queries/SlowFuzzyQuery.java
+@@ -142,9 +142,9 @@ public class SlowFuzzyQuery extends MultiTermQuery {
+   }
+ 
+   @Override
+-  protected TermsEnum getTermsEnum(Terms terms, AttributeSource atts) throws IOException {
++  protected TermsEnum getTermsEnum(Terms terms, TermsEnum reuse, AttributeSource atts) throws IOException {
+     if (!termLongEnough) {  // can only match if it's exact
+-      return new SingleTermsEnum(terms.iterator(null), term.bytes());
++      return new SingleTermsEnum(terms.iterator(reuse), term.bytes());
+     }
+     return new SlowFuzzyTermsEnum(terms, atts, getTerm(), minimumSimilarity, prefixLength);
+   }
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/sandbox/queries/regex/RegexQuery.java b/lucene/sandbox/src/java/org/apache/lucene/sandbox/queries/regex/RegexQuery.java
+index e4038c3..c4d6757 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/sandbox/queries/regex/RegexQuery.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/sandbox/queries/regex/RegexQuery.java
+@@ -22,6 +22,7 @@ import org.apache.lucene.index.FilteredTermsEnum;
+ import org.apache.lucene.search.RegexpQuery; // javadoc
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.index.Terms;
++import org.apache.lucene.index.TermsEnum;
+ import org.apache.lucene.util.AttributeSource;
+ import org.apache.lucene.util.ToStringUtils;
+ 
+@@ -62,8 +63,8 @@ public class RegexQuery extends MultiTermQuery implements RegexQueryCapable {
+   }
+ 
+   @Override
+-  protected FilteredTermsEnum getTermsEnum(Terms terms, AttributeSource atts) throws IOException {
+-    return new RegexTermsEnum(terms.iterator(null), term, regexImpl);
++  protected FilteredTermsEnum getTermsEnum(Terms terms, TermsEnum reuse, AttributeSource atts) throws IOException {
++    return new RegexTermsEnum(terms.iterator(reuse), term, regexImpl);
+   }
+ 
+   @Override
+diff --git a/lucene/sandbox/src/test/org/apache/lucene/sandbox/queries/regex/TestRegexQuery.java b/lucene/sandbox/src/test/org/apache/lucene/sandbox/queries/regex/TestRegexQuery.java
+index 7ae01e2..c371b26 100644
+--- a/lucene/sandbox/src/test/org/apache/lucene/sandbox/queries/regex/TestRegexQuery.java
++++ b/lucene/sandbox/src/test/org/apache/lucene/sandbox/queries/regex/TestRegexQuery.java
+@@ -82,7 +82,7 @@ public class TestRegexQuery extends LuceneTestCase {
+ 
+   public void testMatchAll() throws Exception {
+     Terms terms = MultiFields.getTerms(searcher.getIndexReader(), FN);
+-    TermsEnum te = new RegexQuery(new Term(FN, "jum.")).getTermsEnum(terms, new AttributeSource() /*dummy*/);
++    TermsEnum te = new RegexQuery(new Term(FN, "jum.")).getTermsEnum(terms, null, new AttributeSource() /*dummy*/);
+     // no term should match
+     assertNull(te.next());
+   }

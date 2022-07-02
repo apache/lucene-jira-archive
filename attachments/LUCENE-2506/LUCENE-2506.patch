@@ -1,0 +1,778 @@
+Index: lucene/src/java/org/apache/lucene/search/StatefulFilter.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/search/StatefulFilter.java	(revision 0)
++++ lucene/src/java/org/apache/lucene/search/StatefulFilter.java	(revision 0)
+@@ -0,0 +1,751 @@
++package org.apache.lucene.search;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.Map;
++import java.util.Set;
++
++import org.apache.lucene.index.CorruptIndexException;
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.MultiFields;
++import org.apache.lucene.index.SegmentInfos;
++import org.apache.lucene.index.SegmentReader;
++import org.apache.lucene.index.Terms;
++import org.apache.lucene.index.TermsEnum;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.DocIdBitSet;
++
++/**
++ * The <code>StatefulFilter</code> builds on the {@link Filter} class so as to
++ * make it capable of remembering terms across segments spanning the whole
++ * underlying index. The need for making filters stateful stems from the fact
++ * that some, although not most, filters care about what terms they may have
++ * come across in prior segments. Note that, by design, the reader provided to a
++ * {@link Filter} typically only represents a single segment.
++ */
++public abstract class StatefulFilter extends Filter {
++  protected static final long serialVersionUID = 1219268102015079116L;
++  
++  // The directory representing the whole underlying index.
++  protected Directory directory;
++  // The current set of segments seen under the above {@link #directory}.
++  protected Set<String> segmentReaders = new HashSet<String>();
++  // The total set of segments that exist under the above {@link #directory}.
++  protected SegmentInfos segmentInfos = null;
++  // The top-level reader for the index that is currently being searched.
++  protected IndexReader topLevelReader = null;
++  // Was the top-level reader user-defined or system-defined? Ideally, the user
++  // should define the top-level reader so that the system doesn't have to guess
++  // what it might be. There are cases such as when the top-level reader is a
++  // {@link MultiReader} where it is impossible to get to it from the {@link
++  // SegmentReader} that is passed to the filter.
++  protected boolean topLevelReaderUserDefined = false;
++  // The low-level reader (for an index segment) currently being searched.
++  protected IndexReader lowLevelReader = null;
++  // The total number of segments in the top-level reader.
++  protected int topLevelSegmentCount = 0;
++  // The total number of segments coresponding to the low-level readers that
++  // have been filtered so far.
++  protected int lowLevelSegmentCount = 0;
++  
++  // A thread-local variable that stores the {@link TermsEnum} by individual
++  // threads. In essence, each thread ends up getting a distinct copy of the
++  // {@link TermsEnum}, which allows the {@link StatefulFilter} instances to be
++  // completely thread-safe.
++  protected ThreadLocal<StatefulTermsEnum> threadLocalTermsEnum = new ThreadLocal<StatefulTermsEnum>() {
++    // An instance of the {@link TermsEnum} to use as the model for each
++    // thread's initial value.
++    private StatefulTermsEnum modelTermsEnum = getTermsEnumModel();
++    
++    /**
++     * Clone a {@link StatefulTermsEnum} from the {@link #modelTermsEnum}.
++     * 
++     * @return an initial value for the {@link StatefulTermsEnum} to hand out to
++     *         the current thread.
++     */
++    @Override
++    protected StatefulTermsEnum initialValue() {
++      try {
++        return (StatefulTermsEnum) modelTermsEnum.clone();
++      } catch (CloneNotSupportedException e) {
++        System.out.println("Unable to initialize stateful term enum ("
++            + e.getMessage() + ")");
++        return null;
++      }
++    }
++  };
++  
++  /**
++   * Before returning the {@link DocIdSet} for the given reader, reset the state
++   * of the filter, if that reader corresponds to the first segment of the whole
++   * underlying index currently being searched on. Subclasses will now need to
++   * override the {@link #getStatefulDocIdSet(IndexReader, StatefulTermsEnum)}
++   * method, instead of this one.
++   * 
++   * <p>
++   * If this reader corresponds to the first segment in the index, then we setup
++   * our state by re-initializing it. Similarly, if this reader corresponds to
++   * the last segment in the index, then we clean up after ourselves.
++   * 
++   * @return a DocIdSet that provides the documents which should be permitted or
++   *         prohibited in search results. <b>NOTE:</b> null can be returned if
++   *         no documents will be accepted by this Filter.
++   * 
++   * @see DocIdBitSet
++   */
++  @Override
++  public DocIdSet getDocIdSet(IndexReader reader) throws IOException {
++    maybeSetupState(reader);
++    DocIdSet docIdSet = getStatefulDocIdSet(reader, getTermsEnum());
++    maybeTeardownState(reader);
++    return docIdSet;
++  }
++  
++  /**
++   * Creates a {@link DocIdSet} enumerating the documents that should be
++   * permitted in search results. <b>NOTE:</b> null can be returned if no
++   * documents are accepted by this Filter.
++   * <p>
++   * Note: The returned {@link DocIdSet} must refer to document IDs for that
++   * segment, not for the top-level reader. Although this method will be called
++   * once per segment in the index during searching, it is passed a
++   * {@link StatefulTermsEnum} that has a "memory" of past terms seen in prior
++   * segments.
++   * 
++   * @param reader
++   *          a {@link IndexReader} instance opened on the index currently
++   *          searched on. Note, it is likely that the provided reader does not
++   *          represent the whole underlying index i.e. if the index has more
++   *          than one segment the given reader only represents a single
++   *          segment.
++   * @param termsEnum
++   *          a {@link StatefulTermsEnum} whose memory may impact the
++   *          composition of the returned {@link DocIdSet}.
++   * 
++   * @return a DocIdSet that provides the documents which should be permitted or
++   *         prohibited in search results. <b>NOTE:</b> null can be returned if
++   *         no documents will be accepted by this Filter.
++   * 
++   * @see DocIdBitSet
++   */
++  protected abstract DocIdSet getStatefulDocIdSet(IndexReader reader,
++      StatefulTermsEnum termsEnum) throws IOException;
++  
++  /**
++   * Obtain a copy of the {@StatefulTermsEnum} to use as the
++   * model for thread-specific ones.
++   * 
++   * @return a {@link StatefulTermsEnum} that has been properly populated
++   */
++  protected abstract StatefulTermsEnum getTermsEnumModel();
++  
++  /**
++   * @return the current thread's copy of the {link @StatefulTermsEnum}
++   */
++  protected StatefulTermsEnum getTermsEnum() {
++    return threadLocalTermsEnum.get();
++  }
++  
++  /**
++   * Set the current thread's copy of the {@link StatefulTermsEnum}.
++   */
++  protected void setTermsEnum(StatefulTermsEnum termsEnum) {
++    threadLocalTermsEnum.set(termsEnum);
++  }
++  
++  /**
++   * Check to see if the low-level reader corresponds to a directory different
++   * from the one provided before, or to the first segment of that directory. If
++   * so, then we have sufficient cause to clear the state of the filter, on
++   * account of the fact that the filter is dealing with a brand-new search.
++   * 
++   * @param reader
++   *          the {@link IndexReader} provided to the
++   *          {@link #getDocIdSet(IndexReader)} method
++   * @throws IOException
++   */
++  protected void maybeSetupState(IndexReader reader) throws IOException {
++    boolean resetState = false;
++    String readerQName = getReaderQName((SegmentReader) reader);
++    if (directory == null || !isRelatedTo(reader, topLevelReader)) {
++      resetState = true;
++    } else {
++      if (reader instanceof SegmentReader) {
++        if (segmentReaders.contains(readerQName)) {
++          resetState = true;
++        }
++      } else {
++        resetState = true;
++      }
++    }
++    if (resetState) {
++      resetState(reader);
++    }
++    if (reader instanceof SegmentReader) {
++      if (!segmentReaders.contains(readerQName)) {
++        segmentReaders.add(readerQName);
++        lowLevelSegmentCount++;
++      }
++    }
++    lowLevelReader = reader;
++  }
++  
++  /**
++   * Check to see if the low-level reader corresponds to the last segment in the
++   * whole underlying index. If so, then we have sufficient cause to clear the
++   * state of the filter, on account of the fact that the filter is done with
++   * the current search.
++   * 
++   * @param reader
++   *          the {@link IndexReader} provided to the
++   *          {@link #getDocIdSet(IndexReader)} method
++   * @throws IOException
++   */
++  protected void maybeTeardownState(IndexReader reader) throws IOException {
++    if (isLastReader(reader)) {
++      resetState(null);
++    }
++  }
++  
++  /**
++   * Calculate the number of segments that fall directly or indirectly
++   * underneath the given reader.
++   * 
++   * @param reader
++   *          a top-level or low-level {@link IndexReader}
++   * @return
++   */
++  protected int getSegmentCount(IndexReader reader) {
++    if (reader == null) {
++      return 0;
++    }
++    try {
++      SegmentInfos si = new SegmentInfos();
++      si.read(reader.directory());
++      return si.size();
++    } catch (Exception e) {
++      int segmentCount = 0;
++      IndexReader[] subReaders = reader.getSequentialSubReaders();
++      if (subReaders != null) {
++        for (IndexReader subReader : subReaders) {
++          segmentCount += getSegmentCount(subReader);
++        }
++      }
++      return segmentCount;
++    }
++  }
++  
++  /**
++   * Check to see if the given (low-level) sub-reader is part of the given
++   * (top-level) reader. It does so by walking through the sequence of
++   * sub-readers in the given (top-level) reader until it finds a match (or
++   * not).
++   * 
++   * @param subReader
++   *          a (low-level) reader
++   * @param reader
++   *          a (top-level) reader
++   * @return true iff the subReader is part of the reader
++   */
++  protected boolean isRelatedTo(IndexReader subReader, IndexReader reader) {
++    if (subReader.equals(reader)) {
++      return true;
++    }
++    IndexReader[] subReaders = reader.getSequentialSubReaders();
++    if (subReaders != null) {
++      for (IndexReader sequentialSubReader : subReaders) {
++        if (sequentialSubReader.equals(subReader)) {
++          return true;
++        }
++        if (isRelatedTo(subReader, sequentialSubReader)) {
++          return true;
++        }
++      }
++    }
++    return false;
++  }
++  
++  /**
++   * Obtain a qualified name for the given reader, which is based on its
++   * directory's lock ID, plus if it corresponds to a segment, the name of the
++   * segment.
++   * 
++   * @param reader
++   *          an arbitrary index reader
++   * @return the qualified name for the given reader
++   */
++  protected String getReaderQName(IndexReader reader) {
++    return reader.directory().getLockID()
++        + ((reader instanceof SegmentReader) ? ((SegmentReader) reader)
++            .getSegmentName() : "");
++  }
++  
++  /**
++   * Check to see if the given reader is the last reader, with respect to the
++   * top-level reader as defined in {@link #topLevelReader}.
++   * 
++   * <p>
++   * This method works with the assumption that the {@link Searcher} will pass
++   * any given reader that is part of the index to this filter exactly once.
++   * Because we keep track of how many readers have been filtered so far, we can
++   * tell whether or not the given reader is the last one based on how many
++   * total readers exist in the whole underlying index.
++   * 
++   * @param reader
++   *          a (low-level) index reader
++   * @return true iff the given reader is the last one in the index being
++   *         searched.
++   */
++  protected boolean isLastReader(IndexReader reader) {
++    return lowLevelSegmentCount == topLevelSegmentCount;
++  }
++  
++  /**
++   * Reset the state of the filter by clearing the segments herein, and the
++   * memory of this thread's copy of the {@link StatefulTermsEnum}.
++   * 
++   * @throws IOException
++   * @throws CorruptIndexException
++   */
++  protected void resetState(IndexReader reader) throws CorruptIndexException,
++      IOException {
++    segmentReaders.clear();
++    getTermsEnum().resetTermsEnum();
++    if (reader != null) {
++      directory = reader.directory();
++      setTopLevelReader(reader);
++    } else {
++      directory = null;
++      setTopLevelReader(null);
++    }
++    topLevelSegmentCount = getSegmentCount(topLevelReader);
++    lowLevelSegmentCount = 0;
++  }
++  
++  /**
++   * Set the top-level reader corresponding to the whole underlying index that
++   * is currently being searched.
++   * 
++   * <p>
++   * Note that if the provided reader is a low-level one (for instance, if it is
++   * a {@link SegmentReader}), then we try to determine as best as we can what
++   * the top-level reader should be. On the other hand, if the provided reader
++   * does not appear to be a low-level reader, then we take it that it is being
++   * user-defined, in which case, we try not to overwrite that.
++   * </p>
++   * 
++   * <p>
++   * As previously mentioned, there are certain cases where it is impossible to
++   * tell what the top-level reader is just by looking at the low-level reader
++   * (such as when the whole underlying index is defined by a
++   * {@link MultiReader}). That said, in the event the whole underlying index
++   * spans exactly one directory, then chances are that this method will be able
++   * to determine the top-level reader correctly. Given that the system-defined
++   * mechanism of detecting top-level readers may not always be accurate, we
++   * highly recommend that users of any type of {@link StatefulFilter}
++   * explicitly set the top-level reader by using this method.
++   * </p>
++   * 
++   * @param reader
++   *          a top- or low-level reader
++   * @return
++   */
++  public StatefulFilter setTopLevelReader(IndexReader reader) {
++    if (reader instanceof SegmentReader) {
++      if (!topLevelReaderUserDefined) {
++        try {
++          topLevelReader = IndexReader.open(reader.directory(), true);
++        } catch (Exception e) {
++          e.printStackTrace();
++          topLevelReader = reader;
++        }
++      }
++    } else {
++      topLevelReader = reader;
++      topLevelReaderUserDefined = true;
++    }
++    return this;
++  }
++  
++  /**
++   * @return the top-level reader corresponding to the whole underlying index
++   */
++  public IndexReader getTopLevelReader() {
++    return topLevelReader;
++  }
++  
++  /**
++   * @return the low-level reader corresponding to the segment being filtered
++   */
++  protected IndexReader getLowLevelReader() {
++    return lowLevelReader;
++  }
++  
++  /**
++   * The <code>StatefulTermsEnum</code> abstract class builds on the
++   * {@link FilteredTermsEnum} by essentially giving it a "memory" of past
++   * terms. More importantly, it acts as a reusable {@link FilteredTermsEnum} in
++   * the sense that its actual {@link TermsEnum} can be reset over and over
++   * during an instance's life. Note that, by default, a
++   * {@link FilteredTermsEnum} applies to exactly one underlying
++   * {@link TermsEnum}.
++   * 
++   * @author Karthick Sankarachary
++   */
++  public abstract class StatefulTermsEnum extends FilteredTermsEnum implements
++      Cloneable {
++    // The name of the field to filter on.
++    protected String field = null;
++    // The value of the text to initially seek on.
++    protected String initialText = null;
++    // A flag to indicate when to end this enum.
++    protected boolean endEnum = false;
++    // The terms for the given {@link #field} in the top-level reader.
++    protected Terms topLevelTerms = null;
++    
++    // A cache of the text of the word in terms belonging to current
++    // and/or previous segments. As an aside, using a byte-based Trie data
++    // structure instead of a {@link HashSet} might improve performance.
++    private Set<byte[]> memorizedTerms = new HashSet<byte[]>();
++    // A cache of the {@link TermsEnum.docFreq()} for terms that appear in the
++    // scope of the top-level reader. The key corresponds to a unique term and
++    // the value to its corresponding {@link TermsEnum.docFreq()}.
++    private Map<String,Integer> topLevelDocFreqs = new HashMap<String,Integer>();
++    // A cache of the {@link TermsEnum.docFreq()} for terms that appear in the
++    // scope of the low-level readers. The key corresponds to the name of a
++    // low-level reader, and the value has the same structure as that of {@link
++    // #topLevelDocFreqs}.
++    private Map<String,Map<String,Integer>> lowLevelDocFreqs = new HashMap<String,Map<String,Integer>>();
++    
++    /**
++     * Create a {@link StatefulTermsEnum} with no specific underlying
++     * {@link TermsEnum}.
++     */
++    public StatefulTermsEnum() {
++      super(null);
++    }
++    
++    /**
++     * Create a {@link StatefulTermsEnum} narrowing down the subset of terms by
++     * the given field.
++     * 
++     * @param field
++     *          the name of a field
++     */
++    public StatefulTermsEnum(String field) {
++      this(field, null);
++    }
++    
++    /**
++     * Create a {@link StatefulTermsEnum} narrowing down the subset of terms by
++     * the given field. Moreover, the enumeration starts at the given initial
++     * text.
++     * 
++     * @param field
++     *          the name of a field
++     * @param initialText
++     *          the initial text to seek on
++     */
++    public StatefulTermsEnum(String field, String initialText) {
++      this();
++      setField(field);
++      setInitialSeekTerm(initialText);
++    }
++    
++    /**
++     * Set the field to filter on.
++     * 
++     * @param field
++     *          the name of a field
++     */
++    protected void setField(String field) {
++      this.field = field;
++    }
++    
++    /**
++     * @return a non-null name of the field being filtered on
++     */
++    protected String getField() {
++      return field != null ? field : "";
++    }
++    
++    /**
++     * Set the initial seek term to a {@link BytesRef} based on the given text.
++     * 
++     * @param initialText
++     *          the value of the text to initially seek to.
++     */
++    protected void setInitialSeekTerm(String initialText) {
++      if (initialText == null) {
++        initialText = "";
++      }
++      BytesRef singleRef = new BytesRef(initialText);
++      try {
++        setInitialSeekTerm(singleRef);
++      } catch (IOException e) {
++        System.out
++            .println("Warning: Unable to seek to the initial term for the field "
++                + field + " (" + e.getMessage() + ")");
++      }
++      this.initialText = initialText;
++    }
++    
++    /**
++     * Reset the underlying {@link TermsEnum} and clear the state of this
++     * instance.
++     */
++    public void resetTermsEnum() {
++      endEnum = false;
++      memorizedTerms.clear();
++      topLevelDocFreqs.clear();
++      setInitialSeekTerm(initialText);
++    }
++    
++    /**
++     * Reset the underlying {@link TermsEnum} to the given one and clear the
++     * state of this instance.
++     * 
++     * @param tenum
++     *          a {@link TermsEnum} to point this instance to
++     */
++    public void resetTermsEnum(TermsEnum tenum) {
++      resetTermsEnum();
++      this.tenum = tenum;
++    }
++    
++    /**
++     * Reset the underlying {@link TermsEnum} to one based on the given reader
++     * and field and clear the state of this instance.
++     * 
++     * @param reader
++     *          a reference to a {@link IndexReader} for a segment
++     * @param field
++     *          the name of the field
++     * @throws IOException
++     */
++    public void resetTermsEnum(IndexReader reader, String field)
++        throws IOException {
++      this.field = field;
++      Terms terms = reader.fields().terms(field);
++      if (terms != null) {
++        resetTermsEnum(terms.iterator());
++      } else {
++        resetTermsEnum();
++      }
++    }
++    
++    /**
++     * Memorize the text of the word contained in the given term.
++     * 
++     * @param term
++     *          a {@link BytesRef} denoting the text of a word
++     */
++    protected void memorizeTerm(BytesRef term) {
++      memorizedTerms.add(term.bytes);
++    }
++    
++    /**
++     * Forget the text of the word contained in the given term.
++     * 
++     * @param term
++     *          a {@link BytesRef} denoting the text of a word
++     */
++    protected void forgetTerm(BytesRef term) {
++      memorizedTerms.remove(term.bytes);
++    }
++    
++    /**
++     * @return the number of terms memorized so far
++     */
++    protected int termsMemorized() {
++      return memorizedTerms.size();
++    }
++    
++    /**
++     * Check to see if the given term is in this instance's memory.
++     * 
++     * @param term
++     *          a {@link BytesRef} denoting the text of a word
++     * @return true iff the given term exists in memory
++     */
++    protected boolean isTermMemorized(BytesRef term) {
++      return memorizedTerms.contains(term.bytes);
++    }
++    
++    /**
++     * Obtain the {@link #docFreq()} for the current term in the context of the
++     * top-level reader.
++     * 
++     * @return the number of documents in the top-level reader containing the
++     *         current term
++     */
++    protected int getTopLevelDocFreq() {
++      try {
++        return getTopLevelDocFreq(term());
++      } catch (IOException e) {
++        System.out.println("Warning: unable to obtain current term for field "
++            + field);
++        return 0;
++      }
++    }
++    
++    /**
++     * Obtain the {@link #docFreq()} for the given term in the context of the
++     * top-level reader.
++     * 
++     * @param term
++     *          a term
++     * @return the number of documents in the top-level reader containing the
++     *         given term
++     */
++    protected int getTopLevelDocFreq(BytesRef term) {
++      Integer topLevelDocFreq = topLevelDocFreqs.get(term.utf8ToString());
++      if (topLevelDocFreq == null) {
++        if (topLevelTerms == null) {
++          if (topLevelReader != null) {
++            try {
++              topLevelTerms = MultiFields.getFields(topLevelReader)
++                  .terms(field);
++            } catch (IOException e) {
++              System.out
++                  .println("Warning: unable to get top-level terms for field "
++                      + field);
++            }
++          }
++        }
++        if (topLevelTerms != null) {
++          try {
++            topLevelDocFreqs.put(term.utf8ToString(), topLevelTerms
++                .docFreq(term));
++          } catch (IOException e) {
++            System.out
++                .println("Warning: unable to determine top-level docFreq for term "
++                    + term.utf8ToString());
++          }
++        }
++        topLevelDocFreq = topLevelDocFreqs.get(term.utf8ToString());
++      }
++      return topLevelDocFreq;
++    }
++    
++    /**
++     * Obtain the {@link #docFreq()} for the current term in the context of the
++     * low-level reader.
++     * 
++     * @return the number of documents in the low-level reader containing the
++     *         current term
++     */
++    protected int getLowLevelDocFreq() {
++      try {
++        return getLowLevelDocFreq(term());
++      } catch (IOException e) {
++        System.out.println("Warning: unable to obtain current term for field "
++            + field);
++        return 0;
++      }
++    }
++    
++    /**
++     * Obtain the {@link #docFreq()} for the given term in the context of the
++     * low-level reader.
++     * 
++     * @param term
++     *          a term
++     * @return the number of documents in the current low-level reader
++     *         containing the given term
++     */
++    protected int getLowLevelDocFreq(BytesRef term) {
++      String segmentQName = getReaderQName(getLowLevelReader());
++      Map<String,Integer> termDocFreqs = lowLevelDocFreqs.get(segmentQName);
++      if (termDocFreqs == null) {
++        termDocFreqs = new HashMap<String,Integer>();
++        lowLevelDocFreqs.put(segmentQName, termDocFreqs);
++      }
++      Integer lowLevelDocFreq = termDocFreqs.get(term.utf8ToString());
++      if (lowLevelDocFreq == null) {
++        lowLevelDocFreq = super.docFreq();
++        termDocFreqs.put(term.utf8ToString(), lowLevelDocFreq);
++      }
++      return lowLevelDocFreq;
++    }
++    
++    /**
++     * Obtain the total of all the {@link #docFreq()} of the current term in the
++     * context of all the low-level readers seen so far.
++     * 
++     * @return the number of documents in all low-level readers containing the
++     *         current term
++     */
++    protected int getTotalLowLevelDocFreq() {
++      try {
++        return getTotalLowLevelDocFreq(term());
++      } catch (IOException e) {
++        System.out.println("Warning: unable to obtain current term for field "
++            + field);
++        return 0;
++      }
++    }
++    
++    /**
++     * Obtain the total of all the {@link #docFreq()} of the given term in the
++     * context of all the low-level readers seen so far.
++     * 
++     * @param term
++     *          a term
++     * @return the number of documents in all low-level readers containing the
++     *         given term
++     */
++    protected int getTotalLowLevelDocFreq(BytesRef term) {
++      int totalLowLevelDocFreq = 0;
++      for (Map<String,Integer> termDocFreqs : lowLevelDocFreqs.values()) {
++        if (termDocFreqs != null) {
++          Integer lowLevelDocFreq = termDocFreqs.get(term.utf8ToString());
++          if (lowLevelDocFreq != null) {
++            totalLowLevelDocFreq += lowLevelDocFreq;
++          }
++        }
++      }
++      totalLowLevelDocFreq += getLowLevelDocFreq(term);
++      return totalLowLevelDocFreq;
++    }
++    
++    /**
++     * Release the resources held by this instance.
++     * 
++     * @throws IOException
++     */
++    public void close() throws IOException {
++      resetTermsEnum();
++    }
++    
++    /**
++     * Clone a copy of this instance making sure to clear its state before
++     * returning it.
++     */
++    @Override
++    protected Object clone() throws CloneNotSupportedException {
++      StatefulTermsEnum clone = (StatefulTermsEnum) super.clone();
++      clone.resetTermsEnum();
++      return clone;
++    }
++  }
++}
+Index: lucene/src/java/org/apache/lucene/search/FilteredTermsEnum.java
+===================================================================
+--- lucene/src/java/org/apache/lucene/search/FilteredTermsEnum.java	(revision 953479)
++++ lucene/src/java/org/apache/lucene/search/FilteredTermsEnum.java	(working copy)
+@@ -48,7 +48,7 @@
+   private BytesRef actualTerm = null;
+   private boolean useTermsCache = false;
+ 
+-  private final TermsEnum tenum;
++  protected TermsEnum tenum;
+ 
+   /** Return value, if term should be accepted or the iteration should
+    * {@code END}. The {@code *_SEEK} values denote, that after handling the current term
+@@ -223,6 +223,8 @@
+           // invalid term, seek next time
+           doSeek = true;
+           break;
++        case NO:
++          break;
+         case END:
+           // we are supposed to end the enum
+           return null;

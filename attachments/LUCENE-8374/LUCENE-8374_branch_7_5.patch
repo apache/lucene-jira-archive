@@ -1,0 +1,2614 @@
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/lucene70/IndexedDISI.java b/lucene/core/src/java/org/apache/lucene/codecs/lucene70/IndexedDISI.java
+index 24eaf7a9092..ac56e5b5e3a 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/lucene70/IndexedDISI.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/lucene70/IndexedDISI.java
+@@ -50,6 +50,9 @@ import org.apache.lucene.util.RoaringDocIdSet;
+ final class IndexedDISI extends DocIdSetIterator {
+ 
+   static final int MAX_ARRAY_LENGTH = (1 << 12) - 1;
++  static final String NO_NAME = "n/a";
++
++  public final String name;
+ 
+   private static void flush(int block, FixedBitSet buffer, int cardinality, IndexOutput out) throws IOException {
+     assert block >= 0 && block < 65536;
+@@ -98,13 +101,49 @@ final class IndexedDISI extends DocIdSetIterator {
+   /** The slice that stores the {@link DocIdSetIterator}. */
+   private final IndexInput slice;
+   private final long cost;
++  private final IndexedDISICache cache;
+ 
+   IndexedDISI(IndexInput in, long offset, long length, long cost) throws IOException {
+-    this.slice = in.slice("docs", offset, length);
++    this(in, offset, length, cost, NO_NAME);
++  }
++
++  IndexedDISI(IndexInput in, long offset, long length, long cost, String name) throws IOException {
++    this(in, offset, length, cost, null, name);
++  }
++
++  IndexedDISI(IndexInput in, long offset, long length, long cost, IndexedDISICache cache) throws IOException {
++    this(in, offset, length, cost, cache, NO_NAME);
++  }
++
++  IndexedDISI(IndexInput in, long offset, long length, long cost, IndexedDISICache cache, String name) throws IOException {
++    this(in.slice("docs", offset, length), cost, cache, name);
++  }
++
++  IndexedDISI(IndexInput slice, long cost) throws IOException {
++    this(slice, cost, NO_NAME);
++  }
++  // This constructor allows to pass the slice directly in case it helps reuse
++  // see eg. Lucene70 norms producer's merge instance
++  IndexedDISI(IndexInput slice, long cost, String name) throws IOException {
++    this(slice, cost, null, name);
++//    IndexedDISICacheFactory.debug(
++//        "Non-cached direct slice IndexedDISI with length " + slice.length() + ": " + slice.toString());
++  }
++
++  IndexedDISI(IndexInput slice, long cost, IndexedDISICache cache) throws IOException {
++    this(slice, cost, cache, NO_NAME);
++  }
++  // This constructor allows to pass the slice directly in case it helps reuse
++  // see eg. Lucene70 norms producer's merge instance
++  IndexedDISI(IndexInput slice, long cost, IndexedDISICache cache, String name) {
++    this.name = name;
++    this.slice = slice;
+     this.cost = cost;
++    this.cache = cache == null ? IndexedDISICache.EMPTY : cache;
+   }
+ 
+   private int block = -1;
++  private long blockStart; // Used with the DENSE cache
+   private long blockEnd;
+   private int nextBlockIndex = -1;
+   Method method;
+@@ -120,6 +159,8 @@ final class IndexedDISI extends DocIdSetIterator {
+   private int wordIndex = -1;
+   // number of one bits encountered so far, including those of `word`
+   private int numberOfOnes;
++  // Used with rank for jumps inside of DENSE
++  private int denseOrigoIndex;
+ 
+   // ALL variables
+   private int gap;
+@@ -132,6 +173,7 @@ final class IndexedDISI extends DocIdSetIterator {
+   @Override
+   public int advance(int target) throws IOException {
+     final int targetBlock = target & 0xFFFF0000;
++    // Note: The cache makes it easy to add support for random access. This has not been done as the API forbids it
+     if (block < targetBlock) {
+       advanceBlock(targetBlock);
+     }
+@@ -157,6 +199,22 @@ final class IndexedDISI extends DocIdSetIterator {
+   }
+ 
+   private void advanceBlock(int targetBlock) throws IOException {
++    if (targetBlock >= block+2) { // 1 block skip is (slightly) faster to do without block jump table
++      long offset = cache.getFilePointerForBlock(targetBlock>>IndexedDISICache.BLOCK_BITS);
++      if (offset != -1 && offset > slice.getFilePointer()) {
++        int origo = cache.getIndexForBlock(targetBlock>>IndexedDISICache.BLOCK_BITS);
++        if (origo != -1) {
++   //   System.out.println("Seeking to " + offset + " for targetBlock " + (targetBlock>>IndexedDISICache.BLOCK_BITS) + " with origo " + origo);
++          this.nextBlockIndex = origo-1; // -1 to compensate for the always-added 1 in readBlockHeader
++          slice.seek(offset);
++          readBlockHeader();
++          return;
++        }
++      }
++    }
++    // TODO (Toke): Make sanity check debug for whether the cache is always used when targetBlock >= block+2
++
++    // Fallback to non-cached
+     do {
+       slice.seek(blockEnd);
+       readBlockHeader();
+@@ -164,6 +222,7 @@ final class IndexedDISI extends DocIdSetIterator {
+   }
+ 
+   private void readBlockHeader() throws IOException {
++    blockStart = slice.getFilePointer();
+     block = Short.toUnsignedInt(slice.readShort()) << 16;
+     assert block >= 0;
+     final int numValues = 1 + Short.toUnsignedInt(slice.readShort());
+@@ -181,6 +240,7 @@ final class IndexedDISI extends DocIdSetIterator {
+       blockEnd = slice.getFilePointer() + (1 << 13);
+       wordIndex = -1;
+       numberOfOnes = index + 1;
++      denseOrigoIndex = numberOfOnes;
+     }
+   }
+ 
+@@ -244,6 +304,14 @@ final class IndexedDISI extends DocIdSetIterator {
+       boolean advanceWithinBlock(IndexedDISI disi, int target) throws IOException {
+         final int targetInBlock = target & 0xFFFF;
+         final int targetWordIndex = targetInBlock >>> 6;
++
++        if (target == (target >> 9 << 9)) {
++//          System.out.println("-----");
++        }
++
++        // If possible, skip ahead using the rank cache
++        disi.rankSkip(disi, target);
++
+         for (int i = disi.wordIndex + 1; i <= targetWordIndex; ++i) {
+           disi.word = disi.slice.readLong();
+           disi.numberOfOnes += Long.bitCount(disi.word);
+@@ -257,7 +325,10 @@ final class IndexedDISI extends DocIdSetIterator {
+           return true;
+         }
+ 
++        // There were no set bits at the wanted position. Move forward until one is reached
+         while (++disi.wordIndex < 1024) {
++          // This could use the rank cache to skip empty spaces >= 512 bits, but it seems unrealistic
++          // that such blocks would be DENSE
+           disi.word = disi.slice.readLong();
+           if (disi.word != 0) {
+             disi.index = disi.numberOfOnes;
+@@ -266,12 +337,18 @@ final class IndexedDISI extends DocIdSetIterator {
+             return true;
+           }
+         }
++        // No set bits in the block at or after the wanted position.
+         return false;
+       }
++
+       @Override
+       boolean advanceExactWithinBlock(IndexedDISI disi, int target) throws IOException {
+         final int targetInBlock = target & 0xFFFF;
+         final int targetWordIndex = targetInBlock >>> 6;
++
++        // If possible, skip ahead using the rank cache
++        disi.rankSkip(disi, target);
++
+         for (int i = disi.wordIndex + 1; i <= targetWordIndex; ++i) {
+           disi.word = disi.slice.readLong();
+           disi.numberOfOnes += Long.bitCount(disi.word);
+@@ -282,6 +359,8 @@ final class IndexedDISI extends DocIdSetIterator {
+         disi.index = disi.numberOfOnes - Long.bitCount(leftBits);
+         return (leftBits & 1L) != 0;
+       }
++
++
+     },
+     ALL {
+       @Override
+@@ -306,4 +385,53 @@ final class IndexedDISI extends DocIdSetIterator {
+     abstract boolean advanceExactWithinBlock(IndexedDISI disi, int target) throws IOException;
+   }
+ 
++  /**
++   * If the distance between the current position and the target is > 8 words, the rank cache will
++   * be used to guarantee a worst-case of 1 rank-lookup and 7 word-read-and-count-bits operations.
++   * Note: This does not guarantee a skip up to target, only up to nearest rank boundary. It is the
++   * responsibility of the caller to iterate further to reach target.
++   * @param disi standard DISI.
++   * @param target the wanted docID for which to calculate set-flag and index.
++   * @throws IOException if a disi seek failed.
++   */
++  private void rankSkip(IndexedDISI disi, int target) throws IOException {
++    final int targetInBlock = target & 0xFFFF;
++    final int targetWordIndex = targetInBlock >>> 6;
++
++    // If the distance between the current position and the target is >= 8
++    // then it pays to use the rank to jump
++    if (!(disi.cache.hasRank() && targetWordIndex - disi.wordIndex >= IndexedDISICache.RANK_BLOCK_LONGS)) {
++      return;
++    }
++
++    int rankPos = disi.cache.denseRankPosition(target);
++    if (rankPos == -1) {
++      return;
++    }
++    int rank = disi.cache.getRankInBlock(rankPos);
++    if (rank == -1) {
++      //System.out.println("Rank -1 for target=" + target);
++      return;
++    }
++    int rankIndex = disi.denseOrigoIndex + rank;
++    int rankWordIndex = (rankPos & 0xFFFF) >> 6;
++    long rankOffset = disi.blockStart + 4 + (rankWordIndex * 8);
++
++    long mark = disi.slice.getFilePointer();
++    disi.slice.seek(rankOffset);
++    long rankWord = disi.slice.readLong();
++    int rankNOO = rankIndex + Long.bitCount(rankWord);
++    rankOffset += Long.BYTES;
++
++
++    //disi.slice.seek(mark);
++    disi.wordIndex = rankWordIndex;
++    disi.word = rankWord;
++    disi.numberOfOnes = rankNOO;
++
++//            System.out.println("> rank denseOrigoIndex=" + disi.denseOrigoIndex +
++//                ", rank[" + (target >> IndexedDISICache.RANK_BLOCK_BITS) + "]=" + disi.cache.getRankInBlock(rankPos) +
++//                ", rankWordIndex=" + rankWordIndex + ", twi=" + targetWordIndex +
++//               ", offset=" + rankOffset + ", rankOnes=" + rankNOO + ", endIndex=" + rankIndex);
++  }
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/lucene70/IndexedDISICache.java b/lucene/core/src/java/org/apache/lucene/codecs/lucene70/IndexedDISICache.java
+new file mode 100644
+index 00000000000..d0aa0739e2c
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/codecs/lucene70/IndexedDISICache.java
+@@ -0,0 +1,356 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.codecs.lucene70;
++
++import java.io.IOException;
++import java.util.Arrays;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import org.apache.lucene.search.DocIdSetIterator;
++import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.util.Accountable;
++import org.apache.lucene.util.ArrayUtil;
++import org.apache.lucene.util.RamUsageEstimator;
++import org.apache.lucene.util.packed.PackedInts;
++
++import static org.apache.lucene.codecs.lucene70.IndexedDISI.MAX_ARRAY_LENGTH;
++
++/**
++ * Caching of IndexedDISI with two strategies:
++ *
++ * A lookup table for block blockCache and index and a rank structure for DENSE block lookups.
++ *
++ * The lookup table is an array of {@code long}s with an entry for each block (65536 bits).
++ * Each long entry consists of 2 logical parts:
++ * The first 31 bits holds the index up to just before the wanted block.
++ * The next 33 bits holds the offset into the underlying slice.
++ * As there is a maximum of 2^16 blocks, it follows that the maximum size of any block must
++ * not exceed 2^17 bits to avoid  overflow. This is currently the case, with the largest
++ * block being DENSE and using 2^16 + 32 bits, and is likely to continue to hold as using
++ * more than double the amount of bits is unlikely to be an efficient representation.
++ * The alternative to using the lookup table is iteration of all blocks up to the wanted one.
++ * The cache overhead is numDocs/1024 bytes.
++ *
++ * Note: There are 4 types of blocks: ALL, DENSE, SPARSE and non-existing (0 set bits).
++ * In the case of non-existing blocks, the entry in the lookup table has index equal to the
++ * previous entry and offset equal to the next non-empty block.
++ *
++ * The rank structure for DENSE blocks is an array of unsigned {@code short}s with an entry
++ * or each sub-block of 512 bits out of the 65536 bits in the outer block.
++ * Each rank-entry states the number of set bits within the block up to the bit before the
++ * bit positioned at the start of the sub-block.
++ * Note that that the rank entry of the first sub-block is always 0 and that the last entry can
++ * at most be 65536-512 = 65024 and thus will always fit into an unsigned short.
++ * See https://en.wikipedia.org/wiki/Succinct_data_structure for details on rank structures.
++ * The alternative to using the rank structure is iteration and summing of set bits for all
++ * entries in the DENSE sub-block up until the wanted bit, with a worst-case of 1024 entries.
++ * The rank cache overhead for a single DENSE block is 128 shorts (128*16 = 2048 bits) or
++ * 1/32th.
++ *
++ * The total overhead for the rank cache is currently also numDocs/32 bits or numDocs/8 bytes
++ * as the rank-representation is not sparse itself, using empty entries for sub-blocks of type
++ * ALL or SPARSE.
++ *
++ * See https://issues.apache.org/jira/browse/LUCENE-8374 for details
++ */
++public class IndexedDISICache implements Accountable {
++
++  public static final int BLOCK = 65536;
++  public static final int BLOCK_BITS = 16;
++  public static final long BLOCK_INDEX_SHIFT = 33;
++  public static final long BLOCK_INDEX_MASK = ~0L << BLOCK_INDEX_SHIFT;
++  public static final long BLOCK_LOOKUP_MASK = ~BLOCK_INDEX_MASK;
++
++  public static final int RANK_BLOCK = 512;
++  public static final int RANK_BLOCK_LONGS = 512/Long.SIZE;
++  public static final int RANK_BLOCK_BITS = 9;
++  public static final int RANKS_PER_BLOCK = BLOCK/RANK_BLOCK;
++
++  private PackedInts.Reader rank;   // One every 512 docs, sparsely represented as not all blocks are DENSE
++  private long[] blockCache = null; // One every 65536 docs, contains index & slice position
++  public String creationStats = ""; // TODO: Definitely not the way to keep the stats, but where to send them?
++  public String name; // Identifier for debug, log & inspection
++
++  // Flags for not-yet-defined-values used during building
++  private static final long BLOCK_EMPTY_INDEX = ~0L << BLOCK_INDEX_SHIFT;
++  private static final long BLOCK_EMPTY_LOOKUP = BLOCK_LOOKUP_MASK;
++  private static final long BLOCK_EMPTY = BLOCK_EMPTY_INDEX | BLOCK_EMPTY_LOOKUP;
++
++  /**
++   * Builds the stated caches for the given Indexed
++   *
++   * @param in positioned at the start of the logical underlying bitmap.
++   */
++  IndexedDISICache(IndexInput in, boolean createBlockCache, boolean createRankCache, String name) throws IOException {
++    if (createBlockCache) {
++      blockCache = new long[16];    // Will be extended when needed
++      Arrays.fill(blockCache, BLOCK_EMPTY);
++    }
++    if (!createBlockCache && !createRankCache) {
++      return; // Nothing to do
++    }
++    this.name = name;
++    updateCaches(in, createBlockCache, createRankCache);
++  }
++
++  private IndexedDISICache() {
++    this.blockCache = null;
++    this.rank = null;
++    this.name = "";
++  }
++  // TODO: EMPTY works poorly with name, but creating multiple EMPTYs with different names seems wasteful
++  public static final IndexedDISICache EMPTY = new IndexedDISICache();
++
++  /**
++   * If available, returns a position within the underlying {@link IndexInput} for the start of the block
++   * containing the wanted bit (the target) or the next non-EMPTY block, if the block representing the bit is empty.
++   * @param targetBlock the index for the block to resolve (docID / 65536).
++   * @return the offset for the block for target or -1 if it cannot be resolved.
++   */
++  public long getFilePointerForBlock(int targetBlock) {
++    long offset = !IndexedDISICacheFactory.BLOCK_CACHING_ENABLED ||
++        blockCache == null || blockCache.length <= targetBlock ?
++        -1 : blockCache[targetBlock] & BLOCK_LOOKUP_MASK;
++    return offset == BLOCK_EMPTY_LOOKUP ? -1 : offset;
++  }
++
++  /**
++   * If available, returns the index; number of set bits before the wanted block.
++   * @param targetBlock the block to resolve (docID / 65536).
++   * @return the index for the block or -1 if it cannot be resolved.
++   */
++  public int getIndexForBlock(int targetBlock) {
++    if (!IndexedDISICacheFactory.BLOCK_CACHING_ENABLED || blockCache == null || blockCache.length <= targetBlock) {
++      return -1;
++    }
++    return (blockCache[targetBlock] & BLOCK_INDEX_MASK) == BLOCK_EMPTY_INDEX ?
++        -1 : (int)(blockCache[targetBlock] >>> BLOCK_INDEX_SHIFT);
++  }
++
++  /**
++   * Given a target (docID), this method returns the docID
++   * @param target the docID for which an index is wanted.
++   * @return the docID where the rank is known. This will be lte target.
++   */
++  // TODO: This method requires way too much knowledge of the intrinsics of the cache. Usage should be simplified
++  public int denseRankPosition(int target) {
++       return target >> RANK_BLOCK_BITS << RANK_BLOCK_BITS;
++  }
++
++  public boolean hasOffsets() {
++    return blockCache != null;
++  }
++
++  public boolean hasRank() {
++    return rank != null;
++  }
++  
++  /**
++   * Get the rank (index) for all set bits up to just before the given rankPosition in the block.
++   * The caller is responsible for deriving the count of bits up to the docID target from the rankPosition.
++   * The caller is also responsible for keeping track of set bits up to the current block.
++   * Important: This only accepts rankPositions that aligns to {@link #RANK_BLOCK} boundaries.
++   * Note 1: Use {@link #denseRankPosition(int)} to obtain a calid rankPosition for a wanted docID.
++   * Note 2: The caller should seek to the rankPosition in the underlying slice to keep everything in sync.
++   * @param rankPosition a docID target that aligns to {@link #RANK_BLOCK}.
++   * @return the rank (index / set bits count) up to just before the given rankPosition.
++   *         If rank is disabled, -1 is returned.
++   */
++  // TODO: This method requires way too much knowledge of the intrinsics of the cache. Usage should be simplified
++  public int getRankInBlock(int rankPosition) {
++    if (!IndexedDISICacheFactory.DENSE_CACHING_ENABLED || rank == null) {
++      return -1;
++    }
++    assert rankPosition == denseRankPosition(rankPosition);
++    int rankIndex = rankPosition >> RANK_BLOCK_BITS;
++    return rankIndex >= rank.size() ? -1 : (int) rank.get(rankIndex);
++  }
++
++  private void updateCaches(IndexInput slice, boolean fillBlockCache, boolean fillRankCache)
++      throws IOException {
++    final long startOffset = slice.getFilePointer();
++
++    final long startTime = System.nanoTime();
++    AtomicInteger statBlockALL = new AtomicInteger(0);
++    AtomicInteger statBlockDENSE = new AtomicInteger(0);
++    AtomicInteger statBlockSPARSE = new AtomicInteger(0);
++
++    // Fill phase
++    int largestBlock;
++    try {
++      largestBlock = fillCache(slice, fillBlockCache, fillRankCache, statBlockALL, statBlockDENSE, statBlockSPARSE);
++    } catch (Exception e) { // TODO (Toke): Development debug only. Remove when stable
++      creationStats = "Exception filling cache with slice of length " + slice.getFilePointer();
++      System.err.println(creationStats);
++      e.printStackTrace();
++      blockCache = null;
++      rank = null;
++      slice.seek(startOffset); // Leave it as we found it
++      return;
++    }
++
++    freezeCaches(fillBlockCache, fillRankCache, largestBlock);
++
++    slice.seek(startOffset); // Leave it as we found it
++    creationStats = String.format(
++        "name=%s, blocks=%d (ALL=%d, DENSE=%d, SPARSE=%d, EMPTY=%d), time=%dms, block=%b (%d bytes), rank=%b (%d bytes)",
++        name,
++        largestBlock+1, statBlockALL.get(), statBlockDENSE.get(), statBlockSPARSE.get(),
++        (largestBlock+1-statBlockALL.get()-statBlockDENSE.get()-statBlockSPARSE.get()),
++        (System.nanoTime()-startTime)/1000000,
++        fillBlockCache, blockCache == null ? 0 : blockCache.length*Long.BYTES,
++        fillRankCache, rank == null ? 0 : rank.ramBytesUsed());
++  }
++
++  private int fillCache(IndexInput slice, boolean fillBlockCache, boolean fillRankCache,
++                        AtomicInteger statBlockALL, AtomicInteger statBlockDENSE, AtomicInteger statBlockSPARSE)
++      throws IOException {
++    char[] buildRank = new char[256];
++    int largestBlock = -1;
++    long index = 0;
++    int rankIndex = -1;
++    int rankCountTemp = 0;
++    while (slice.getFilePointer() < slice.length()) {
++      final long startFilePointer = slice.getFilePointer();
++
++      final int blockIndex = Short.toUnsignedInt(slice.readShort());
++      final int numValues = 1 + Short.toUnsignedInt(slice.readShort());
++
++      assert blockIndex > largestBlock;
++      if (blockIndex == DocIdSetIterator.NO_MORE_DOCS >>> 16) { // End reached
++        assert Short.toUnsignedInt(slice.readShort()) == (DocIdSetIterator.NO_MORE_DOCS & 0xFFFF);
++        break;
++      }
++      largestBlock = blockIndex;
++
++      if (fillBlockCache) {
++        blockCache = ArrayUtil.grow(blockCache, blockIndex+1); // No-op if large enough
++        blockCache[blockIndex] = (index << BLOCK_INDEX_SHIFT) | startFilePointer;
++      }
++      index += numValues;
++
++      if (numValues <= MAX_ARRAY_LENGTH) { // SPARSE
++        statBlockSPARSE.incrementAndGet();
++        slice.seek(slice.getFilePointer() + (numValues << 1));
++        continue;
++      }
++      if (numValues == 65536) { // ALL
++        statBlockALL.incrementAndGet();
++        // Already at next block offset
++        continue;
++      }
++
++      // The block is DENSE
++      statBlockDENSE.incrementAndGet();
++      long nextBlockOffset = slice.getFilePointer() + (1 << 13);
++      if (fillRankCache) {
++        int setBits = 0;
++        int rankOrigo = blockIndex << 16 >> 9; // Double shift for clarity: The compiler will simplify it
++        for (int rankDelta = 0 ; rankDelta < RANKS_PER_BLOCK ; rankDelta++) { // 128 rank-entries in a block
++          rankIndex = rankOrigo + rankDelta;
++          buildRank = ArrayUtil.grow(buildRank, rankIndex+1);
++          buildRank[rankIndex] = (char)setBits;
++          rankCountTemp++;
++          for (int i = 0 ; i < 512/64 ; i++) { // 8 longs for each rank-entry
++            setBits += Long.bitCount(slice.readLong());
++          }
++        }
++        assert slice.getFilePointer() == nextBlockOffset;
++      } else {
++        slice.seek(nextBlockOffset);
++      }
++    }
++    // Compress the buildRank as it is potentially very sparse
++    if (rankIndex < 0) {
++      rank = null;
++    } else {
++      PackedInts.Mutable ranks = PackedInts.getMutable(rankIndex, 16, PackedInts.DEFAULT); // Char = 16 bit
++      for (int i = 0 ; i < rankIndex ; i++) {
++        ranks.set(i, buildRank[i]);
++      }
++      rank = LongCompressor.compress(ranks);
++    }
++
++    //maxDocID = ((largestBlock+1) << BLOCK_BITS)-1;
++    return largestBlock;
++  }
++
++  private void freezeCaches(boolean fillBlockCache, boolean fillRankCache, int largestBlock) {
++    if (largestBlock == -1) { // No set bit: Disable the caches
++      blockCache = null;
++      rank = null;
++      return;
++    }
++
++    // Reduce size to minimum
++    if (fillBlockCache && blockCache.length-1 > largestBlock) {
++      long[] newBC = new long[Math.max(largestBlock - 1, 1)];
++      System.arraycopy(blockCache, 0, newBC, 0, newBC.length);
++      blockCache = newBC;
++    }
++/*    if (fillRankCache && rank.s > (largestBlock+1)*RANKS_PER_BLOCK) {
++      char[] newRank = new char[(largestBlock+1)*RANKS_PER_BLOCK];
++      System.arraycopy(rank, 0, newRank, 0, newRank.length);
++      rank = newRank;
++    }*/
++
++    // Replace non-defined values with usable ones
++    if (fillBlockCache) {
++
++      // Set non-defined blockCache entries (caused by blocks with 0 set bits) to the subsequently defined one
++      long latest = BLOCK_EMPTY;
++      for (int i = blockCache.length-1; i >= 0 ; i--) {
++        long current = blockCache[i];
++        if (current == BLOCK_EMPTY) {
++          blockCache[i] = latest;
++        } else {
++          latest = current;
++        }
++      }
++
++/*      // Set non-defined blockCache entries (caused by blocks with 0 set bits) to the next defined offset
++      long latestLookup = BLOCK_EMPTY_LOOKUP;
++      for (int i = blockCache.length-1; i >= 0 ; i--) {
++        long currentLookup = blockCache[i] & BLOCK_LOOKUP_MASK;
++        if (currentLookup == BLOCK_EMPTY_LOOKUP) { // If empty, set the pointer to the sub-sequent defined one
++          blockCache[i] = (blockCache[i] & BLOCK_INDEX_MASK) | (latestLookup & BLOCK_LOOKUP_MASK);
++        } else {
++          latestLookup = currentLookup;
++        }
++      }
++  */
++/*      // Set non-defined index (caused by blocks with 0 set bits) to the previous origo
++      long lastIndex = 0L;
++      for (int i = 0 ; i < blockCache.length ; i++) {
++        long currentIndex = blockCache[i] & BLOCK_INDEX_MASK;
++        if (currentIndex == BLOCK_EMPTY_INDEX) {
++          blockCache[i] = lastIndex | (blockCache[i] & BLOCK_LOOKUP_MASK);
++        } else {
++          lastIndex = currentIndex;
++        }
++      }*/
++    }
++  }
++
++  @Override
++  public long ramBytesUsed() {
++    return (blockCache == null ? 0 : RamUsageEstimator.sizeOf(blockCache)) +
++        (rank == null ? 0 : rank.ramBytesUsed()) +
++        RamUsageEstimator.NUM_BYTES_OBJECT_REF*3 +
++        RamUsageEstimator.NUM_BYTES_OBJECT_HEADER + creationStats.length()*2;
++  }
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/lucene70/IndexedDISICacheFactory.java b/lucene/core/src/java/org/apache/lucene/codecs/lucene70/IndexedDISICacheFactory.java
+new file mode 100644
+index 00000000000..230d5858ff5
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/codecs/lucene70/IndexedDISICacheFactory.java
+@@ -0,0 +1,313 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.codecs.lucene70;
++
++
++import java.io.IOException;
++import java.util.Collection;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.Locale;
++import java.util.Map;
++import java.util.function.Supplier;
++import java.util.Set;
++
++import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.store.RandomAccessInput;
++import org.apache.lucene.util.Accountable;
++import org.apache.lucene.util.ArrayUtil;
++import org.apache.lucene.util.RamUsageEstimator;
++
++/**
++ * Creates and stores caches for {@link IndexedDISI}.
++ *
++ * See https://issues.apache.org/jira/browse/LUCENE-8374 for details
++ */
++// Note: This was hacked together with little understanding of overall caching principles for Lucene.
++// All Lucene70NormsProducer and Lucene70DocValuesProducer instances holds their own factory, but maybe this
++// should be in a central cache somewhere?
++public class IndexedDISICacheFactory implements Accountable {
++  public static int MIN_LENGTH_FOR_CACHING = 50; // Set this very low: Could be 9 EMPTY followed by a SPARSE
++
++  // TODO (Toke): Remove this when code has stabilized
++  // The on/off switches are static as per-call switching would change a lot of logic in Lucene.
++  // They are intended for experimentation and expected to be removed after LUCENE-8374 stabilization.
++  public static boolean NORMS_CACHING_ENABLED = true;
++  public static boolean BLOCK_CACHING_ENABLED = true;
++  public static boolean DENSE_CACHING_ENABLED = true;
++  public static boolean VARYINGBPV_CACHING_ENABLED = true;
++  public static boolean DEBUG = true;
++
++  private final Map<Long, IndexedDISICache> disiPool = new HashMap<>();
++  private final Map<String, VaryingBPVJumpTable> vBPVPool = new HashMap<>();
++
++  /**
++   * Debug-oriented setter for toggling lucene8374 caching.
++   * @param switches comma-separated list of caches to enable: norms, block, dense, vbpv, debug.
++   *                 Caches not mentioned in the list are disabled. Also supported are explicit flags, e.g.
++   *                 "norms=false,block=true"
++   * @return human readable description of what is enabled, with error message if the enable-string could not be parsed.
++   */
++  public static String setEnabled(String switches) {
++    // Shortcuts
++    switch (switches) {
++      case "all":
++      case "true":
++      case "on": {
++        switches = "norm,block,dense,vbpv,debug";
++        break;
++      }
++      case "none":
++      case "false":
++      case "off": {
++        switches = "";
++        break;
++      }
++    }
++
++    // Collect enabled
++    Set<String> enabled = new HashSet<>(10);
++    String[] tokens = switches.split(", *");
++    for (String token: tokens) {
++      String keyValue[] = token.split("=");
++      if (keyValue.length == 1 || Boolean.parseBoolean(keyValue[1])) {
++        enabled.add(keyValue[0].toLowerCase(Locale.ENGLISH));
++      }
++    }
++
++    // Toggle if needed
++    NORMS_CACHING_ENABLED = enabled.contains("norm") || enabled.contains("norms");
++    BLOCK_CACHING_ENABLED = enabled.contains("block");
++    DENSE_CACHING_ENABLED = enabled.contains("dense");
++    VARYINGBPV_CACHING_ENABLED = enabled.contains("vbpv");
++    DEBUG = enabled.contains("debug");;
++
++    return getEnabled();
++  }
++  public static String getEnabled() {
++    return String.format("lucene8374(norms=%b, block=%b, dense=%b, vBPV=%b, debug=%b)",
++        NORMS_CACHING_ENABLED, BLOCK_CACHING_ENABLED, DENSE_CACHING_ENABLED, VARYINGBPV_CACHING_ENABLED, DEBUG);
++  }
++
++  static {
++    if (DEBUG) {
++      System.out.println(IndexedDISICacheFactory.class.getSimpleName() +
++          ": LUCENE-8374 beta patch enabled with default caching " +
++          "norms=" + NORMS_CACHING_ENABLED +
++          ", block=" + BLOCK_CACHING_ENABLED +
++          ", dense=" + DENSE_CACHING_ENABLED +
++          ", vBPV=" + VARYINGBPV_CACHING_ENABLED);
++    }
++  }
++
++  public IndexedDISI createCachedIndexedDISI(IndexInput data, long offset, long length, long cost, String name)
++      throws IOException {
++    IndexedDISICache cache = getCache(data, offset, length, name);
++    return new IndexedDISI(data, offset, length, cost, cache, name);
++  }
++
++  public IndexedDISI createCachedIndexedDISI(IndexInput data, long key, int cost, String name) throws IOException {
++    IndexedDISICache cache = getCache(data, key, name);
++    return new IndexedDISI(data, cost, cache, name);
++  }
++
++  /**
++   * Creates a cache (jump table) if not already present and returns it.
++   * @param name the name for the cache, typically the field name. Used as key for later retrieval.
++   * @param slice the long values with varying bits per value.
++   * @param valuesLength the length in bytes of the slice.
++   * @return a jump table for the longs in the given slice or null if the structure is not suitable for caching.
++   */
++  public VaryingBPVJumpTable getVBPVJumpTable(
++      String name, RandomAccessInput slice, long valuesLength) throws IOException {
++    if (!VARYINGBPV_CACHING_ENABLED) {
++      return null;
++    }
++
++    VaryingBPVJumpTable jumpTable = vBPVPool.get(name);
++    if (jumpTable == null) {
++      // TODO: Avoid overlapping builds of the same jump table
++      jumpTable = new VaryingBPVJumpTable(slice, name, valuesLength);
++      vBPVPool.put(name, jumpTable);
++      debug("Created packed numeric jump table for " + name + ": " +
++          jumpTable.creationStats + " (total " + jumpTable.ramBytesUsed() + " bytes)");
++    }
++    return jumpTable;
++  }
++
++  /**
++   * Creates a cache if not already present and returns it.
++   * @param data   the slice to create a cache for.
++   * @param offset same as the offset that will also be used for creating an {@link IndexedDISI}.
++   * @param length same af the length that will also be used for creating an {@link IndexedDISI}.
++   * @param name human readable designation, typically a field name. Used for debug, log and inspection.
++   * @return a cache for the given slice+offset+length or null if not suitable for caching.
++   */
++  public IndexedDISICache getCache(IndexInput data, long offset, long length, String name) throws IOException {
++    if (!(BLOCK_CACHING_ENABLED || DENSE_CACHING_ENABLED) || length < MIN_LENGTH_FOR_CACHING) {
++      return null;
++    }
++
++    long key = offset + length;
++    IndexedDISICache cache = disiPool.get(key);
++    if (cache == null) {
++      // TODO: Avoid overlapping builds of the same cache
++      // Both BLOCK & DENSE caches are created as they might be requested later for the field,
++      // regardless of whether they are requested now
++      cache = new IndexedDISICache(data.slice("docs", offset, length), true, true, name);
++      disiPool.put(key, cache);
++      debug("Created IndexedDISI cache for " + data.toString() + ": " + cache.creationStats + " (" + cache.ramBytesUsed() + " bytes)");
++    }
++    return cache;
++  }
++
++  /**
++   * Creates a cache if not already present and returns it.
++   * @param slice    the input slice.
++   * @param key identifier for the cache, unique within the segment that originated the slice.
++   *            Recommendation is offset+length for the slice, relative to the data mapping the segment.
++   *            Warning: Do not use slice.getFilePointer and slice.length as they are not guaranteed
++   *            to be unique within the segment (slice.getFilePointer is 0 when a sub-slice is created).
++   * @param name human readable designation, typically a field name. Used for debug, log and inspection.
++   * @return a cache for the given slice+offset+length or null if not suitable for caching.
++   */
++  public IndexedDISICache getCache(IndexInput slice, long key, String name) throws IOException {
++    final long length = slice.length();
++    if (!(BLOCK_CACHING_ENABLED || DENSE_CACHING_ENABLED) || length < MIN_LENGTH_FOR_CACHING) {
++      return null;
++    }
++
++    IndexedDISICache cache = disiPool.get(key);
++    if (cache == null) {
++      // TODO: Avoid overlapping builds of the same cache
++      // Both BLOCK & DENSE caches are created as they might be requested later for the field,
++      // regardless of whether they are requested now
++      cache = new IndexedDISICache(slice, true, true, name);
++      disiPool.put(key, cache);
++      debug("Created cache for " + slice.toString() + ": " + cache.creationStats + " (" + cache.ramBytesUsed() + " bytes)");
++    }
++    return cache;
++  }
++
++  // TODO (Toke): Definitely not the way to do it. Connect to InputStream or just remove it fully when IndexedDISICache is stable
++  public static void debug(String message) {
++    if (DEBUG) {
++      System.out.println(IndexedDISICacheFactory.class.getSimpleName() + ": " + message);
++    }
++  }
++
++  public long getDISIBlocksWithOffsetsCount() {
++    return disiPool.values().stream().filter(IndexedDISICache::hasOffsets).count();
++  }
++
++  public long getDISIBlocksWithRankCount() {
++    return disiPool.values().stream().filter(IndexedDISICache::hasRank).count();
++  }
++
++  public long getVaryingBPVCount() {
++    return vBPVPool.size();
++  }
++
++  @Override
++  public long ramBytesUsed() {
++    long mem = RamUsageEstimator.shallowSizeOf(this) +
++        RamUsageEstimator.shallowSizeOf(disiPool) +
++        RamUsageEstimator.shallowSizeOf(vBPVPool);
++    for (Map.Entry<Long, IndexedDISICache> cacheEntry: disiPool.entrySet()) {
++      mem += RamUsageEstimator.shallowSizeOf(cacheEntry);
++      mem += RamUsageEstimator.sizeOf(cacheEntry.getKey());
++      mem += cacheEntry.getValue().ramBytesUsed();
++    }
++    for (Map.Entry<String, VaryingBPVJumpTable> cacheEntry: vBPVPool.entrySet()) {
++      String key = cacheEntry.getKey();
++      mem += RamUsageEstimator.shallowSizeOf(cacheEntry);
++      mem += RamUsageEstimator.shallowSizeOf(key)+key.length()*2;
++      mem += cacheEntry.getValue().ramBytesUsed();
++    }
++    return mem;
++  }
++
++  /**
++   * Releases all caches.
++   */
++  public void releaseAll() {
++    disiPool.clear();
++    vBPVPool.clear();
++  }
++
++  /**
++   * Jump table used by Lucene70DocValuesProducer.VaryingBPVReader to avoid iterating all blocks from
++   * current to wanted index. The jump table holds offsets for all blocks.
++   */
++  public static class VaryingBPVJumpTable implements Accountable {
++    // Consider: Is there room for also storing the BPV? That would save the seek to the start of the block
++
++    // TODO: It is way overkill to use longs here for practically all indexes. Maybe a PackedInts representation?
++    long[] offsets = new long[10];
++    final String creationStats;
++
++    public VaryingBPVJumpTable(RandomAccessInput slice, String name, long valuesLength) throws IOException {
++      final long startTime = System.nanoTime();
++
++      int block = -1;
++      long offset;
++      long blockEndOffset = 0;
++
++      int bitsPerValue;
++      do {
++        offset = blockEndOffset;
++
++        offsets = ArrayUtil.grow(offsets, block+2); // No-op if large enough
++        offsets[block+1] = offset;
++
++        bitsPerValue = slice.readByte(offset++);
++        offset += Long.BYTES; // Skip over delta as we do not resolve the values themselves at this point
++        if (bitsPerValue == 0) {
++          blockEndOffset = offset;
++        } else {
++          final int length = slice.readInt(offset);
++          offset += Integer.BYTES;
++          blockEndOffset = offset + length;
++        }
++        block++;
++      } while (blockEndOffset < valuesLength-Byte.BYTES);
++      long[] newOffsets = new long[block+1];
++      System.arraycopy(offsets, 0, newOffsets, 0, block+1);
++      offsets = newOffsets;
++      //offsets = ArrayUtil.copyOfSubArray(offsets, 0, block+1);
++      creationStats = String.format(
++          "name=%s, blocks=%d, time=%dms",
++          name, offsets.length, (System.nanoTime()-startTime)/1000000);
++    }
++
++    /**
++     * @param block the logical block in the vBPV structure ( valueindex/16384 ).
++     * @return the index slice offset for the vBPV block (1 block = 16384 values) or -1 if not available.
++     */
++    public long getBlockOffset(long block) {
++      // Technically a limitation in caching vs. VaryingBPVReader to limit to 2b blocks
++      return IndexedDISICacheFactory.VARYINGBPV_CACHING_ENABLED ? offsets[(int) block] : -1;
++    }
++
++    @Override
++    public long ramBytesUsed() {
++      return RamUsageEstimator.shallowSizeOf(this) +
++          (offsets == null ? 0 : RamUsageEstimator.sizeOf(offsets)) + // offsets
++          RamUsageEstimator.NUM_BYTES_OBJECT_HEADER + creationStats.length()*2;  // creationStats
++    }
++  }
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/lucene70/LongCompressor.java b/lucene/core/src/java/org/apache/lucene/codecs/lucene70/LongCompressor.java
+new file mode 100644
+index 00000000000..a7607f98216
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/codecs/lucene70/LongCompressor.java
+@@ -0,0 +1,217 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.codecs.lucene70;
++
++import org.apache.lucene.util.MathUtil;
++import org.apache.lucene.util.RankBitSet;
++import org.apache.lucene.util.packed.PackedInts;
++
++/**
++ * Utility class for generating compressed read-only in-memory representations of longs.
++ * The representation is optimized towards random access.
++ * The representation always applies delta-to-minvalue and greatest-common-divisor compression.
++ * Depending on the number of 0-entries and the length of the array, a sparse representation
++ * is used, using rank to improve access speed. This can be turned off.
++ */
++// TODO: Consider how negative numbers are handled and if they should be supported at all
++// TODO (Toke): Consider if this belongs in the util namespace alongside RankBitSet
++public class LongCompressor {
++
++  /**
++   * The minimum amount of total values in the data set for sparse to be active.
++   */
++  public static final int DEFAULT_MIN_TOTAL_VALUES_FOR_SPARSE = 10_000;
++
++  /**
++   * The minimum total amount of zero values in the data set for sparse to be active.
++   */
++  public static final int DEFAULT_MIN_ZERO_VALUES_FOR_SPARSE = 500;
++  /**
++   * The minimum fraction of the data set that must be zero for sparse to be active.
++   */
++  public static final double DEFAULT_MIN_ZERO_VALUES_FRACTION_FOR_SPARSE = 0.2; // 20% (just guessing of a value here)
++
++  public static PackedInts.Reader compress(PackedInts.Reader values) {
++    return compress(values, values.size());
++  }
++
++  public static PackedInts.Reader compress(PackedInts.Reader values, int length) {
++    return compress(values, values.size(), true);
++  }
++
++  public static PackedInts.Reader compress(PackedInts.Reader values, int length, boolean allowSparse) {
++    return compress(values, length, allowSparse,
++        DEFAULT_MIN_TOTAL_VALUES_FOR_SPARSE,
++        DEFAULT_MIN_ZERO_VALUES_FOR_SPARSE,
++        DEFAULT_MIN_ZERO_VALUES_FRACTION_FOR_SPARSE);
++  }
++
++  public static PackedInts.Reader compress(
++      PackedInts.Reader values, int length, boolean allowSparse,
++      int minTotalSparse, int minZeroSparse, double minZeroFractionSparse) {
++    if (length == 0) {
++      return PackedInts.getMutable(0, 1, PackedInts.DEFAULT);
++    }
++
++    final long min = getMin(values, length);
++    final long gcd = getGCD(values, length, min);
++    final long maxCompressed = getMax(values, length, min, gcd);
++
++    int zeroCount;
++    if (!isPossiblySparseCandidate(length, allowSparse, minTotalSparse) ||
++        !isSparseCandidate(values, length, true, minTotalSparse,
++            (zeroCount = countZeroes(values, length, min, gcd)), minZeroSparse, minZeroFractionSparse)) {
++      // TODO: Add abort-early if it becomes apparent that no space saving is possible
++      PackedInts.Mutable inner =
++          PackedInts.getMutable(length, PackedInts.bitsRequired(maxCompressed), PackedInts.DEFAULT);
++      for (int i = 0 ; i < length ; i++) {
++        inner.set(i, (values.get(i)-min)/gcd);
++      }
++      PackedInts.Reader comp = new CompressedReader(inner, min, gcd);
++      // Sanity check that compression worked and if not, return the original input
++      return comp.ramBytesUsed() < values.ramBytesUsed() ? comp : values;
++    }
++
++    // Sparsify
++    RankBitSet rank = new RankBitSet(length);
++    PackedInts.Mutable inner =
++        PackedInts.getMutable(values.size()-zeroCount, PackedInts.bitsRequired(maxCompressed), PackedInts.DEFAULT);
++    int valueIndex = 0;
++    for (int i = 0 ; i < length ; i++) {
++      long value = (values.get(i)-min)/gcd;
++      if (value != 0) {
++        rank.set(i);
++        inner.set(valueIndex++, value);
++      }
++    }
++    rank.buildRankCache();
++    PackedInts.Reader comp = new CompressedReader(inner, min, gcd, rank);
++    // Sanity check that compression worked and if not, return the original input
++    return comp.ramBytesUsed() < values.ramBytesUsed() ? comp : values;
++  }
++
++  // Fast check
++  private static boolean isPossiblySparseCandidate(int length, boolean allowSparse, int minTotalSparse) {
++    return allowSparse && minTotalSparse <= length;
++  }
++
++  // Also fast, but requires zeroCount which is slow to calculate
++  private static boolean isSparseCandidate(
++      PackedInts.Reader values, int length, boolean allowSparse, int minTotalSparse,
++      int zeroCount, int minZeroSparse, double minZeroFractionSparse) {
++    return allowSparse && minTotalSparse <= length &&
++        minZeroSparse < zeroCount && minZeroFractionSparse < 1.0 * zeroCount / length;
++  }
++
++  private static int countZeroes(PackedInts.Reader values, int length, long min, long gcd) {
++    int zeroCount = 0;
++    for (int i = 0 ; i < length ; i++) {
++      if ((values.get(i)-min)/gcd == 0) {
++        zeroCount++;
++      }
++    }
++    return zeroCount;
++  }
++
++  static class CompressedReader extends PackedInts.Reader {
++    private final PackedInts.Reader inner;
++    final long min;
++    final long gcd;
++    final RankBitSet rank;
++
++    public CompressedReader(PackedInts.Reader inner, long min, long gcd) {
++      this(inner, min, gcd, null);
++    }
++
++    public CompressedReader(PackedInts.Reader inner, long min, long gcd, RankBitSet rank) {
++      this.inner = inner;
++      this.min = min;
++      this.gcd = gcd;
++      this.rank = rank;
++    }
++
++    @Override
++    public int size() {
++      return rank == null ? inner.size() : rank.length();
++    }
++
++    @Override
++    public long get(int docID) {
++      // No rank: The value at the index
++      // Rank but no set bit: min*gcd
++      // Rank and set bit: (The value at the rank + min) * gcd
++      return (rank == null ? inner.get(docID) : rank.get(docID) ? inner.get(rank.rank(docID)) : 0) * gcd + min;
++    }
++
++    @Override
++    public long ramBytesUsed() {
++      return inner.ramBytesUsed() + (rank == null ? 0 : rank.ramBytesUsed());
++    }
++  }
++
++  private static long getMin(PackedInts.Reader values, int length) {
++    long min = Long.MAX_VALUE;
++    for (int i = 0 ; i < length ; i++) {
++      if (min > values.get(i)) {
++        min = values.get(i);
++      }
++    }
++    return min;
++  }
++
++  private static long getGCD(final PackedInts.Reader values, final int length, final long min) {
++    // GCD-code adjusted form Lucene70DocValuesConsumer
++    long gcd = -1;
++
++    for (int i = 0 ; i < length ; i++) {
++      long value = values.get(i)-min;
++      if (value == 0) {
++        continue;
++      }
++      if (gcd == -1) {
++        gcd = value;
++        continue;
++      }
++
++      if (value < Long.MIN_VALUE / 2 || value > Long.MAX_VALUE / 2) {
++        // in that case v - minValue might overflow and make the GCD computation return
++        // wrong results. Since these extreme values are unlikely, we just discard
++        // GCD computation for them
++        gcd = 1;
++      } else { // minValue needs to be set first
++        gcd = MathUtil.gcd(gcd, value);
++      }
++
++      if (gcd == 1) {
++        break;
++      }
++    }
++    return gcd == -1 ? 1 : gcd;
++  }
++
++  private static long getMax(final PackedInts.Reader values, final int length, final long min, final long gcd) {
++    long max = Long.MIN_VALUE;
++    for (int i = 0 ; i < length ; i++) {
++      long value = (values.get(i)-min)/gcd;
++      if (value > max) {
++        max = value;
++      }
++    }
++    return max;
++  }
++
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/lucene70/Lucene70DocValuesProducer.java b/lucene/core/src/java/org/apache/lucene/codecs/lucene70/Lucene70DocValuesProducer.java
+index 386655e8c77..44782aa6311 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/lucene70/Lucene70DocValuesProducer.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/lucene70/Lucene70DocValuesProducer.java
+@@ -56,6 +56,7 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
+   private final Map<String,SortedNumericEntry> sortedNumerics = new HashMap<>();
+   private long ramBytesUsed;
+   private final IndexInput data;
++  private final IndexedDISICacheFactory disiCacheFactory = new IndexedDISICacheFactory();
+   private final int maxDoc;
+ 
+   /** expert: instantiates a new reader */
+@@ -118,23 +119,23 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
+       }
+       byte type = meta.readByte();
+       if (type == Lucene70DocValuesFormat.NUMERIC) {
+-        numerics.put(info.name, readNumeric(meta));
++        numerics.put(info.name, readNumeric(meta, info.name));
+       } else if (type == Lucene70DocValuesFormat.BINARY) {
+-        binaries.put(info.name, readBinary(meta));
++        binaries.put(info.name, readBinary(meta, info.name));
+       } else if (type == Lucene70DocValuesFormat.SORTED) {
+-        sorted.put(info.name, readSorted(meta));
++        sorted.put(info.name, readSorted(meta, info.name));
+       } else if (type == Lucene70DocValuesFormat.SORTED_SET) {
+-        sortedSets.put(info.name, readSortedSet(meta));
++        sortedSets.put(info.name, readSortedSet(meta, info.name));
+       } else if (type == Lucene70DocValuesFormat.SORTED_NUMERIC) {
+-        sortedNumerics.put(info.name, readSortedNumeric(meta));
++        sortedNumerics.put(info.name, readSortedNumeric(meta, info.name));
+       } else {
+         throw new CorruptIndexException("invalid type: " + type, meta);
+       }
+     }
+   }
+ 
+-  private NumericEntry readNumeric(ChecksumIndexInput meta) throws IOException {
+-    NumericEntry entry = new NumericEntry();
++  private NumericEntry readNumeric(ChecksumIndexInput meta, String name) throws IOException {
++    NumericEntry entry = new NumericEntry(name);
+     readNumeric(meta, entry);
+     return entry;
+   }
+@@ -166,8 +167,8 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
+     entry.valuesLength = meta.readLong();
+   }
+ 
+-  private BinaryEntry readBinary(ChecksumIndexInput meta) throws IOException {
+-    BinaryEntry entry = new BinaryEntry();
++  private BinaryEntry readBinary(ChecksumIndexInput meta, String name) throws IOException {
++    BinaryEntry entry = new BinaryEntry(name);
+     entry.dataOffset = meta.readLong();
+     entry.dataLength = meta.readLong();
+     entry.docsWithFieldOffset = meta.readLong();
+@@ -185,8 +186,8 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
+     return entry;
+   }
+ 
+-  private SortedEntry readSorted(ChecksumIndexInput meta) throws IOException {
+-    SortedEntry entry = new SortedEntry();
++  private SortedEntry readSorted(ChecksumIndexInput meta, String name) throws IOException {
++    SortedEntry entry = new SortedEntry(name);
+     entry.docsWithFieldOffset = meta.readLong();
+     entry.docsWithFieldLength = meta.readLong();
+     entry.numDocsWithField = meta.readInt();
+@@ -197,12 +198,12 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
+     return entry;
+   }
+ 
+-  private SortedSetEntry readSortedSet(ChecksumIndexInput meta) throws IOException {
+-    SortedSetEntry entry = new SortedSetEntry();
++  private SortedSetEntry readSortedSet(ChecksumIndexInput meta, String name) throws IOException {
++    SortedSetEntry entry = new SortedSetEntry(name);
+     byte multiValued = meta.readByte();
+     switch (multiValued) {
+       case 0: // singlevalued
+-        entry.singleValueEntry = readSorted(meta);
++        entry.singleValueEntry = readSorted(meta, name);
+         return entry;
+       case 1: // multivalued
+         break;
+@@ -244,8 +245,8 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
+     entry.termsIndexAddressesLength = meta.readLong();
+   }
+ 
+-  private SortedNumericEntry readSortedNumeric(ChecksumIndexInput meta) throws IOException {
+-    SortedNumericEntry entry = new SortedNumericEntry();
++  private SortedNumericEntry readSortedNumeric(ChecksumIndexInput meta, String name) throws IOException {
++    SortedNumericEntry entry = new SortedNumericEntry(name);
+     readNumeric(meta, entry);
+     entry.numDocsWithField = meta.readInt();
+     if (entry.numDocsWithField != entry.numValues) {
+@@ -261,9 +262,23 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
+   @Override
+   public void close() throws IOException {
+     data.close();
++    disiCacheFactory.releaseAll();
+   }
+ 
+-  private static class NumericEntry {
++  // Highly debatable if this is a sane construct as the name is only used for debug/logging/inspection purposes
++  // This was introduced in LUCENE-8374
++  private static class EntryImpl {
++    final String name;
++
++    public EntryImpl(String name) {
++      this.name = name;
++    }
++  }
++
++  private static class NumericEntry extends EntryImpl {
++    public NumericEntry(String name) {
++      super(name);
++    }
+     long[] table;
+     int blockShift;
+     byte bitsPerValue;
+@@ -276,7 +291,10 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
+     long valuesLength;
+   }
+ 
+-  private static class BinaryEntry {
++  private static class BinaryEntry extends EntryImpl {
++    public BinaryEntry(String name) {
++      super(name);
++    }
+     long dataOffset;
+     long dataLength;
+     long docsWithFieldOffset;
+@@ -289,7 +307,10 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
+     DirectMonotonicReader.Meta addressesMeta;
+   }
+ 
+-  private static class TermsDictEntry {
++  private static class TermsDictEntry extends EntryImpl {
++    public TermsDictEntry(String name) {
++      super(name);
++    }
+     long termsDictSize;
+     int termsDictBlockShift;
+     DirectMonotonicReader.Meta termsAddressesMeta;
+@@ -307,6 +328,9 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
+   }
+ 
+   private static class SortedEntry extends TermsDictEntry {
++    public SortedEntry(String name) {
++      super(name);
++    }
+     long docsWithFieldOffset;
+     long docsWithFieldLength;
+     int numDocsWithField;
+@@ -316,6 +340,9 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
+   }
+ 
+   private static class SortedSetEntry extends TermsDictEntry {
++    public SortedSetEntry(String name) {
++      super(name);
++    }
+     SortedEntry singleValueEntry;
+     long docsWithFieldOffset;
+     long docsWithFieldLength;
+@@ -329,6 +356,9 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
+   }
+ 
+   private static class SortedNumericEntry extends NumericEntry {
++    public SortedNumericEntry(String name) {
++      super(name);
++    }
+     int numDocsWithField;
+     DirectMonotonicReader.Meta addressesMeta;
+     long addressesOffset;
+@@ -337,7 +367,7 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
+ 
+   @Override
+   public long ramBytesUsed() {
+-    return ramBytesUsed;
++    return ramBytesUsed + disiCacheFactory.ramBytesUsed();
+   }
+ 
+   @Override
+@@ -434,44 +464,18 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
+           }
+         };
+       } else {
+-        final RandomAccessInput slice = data.randomAccessSlice(entry.valuesOffset, entry.valuesLength);
+         if (entry.blockShift >= 0) {
+           // dense but split into blocks of different bits per value
+-          final int shift = entry.blockShift;
+-          final long mul = entry.gcd;
+-          final int mask = (1 << shift) - 1;
+           return new DenseNumericDocValues(maxDoc) {
+-            int block = -1;
+-            long delta;
+-            long offset;
+-            long blockEndOffset;
+-            LongValues values;
++            final VaryingBPVReader vBPVReader = new VaryingBPVReader(entry);
+ 
+             @Override
+             public long longValue() throws IOException {
+-              final int block = doc >>> shift;
+-              if (this.block != block) {
+-                int bitsPerValue;
+-                do {
+-                  offset = blockEndOffset;
+-                  bitsPerValue = slice.readByte(offset++);
+-                  delta = slice.readLong(offset);
+-                  offset += Long.BYTES;
+-                  if (bitsPerValue == 0) {
+-                    blockEndOffset = offset;
+-                  } else {
+-                    final int length = slice.readInt(offset);
+-                    offset += Integer.BYTES;
+-                    blockEndOffset = offset + length;
+-                  }
+-                  this.block ++;
+-                } while (this.block != block);
+-                values = bitsPerValue == 0 ? LongValues.ZEROES : DirectReader.getInstance(slice, bitsPerValue, offset);
+-              }
+-              return mul * values.get(doc & mask) + delta;
++              return vBPVReader.getLongValue(doc);
+             }
+           };
+         } else {
++          final RandomAccessInput slice = data.randomAccessSlice(entry.valuesOffset, entry.valuesLength);
+           final LongValues values = DirectReader.getInstance(slice, entry.bitsPerValue);
+           if (entry.table != null) {
+             final long[] table = entry.table;
+@@ -495,7 +499,8 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
+       }
+     } else {
+       // sparse
+-      final IndexedDISI disi = new IndexedDISI(data, entry.docsWithFieldOffset, entry.docsWithFieldLength, entry.numValues);
++      final IndexedDISI disi = disiCacheFactory.createCachedIndexedDISI(
++          data, entry.docsWithFieldOffset, entry.docsWithFieldLength, entry.numValues, entry.name);
+       if (entry.bitsPerValue == 0) {
+         return new SparseNumericDocValues(disi) {
+           @Override
+@@ -504,45 +509,19 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
+           }
+         };
+       } else {
+-        final RandomAccessInput slice = data.randomAccessSlice(entry.valuesOffset, entry.valuesLength);
+         if (entry.blockShift >= 0) {
+           // sparse and split into blocks of different bits per value
+-          final int shift = entry.blockShift;
+-          final long mul = entry.gcd;
+-          final int mask = (1 << shift) - 1;
+           return new SparseNumericDocValues(disi) {
+-            int block = -1;
+-            long delta;
+-            long offset;
+-            long blockEndOffset;
+-            LongValues values;
++            final VaryingBPVReader vBPVReader = new VaryingBPVReader(entry);
+ 
+             @Override
+             public long longValue() throws IOException {
+               final int index = disi.index();
+-              final int block = index >>> shift;
+-              if (this.block != block) {
+-                int bitsPerValue;
+-                do {
+-                  offset = blockEndOffset;
+-                  bitsPerValue = slice.readByte(offset++);
+-                  delta = slice.readLong(offset);
+-                  offset += Long.BYTES;
+-                  if (bitsPerValue == 0) {
+-                    blockEndOffset = offset;
+-                  } else {
+-                    final int length = slice.readInt(offset);
+-                    offset += Integer.BYTES;
+-                    blockEndOffset = offset + length;
+-                  }
+-                  this.block ++;
+-                } while (this.block != block);
+-                values = bitsPerValue == 0 ? LongValues.ZEROES : DirectReader.getInstance(slice, bitsPerValue, offset);
+-              }
+-              return mul * values.get(index & mask) + delta;
++              return vBPVReader.getLongValue(index);
+             }
+           };
+         } else {
++          final RandomAccessInput slice = data.randomAccessSlice(entry.valuesOffset, entry.valuesLength);
+           final LongValues values = DirectReader.getInstance(slice, entry.bitsPerValue);
+           if (entry.table != null) {
+             final long[] table = entry.table;
+@@ -576,47 +555,20 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
+         }
+       };
+     } else {
+-      final RandomAccessInput slice = data.randomAccessSlice(entry.valuesOffset, entry.valuesLength);
+       if (entry.blockShift >= 0) {
+-        final int shift = entry.blockShift;
+-        final long mul = entry.gcd;
+-        final long mask = (1L << shift) - 1;
+         return new LongValues() {
+-          long block = -1;
+-          long delta;
+-          long offset;
+-          long blockEndOffset;
+-          LongValues values;
+-
++          final VaryingBPVReader vBPVReader = new VaryingBPVReader(entry);
++          @Override
+           public long get(long index) {
+-            final long block = index >>> shift;
+-            if (this.block != block) {
+-              assert block > this.block : "Reading backwards is illegal: " + this.block + " < " + block;
+-              int bitsPerValue;
+-              do {
+-                offset = blockEndOffset;
+-                try {
+-                  bitsPerValue = slice.readByte(offset++);
+-                  delta = slice.readLong(offset);
+-                  offset += Long.BYTES;
+-                  if (bitsPerValue == 0) {
+-                    blockEndOffset = offset;
+-                  } else {
+-                    final int length = slice.readInt(offset);
+-                    offset += Integer.BYTES;
+-                    blockEndOffset = offset + length;
+-                  }
+-                } catch (IOException e) {
+-                  throw new RuntimeException(e);
+-                }
+-                this.block ++;
+-              } while (this.block != block);
+-              values = bitsPerValue == 0 ? LongValues.ZEROES : DirectReader.getInstance(slice, bitsPerValue, offset);
++            try {
++              return vBPVReader.getLongValue(index);
++            } catch (IOException e) {
++              throw new RuntimeException(e);
+             }
+-            return mul * values.get(index & mask) + delta;
+           }
+         };
+       } else {
++        final RandomAccessInput slice = data.randomAccessSlice(entry.valuesOffset, entry.valuesLength);
+         final LongValues values = DirectReader.getInstance(slice, entry.bitsPerValue);
+         if (entry.table != null) {
+           final long[] table = entry.table;
+@@ -766,7 +718,8 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
+       }
+     } else {
+       // sparse
+-      final IndexedDISI disi = new IndexedDISI(data, entry.docsWithFieldOffset, entry.docsWithFieldLength, entry.numDocsWithField);
++      final IndexedDISI disi = disiCacheFactory.createCachedIndexedDISI(
++          data, entry.docsWithFieldOffset, entry.docsWithFieldLength, entry.numDocsWithField, entry.name);
+       if (entry.minLength == entry.maxLength) {
+         // fixed length
+         final int length = entry.maxLength;
+@@ -867,7 +820,8 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
+       };
+     } else {
+       // sparse
+-      final IndexedDISI disi = new IndexedDISI(data, entry.docsWithFieldOffset, entry.docsWithFieldLength, entry.numDocsWithField);
++      final IndexedDISI disi = disiCacheFactory.createCachedIndexedDISI(
++          data, entry.docsWithFieldOffset, entry.docsWithFieldLength, entry.numDocsWithField, entry.name);
+       return new BaseSortedDocValues(entry, data) {
+ 
+         @Override
+@@ -1230,7 +1184,8 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
+       };
+     } else {
+       // sparse
+-      final IndexedDISI disi = new IndexedDISI(data, entry.docsWithFieldOffset, entry.docsWithFieldLength, entry.numDocsWithField);
++      final IndexedDISI disi = disiCacheFactory.createCachedIndexedDISI(
++          data, entry.docsWithFieldOffset, entry.docsWithFieldLength, entry.numDocsWithField, entry.name);
+       return new SortedNumericDocValues() {
+ 
+         boolean set;
+@@ -1356,7 +1311,8 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
+       };
+     } else {
+       // sparse
+-      final IndexedDISI disi = new IndexedDISI(data, entry.docsWithFieldOffset, entry.docsWithFieldLength, entry.numDocsWithField);
++      final IndexedDISI disi = disiCacheFactory.createCachedIndexedDISI(
++          data, entry.docsWithFieldOffset, entry.docsWithFieldLength, entry.numDocsWithField, entry.name);
+       return new BaseSortedSetDocValues(entry, data) {
+ 
+         boolean set;
+@@ -1416,4 +1372,64 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
+     CodecUtil.checksumEntireFile(data);
+   }
+ 
++  /**
++   * Reader for longs split into blocks of different bits per values.
++   * The longs are requested by index and must be accessed in monotonically increasing order.
++   */
++  // Note: The order requirement goes away when using caching.
++  private class VaryingBPVReader {
++    final RandomAccessInput slice;
++    final NumericEntry entry;
++    final int shift;
++    final long mul;
++    final int mask;
++
++    long block = -1;
++    long delta;
++    long offset;
++    long blockEndOffset;
++    LongValues values;
++
++    VaryingBPVReader(NumericEntry entry) throws IOException {
++      this.entry = entry;
++      slice = data.randomAccessSlice(entry.valuesOffset, entry.valuesLength);
++      shift = entry.blockShift;
++      mul = entry.gcd;
++      mask = (1 << shift) - 1;
++    }
++
++    long getLongValue(long index) throws IOException {
++      final long block = index >>> shift;
++      if (this.block != block) {
++        int bitsPerValue;
++        do {
++          // If the needed block is the one directly following the current block, it is cheaper to avoid the cache
++          if (block != this.block+1) {
++            IndexedDISICacheFactory.VaryingBPVJumpTable cache;
++            if ((cache = disiCacheFactory.getVBPVJumpTable(entry.name, slice, entry.valuesLength)) != null) {
++              long candidateOffset;
++              if ((candidateOffset = cache.getBlockOffset(block)) != -1) {
++                blockEndOffset = candidateOffset;
++              this.block = block - 1;
++              }
++            }
++          }
++          offset = blockEndOffset;
++          bitsPerValue = slice.readByte(offset++);
++          delta = slice.readLong(offset);
++          offset += Long.BYTES;
++          if (bitsPerValue == 0) {
++            blockEndOffset = offset;
++          } else {
++            final int length = slice.readInt(offset);
++            offset += Integer.BYTES;
++            blockEndOffset = offset + length;
++          }
++          this.block++;
++        } while (this.block != block);
++        values = bitsPerValue == 0 ? LongValues.ZEROES : DirectReader.getInstance(slice, bitsPerValue, offset);
++      }
++      return mul * values.get(index & mask) + delta;
++    }
++  }
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/lucene70/Lucene70NormsProducer.java b/lucene/core/src/java/org/apache/lucene/codecs/lucene70/Lucene70NormsProducer.java
+index eb7c41a5021..2b0bca11bb7 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/lucene70/Lucene70NormsProducer.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/lucene70/Lucene70NormsProducer.java
+@@ -43,8 +43,13 @@ import org.apache.lucene.util.IOUtils;
+ final class Lucene70NormsProducer extends NormsProducer {
+   // metadata maps (just file pointers and minimal stuff)
+   private final Map<Integer,NormsEntry> norms = new HashMap<>();
+-  private final IndexInput data;
+   private final int maxDoc;
++  private IndexInput data;
++  private final IndexedDISICacheFactory disiCacheFactory = new IndexedDISICacheFactory();
++  private boolean merging;
++  private Map<Integer, IndexInput> disiInputs;
++  private Map<Integer, RandomAccessInput> dataInputs;
++
+ 
+   Lucene70NormsProducer(SegmentReadState state, String dataCodec, String dataExtension, String metaCodec, String metaExtension) throws IOException {
+     maxDoc = state.segmentInfo.maxDoc();
+@@ -245,7 +250,13 @@ final class Lucene70NormsProducer extends NormsProducer {
+       }
+     } else {
+       // sparse
+-      final IndexedDISI disi = new IndexedDISI(data, entry.docsWithFieldOffset, entry.docsWithFieldLength, entry.numDocsWithField);
++      final IndexInput disiInput = data.slice("docs", entry.docsWithFieldOffset, entry.docsWithFieldLength);
++      // TODO (Toke): Review if it makes sense to use caching here - aren't there already skip structures in place?
++      final IndexedDISI disi = IndexedDISICacheFactory.NORMS_CACHING_ENABLED ?
++          disiCacheFactory.createCachedIndexedDISI(
++              disiInput, entry.docsWithFieldOffset + entry.docsWithFieldLength, entry.numDocsWithField, field.name)
++          : new IndexedDISI(disiInput, entry.numDocsWithField);
++
+       if (entry.bytesPerNorm == 0) {
+         return new SparseNormsIterator(disi) {
+           @Override
+@@ -294,11 +305,12 @@ final class Lucene70NormsProducer extends NormsProducer {
+   @Override
+   public void close() throws IOException {
+     data.close();
++    disiCacheFactory.releaseAll();
+   }
+ 
+   @Override
+   public long ramBytesUsed() {
+-    return 64L * norms.size(); // good enough
++    return 64L * norms.size() + disiCacheFactory.ramBytesUsed(); // good enough
+   }
+ 
+   @Override
+diff --git a/lucene/core/src/java/org/apache/lucene/util/RankBitSet.java b/lucene/core/src/java/org/apache/lucene/util/RankBitSet.java
+new file mode 100644
+index 00000000000..cf3c76b41bc
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/util/RankBitSet.java
+@@ -0,0 +1,286 @@
++package org.apache.lucene.util;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.Collection;
++
++import org.apache.lucene.search.DocIdSetIterator;
++
++/**
++ * Wrapper for OpenBitSet which creates and exposes a rank cache. The rank-cache scales to 2 billion bits.
++ *
++ * The rankCache has a long for every 2048 bits and thus has an overhead of 3.17%.
++ * Performance is O(1):
++ * 1 lookup in cache,
++ * a maximum of 3 sums,
++ * a maximum of 8 Long.bitCounts.
++ *
++ * Note: {@link #buildRankCache()} must be called once after the bit set has been created or changed and before
++ * calling {@link #rank(long)}.
++ *
++ * The design is based heavily on the article
++ * Space-Efficient, High-Performance Rank and Select Structures on Uncompressed Bit Sequences
++ * by Dong Zhou, David G. Andersen, Michael Kaminsky, Carnegie Mellon University, Intel Labs
++ * http://www.cs.cmu.edu/~dga/papers/zhou-sea2013.pdf
++ */
++// TODO: If the total number of set bits is <= 65535, a faster rank cache is a short for every 512 bits
++// Extending the rank beyond 2 billion bits would likely be done by dividing the bitmap into blocks of 2b bits
++// and introducing yet another table with a rank-origo for each block
++public class RankBitSet extends BitSet {
++  public static final int  LOWER_BITS = 32; // Must be capable of addressing full Java array
++  public static final long LOWER_MASK = ~(~1L << (LOWER_BITS-1));
++  public static final int LOWER_OVER_BITS = 11;
++  public static final long LOWER_OVER_MASK = ~(~1L << (LOWER_OVER_BITS-1));
++  public static final int LOWER_OVER_SIZE = 2048; // Overflow bits handled by a lower block
++
++  public static final int BASIC_BITS = 10; // Needs to hold counts from 0-512 (513-1023 are never used)
++  public static final long BASIC_MASK = ~(~1L << (BASIC_BITS-1));
++  public static final int BASIC_OVER_BITS = 9;
++  public static final long BASIC_OVER_MASK = ~(~1L << (BASIC_OVER_BITS-1));
++  public static final int BASIC_OVER_SIZE = 512; // Overflow bits handled by a basic block
++  public static final int BASIC_WORDS = BASIC_OVER_SIZE /Long.SIZE; // word == long
++  /**
++   * Each entry is made up of 1 long<br/>
++   * Bits 63-32: 32 bit first-level absolute index.<br/>
++   * Bits 29-0: 3 * 10 bit (0-1023) second-level relative index. Only numbers 0-512 are used.
++   */
++  private long[] rankCache = null;
++  private final FixedBitSet inner;
++  private final int wlen; // Number of words (longs with FixedBitSet) in inner
++
++  public RankBitSet(int numBits) {
++    this(new FixedBitSet(numBits));
++  }
++
++  public RankBitSet(FixedBitSet inner) {
++    this.inner = inner;
++    wlen = inner.getBits().length;
++  }
++
++  /**
++   * Must be called after bits has changed and before {@link #rank} is called.
++   */
++  public void buildRankCache() {
++    rankCache = new long[(length() >>> LOWER_OVER_BITS)+1];
++    long total = 0;
++    int lower = 0 ;
++    while (lower * LOWER_OVER_SIZE < length()) { // Full lower block processing
++      final int origoWordIndex = (lower * LOWER_OVER_SIZE) >>> 6;
++    // TODO: Some conditionals could be spared by checking once if all basic blocks are within size
++      final long basic1 = origoWordIndex + BASIC_WORDS <= wlen ?
++          BitUtil.pop_array(inner.getBits(), origoWordIndex, BASIC_WORDS) : 0;
++      final long basic2 =  origoWordIndex + BASIC_WORDS*2 <= wlen ?
++          BitUtil.pop_array(inner.getBits(), origoWordIndex + BASIC_WORDS, BASIC_WORDS) : 0;
++      final long basic3 =  origoWordIndex + BASIC_WORDS*3 <= wlen ?
++          BitUtil.pop_array(inner.getBits(), origoWordIndex + BASIC_WORDS *2, BASIC_WORDS) : 0;
++      final long basic4 =  origoWordIndex + BASIC_WORDS*4 <= wlen ?
++          BitUtil.pop_array(inner.getBits(), origoWordIndex + BASIC_WORDS *3, BASIC_WORDS) : 0;
++      rankCache[lower] = total << (Long.SIZE-LOWER_BITS) |
++           basic1 << (BASIC_BITS *2) |
++           basic2 << BASIC_BITS |
++           basic3;
++      total += basic1 + basic2 + basic3 + basic4;
++      lower++;
++    }
++  }
++
++  public int rank(long index) {
++    final long cache = rankCache[((int) (index >>> LOWER_OVER_BITS))];
++    // lower cache (absolute)
++    long rank = cache >>> (Long.SIZE-LOWER_BITS);
++    int startBitIndex = (int) (index & ~LOWER_OVER_MASK);
++    // basic blocks (relative)
++    if (startBitIndex < index-BASIC_OVER_SIZE) {
++      rank += (cache >>> (BASIC_BITS*2)) & BASIC_MASK;
++      startBitIndex += BASIC_OVER_SIZE;
++      if (startBitIndex < index-BASIC_OVER_SIZE) {
++        rank += (cache >>> BASIC_BITS) & BASIC_MASK;
++        startBitIndex += BASIC_OVER_SIZE;
++        if (startBitIndex < index-BASIC_OVER_SIZE) {
++          rank += cache & BASIC_MASK;
++          startBitIndex += BASIC_OVER_SIZE;
++        }
++      }
++    }
++    // long.bitcount (relative)
++    while(startBitIndex < index-Long.SIZE) {
++      rank += Long.bitCount(inner.getBits()[startBitIndex >>> 6]);
++      startBitIndex += Long.SIZE;
++    }
++    // Single bits (relative)
++    if (startBitIndex < index) {
++/*      System.out.println(String.format(Locale.ENGLISH,
++          "startBitIndex=%d, index=%d, getBits()[startBitIndex>>>6=%d]=%s, index-startBitIndex=%d, mask=%s",
++          startBitIndex, index, startBitIndex>>>6, Long.toBinaryString(getBits()[startBitIndex>>>6]),
++          index-startBitIndex, Long.toBinaryString(~(~1L << (index-startBitIndex-1)))));*/
++      rank += Long.bitCount(inner.getBits()[startBitIndex >>> 6] & ~(~1L << (index-startBitIndex-1)));
++    }
++//    for (int i = startBitIndex ; i < index ; i++) {
++//      rank += fastGet(i) ? 1 : 0;
++//    }
++    return (int) rank;
++  }
++
++  @Override
++  public long ramBytesUsed() {
++    return RamUsageEstimator.alignObjectSize(RamUsageEstimator.NUM_BYTES_OBJECT_REF*2 +
++        Integer.BYTES + Long.BYTES) +
++        inner.ramBytesUsed() +
++        (rankCache == null ? 0 :
++            RamUsageEstimator.NUM_BYTES_ARRAY_HEADER + Long.BYTES*rankCache.length);
++  }
++
++  /* Delegations to inner below */
++
++  public static FixedBitSet ensureCapacity(FixedBitSet bits, int numBits) {
++    return FixedBitSet.ensureCapacity(bits, numBits);
++  }
++
++  public static int bits2words(int numBits) {
++    return FixedBitSet.bits2words(numBits);
++  }
++
++  public static long intersectionCount(FixedBitSet a, FixedBitSet b) {
++    return FixedBitSet.intersectionCount(a, b);
++  }
++
++  public static long unionCount(FixedBitSet a, FixedBitSet b) {
++    return FixedBitSet.unionCount(a, b);
++  }
++
++  public static long andNotCount(FixedBitSet a, FixedBitSet b) {
++    return FixedBitSet.andNotCount(a, b);
++  }
++
++  @Override
++  public int length() {
++    return inner.length();
++  }
++
++  public long[] getBits() {
++    return inner.getBits();
++  }
++
++  @Override
++  public int cardinality() {
++    return inner.cardinality();
++  }
++
++  @Override
++  public boolean get(int index) {
++    return inner.get(index);
++  }
++
++  @Override
++  public void set(int index) {
++    inner.set(index);
++  }
++
++  public boolean getAndSet(int index) {
++    return inner.getAndSet(index);
++  }
++
++  @Override
++  public void clear(int index) {
++    inner.clear(index);
++  }
++
++  public boolean getAndClear(int index) {
++    return inner.getAndClear(index);
++  }
++
++  @Override
++  public int nextSetBit(int index) {
++    return inner.nextSetBit(index);
++  }
++
++  @Override
++  public int prevSetBit(int index) {
++    return inner.prevSetBit(index);
++  }
++
++  @Override
++  public void or(DocIdSetIterator iter) throws IOException {
++    inner.or(iter);
++  }
++
++  public void or(FixedBitSet other) {
++    inner.or(other);
++  }
++
++  public void xor(FixedBitSet other) {
++    inner.xor(other);
++  }
++
++  public void xor(DocIdSetIterator iter) throws IOException {
++    inner.xor(iter);
++  }
++
++  public boolean intersects(FixedBitSet other) {
++    return inner.intersects(other);
++  }
++
++  public void and(FixedBitSet other) {
++    inner.and(other);
++  }
++
++  public void andNot(FixedBitSet other) {
++    inner.andNot(other);
++  }
++
++  public boolean scanIsEmpty() {
++    return inner.scanIsEmpty();
++  }
++
++  public void flip(int startIndex, int endIndex) {
++    inner.flip(startIndex, endIndex);
++  }
++
++  public void flip(int index) {
++    inner.flip(index);
++  }
++
++  public void set(int startIndex, int endIndex) {
++    inner.set(startIndex, endIndex);
++  }
++
++  @Override
++  public void clear(int startIndex, int endIndex) {
++    inner.clear(startIndex, endIndex);
++  }
++
++  @Override
++  public int hashCode() {
++    return inner.hashCode();
++  }
++
++  public static BitSet of(DocIdSetIterator it, int maxDoc) throws IOException {
++    return BitSet.of(it, maxDoc);
++  }
++
++  @Override
++  public int approximateCardinality() {
++    return inner.approximateCardinality();
++  }
++
++  @Override
++  public Collection<Accountable> getChildResources() {
++    return inner.getChildResources();
++  }
++}
+diff --git a/lucene/core/src/test/org/apache/lucene/codecs/lucene70/TestIndexedDISI.java b/lucene/core/src/test/org/apache/lucene/codecs/lucene70/TestIndexedDISI.java
+index 64bfbd5fc96..c46e23ba4ac 100644
+--- a/lucene/core/src/test/org/apache/lucene/codecs/lucene70/TestIndexedDISI.java
++++ b/lucene/core/src/test/org/apache/lucene/codecs/lucene70/TestIndexedDISI.java
+@@ -19,6 +19,7 @@ package org.apache.lucene.codecs.lucene70;
+ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.List;
++import java.util.Locale;
+ 
+ import org.apache.lucene.search.DocIdSetIterator;
+ import org.apache.lucene.store.Directory;
+@@ -150,6 +151,189 @@ public class TestIndexedDISI extends LuceneTestCase {
+       }
+     }
+   }
++  public void testDenseMultiBlock() throws IOException {
++    try (Directory dir = newDirectory()) {
++      int maxDoc = 10 * 65536; // 10 blocks
++      FixedBitSet set = new FixedBitSet(maxDoc);
++      for (int i = 0; i < maxDoc; i += 2) { // Set every other to ensure dense
++        set.set(i);
++      }
++      doTest(set, dir);
++    }
++  }
++
++  public void testOneDocMissingFixed() throws IOException {
++    int maxDoc = 9699;
++    FixedBitSet set = new FixedBitSet(maxDoc);
++    set.set(0, maxDoc);
++    set.clear(1345);
++    try (Directory dir = newDirectory()) {
++
++      final int cardinality = set.cardinality();
++      long length;
++      try (IndexOutput out = dir.createOutput("foo", IOContext.DEFAULT)) {
++        IndexedDISI.writeBitSet(new BitSetIterator(set, cardinality), out);
++        length = out.getFilePointer();
++      }
++
++      int step = 16000;
++      try (IndexInput in = dir.openInput("foo", IOContext.DEFAULT)) {
++        IndexedDISI disi = new IndexedDISI(in, 0L, length, cardinality);
++        BitSetIterator disi2 = new BitSetIterator(set, cardinality);
++        assertAdvanceEquality(disi, disi2, step);
++      }
++    }
++  }
++
++  final int[] SIZES = new int[]{10_000, 100_000, 1_000_000, 10_000_000, 100_000_000};
++  final int[] STEPS = new int[]{1, 9, 99, 999, 9_999, 99_999, 999_999, 9_999_999, 99_999_999};
++  public void testCacheSpeedDense() throws IOException {
++    IndexedDISICacheFactory.DEBUG = false; // No chattiness as we want a clean output
++    for (int size: SIZES) {
++      FixedBitSet set = new FixedBitSet(size);
++      for (int i = 0; i < size; i += 3) {
++        set.set(i); // Quite DENSE
++      }
++      measureCacheSpeed("Dense", set, STEPS);
++    }
++  }
++
++  public void testCacheVaryingDensity() throws IOException {
++    IndexedDISICacheFactory.DEBUG = false; // No chattiness as we want a clean output
++    for (int size: SIZES) {
++      FixedBitSet set = new FixedBitSet(size);
++      set.clear(0, set.length());
++      for (int maxSkip: STEPS) {
++        for (int i = 0; i < size; i += random().nextInt(maxSkip)+1) {
++          set.set(i);
++        }
++        measureCacheSpeed("R-dense(" + (maxSkip+1) + ")", set, STEPS);
++      }
++    }
++  }
++
++  public void testCacheSpeedNearFull() throws IOException {
++    IndexedDISICacheFactory.DEBUG = false; // No chattiness as we want a clean output
++    for (int size: SIZES) {
++      FixedBitSet set = new FixedBitSet(size);
++      set.set(0, set.length());
++      set.clear(set.length() - 1);
++      measureCacheSpeed("Near full", set, STEPS);
++    }
++  }
++
++  private void measureCacheSpeed(String designation, FixedBitSet set, int[] steps) throws IOException {
++    for (int step: new int[]{1, 9, 99, 999, 9_999, 99_999, 999_999, 9_999_999, 99_999_999}) {
++      if (step > set.length()) {
++        continue;
++      }
++      measureCacheSpeed(designation, set, step);
++    }
++
++  }
++
++  // TODO (Toke): Remove when stable
++  public void testLucene8374Toggle() {
++    assertEquals("lucene8374(norms=true, block=false, dense=true, vBPV=false, debug=true)",
++        IndexedDISICacheFactory.setEnabled("norms,dense,debug"));
++    assertEquals("lucene8374(norms=false, block=false, dense=true, vBPV=false, debug=true)",
++        IndexedDISICacheFactory.setEnabled("norms=false,dense,debug"));
++  }
++
++  // TODO (Toke): Remove when stable
++  // This microbenchmark is just for sanity checking and not intended to provide realistic measurements
++  private void measureCacheSpeed(String designation, FixedBitSet set, int step) throws IOException {
++    final double MSD = 1000000.0;
++    final IndexedDISICacheFactory factory = new IndexedDISICacheFactory();
++    final int cardinality = set.cardinality();
++    long length;
++    try (Directory dir = newDirectory()) {
++      try (IndexOutput out = dir.createOutput("foo", IOContext.DEFAULT)) {
++        IndexedDISI.writeBitSet(new BitSetIterator(set, cardinality), out);
++        length = out.getFilePointer();
++      }
++
++      try (IndexInput inVanilla1 = dir.openInput("foo", IOContext.DEFAULT);
++           IndexInput inCached1 = dir.openInput("foo", IOContext.DEFAULT);
++           IndexInput inVanilla2 = dir.openInput("foo", IOContext.DEFAULT);
++           IndexInput inCached2 = dir.openInput("foo", IOContext.DEFAULT)) {
++        IndexedDISI vanilla1 = new IndexedDISI(inVanilla1, 0L, length, cardinality);
++        IndexedDISI cached1 = factory.createCachedIndexedDISI(inCached1, 0L, length, cardinality, "cached1");
++        IndexedDISI vanilla2 = new IndexedDISI(inVanilla2, 0L, length, cardinality);
++        IndexedDISI cached2 = factory.createCachedIndexedDISI(inCached2, 0L, length, cardinality, "cached2");
++
++        final long c1NS = stepTime(cached1, step);
++        final long v1NS = stepTime(vanilla1, step);
++        final long c2NS = stepTime(cached2, step);
++        final long v2NS = stepTime(vanilla2, step);
++        System.out.println(String.format(Locale.ENGLISH,
++            "%-20s: length=%10d, step=%10d, v=[%6.2f, %6.2f]ms, c=[%6.2f, %6.2f]ms, c2/v2=%4d%%",
++            designation, set.length(), step, v1NS/MSD, v2NS/MSD, c1NS/MSD, c2NS/MSD, c2NS*100/v2NS));
++      }
++    }
++  }
++
++  // TODO (Toke): Remove when stable
++  private long stepTime(IndexedDISI disi, int step) throws IOException {
++    final long startTime = System.nanoTime();
++
++    int target = 0;
++    int doc;
++    while ((doc = disi.advance(target)) != DocIdSetIterator.NO_MORE_DOCS) {
++      target = doc + step;
++    }
++
++    return System.nanoTime()-startTime;
++  }
++
++  // TODO (Toke): Remove when stable
++  public void testExplorativeTestCachedDense() throws IOException {
++    final IndexedDISICacheFactory factory = new IndexedDISICacheFactory();
++    try (Directory dir = newDirectory()) {
++      int maxDoc = 100*65536; // 10 blocks
++      FixedBitSet set = new FixedBitSet(maxDoc);
++      for (int block = 0 ; block < 100 ; block++) {
++        switch (block % 4) {
++          case 0: break; // EMPTY
++          case 1: {
++            for (int i = 0; i < 65536; i++) { // ALL
++              set.set((block << 16) | i);
++            }
++            break;
++          }
++          case 2: {
++            for (int i = 0; i < 65536; i += 2) { // DENSE
++              set.set((block << 16) | i);
++            }
++            break;
++          }
++          case 3: {
++            for (int i = 0; i < 65536; i += 5000) { // SPARSE
++              set.set((block << 16) | i);
++            }
++            break;
++          }
++        }
++      }
++
++      final int cardinality = set.cardinality();
++      long length;
++      try (IndexOutput out = dir.createOutput("foo", IOContext.DEFAULT)) {
++        IndexedDISI.writeBitSet(new BitSetIterator(set, cardinality), out);
++        length = out.getFilePointer();
++      }
++
++      for (int step: new int[] {1, 10, 100, 1000, 10000, 100000}) {
++        try (IndexInput in = dir.openInput("foo", IOContext.DEFAULT)) {
++//        IndexedDISICache cache = new IndexedDISICache(in.slice("docs", 0L, length), true, true);
++          IndexedDISI disi = factory.createCachedIndexedDISI(in, 0L, length, cardinality, "foo");
++          BitSetIterator disi2 = new BitSetIterator(set, cardinality);
++          assertAdvanceEquality(disi, disi2, step);
++//        assertAdvanceExactRandomized(disi, disi2, set.cardinality(), step);
++        }
++      }
++    }
++  }
+ 
+   public void testRandom() throws IOException {
+     try (Directory dir = newDirectory()) {
+@@ -246,4 +430,21 @@ public class TestIndexedDISI extends LuceneTestCase {
+     dir.deleteFile("foo");
+   }
+ 
++  private void assertAdvanceEquality(IndexedDISI disi, BitSetIterator disi2, int step) throws IOException {
++    int index = -1;
++    while (true) {
++      int target = disi2.docID() + step;
++      int doc;
++      do {
++        doc = disi2.nextDoc();
++        index++;
++      } while (doc < target);
++      assertEquals(doc, disi.advance(target));
++      if (doc == DocIdSetIterator.NO_MORE_DOCS) {
++        break;
++      }
++      assertEquals("Expected equality using step " + step + " at docID " + doc, index, disi.index());
++    }
++  }
++
+ }
+diff --git a/lucene/core/src/test/org/apache/lucene/codecs/lucene70/TestLongCompressor.java b/lucene/core/src/test/org/apache/lucene/codecs/lucene70/TestLongCompressor.java
+new file mode 100644
+index 00000000000..d81a39aef2b
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/codecs/lucene70/TestLongCompressor.java
+@@ -0,0 +1,85 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.lucene.codecs.lucene70;
++
++import java.util.Random;
++
++import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util.packed.PackedInts;
++
++public class TestLongCompressor extends LuceneTestCase {
++
++  // Simple money test that builds a collection of random longs, compresses them with LongCompressor and
++  // checks if all values from the compressed version are equal to the source
++  public void testLongCompressorMonkey() {
++    final int RUNS = 10;
++    final int[] MAX_SIZES = new int[]{0, 1, 10, 1000, 100_000};
++    final int[] MAX_VALUE = new int[]{0, 1, 10, 1000, 100_000};
++    for (int run = 0 ; run < RUNS ; run++) {
++      for (int maxSize: MAX_SIZES) {
++        int size = maxSize == 0 ? 0 : random().nextInt(maxSize);
++        for (int maxValue: MAX_VALUE) {
++          int minValue = maxValue == 0 ? 0 : random().nextInt(maxValue);
++          double minChance = random().nextDouble();
++          longCompressorMonkeyTest(run, size, minValue, maxValue, minChance, random().nextLong());
++        }
++      }
++    }
++  }
++
++  public void testVerySparse() {
++    final int SIZE = 674932;
++    final int EVERY = SIZE/896;
++    PackedInts.Mutable ranks = PackedInts.getMutable(674932, 16, PackedInts.DEFAULT);
++    for (int i = 0 ; i < SIZE; i+=EVERY) {
++      ranks.set(i, random().nextInt(65535));
++    }
++    PackedInts.Reader sparsed = LongCompressor.compress(ranks);
++    assertFalse("The input and the sparsed should not be the same", ranks == sparsed);
++  }
++
++  private void longCompressorMonkeyTest(
++      int run, int size, int minValue, int maxValue, double minChance, long randomSeed) {
++    final String description = String.format("run=%d, size=%d, minValue=%d, maxValue=%d, minChance=%1.2f, seed=%d",
++        run, size, minValue, maxValue, minChance, randomSeed);
++    Random innerRandom = new Random(randomSeed);
++    PackedInts.Mutable expected = PackedInts.getMutable(size, PackedInts.bitsRequired(maxValue), PackedInts.DEFAULT);
++    for (int i = 0 ; i < size ; i++) {
++      if (innerRandom.nextDouble() <= minChance) {
++        continue;
++      }
++      expected.set(i, maxValue-minValue == 0 ? minValue : innerRandom.nextInt(maxValue-minValue)+minValue);
++    }
++    assertSparseValid(description, expected);
++  }
++
++  private void assertSparseValid(String description, PackedInts.Reader values) {
++    try {
++      PackedInts.Reader sparsed = LongCompressor.compress(values, values.size());
++
++      for (int i = 0; i < values.size(); i++) {
++        assertEquals("The value at index " + i + " should be as expected for " + description,
++            values.get(i), sparsed.get(i));
++      }
++    } catch (Exception e) {
++      throw new RuntimeException("Unexpected Exception for " + description, e);
++    }
++  }
++
++
++}
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestDocValues.java b/lucene/core/src/test/org/apache/lucene/index/TestDocValues.java
+index 0214e5447b4..630faaa9336 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestDocValues.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestDocValues.java
+@@ -18,7 +18,16 @@ package org.apache.lucene.index;
+ 
+ 
+ import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
+ 
++import org.apache.lucene.analysis.standard.StandardAnalyzer;
++import org.apache.lucene.codecs.Codec;
++import org.apache.lucene.codecs.lucene70.IndexedDISICacheFactory;
+ import org.apache.lucene.document.BinaryDocValuesField;
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.Field;
+@@ -27,7 +36,9 @@ import org.apache.lucene.document.SortedDocValuesField;
+ import org.apache.lucene.document.SortedNumericDocValuesField;
+ import org.apache.lucene.document.SortedSetDocValuesField;
+ import org.apache.lucene.document.StringField;
++import org.apache.lucene.search.DocIdSetIterator;
+ import org.apache.lucene.store.Directory;
++import org.apache.lucene.store.MMapDirectory;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.LuceneTestCase;
+@@ -125,6 +136,319 @@ public class TestDocValues extends LuceneTestCase {
+   }
+   
+   /** 
++   * Triggers varying bits per value codec representation for numeric.
++   */
++  public void testNumericFieldVaryingBPV() throws Exception {
++    Directory dir = newDirectory();
++    IndexWriter iw = new IndexWriter(dir, newIndexWriterConfig(null));
++    long generatedSum = 0;
++    for (int bpv = 2; bpv < 24; bpv += 3) {
++      for (int i = 0; i < 66000; i++) {
++        Document doc = new Document();
++        int max = 1 << (bpv - 1);
++        int value = random().nextInt(max) | max;
++        generatedSum += value;
++        //System.out.println("--- " + value);
++        doc.add(new NumericDocValuesField("foo", value));
++        iw.addDocument(doc);
++      }
++    }
++    iw.flush();
++    iw.forceMerge(1, true);
++    iw.commit();
++    DirectoryReader dr = DirectoryReader.open(iw);
++    LeafReader r = getOnlyLeafReader(dr);
++
++    // ok
++    NumericDocValues numDV = DocValues.getNumeric(r, "foo");
++
++    assertNotNull(numDV);
++    long sum = 0;
++    while (numDV.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
++      sum += numDV.longValue();
++    }
++    assertEquals("The sum of retrieved values should match the input", generatedSum, sum);
++
++//    assertNotNull(DocValues.getSortedNumeric(r, "foo"));
++
++    dr.close();
++    iw.close();
++    dir.close();
++  }
++
++  // LUCENE-8374 had a bug where a vBPV-block with BPV==0 as the very end of the numeric DocValues made it fail
++  public void testNumericEntryZeroesLastBlock() throws IOException {
++    List<Long> docValues = new ArrayList<>(2 * 16384);
++    for (int id = 0; id < 2 * 16384; id++) { // 2 vBPV-blocks for the dv-field
++      if (id < 16384) { // First vBPV-block just has semi-ramdom values
++        docValues.add((long) (id % 1000));
++      } else {          // Second block is all zeroes, resulting in an extreme "1-byte for the while block"-representation
++        docValues.add(0L);
++      }
++    }
++    assertRandomAccessDV("Last block BPV=0", docValues);
++  }
++
++  private void assertRandomAccessDV(String designation, List<Long> docValues) throws IOException {
++    // Create corpus
++    Path zeroPath = Paths.get(System.getProperty("java.io.tmpdir"), "plain_" + random().nextInt());
++    Directory zeroDir = new MMapDirectory(zeroPath);
++    IndexWriterConfig iwc = new IndexWriterConfig(new StandardAnalyzer());
++    iwc.setCodec(Codec.forName("Lucene70"));
++    IndexWriter iw = new IndexWriter(zeroDir, iwc);
++
++    for (int id = 0; id < docValues.size(); id++) {
++      Document doc = new Document();
++      doc.add(new StringField("id", Integer.toString(id), Field.Store.YES));
++      doc.add(new NumericDocValuesField("dv", docValues.get(id)));
++      iw.addDocument(doc);
++    }
++    iw.flush();
++    iw.commit();
++    iw.forceMerge(1, true);
++    iw.close();
++
++    // Check
++    // Ensure that LUCENE-8374 is enabled for vBPV
++    IndexedDISICacheFactory.VARYINGBPV_CACHING_ENABLED = true;
++    DirectoryReader dr = DirectoryReader.open(zeroDir);
++
++    for (int id = 0; id < docValues.size(); id++) {
++      int readerIndex = dr.readerIndex(id);
++      // We create a new reader each time as we want to test vBPV-skipping and not sequential iteration
++      NumericDocValues numDV = dr.leaves().get(readerIndex).reader().getNumericDocValues("dv");
++      assertTrue("There should be a value for docID " + id, numDV.advanceExact(id));
++      assertEquals("The value for docID " + id + " should be as expected",
++          docValues.get(id), Long.valueOf(numDV.longValue()));
++    }
++
++    // Clean up
++    deleteAndClose(zeroDir);
++    Files.delete(zeroPath);
++  }
++
++  // TODO (Toke): Remove this when LUCENE-8374 is ready for release
++  // Note: vBPV only helps for segments with > 16384 values for the DV-field
++  @Slow
++  public void testNumericRetrievalSpeed() throws IOException {
++    final int BPV_MIN = 2;
++    final int BPV_STEP = 3;
++    final int BPV_MAX = 24;
++
++    final int MAJOR_RUNS = 1;
++    final int INNER_RUNS = 10;
++    //final int[] DOCS_PER_BPV = new int[]{100, 10_000, 500_000, 2_000_000};
++    final int[] DOCS_PER_BPV = new int[]{5_000_000};
++    //final int[] QUERIES = new int[]{10, 100, 1_000, 10_000, 100_000};
++    final int[] QUERIES = new int[]{10_000};
++    final int[] DOCS_PER_QUERY = new int[]{10, 1000};
++    final boolean LEAVE_TEST_INDEXES = true; // Indexes are stored in TMP. Remember to delete manually if set to true
++
++    boolean oldDebug = IndexedDISICacheFactory.DEBUG;
++
++    for (int docsPerBPV : DOCS_PER_BPV) {
++      IndexedDISICacheFactory.DEBUG = false;
++      String POST_DESIGNATION =
++          "bpvmin=" + BPV_MIN + "_bpvstep=" + BPV_STEP + "_bpvmax=" + BPV_MAX + "_docsperbpv=" + docsPerBPV;
++      Path pathPlain = Paths.get(System.getProperty("java.io.tmpdir"), "plain_" + POST_DESIGNATION);
++      boolean plainExists = Files.isDirectory(pathPlain);
++      Directory dirPlain = new MMapDirectory(pathPlain);
++      if (plainExists) {
++        System.out.println("Skipping plain index creation as folder " + pathPlain + " already exists");
++      } else {
++        System.out.println("Generating plain index with " + POST_DESIGNATION);
++        generateVaryingBPVIndex(dirPlain, BPV_MIN, BPV_STEP, BPV_MAX, docsPerBPV, false);
++      }
++
++      Path pathOptimize = Paths.get(System.getProperty("java.io.tmpdir"), "optimized_" + POST_DESIGNATION);
++      boolean optimizedExists = Files.isDirectory(pathOptimize);
++      Directory dirOptimize = new MMapDirectory(pathOptimize);
++      if (optimizedExists) {
++        System.out.println("Skipping optimized index creation as folder " + pathOptimize + " already exists");
++      } else {
++        System.out.println("Generating optimized index with " + POST_DESIGNATION);
++        generateVaryingBPVIndex(dirOptimize, BPV_MIN, BPV_STEP, BPV_MAX, docsPerBPV, true);
++      }
++
++      // Disk cache warm
++      final double[] NONE = new double[]{-1d, -1d};
++
++      System.out.println("Running performance tests (note: Indexes < 16K docs are unlikely to have usable LUCENE-8374 caches)");
++
++      for (boolean sequential : new boolean[]{false, true}) {
++        System.out.println("************** " + (sequential ? "Sequential" : "Random") + " access");
++        for (int run = 0; run < MAJOR_RUNS; run++) {
++          System.out.println(DV_PERFORMANCE_HEADER);
++          for (int queries : QUERIES) {
++            for (int dpq : DOCS_PER_QUERY) {
++              for (boolean optimize : new boolean[]{false, true}) {
++                Directory dir = optimize ? dirOptimize : dirPlain;
++                // Warm
++                numericRetrievalSpeed(dir, 5, 1000, 10, true, true, true, false, NONE, false, true);
++
++                // Establish baseline
++                double[] basePlain = numericRetrievalSpeed(dir, INNER_RUNS, queries, dpq, false, false, false, true, NONE, sequential, true);
++                numericRetrievalSpeed(dir, INNER_RUNS, queries, dpq, false, false, false, true, basePlain, sequential, true);
++
++                numericRetrievalSpeed(dir, INNER_RUNS, queries, dpq, true, false, false, true, basePlain, sequential, true);
++                numericRetrievalSpeed(dir, INNER_RUNS, queries, dpq, false, true, false, true, basePlain, sequential, true);
++                numericRetrievalSpeed(dir, INNER_RUNS, queries, dpq, false, false, true, true, basePlain, sequential, true);
++                numericRetrievalSpeed(dir, INNER_RUNS, queries, dpq, true, true, true, true, basePlain, sequential, true);
++
++                // Run baseline again and compare to old to observe measuring skews due to warming and chance
++                numericRetrievalSpeed(dir, INNER_RUNS, queries, dpq, false, false, false, true, basePlain, sequential, true);
++                numericRetrievalSpeed(dir, INNER_RUNS, queries, dpq, false, false, false, true, basePlain, sequential, true);
++                System.out.println("");
++              }
++            }
++          }
++          if (run < MAJOR_RUNS - 1) {
++            System.out.println("----------------------");
++          }
++        }
++      }
++
++      if (LEAVE_TEST_INDEXES) {
++        dirPlain.close();
++        dirOptimize.close();
++      } else {
++        deleteAndClose(dirPlain);
++        Files.delete(pathPlain);
++        deleteAndClose(dirOptimize);
++        Files.delete(pathOptimize);
++      }
++    }
++    IndexedDISICacheFactory.DEBUG = oldDebug;
++  }
++
++  private void deleteAndClose(Directory dir) throws IOException {
++    String[] files = dir.listAll();
++    for (String file : files) {
++      dir.deleteFile(file);
++    }
++    dir.close();
++  }
++
++  public static final String DV_PERFORMANCE_HEADER = "  docs segments requests doc/req block dense  vBPV worst_r/s best_r/s  worst/base best/base";
++  public static final String DV_PERFORMANCE_PATTERN = "%6s %8s %8s %8s %5s %5s %5s %9s %8s %10.0f%% %9.0f%%";
++
++  // Returns [worst, best] docs/s
++
++  /**
++   * Attempts to simulate retrieval of a single DocValues long field by creating a sorted list of docIDs and using
++   * {@link LeafReader#getNumericDocValues(String)} to retrieve values, reusing the {@link NumericDocValues} between
++   * calls if possible (the streaming API dictates forward iteration only).
++   */
++  private double[] numericRetrievalSpeed(
++      Directory dir, int runs, int requests, int docsPerQuery, boolean block, boolean dense, boolean vBPV,
++      boolean print, double[] base, boolean sequential, boolean reuseDVReader) throws IOException {
++
++    IndexedDISICacheFactory.BLOCK_CACHING_ENABLED = block;
++    IndexedDISICacheFactory.DENSE_CACHING_ENABLED = dense;
++    IndexedDISICacheFactory.VARYINGBPV_CACHING_ENABLED = vBPV;
++
++    DirectoryReader dr = DirectoryReader.open(dir);
++    int maxDoc = dr.maxDoc();
++
++    long best = Long.MAX_VALUE;
++    long worst = -1;
++    long sum = -1;
++    int sequentialDocID = -1;
++
++    int lastDocID = 0;
++    int lastReaderIndex = -1;
++    final int[] docsToRetrieve = new int[docsPerQuery];
++    NumericDocValues numDV = null;
++    // TODO: Add realistic simulation of top-X retrieval
++    // For real-world, top-10 or top-20 is likely to be used and those will be resolved in sorted order
++    for (int run = 0; run < runs; run++) {
++      long runTime = -System.nanoTime();
++      for (int q = 0; q < requests; q++) {
++        for (int i = 0; i < docsPerQuery; i++) {
++          if (sequential) {
++            sequentialDocID++;
++            if (sequentialDocID == maxDoc) {
++              sequentialDocID = 0;
++            }
++            docsToRetrieve[i] = sequentialDocID;
++          } else {
++            docsToRetrieve[i] = random().nextInt(maxDoc - 1);
++          }
++        }
++        Arrays.sort(docsToRetrieve);
++
++        for (int docID : docsToRetrieve) {
++          int readerIndex = 0;
++          if (!reuseDVReader || docID < lastDocID || (readerIndex = dr.readerIndex(docID)) != lastReaderIndex ||
++              numDV == null) {
++            numDV = dr.leaves().get(readerIndex).reader().getNumericDocValues("dv");
++          }
++          lastDocID = docID;
++          lastReaderIndex = readerIndex;
++          if (!numDV.advanceExact(docID - dr.readerBase(readerIndex))) {
++            //System.err.println("Expected numeric doc value for docID=" + docID);
++            continue;
++          }
++          sum += numDV.longValue();
++        }
++      }
++      runTime += System.nanoTime();
++      best = Math.min(best, runTime);
++      worst = Math.max(worst, runTime);
++    }
++    double worstDPS = docsPerQuery * requests / (worst / 1000000.0 / 1000);
++    double bestDPS = docsPerQuery * requests / (best / 1000000.0 / 1000);
++    double worstRelative = base[0] < 0 ? 100 : worstDPS * 100 / base[0];
++    double bestRelative = base[1] < 0 ? 100 : bestDPS * 100 / base[1];
++    if (print) {
++      System.out.println(String.format(DV_PERFORMANCE_PATTERN,
++          shorten(maxDoc), dr.leaves().size(), shorten(requests), shorten(docsPerQuery),
++          block ? "block" : "", dense ? "dense" : "", vBPV ? "vBPV" : "",
++          shortenKB((int) worstDPS), shortenKB((int) bestDPS), worstRelative, bestRelative));
++    }
++    assertFalse("There should be at least 1 long value", sum == -1);
++
++    dr.close();
++    return new double[]{worstDPS, bestDPS};
++  }
++
++  private String shortenKB(int requests) {
++    return requests >= 1_000 ? requests / 1_000 + "K" : requests + "";
++  }
++
++  private String shorten(int requests) {
++    return requests >= 1_000_000 ? requests / 1_000_000 + "M" : requests >= 1_000 ? requests / 1_000 + "K" : requests + "";
++  }
++
++  private void generateVaryingBPVIndex(
++      Directory dir, int bpvMin, int bpvStep, int bpvMax, int docsPerBPV, boolean optimize) throws IOException {
++
++    IndexWriterConfig iwc = new IndexWriterConfig(new StandardAnalyzer());
++    iwc.setCodec(Codec.forName("Lucene70"));
++    IndexWriter iw = new IndexWriter(dir, iwc);
++
++    int id = 0;
++    for (int bpv = bpvMin; bpv < bpvMax + 1; bpv += bpvStep) {
++      for (int i = 0; i < docsPerBPV; i++) {
++        Document doc = new Document();
++        int max = 1 << (bpv - 1);
++        int value = random().nextInt(max) | max;
++        doc.add(new StringField("id", Integer.toString(id++), Field.Store.YES));
++        if (id % 87 != 0) { // Ensure sparse
++          doc.add(new NumericDocValuesField("dv", value));
++        }
++        iw.addDocument(doc);
++      }
++    }
++    iw.flush();
++    if (optimize) {
++      iw.forceMerge(1, true);
++    }
++    iw.commit();
++    iw.close();
++  }
++
++  /**
+    * field with binary docvalues
+    */
+   public void testBinaryField() throws Exception {
+diff --git a/solr/core/src/java/org/apache/solr/request/SolrQueryRequestBase.java b/solr/core/src/java/org/apache/solr/request/SolrQueryRequestBase.java
+index e8dac1ccf69..a03797af71c 100644
+--- a/solr/core/src/java/org/apache/solr/request/SolrQueryRequestBase.java
++++ b/solr/core/src/java/org/apache/solr/request/SolrQueryRequestBase.java
+@@ -16,6 +16,7 @@
+  */
+ package org.apache.solr.request;
+ 
++import org.apache.lucene.codecs.lucene70.IndexedDISICacheFactory;
+ import org.apache.solr.api.ApiBag;
+ import org.apache.solr.common.SolrException;
+ import org.apache.solr.common.util.ValidatingJsonMap;
+@@ -70,6 +71,15 @@ public abstract class SolrQueryRequestBase implements SolrQueryRequest, Closeabl
+     this.params = this.origParams = params;
+     this.requestTimer = requestTimer;
+     this.startTime = System.currentTimeMillis();
++    // TODO (Toke): Remove all tracks of this cache switch hack before releasing LUCENE-7384
++    if (params.get("lucene8374", null) != null) {
++      String oldSw = IndexedDISICacheFactory.getEnabled();
++      String newSw = org.apache.lucene.codecs.lucene70.IndexedDISICacheFactory.setEnabled(params.get("lucene8374"));
++
++      if (!newSw.equals(oldSw)) {
++        System.out.println("Changed static cache switches to " + newSw);
++      }
++    }
+   }
+ 
+   public SolrQueryRequestBase(SolrCore core, SolrParams params) {

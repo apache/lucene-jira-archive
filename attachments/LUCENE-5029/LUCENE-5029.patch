@@ -1,0 +1,621 @@
+Index: lucene/core/src/java/org/apache/lucene/codecs/TempPostingsReaderBase.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/TempPostingsReaderBase.java	(revision 1493481)
++++ lucene/core/src/java/org/apache/lucene/codecs/TempPostingsReaderBase.java	(working copy)
+@@ -24,6 +24,7 @@
+ import org.apache.lucene.index.DocsAndPositionsEnum;
+ import org.apache.lucene.index.FieldInfo;
+ import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.store.DataInput;
+ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.codecs.temp.TempTermState;
+ 
+@@ -56,8 +57,12 @@
+   public abstract TempTermState newTermState() throws IOException;
+ 
+   /** Actually decode metadata for next term */
+-  public abstract void nextTerm(FieldInfo fieldInfo, TempTermState state) throws IOException;
++  // nocommit: remove the 'fieldInfo' ? I suppose for a given postingsPBR, this should be fixed?
++  public abstract void nextTerm(long[] longs, DataInput in, FieldInfo fieldInfo, TempTermState state) throws IOException;
+ 
++  /** Return the fixed length of longs */
++  public abstract int longsSize(FieldInfo fieldInfo);
++
+   /** Must fully consume state, since after this call that
+    *  TermState may be reused. */
+   public abstract DocsEnum docs(FieldInfo fieldInfo, TempTermState state, Bits skipDocs, DocsEnum reuse, int flags) throws IOException;
+@@ -69,9 +74,4 @@
+ 
+   @Override
+   public abstract void close() throws IOException;
+-
+-  /** Reads data for all terms in the next block; this
+-   *  method should merely load the byte[] blob but not
+-   *  decode, which is done in {@link #nextTerm}. */
+-  public abstract void readTermsBlock(IndexInput termsIn, FieldInfo fieldInfo, TempTermState termState) throws IOException;
+ }
+Index: lucene/core/src/java/org/apache/lucene/codecs/TempPostingsWriterBase.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/TempPostingsWriterBase.java	(revision 1493481)
++++ lucene/core/src/java/org/apache/lucene/codecs/TempPostingsWriterBase.java	(working copy)
+@@ -20,6 +20,7 @@
+ import java.io.IOException;
+ import java.io.Closeable;
+ 
++import org.apache.lucene.store.DataOutput;
+ import org.apache.lucene.store.IndexOutput;
+ import org.apache.lucene.index.FieldInfo;
+ 
+@@ -55,16 +56,13 @@
+    *  document. */
+   public abstract void startTerm() throws IOException;
+ 
+-  /** Flush count terms starting at start "backwards", as a
+-   *  block. start is a negative offset from the end of the
+-   *  terms stack, ie bigger start means further back in
+-   *  the stack. */
+-  public abstract void flushTermsBlock(int start, int count) throws IOException;
+-
+   /** Finishes the current term.  The provided {@link
+    *  TermStats} contains the term's summary statistics. */
+-  public abstract void finishTerm(TermStats stats) throws IOException;
++  public abstract void finishTerm(long[] longs, DataOutput out, TermStats stats) throws IOException;
+ 
++  /** Return the fixed length of longs */
++  public abstract int longsSize(FieldInfo fieldInfo);
++
+   /** Called when the writing switches to another field. */
+   public abstract void setField(FieldInfo fieldInfo);
+ 
+Index: lucene/core/src/java/org/apache/lucene/codecs/temp/TempBlockTermsReader.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/temp/TempBlockTermsReader.java	(revision 1493481)
++++ lucene/core/src/java/org/apache/lucene/codecs/temp/TempBlockTermsReader.java	(working copy)
+@@ -26,6 +26,7 @@
+ import java.util.Iterator;
+ import java.util.Locale;
+ import java.util.TreeMap;
++import java.util.Arrays;
+ 
+ import org.apache.lucene.index.CorruptIndexException;
+ import org.apache.lucene.index.DocsAndPositionsEnum;
+@@ -621,6 +622,12 @@
+         FST.Arc<BytesRef> arc;
+ 
+         final TempTermState termState;
++  
++        // metadata buffer, holding monotonical values
++        public long[] longs;
++        // metadata buffer, holding general values
++        public byte[] bytes;
++        ByteArrayDataInput bytesReader;
+ 
+         // Cumulative output so far
+         BytesRef outputPrefix;
+@@ -630,8 +637,9 @@
+ 
+         public Frame(int ord) throws IOException {
+           this.ord = ord;
+-          termState = postingsReader.newTermState();
+-          termState.totalTermFreq = -1;
++          this.termState = postingsReader.newTermState();
++          this.termState.totalTermFreq = -1;
++          this.longs = new long[postingsReader.longsSize(fieldInfo)];
+         }
+ 
+         void loadNextFloorBlock() throws IOException {
+@@ -729,8 +737,17 @@
+ 
+           termState.termBlockOrd = 0;
+           nextEnt = 0;
+-          
+-          postingsReader.readTermsBlock(in, fieldInfo, termState);
++         
++          // metadata
++          numBytes = in.readVInt();
++          if (bytes == null) {
++            bytes = new byte[ArrayUtil.oversize(numBytes, 1)];
++            bytesReader = new ByteArrayDataInput();
++          } else if (bytes.length < numBytes) {
++            bytes = new byte[ArrayUtil.oversize(numBytes, 1)];
++          }
++          in.readBytes(bytes, 0, numBytes);
++          bytesReader.reset(bytes, 0, numBytes);
+ 
+           if (!isLastInFloor) {
+             // Sub-blocks of a single floor block are always
+@@ -788,6 +805,11 @@
+           // We must set/incr state.termCount because
+           // postings impl can look at this
+           termState.termBlockOrd = metaDataUpto;
++
++          if (termState.termBlockOrd == 0) {
++            Arrays.fill(longs, 0);
++          }
++          final int longSize = longs.length;
+       
+           // TODO: better API would be "jump straight to term=N"???
+           while (metaDataUpto < limit) {
+@@ -800,14 +822,18 @@
+ 
+             // TODO: if docFreq were bulk decoded we could
+             // just skipN here:
++
++            // stats
+             termState.docFreq = statsReader.readVInt();
+-            //if (DEBUG) System.out.println("    dF=" + state.docFreq);
+             if (fieldInfo.getIndexOptions() != IndexOptions.DOCS_ONLY) {
+               termState.totalTermFreq = termState.docFreq + statsReader.readVLong();
+-              //if (DEBUG) System.out.println("    totTF=" + state.totalTermFreq);
+             }
++            // metadata 
++            for (int i = 0; i < longSize; i++) {
++              longs[i] += bytesReader.readVLong();
++            }
++            postingsReader.nextTerm(longs, bytesReader, fieldInfo, termState);
+ 
+-            postingsReader.nextTerm(fieldInfo, termState);
+             metaDataUpto++;
+             termState.termBlockOrd++;
+           }
+@@ -2300,10 +2326,17 @@
+ 
+         final TempTermState state;
+ 
++        // metadata buffer, holding monotonical values
++        public long[] longs;
++        // metadata buffer, holding general values
++        public byte[] bytes;
++        ByteArrayDataInput bytesReader;
++
+         public Frame(int ord) throws IOException {
+           this.ord = ord;
+-          state = postingsReader.newTermState();
+-          state.totalTermFreq = -1;
++          this.state = postingsReader.newTermState();
++          this.state.totalTermFreq = -1;
++          this.longs = new long[postingsReader.longsSize(fieldInfo)];
+         }
+ 
+         public void setFloorData(ByteArrayDataInput in, BytesRef source) {
+@@ -2401,8 +2434,18 @@
+ 
+           // TODO: we could skip this if !hasTerms; but
+           // that's rare so won't help much
+-          postingsReader.readTermsBlock(in, fieldInfo, state);
++          // metadata
++          numBytes = in.readVInt();
++          if (bytes == null) {
++            bytes = new byte[ArrayUtil.oversize(numBytes, 1)];
++            bytesReader = new ByteArrayDataInput();
++          } else if (bytes.length < numBytes) {
++            bytes = new byte[ArrayUtil.oversize(numBytes, 1)];
++          }
++          in.readBytes(bytes, 0, numBytes);
++          bytesReader.reset(bytes, 0, numBytes);
+ 
++
+           // Sub-blocks of a single floor block are always
+           // written one after another -- tail recurse:
+           fpEnd = in.getFilePointer();
+@@ -2590,6 +2633,11 @@
+           // We must set/incr state.termCount because
+           // postings impl can look at this
+           state.termBlockOrd = metaDataUpto;
++
++          if (state.termBlockOrd == 0) {
++            Arrays.fill(longs, 0);
++          }
++          final int longSize = longs.length;
+       
+           // TODO: better API would be "jump straight to term=N"???
+           while (metaDataUpto < limit) {
+@@ -2602,14 +2650,18 @@
+ 
+             // TODO: if docFreq were bulk decoded we could
+             // just skipN here:
++
++            // stats
+             state.docFreq = statsReader.readVInt();
+-            //if (DEBUG) System.out.println("    dF=" + state.docFreq);
+             if (fieldInfo.getIndexOptions() != IndexOptions.DOCS_ONLY) {
+               state.totalTermFreq = state.docFreq + statsReader.readVLong();
+-              //if (DEBUG) System.out.println("    totTF=" + state.totalTermFreq);
+             }
++            // metadata 
++            for (int i = 0; i < longSize; i++) {
++              longs[i] += bytesReader.readVLong();
++            }
++            postingsReader.nextTerm(longs, bytesReader, fieldInfo, state);
+ 
+-            postingsReader.nextTerm(fieldInfo, state);
+             metaDataUpto++;
+             state.termBlockOrd++;
+           }
+Index: lucene/core/src/java/org/apache/lucene/codecs/temp/TempBlockTermsWriter.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/temp/TempBlockTermsWriter.java	(revision 1493481)
++++ lucene/core/src/java/org/apache/lucene/codecs/temp/TempBlockTermsWriter.java	(working copy)
+@@ -21,6 +21,7 @@
+ import java.util.ArrayList;
+ import java.util.Comparator;
+ import java.util.List;
++import java.util.Arrays;
+ 
+ import org.apache.lucene.index.FieldInfo.IndexOptions;
+ import org.apache.lucene.index.FieldInfo;
+@@ -481,6 +482,15 @@
+       }
+     }
+   }
++  
++  private static final class PendingMetaData {
++    public long[] longs;
++    public RAMOutputStream bytesWriter;
++    public PendingMetaData(int length) {
++      longs = new long[length];
++      bytesWriter = new RAMOutputStream();
++    }
++  }
+ 
+   final RAMOutputStream scratchBytes = new RAMOutputStream();
+ 
+@@ -936,8 +946,8 @@
+       bytesWriter2.writeTo(out);
+       bytesWriter2.reset();
+ 
+-      // Have postings writer write block
+-      postingsWriter.flushTermsBlock(futureTermCount+termCount, termCount);
++      // Write term metadata block
++      flushTermsBlock(futureTermCount+termCount, termCount);
+ 
+       // Remove slice replaced by block:
+       slice.clear();
+@@ -957,6 +967,46 @@
+       return new PendingBlock(prefix, startFP, termCount != 0, isFloor, floorLeadByte, subIndices);
+     }
+ 
++    /** Flush count terms starting at start "backwards", as a
++     *  block. start is a negative offset from the end of the
++     *  terms stack, ie bigger start means further back in
++     *  the stack. */
++    void flushTermsBlock(int start, int count) throws IOException {
++      if (count == 0) {
++        out.writeByte((byte) 0);
++        return;
++      }
++
++      assert start <= pendingMetaData.size();
++      assert count <= start;
++
++      final int limit = pendingMetaData.size() - start + count;
++      final int size = postingsWriter.longsSize(fieldInfo);
++
++      long[] lastLongs = new long[size];
++      Arrays.fill(lastLongs, 0);
++      for(int idx=limit-count; idx<limit; idx++) {
++        PendingMetaData meta = pendingMetaData.get(idx);
++        for (int pos = 0; pos < size; pos++) {
++          if (meta.longs[pos] < 0) {
++            // nocommit: this -1 padding is implicit (maybe we need javadocs, or better
++            // an API to tell PostingsBase that: every time you meet a 'don't care', just put -1 on it?
++            meta.longs[pos] = lastLongs[pos];
++          }
++          bytesWriter3.writeVLong(meta.longs[pos] - lastLongs[pos]);
++        }
++        lastLongs = meta.longs;
++        meta.bytesWriter.writeTo(bytesWriter3);
++      }
++
++      out.writeVInt((int) bytesWriter3.getFilePointer());
++      bytesWriter3.writeTo(out);
++      bytesWriter3.reset();
++
++      // Remove the terms we just wrote:
++      pendingMetaData.subList(limit-count, limit).clear();
++    }
++
+     TermsWriter(FieldInfo fieldInfo) {
+       this.fieldInfo = fieldInfo;
+ 
+@@ -997,6 +1047,9 @@
+ 
+     private final IntsRef scratchIntsRef = new IntsRef();
+ 
++    private final List<PendingMetaData> pendingMetaData = new ArrayList<PendingMetaData>();
++    private final RAMOutputStream bytesWriter3 = new RAMOutputStream();
++
+     @Override
+     public void finishTerm(BytesRef text, TermStats stats) throws IOException {
+ 
+@@ -1004,8 +1057,11 @@
+       //if (DEBUG) System.out.println("BTTW.finishTerm term=" + fieldInfo.name + ":" + toString(text) + " seg=" + segment + " df=" + stats.docFreq);
+ 
+       blockBuilder.add(Util.toIntsRef(text, scratchIntsRef), noOutputs.getNoOutput());
+-      pending.add(new PendingTerm(BytesRef.deepCopyOf(text), stats));
+-      postingsWriter.finishTerm(stats);
++      PendingTerm term = new PendingTerm(BytesRef.deepCopyOf(text), stats);
++      PendingMetaData meta = new PendingMetaData(postingsWriter.longsSize(fieldInfo));
++      pending.add(term);
++      postingsWriter.finishTerm(meta.longs, meta.bytesWriter, stats);
++      pendingMetaData.add(meta);
+       numTerms++;
+     }
+ 
+Index: lucene/core/src/java/org/apache/lucene/codecs/temp/TempPostingsReader.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/temp/TempPostingsReader.java	(revision 1493481)
++++ lucene/core/src/java/org/apache/lucene/codecs/temp/TempPostingsReader.java	(working copy)
+@@ -199,79 +199,41 @@
+     IOUtils.close(docIn, posIn, payIn);
+   }
+ 
+-  /* Reads but does not decode the byte[] blob holding
+-     metadata for the current terms block */
+   @Override
+-  public void readTermsBlock(IndexInput termsIn, FieldInfo fieldInfo, TempTermState _termState) throws IOException {
+-    final IntBlockTermState termState = (IntBlockTermState) _termState;
+-
+-    final int numBytes = termsIn.readVInt();
+-
+-    if (termState.bytes == null) {
+-      termState.bytes = new byte[ArrayUtil.oversize(numBytes, 1)];
+-      termState.bytesReader = new ByteArrayDataInput();
+-    } else if (termState.bytes.length < numBytes) {
+-      termState.bytes = new byte[ArrayUtil.oversize(numBytes, 1)];
++  public int longsSize(FieldInfo fieldInfo) {
++    final boolean fieldHasPositions = fieldInfo.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0;
++    if (fieldHasPositions) {
++      return 3;
++    } else {
++      return 1;
+     }
+-
+-    termsIn.readBytes(termState.bytes, 0, numBytes);
+-    termState.bytesReader.reset(termState.bytes, 0, numBytes);
+   }
+ 
+   @Override
+-  public void nextTerm(FieldInfo fieldInfo, TempTermState _termState)
++  public void nextTerm(long[] longs, DataInput in, FieldInfo fieldInfo, TempTermState _termState)
+     throws IOException {
+     final IntBlockTermState termState = (IntBlockTermState) _termState;
+-    final boolean isFirstTerm = termState.termBlockOrd == 0;
+     final boolean fieldHasPositions = fieldInfo.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0;
+     final boolean fieldHasOffsets = fieldInfo.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0;
+     final boolean fieldHasPayloads = fieldInfo.hasPayloads();
++    
++    termState.docStartFP = longs[0];
++    if (fieldHasPositions) {
++      termState.posStartFP = longs[1];
++      termState.payStartFP = longs[2];
++    }
+ 
+-    final DataInput in = termState.bytesReader;
+-    if (isFirstTerm) {
+-      if (termState.docFreq == 1) {
+-        termState.singletonDocID = in.readVInt();
+-        termState.docStartFP = 0;
+-      } else {
+-        termState.singletonDocID = -1;
+-        termState.docStartFP = in.readVLong();
+-      }
+-      if (fieldHasPositions) {
+-        termState.posStartFP = in.readVLong();
+-        if (termState.totalTermFreq > BLOCK_SIZE) {
+-          termState.lastPosBlockOffset = in.readVLong();
+-        } else {
+-          termState.lastPosBlockOffset = -1;
+-        }
+-        if ((fieldHasPayloads || fieldHasOffsets) && termState.totalTermFreq >= BLOCK_SIZE) {
+-          termState.payStartFP = in.readVLong();
+-        } else {
+-          termState.payStartFP = -1;
+-        }
+-      }
++    if (termState.docFreq == 1) {
++      termState.singletonDocID = in.readVInt();
+     } else {
+-      if (termState.docFreq == 1) {
+-        termState.singletonDocID = in.readVInt();
++      termState.singletonDocID = -1;
++    }
++    if (fieldHasPositions) {
++      if (termState.totalTermFreq > BLOCK_SIZE) {
++        termState.lastPosBlockOffset = in.readVLong();
+       } else {
+-        termState.singletonDocID = -1;
+-        termState.docStartFP += in.readVLong();
++        termState.lastPosBlockOffset = -1;
+       }
+-      if (fieldHasPositions) {
+-        termState.posStartFP += in.readVLong();
+-        if (termState.totalTermFreq > BLOCK_SIZE) {
+-          termState.lastPosBlockOffset = in.readVLong();
+-        } else {
+-          termState.lastPosBlockOffset = -1;
+-        }
+-        if ((fieldHasPayloads || fieldHasOffsets) && termState.totalTermFreq >= BLOCK_SIZE) {
+-          long delta = in.readVLong();
+-          if (termState.payStartFP == -1) {
+-            termState.payStartFP = delta;
+-          } else {
+-            termState.payStartFP += delta;
+-          }
+-        }
+-      }
+     }
+ 
+     if (termState.docFreq > BLOCK_SIZE) {
+Index: lucene/core/src/java/org/apache/lucene/codecs/temp/TempPostingsWriter.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/temp/TempPostingsWriter.java	(revision 1493481)
++++ lucene/core/src/java/org/apache/lucene/codecs/temp/TempPostingsWriter.java	(working copy)
+@@ -35,6 +35,7 @@
+ import org.apache.lucene.index.FieldInfo.IndexOptions;
+ import org.apache.lucene.index.IndexFileNames;
+ import org.apache.lucene.index.SegmentWriteState;
++import org.apache.lucene.store.DataOutput;
+ import org.apache.lucene.store.IndexOutput;
+ import org.apache.lucene.store.RAMOutputStream;
+ import org.apache.lucene.util.ArrayUtil;
+@@ -73,8 +74,6 @@
+   final IndexOutput posOut;
+   final IndexOutput payOut;
+ 
+-  private IndexOutput termsOut;
+-
+   // How current field indexes postings:
+   private boolean fieldHasFreqs;
+   private boolean fieldHasPositions;
+@@ -192,7 +191,6 @@
+ 
+   @Override
+   public void start(IndexOutput termsOut) throws IOException {
+-    this.termsOut = termsOut;
+     CodecUtil.writeHeader(termsOut, TERMS_CODEC, VERSION_CURRENT);
+     termsOut.writeVInt(BLOCK_SIZE);
+   }
+@@ -350,29 +348,17 @@
+     }
+   }
+ 
+-  private static class PendingTerm {
+-    public final long docStartFP;
+-    public final long posStartFP;
+-    public final long payStartFP;
+-    public final long skipOffset;
+-    public final long lastPosBlockOffset;
+-    public final int singletonDocID;
+-
+-    public PendingTerm(long docStartFP, long posStartFP, long payStartFP, long skipOffset, long lastPosBlockOffset, int singletonDocID) {
+-      this.docStartFP = docStartFP;
+-      this.posStartFP = posStartFP;
+-      this.payStartFP = payStartFP;
+-      this.skipOffset = skipOffset;
+-      this.lastPosBlockOffset = lastPosBlockOffset;
+-      this.singletonDocID = singletonDocID;
++  public int longsSize(FieldInfo info) {
++    if (fieldHasPositions) {
++      return 3;  // doc + pos + pay FP
++    } else {
++      return 1;  // docFP
+     }
+   }
+ 
+-  private final List<PendingTerm> pendingTerms = new ArrayList<PendingTerm>();
+-
+   /** Called when we are done adding docs to this term */
+   @Override
+-  public void finishTerm(TermStats stats) throws IOException {
++  public void finishTerm(long[] longs, DataOutput out, TermStats stats) throws IOException {
+     assert stats.docFreq > 0;
+ 
+     // TODO: wasteful we are counting this (counting # docs
+@@ -514,72 +500,35 @@
+     } else {
+       payStartFP = -1;
+     }
+-
+     // if (DEBUG) {
+     //   System.out.println("  payStartFP=" + payStartFP);
+     // }
+ 
+-    pendingTerms.add(new PendingTerm(docTermStartFP, posTermStartFP, payStartFP, skipOffset, lastPosBlockOffset, singletonDocID));
++    // write metadata
++    longs[0] = docTermStartFP;
++    if (fieldHasPositions) {
++      longs[1] = posTermStartFP;
++      longs[2] = payStartFP;
++    }
++    if (singletonDocID != -1) {
++      out.writeVInt(singletonDocID);
++    }
++    if (fieldHasPositions) {
++      if (lastPosBlockOffset != -1) {
++        out.writeVLong(lastPosBlockOffset);
++      }
++    }
++    if (skipOffset != -1) {
++      out.writeVLong(skipOffset);
++    }
++
+     docBufferUpto = 0;
+     posBufferUpto = 0;
+     lastDocID = 0;
+     docCount = 0;
+   }
+ 
+-  private final RAMOutputStream bytesWriter = new RAMOutputStream();
+-
+   @Override
+-  public void flushTermsBlock(int start, int count) throws IOException {
+-
+-    if (count == 0) {
+-      termsOut.writeByte((byte) 0);
+-      return;
+-    }
+-
+-    assert start <= pendingTerms.size();
+-    assert count <= start;
+-
+-    final int limit = pendingTerms.size() - start + count;
+-
+-    long lastDocStartFP = 0;
+-    long lastPosStartFP = 0;
+-    long lastPayStartFP = 0;
+-    for(int idx=limit-count; idx<limit; idx++) {
+-      PendingTerm term = pendingTerms.get(idx);
+-
+-      if (term.singletonDocID == -1) {
+-        bytesWriter.writeVLong(term.docStartFP - lastDocStartFP);
+-        lastDocStartFP = term.docStartFP;
+-      } else {
+-        bytesWriter.writeVInt(term.singletonDocID);
+-      }
+-
+-      if (fieldHasPositions) {
+-        bytesWriter.writeVLong(term.posStartFP - lastPosStartFP);
+-        lastPosStartFP = term.posStartFP;
+-        if (term.lastPosBlockOffset != -1) {
+-          bytesWriter.writeVLong(term.lastPosBlockOffset);
+-        }
+-        if ((fieldHasPayloads || fieldHasOffsets) && term.payStartFP != -1) {
+-          bytesWriter.writeVLong(term.payStartFP - lastPayStartFP);
+-          lastPayStartFP = term.payStartFP;
+-        }
+-      }
+-
+-      if (term.skipOffset != -1) {
+-        bytesWriter.writeVLong(term.skipOffset);
+-      }
+-    }
+-
+-    termsOut.writeVInt((int) bytesWriter.getFilePointer());
+-    bytesWriter.writeTo(termsOut);
+-    bytesWriter.reset();
+-
+-    // Remove the terms we just wrote:
+-    pendingTerms.subList(limit-count, limit).clear();
+-  }
+-
+-  @Override
+   public void close() throws IOException {
+     IOUtils.close(docOut, posOut, payOut);
+   }
+Index: lucene/core/src/java/org/apache/lucene/codecs/temp/TempTermState.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/temp/TempTermState.java	(revision 1493481)
++++ lucene/core/src/java/org/apache/lucene/codecs/temp/TempTermState.java	(working copy)
+@@ -16,8 +16,11 @@
+  * limitations under the License.
+  */
+ 
++import java.util.Arrays;
++
+ import org.apache.lucene.index.DocsEnum; // javadocs
+ import org.apache.lucene.index.TermState;
++import org.apache.lucene.store.ByteArrayDataInput;
+ 
+ /**
+  * Holds all state required for {@link PostingsReaderBase}

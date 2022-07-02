@@ -1,0 +1,291 @@
+diff --git a/build.gradle b/build.gradle
+index b77e8209371..8ff971a8255 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -103,6 +103,7 @@ apply from: file('gradle/validation/owasp-dependency-check.gradle')
+ apply from: file('gradle/validation/ecj-lint.gradle')
+ apply from: file('gradle/validation/gradlew-scripts-tweaked.gradle')
+ apply from: file('gradle/validation/missing-docs-check.gradle')
++apply from: file('gradle/validation/validate-log-calls.gradle')
+ 
+ // Source or data regeneration tasks
+ apply from: file('gradle/generation/jflex.gradle')
+diff --git a/gradle/help.gradle b/gradle/help.gradle
+index 872762976f7..d76ce902596 100644
+--- a/gradle/help.gradle
++++ b/gradle/help.gradle
+@@ -26,6 +26,7 @@ configure(rootProject) {
+       ["ForbiddenApis", "help/forbiddenApis.txt", "How to add/apply rules for forbidden APIs."],
+       ["LocalSettings", "help/localSettings.txt", "Local settings, overrides and build performance tweaks."],
+       ["Git", "help/git.txt", "Git assistance and guides."],
++      ["ValidateLogCalls", "help/validateLogCalls.txt", "How to use logging calls efficiently."],
+   ]
+ 
+   helpFiles.each { section, path, sectionInfo ->
+@@ -45,7 +46,7 @@ configure(rootProject) {
+       println "guidelines, ant-equivalent commands etc. under help/*; or type:"
+       helpFiles.each { section, path, sectionInfo ->
+         println String.format(Locale.ROOT,
+-            "  gradlew :help%-14s # %s", section, sectionInfo)
++            "  gradlew :help%-16s # %s", section, sectionInfo)
+       }
+     }
+   }
+diff --git a/gradle/validation/validate-log-calls.gradle b/gradle/validation/validate-log-calls.gradle
+new file mode 100644
+index 00000000000..b5b563960a7
+--- /dev/null
++++ b/gradle/validation/validate-log-calls.gradle
+@@ -0,0 +1,174 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.tools.ant.BuildException
++
++import static java.util.concurrent.TimeUnit.SECONDS
++
++// Checks logging calls to keep from using patterns that might be expensive
++// either in CPU or unnecessary object creation
++
++configure(rootProject) {
++
++  allprojects {
++
++    task validateLogCalls(type: ValidateLogCallsTask) {
++      description "Checks that log calls are either validated or conform to efficient patterns."
++      group "verification"
++
++      doFirst {
++        if (project.hasProperty('srcDir')) {
++          srcDir = project.getProperty('srcDir')
++        } else { // Remove this later, make it optional
++          throw new BuildException(String.format(Locale.ENGLISH,
++              '''Until we get all the calls cleaned up, you MUST specify -PsrcDir=relative_path, e.g.
++            "-PsrcDir=solr/core/src/java/org/apache/solr/core". This task will recursively check all
++             "*.java" files under that directory'''))
++        }
++      }
++    }
++  }
++}
++
++class ValidateLogCallsTask extends DefaultTask {
++  @Input
++  String srcDir = ""
++  def logLevels = ["log.trace", "log.debug", "log.info", "log.warn", "log.error", "log.fatal"]
++
++  def found = 0;
++  def violations = new TreeSet();
++
++  def reportViolation(String msg) {
++    violations.add(msg + System.lineSeparator);
++    found++;
++  }
++
++  // We have a log.someting line, check for patterns we're not fond of.
++  def checkLogLine(File file, String line, int lineNumber, String prevLine) {
++    // Strip all of the comments, things in quotes and the like.
++    def level = ""
++    def lev = (line =~ "log\\.(.*?)\\(")
++    if (lev.find()) {
++      level = lev.group(1)
++    }
++    def stripped =
++        line.replaceFirst(/.*?\(/, "") // Get rid of "log.info("
++            .replaceFirst(/\);/, "") // get rid of the closing ");"
++            .replaceAll(/".*?"/, " ") // remove anything between quotes. This is a bit fragile if there are embedded double quotes.
++            .replaceAll("/\\*.*?\\*/", " ") // replace embedded comments "/*....*/"
++            .replaceAll("//.*", " ") // remove comment to EOL. Again, fragile due to the possibility of embedded double slashes
++            .replaceAll(/timeLeft\(.*?\)/, " ") // used all over tests, it's benign
++            .replaceAll(/TimeUnit\..*?\.convert\(.*?\)/, " ") // again, a pattern that's efficient
++
++
++    def m = stripped =~ "\\(.*?\\)"
++    if (m.find() || stripped.contains("+")) {
++      // Check that previous line isn't an if statement for this log level
++      if (prevLine.toLowerCase().contains("is" + level + "enabled") == false) {
++        reportViolation(String.format("Suspicious logging call File: '%s' line: '%d' log message: '%s' parent path: '%s'. Parameterize or surround with 'if (log.is*Enabled) {..."
++            , file.name
++            , lineNumber, line
++            , file.getParentFile().getAbsolutePath()))
++      }
++    }
++  }
++
++  // Require all our logger definitions lower case "log", except a couple of special ones.
++  def checkLogName(File file, String line) {
++    // It's many times faster to do check this way than use a regex
++    if (line.contains("static ") && line.contains("getLogger") && line.contains(" log ") == false) {
++      switch (file.name) {
++        case "LoggerFactory.java": break
++        case "SolrCore.java": // Except for two know log files with a different name.
++          if (line.contains("requestLog") || line.contains("slowLog")) {
++            break
++          }
++        default:
++          reportViolation("Change the logger name to lower-case 'log' in " + file.name + " " + line)
++          break;
++      }
++    }
++  }
++
++  def checkFile(File file) {
++    int state = 0 // 0 == not collecting a log line, 1 == collecting a log line, 2 == just collected the last.
++    int lineNumber = 0
++    StringBuilder sb = new StringBuilder();
++
++    // We have to assemble line-by-line to get the full log statement. We require that all loggers (except requestLog
++    // and slowLog) be exactly "log". That will be checked as well.
++    String prevLine = ""
++    file.eachLine { String line ->
++      lineNumber++
++      checkLogName(file, line)
++      switch (state) {
++        case 0:
++          logLevels.each {
++            if (line.contains(it)) {
++              if (line.contains(");")) {
++                state = 2
++              } else {
++                state = 1
++              }
++              sb.setLength(0)
++              sb.append(line)
++            }
++          }
++          break
++
++        case 1: // collecting
++          if (line.contains(");")) {
++            state = 2
++          }
++          sb.append(line)
++          break
++
++        default:
++          reportViolation("Bad state, should be 0-1 in the switch statement") // make people aware the code sucks
++          break
++      }
++      switch (state) { // It's just easier to do this here rather than read another line in the switch above.
++        case 0:
++          prevLine = line;
++          break;
++        case 1:
++          break;
++        case 2:
++          checkLogLine(file, sb.toString(), lineNumber, prevLine)
++          state = 0
++          break;
++        default:
++          break;
++      }
++    }
++  }
++
++  @TaskAction
++  def checkLogLines() {
++    project.sourceSets.each { srcSet ->
++      srcSet.java.each { f ->
++        if (srcDir != null && f.getCanonicalPath().contains(srcDir)) {
++          checkFile(f)
++        }
++      }
++    }
++    if (found) {
++      throw new BuildException(String.format(Locale.ENGLISH, 'Found %d violations in source files (%s).',
++          found, violations.join(', ')));
++    }
++  }
++}
+diff --git a/help/validateLogCalls.txt b/help/validateLogCalls.txt
+new file mode 100644
+index 00000000000..4815bf00c7f
+--- /dev/null
++++ b/help/validateLogCalls.txt
+@@ -0,0 +1,46 @@
++Using log calls
++===============
++
++There are several hidden gotchas when using logging. The main
++problem is that certain patterns are evaluated and objects
++constructed even if the logging level is more restrictive
++than this call. If the logging level is WARN, then the following
++log.info patterns are evaluated and never-used objects are
++created even though the message is never logged.
++
++This can be very expensive as per measurements with Java Flight
++Recorder. It's particularly egregious when complex operations
++are performed for, say, log.debug or trace calls, which
++are rarely actually used.
++
++- log.info("some stuff " + "some other stuff") will concatenate the
++  strings and create an object 
++
++- log.info("some stuff {}", object.method()) will execute the
++  method.
++
++- log.info("some stuff {}", object.toString()) will execute
++  the toString and then throw the results away.
++
++-----------
++NOTES:
++
++- If you're creating a logging call that has no choice but to
++  do something expensive, surround it with "if (log.is*Enabled)".
++
++- Logging calls can take a bare exception, but do not
++  use the braces if you want the stack trace! So
++  log.info("stuff {}", exception) will not print the full stack,
++  log.info("stuff ", exception) _will_ print the full stack.
++  log.inf0("stuff {} ", some_object, exception) will print the full stack.
++
++- When slf4j supports lambdas in logging calls (log4j2 does now),
++  we can use lambdas rather than "if log.is*Enabled". slf4j 2.0
++  will when released.
++
++For a fuller discussion, see LUCENE-7788 and the other JIRAs linked
++from there.
++
++Until we get all the calls cleaned up, you MUST specify -PsrcDir=relative_path,
++ e.g. '-PsrcDir=solr/core/src/java/org/apache/solr/core'. This task will
++ recursively check all '*.java. files under that directory.
+diff --git a/solr/test-framework/src/java/org/apache/solr/cloud/AbstractDistribZkTestBase.java b/solr/test-framework/src/java/org/apache/solr/cloud/AbstractDistribZkTestBase.java
+index 51a38734ec4..48b4acd17e6 100644
+--- a/solr/test-framework/src/java/org/apache/solr/cloud/AbstractDistribZkTestBase.java
++++ b/solr/test-framework/src/java/org/apache/solr/cloud/AbstractDistribZkTestBase.java
+@@ -221,7 +221,9 @@ public abstract class AbstractDistribZkTestBase extends BaseDistributedSearchTes
+       DocCollection coll = clusterState.getCollection("collection1");
+       Slice slice = coll.getSlice(shardName);
+       if (slice.getLeader() != null && !slice.getLeader().equals(oldLeader) && slice.getLeader().getState() == Replica.State.ACTIVE) {
+-        log.info("Old leader {}, new leader {}. New leader got elected in {} ms", oldLeader, slice.getLeader(),timeOut.timeElapsed(MILLISECONDS) ); // verified
++        if (log.isInfoEnabled()) {
++          log.info("Old leader {}, new leader {}. New leader got elected in {} ms", oldLeader, slice.getLeader(), timeOut.timeElapsed(MILLISECONDS));
++        }
+         break;
+       }
+ 
+@@ -240,7 +242,9 @@ public abstract class AbstractDistribZkTestBase extends BaseDistributedSearchTes
+ 
+       Slice slice = docCollection.getSlice(shardName);
+       if (slice != null && slice.getLeader() != null && !slice.getLeader().equals(oldLeader) && slice.getLeader().getState() == Replica.State.ACTIVE) {
+-        log.info("Old leader {}, new leader {}. New leader got elected in {} ms", oldLeader, slice.getLeader(), timeOut.timeElapsed(MILLISECONDS) ); // verified
++        if (log.isInfoEnabled()) {
++          log.info("Old leader {}, new leader {}. New leader got elected in {} ms", oldLeader, slice.getLeader(), timeOut.timeElapsed(MILLISECONDS));
++        }
+         return true;
+       }
+       return false;

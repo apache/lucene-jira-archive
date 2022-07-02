@@ -1,0 +1,427 @@
+diff --git a/lucene/core/src/java/org/apache/lucene/search/BlockMaxConjunctionScorer.java b/lucene/core/src/java/org/apache/lucene/search/BlockMaxConjunctionScorer.java
+index cbfcd2eb15..b49c8006df 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/BlockMaxConjunctionScorer.java
++++ b/lucene/core/src/java/org/apache/lucene/search/BlockMaxConjunctionScorer.java
+@@ -246,6 +246,7 @@ final class BlockMaxConjunctionScorer extends Scorer {
+   @Override
+   public void setMinCompetitiveScore(float score) {
+     minScore = score;
++    maxScorePropagator.setMinCompetitiveScore(score);
+   }
+ 
+   @Override
+diff --git a/lucene/core/src/java/org/apache/lucene/search/ConjunctionScorer.java b/lucene/core/src/java/org/apache/lucene/search/ConjunctionScorer.java
+index 7a1b956372..5fe5c7531b 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/ConjunctionScorer.java
++++ b/lucene/core/src/java/org/apache/lucene/search/ConjunctionScorer.java
+@@ -27,7 +27,6 @@ class ConjunctionScorer extends Scorer {
+   final DocIdSetIterator disi;
+   final Scorer[] scorers;
+   final Collection<Scorer> required;
+-  final MaxScoreSumPropagator maxScorePropagator;
+ 
+   /** Create a new {@link ConjunctionScorer}, note that {@code scorers} must be a subset of {@code required}. */
+   ConjunctionScorer(Weight weight, Collection<Scorer> required, Collection<Scorer> scorers) throws IOException {
+@@ -36,7 +35,6 @@ class ConjunctionScorer extends Scorer {
+     this.disi = ConjunctionDISI.intersectScorers(required);
+     this.scorers = scorers.toArray(new Scorer[scorers.size()]);
+     this.required = required;
+-    this.maxScorePropagator = new MaxScoreSumPropagator(scorers);
+   }
+ 
+   @Override
+diff --git a/lucene/core/src/java/org/apache/lucene/search/MaxScoreSumPropagator.java b/lucene/core/src/java/org/apache/lucene/search/MaxScoreSumPropagator.java
+index 6c204ed040..36c46f1b22 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/MaxScoreSumPropagator.java
++++ b/lucene/core/src/java/org/apache/lucene/search/MaxScoreSumPropagator.java
+@@ -19,8 +19,11 @@ package org.apache.lucene.search;
+ import java.io.IOException;
+ import java.util.Collection;
+ 
++import org.apache.lucene.util.InPlaceMergeSorter;
+ import org.apache.lucene.util.MathUtil;
+ 
++import static org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;
++
+ /**
+  * Utility class to propagate scoring information in {@link BooleanQuery}, which
+  * compute the score as the sum of the scores of its matching clauses.
+@@ -28,12 +31,65 @@ import org.apache.lucene.util.MathUtil;
+  */
+ final class MaxScoreSumPropagator {
+ 
++  /**
++   * Return an array which, at index i, stores the sum of all entries of
++   * {@code v} except the one at index i.
++   */
++  private static double[] computeSumOfComplement(float[] v) {
++    // We do not use subtraction on purpose because it would defeat the
++    // upperbound formula that we use for sums.
++    // Naive approach would be O(n^2), but we can do O(n) by computing the
++    // sum for i<j and i>j and then sum them.
++    double[] sum1 = new double[v.length];
++    for (int i = 1; i < sum1.length; ++i) {
++      sum1[i] = sum1[i - 1] + v[i - 1];
++    }
++
++    double[] sum2 = new double[v.length];
++    for (int i = sum2.length - 2; i >= 0; --i) {
++      sum2[i] = sum2[i + 1] + v[i + 1];
++    }
++
++    double[] result = new double[v.length];
++    for (int i = 0; i < result.length; ++i) {
++      result[i] = sum1[i] + sum2[i];
++    }
++    return result;
++  }
++
+   private final int numClauses;
+   private final Scorer[] scorers;
++  private final double[] sumOfOtherMaxScores;
+ 
+   MaxScoreSumPropagator(Collection<? extends Scorer> scorerList) throws IOException {
+     numClauses = scorerList.size();
+     scorers = scorerList.toArray(new Scorer[numClauses]);
++
++    // We'll need max scores multiple times so we cache them
++    float[] maxScores = new float[numClauses];
++    for (int i = 0; i < numClauses; ++i) {
++      scorers[i].advanceShallow(0);
++      maxScores[i] = scorers[i].getMaxScore(NO_MORE_DOCS);
++    }
++    // Sort by decreasing max score
++    new InPlaceMergeSorter() {
++      @Override
++      protected void swap(int i, int j) {
++        Scorer tmp = scorers[i];
++        scorers[i] = scorers[j];
++        scorers[j] = tmp;
++        float tmpF = maxScores[i];
++        maxScores[i] = maxScores[j];
++        maxScores[j] = tmpF;
++      }
++
++      @Override
++      protected int compare(int i, int j) {
++        return Float.compare(maxScores[j], maxScores[i]);
++      }
++    }.sort(0, scorers.length);
++
++    sumOfOtherMaxScores = computeSumOfComplement(maxScores);
+   }
+ 
+   void advanceShallow(int target) throws IOException {
+@@ -54,6 +110,48 @@ final class MaxScoreSumPropagator {
+     return scoreSumUpperBound(maxScore);
+   }
+ 
++  void setMinCompetitiveScore(float minScore) {
++    // A double that is less than 'minScore' might still be converted to 'minScore'
++    // when casted to a float, so we go to the previous float to avoid this issue
++    float minScoreDown = Math.nextDown(minScore);
++    for (int i = 0; i < numClauses; ++i) {
++      double sumOfOtherMaxScores = this.sumOfOtherMaxScores[i];
++      float minCompetitiveScore = getMinCompetitiveScore(minScoreDown, sumOfOtherMaxScores);
++      if (minCompetitiveScore <= 0) {
++        // given that scorers are sorted by decreasing max score, next scorers will
++        // have 0 as a minimum competitive score too
++        break;
++      }
++      scorers[i].setMinCompetitiveScore(minCompetitiveScore);
++    }
++  }
++
++  /**
++   * Return the minimum score that a Scorer must produce in order for a hit to
++   * be competitive.
++   */
++  private float getMinCompetitiveScore(float minScoreSum, double sumOfOtherMaxScores) {
++    assert numClauses > 0;
++    if (minScoreSum <= sumOfOtherMaxScores) {
++      return 0f;
++    }
++
++    // We need to find a value 'minScore' so that 'minScore + sumOfOtherMaxScores <= minScoreSum'
++    // TODO: is there an efficient way to find the greatest value that meets this requirement?
++    float minScore = (float) (minScoreSum - sumOfOtherMaxScores);
++    int iters = 0;
++    while (scoreSumUpperBound(minScore + sumOfOtherMaxScores) > minScoreSum) {
++      // Important: use ulp of minScoreSum and not minScore to make sure that we
++      // converge quickly.
++      minScore -= Math.ulp(minScoreSum);
++      // this should converge in at most two iterations:
++      //  - one because of the subtraction rounding error
++      //  - one because of the error introduced by sumUpperBound
++      assert ++iters <= 2 : iters;
++    }
++    return Math.max(minScore, 0f);
++  }
++
+   private float scoreSumUpperBound(double sum) {
+     if (numClauses <= 2) {
+       // When there are only two clauses, the sum is always the same regardless
+@@ -72,5 +170,4 @@ final class MaxScoreSumPropagator {
+     double b = MathUtil.sumRelativeErrorBound(numClauses);
+     return (float) ((1.0 + 2 * b) * sum);
+   }
+-
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/search/ReqOptSumScorer.java b/lucene/core/src/java/org/apache/lucene/search/ReqOptSumScorer.java
+index dc3ee0224d..28f64b2d9f 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/ReqOptSumScorer.java
++++ b/lucene/core/src/java/org/apache/lucene/search/ReqOptSumScorer.java
+@@ -18,6 +18,7 @@ package org.apache.lucene.search;
+ 
+ import java.io.IOException;
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.Collection;
+ 
+ import static org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;
+@@ -34,6 +35,7 @@ class ReqOptSumScorer extends Scorer {
+   private final DocIdSetIterator approximation;
+   private final TwoPhaseIterator twoPhase;
+ 
++  private final MaxScoreSumPropagator maxScorePropagator;
+   private float minScore = 0;
+   private float reqMaxScore;
+   private boolean optIsRequired;
+@@ -49,6 +51,11 @@ class ReqOptSumScorer extends Scorer {
+     super(reqScorer.weight);
+     assert reqScorer != null;
+     assert optScorer != null;
++    if (scoreMode == ScoreMode.TOP_SCORES) {
++      this.maxScorePropagator = new MaxScoreSumPropagator(Arrays.asList(reqScorer, optScorer));
++    } else {
++      this.maxScorePropagator = null;
++    }
+     this.reqScorer = reqScorer;
+     this.optScorer = optScorer;
+ 
+@@ -289,6 +296,7 @@ class ReqOptSumScorer extends Scorer {
+     if (reqMaxScore < minScore) {
+       optIsRequired = true;
+     }
++    maxScorePropagator.setMinCompetitiveScore(minScore);
+   }
+ 
+   @Override
+diff --git a/lucene/core/src/java/org/apache/lucene/search/WANDScorer.java b/lucene/core/src/java/org/apache/lucene/search/WANDScorer.java
+index 82b8044cf5..01b46f7da6 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/WANDScorer.java
++++ b/lucene/core/src/java/org/apache/lucene/search/WANDScorer.java
+@@ -193,6 +193,7 @@ final class WANDScorer extends Scorer {
+     long scaledMinScore = scaleMinScore(minScore, scalingFactor);
+     assert scaledMinScore >= minCompetitiveScore;
+     minCompetitiveScore = scaledMinScore;
++    maxScorePropagator.setMinCompetitiveScore(minScore);
+   }
+ 
+   @Override
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestMaxScoreSumPropagator.java b/lucene/core/src/test/org/apache/lucene/search/TestMaxScoreSumPropagator.java
+new file mode 100644
+index 0000000000..d0722330a6
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/search/TestMaxScoreSumPropagator.java
+@@ -0,0 +1,200 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.search;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.List;
++
++import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util.TestUtil;
++
++import static org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;
++
++public class TestMaxScoreSumPropagator extends LuceneTestCase {
++
++  private static class FakeScorer extends Scorer {
++
++    final float maxScore;
++    float minCompetitiveScore;
++
++    FakeScorer(float maxScore) {
++      super(null);
++      this.maxScore = maxScore;
++    }
++
++    @Override
++    public int docID() {
++      return 0;
++    }
++
++    @Override
++    public float score() {
++      throw new UnsupportedOperationException();
++    }
++
++    @Override
++    public DocIdSetIterator iterator() {
++      throw new UnsupportedOperationException();
++    }
++
++    @Override
++    public void setMinCompetitiveScore(float minCompetitiveScore) {
++      this.minCompetitiveScore = minCompetitiveScore;
++    }
++
++    @Override
++    public float getMaxScore(int upTo) throws IOException {
++      assert upTo == NO_MORE_DOCS;
++      return maxScore;
++    }
++  }
++
++  public void test0Clause() throws IOException {
++    MaxScoreSumPropagator p = new MaxScoreSumPropagator(Collections.emptyList());
++    p.setMinCompetitiveScore(0f); // no exception
++    p.setMinCompetitiveScore(0.5f); // no exception
++  }
++
++  public void test1Clause() throws IOException {
++    FakeScorer a = new FakeScorer(1);
++
++    MaxScoreSumPropagator p = new MaxScoreSumPropagator(Collections.singletonList(a));
++    assertEquals(1f, p.getMaxScore(NO_MORE_DOCS), 0f);
++    p.setMinCompetitiveScore(0f);
++    assertEquals(0f, a.minCompetitiveScore, 0f);
++    p.setMinCompetitiveScore(0.5f);
++    assertEquals(Math.nextDown(0.5f), a.minCompetitiveScore, 0f);
++    p.setMinCompetitiveScore(1f);
++    assertEquals(Math.nextDown(1f), a.minCompetitiveScore, 0f);
++  }
++
++  public void test2Clauses() throws IOException {
++    FakeScorer a = new FakeScorer(1);
++    FakeScorer b = new FakeScorer(2);
++
++    MaxScoreSumPropagator p = new MaxScoreSumPropagator(Arrays.asList(a, b));
++    assertEquals(3f, p.getMaxScore(NO_MORE_DOCS), 0f);
++
++    p.setMinCompetitiveScore(1f);
++    assertEquals(0f, a.minCompetitiveScore, 0f);
++    assertEquals(0f, b.minCompetitiveScore, 0f);
++
++    p.setMinCompetitiveScore(2f);
++    assertEquals(0f, a.minCompetitiveScore, 0f);
++    assertEquals(Math.nextDown(2f) - 1f, b.minCompetitiveScore, 0f);
++
++    p.setMinCompetitiveScore(2.5f);
++    assertEquals(Math.nextDown(2.5f) - 2f, a.minCompetitiveScore, 0f);
++    assertEquals(Math.nextDown(2.5f) - 1f, b.minCompetitiveScore, 0f);
++
++    p.setMinCompetitiveScore(3f);
++    assertEquals(Math.nextDown(3f) - 2f, a.minCompetitiveScore, 0f);
++    assertEquals(Math.nextDown(3f) - 1f, b.minCompetitiveScore, 0f);
++  }
++
++  public void test3Clauses() throws IOException {
++    FakeScorer a = new FakeScorer(1);
++    FakeScorer b = new FakeScorer(2);
++    FakeScorer c = new FakeScorer(1.5f);
++
++    MaxScoreSumPropagator p = new MaxScoreSumPropagator(Arrays.asList(a, b, c));
++    assertEquals(4.5f, p.getMaxScore(NO_MORE_DOCS), 0f);
++
++    p.setMinCompetitiveScore(1f);
++    assertEquals(0f, a.minCompetitiveScore, 0f);
++    assertEquals(0f, b.minCompetitiveScore, 0f);
++    assertEquals(0f, c.minCompetitiveScore, 0f);
++
++    p.setMinCompetitiveScore(2f);
++    assertEquals(0f, a.minCompetitiveScore, 0f);
++    assertEquals(0f, b.minCompetitiveScore, 0f);
++    assertEquals(0f, c.minCompetitiveScore, 0f);
++
++    p.setMinCompetitiveScore(3f);
++    assertEquals(0f, a.minCompetitiveScore, 0f);
++    assertEquals(Math.nextDown(3f) - 1f - 1.5f, b.minCompetitiveScore, 0f);
++    assertEquals(0f, c.minCompetitiveScore, 0f);
++
++    p.setMinCompetitiveScore(4f);
++    assertEquals(Math.nextDown(4f) - 2f - 1.5f, a.minCompetitiveScore, 0f);
++    assertEquals(Math.nextDown(4f) - 1f - 1.5f, b.minCompetitiveScore, 0f);
++    assertEquals(Math.nextDown(4f) - 1f - 2f, c.minCompetitiveScore, 0f);
++  }
++
++  public void test2ClausesRandomScore() throws IOException {
++    for (int iter = 0; iter < 10; ++iter) {
++      FakeScorer a = new FakeScorer(random().nextFloat());
++      FakeScorer b = new FakeScorer(Math.nextUp(a.getMaxScore(NO_MORE_DOCS)) + random().nextFloat());
++
++      MaxScoreSumPropagator p = new MaxScoreSumPropagator(Arrays.asList(a, b));
++      assertEquals(a.getMaxScore(NO_MORE_DOCS) + b.getMaxScore(NO_MORE_DOCS), p.getMaxScore(NO_MORE_DOCS), 0f);
++      assertMinCompetitiveScore(Arrays.asList(a, b), p, Math.nextUp(a.getMaxScore(NO_MORE_DOCS)));
++      assertMinCompetitiveScore(Arrays.asList(a, b), p, (a.getMaxScore(NO_MORE_DOCS) + b.getMaxScore(NO_MORE_DOCS)) / 2);
++      assertMinCompetitiveScore(Arrays.asList(a, b), p, Math.nextDown(a.getMaxScore(NO_MORE_DOCS) + b.getMaxScore(NO_MORE_DOCS)));
++      assertMinCompetitiveScore(Arrays.asList(a, b), p, a.getMaxScore(NO_MORE_DOCS) + b.getMaxScore(NO_MORE_DOCS));
++    }
++  }
++
++  public void testNClausesRandomScore() throws IOException {
++    for (int iter = 0; iter < 100; ++iter) {
++      List<FakeScorer> scorers = new ArrayList<>();
++      int numScorers = TestUtil.nextInt(random(), 3, 4 << random().nextInt(8));
++      double sumOfMaxScore = 0;
++      for (int i = 0; i < numScorers; ++i) {
++        float maxScore = random().nextFloat();
++        scorers.add(new FakeScorer(maxScore));
++        sumOfMaxScore += maxScore;
++      }
++
++      MaxScoreSumPropagator p = new MaxScoreSumPropagator(scorers);
++      assertTrue(p.getMaxScore(NO_MORE_DOCS)  >= (float) sumOfMaxScore);
++      for (int i = 0; i < 10; ++i) {
++        final float minCompetitiveScore = random().nextFloat() * numScorers;
++        assertMinCompetitiveScore(scorers, p, minCompetitiveScore);
++        // reset
++        for (FakeScorer scorer : scorers) {
++          scorer.minCompetitiveScore = 0;
++        }
++      }
++    }
++  }
++
++  private void assertMinCompetitiveScore(Collection<FakeScorer> scorers, MaxScoreSumPropagator p, float minCompetitiveScore) throws IOException {
++    p.setMinCompetitiveScore(minCompetitiveScore);
++
++    for (FakeScorer scorer : scorers) {
++      if (scorer.minCompetitiveScore == 0f) {
++        // no propagation is performed, still visiting all hits
++        break;
++      }
++      double scoreSum = scorer.minCompetitiveScore;
++      for (FakeScorer scorer2 : scorers) {
++        if (scorer2 != scorer) {
++          scoreSum += scorer2.getMaxScore(NO_MORE_DOCS);
++        }
++      }
++      assertTrue(
++          "scoreSum=" + scoreSum + ", minCompetitiveScore=" + minCompetitiveScore,
++          (float) scoreSum <= minCompetitiveScore);
++    }
++  }
++}
++

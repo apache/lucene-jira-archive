@@ -1,0 +1,193 @@
+diff --git a/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java b/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java
+index c4c9e61f4f..8eca4573e3 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java
++++ b/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java
+@@ -29,7 +29,6 @@ import java.util.LinkedList;
+ import java.util.List;
+ import java.util.Locale;
+ import java.util.Map;
+-import java.util.PriorityQueue;
+ import java.util.Queue;
+ import java.util.Set;
+ import java.util.concurrent.ConcurrentLinkedQueue;
+@@ -585,32 +584,34 @@ public class IndexWriter implements Closeable, TwoPhaseCommit, Accountable,
+           long startNS = System.nanoTime();
+ 
+           long ramBytesUsed = getReaderPoolRamBytesUsed();
+-          if (ramBytesUsed > 0.5 * ramBufferSizeMB * 1024 * 1024) {
++          if (ramBytesUsed > 0.5 * ramBufferSizeMB * 1024 * 1024 ) {
+             if (infoStream.isEnabled("BD")) {
+               infoStream.message("BD", String.format(Locale.ROOT, "now write some pending DV updates: %.2f MB used vs IWC Buffer %.2f MB",
+                   ramBytesUsed/1024./1024., ramBufferSizeMB));
+             }
+ 
+             // Sort by largest ramBytesUsed:
+-            PriorityQueue<ReadersAndUpdates> queue = readerPool.getReadersByRam();
++            final List<ReadersAndUpdates> list = readerPool.getReadersByRam();
+             int count = 0;
+-            while (ramBytesUsed > 0.5 * ramBufferSizeMB * 1024 * 1024) {
+-              ReadersAndUpdates rld = queue.poll();
+-              if (rld == null) {
++            for (ReadersAndUpdates rld : list) {
++
++              if (ramBytesUsed <= 0.5 * ramBufferSizeMB * 1024 * 1024) {
+                 break;
+               }
+-
+               // We need to do before/after because not all RAM in this RAU is used by DV updates, and
+               // not all of those bytes can be written here:
+               long bytesUsedBefore = rld.ramBytesUsed.get();
+-
++              if (bytesUsedBefore == 0) {
++                continue; // nothing to do here - lets not acquire the lock
++              }
+               // Only acquire IW lock on each write, since this is a time consuming operation.  This way
+               // other threads get a chance to run in between our writes.
+               synchronized (this) {
+                 // It's possible that the segment of a reader returned by readerPool#getReadersByRam
+                 // is dropped before being processed here. If it happens, we need to skip that reader.
++                // this is also best effort to free ram, there might be some other thread writing this rld concurrently
++                // which wins and then if readerPooling is off this rld will be dropped.
+                 if (readerPool.get(rld.info, false) == null) {
+-                  assert segmentInfos.contains(rld.info) == false : "Segment [" + rld.info + "] is not dropped yet";
+                   continue;
+                 }
+                 if (rld.writeFieldUpdates(directory, globalFieldNumberMap, bufferedUpdatesStream.getCompletedDelGen(), infoStream)) {
+diff --git a/lucene/core/src/java/org/apache/lucene/index/ReaderPool.java b/lucene/core/src/java/org/apache/lucene/index/ReaderPool.java
+index 5f62c3724d..9b862e3791 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/ReaderPool.java
++++ b/lucene/core/src/java/org/apache/lucene/index/ReaderPool.java
+@@ -19,19 +19,22 @@ package org.apache.lucene.index;
+ 
+ import java.io.Closeable;
+ import java.io.IOException;
++import java.util.ArrayList;
+ import java.util.Collection;
++import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+-import java.util.PriorityQueue;
+ import java.util.Set;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.function.LongSupplier;
++import java.util.stream.Collectors;
+ 
+ import org.apache.lucene.store.AlreadyClosedException;
+ import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.CollectionUtil;
+ import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.InfoStream;
+ 
+@@ -243,16 +246,35 @@ final class ReaderPool implements Closeable {
+     return any;
+   }
+ 
+-  PriorityQueue<ReadersAndUpdates> getReadersByRam() {
+-    // Sort by largest ramBytesUsed:
+-    PriorityQueue<ReadersAndUpdates> queue = new PriorityQueue<>(readerMap.size(),
+-        (a, b) -> Long.compare(b.ramBytesUsed.get(), a.ramBytesUsed.get()));
++  /**
++   * Returns a list of all currently maintained ReadersAndUpdates sorted by it's ram consumption largest to smallest.
++   * This list can also contain readers that don't consume any ram at this point ie. don't have any updates buffered.
++   */
++  synchronized List<ReadersAndUpdates> getReadersByRam() {
++    class RamRecordingHolder {
++      final ReadersAndUpdates updates;
++      final long ramBytesUsed;
++      RamRecordingHolder(ReadersAndUpdates updates) {
++        this.updates = updates;
++        this.ramBytesUsed = updates.ramBytesUsed.get();
++      }
++    }
++    final ArrayList<RamRecordingHolder> readersByRam;
+     synchronized (this) {
++      if (readerMap.isEmpty()) {
++        return Collections.emptyList();
++      }
++      readersByRam = new ArrayList<>(readerMap.size());
+       for (ReadersAndUpdates rld : readerMap.values()) {
+-        queue.add(rld);
++
++        // we have to record the ram usage once and then sort
++        // since the ram usage can change concurrently and that will confuse the sort or hit an assertion
++        readersByRam.add(new RamRecordingHolder(rld));
+       }
+     }
+-    return queue;
++    // Sort this outside of the lock by largest ramBytesUsed:
++    CollectionUtil.introSort(readersByRam, (a, b) -> Long.compare(b.ramBytesUsed, a.ramBytesUsed));
++    return Collections.unmodifiableList(readersByRam.stream().map(h -> h.updates).collect(Collectors.toList()));
+   }
+ 
+ 
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestBinaryDocValuesUpdates.java b/lucene/core/src/test/org/apache/lucene/index/TestBinaryDocValuesUpdates.java
+index 80ae80423e..e9942e49b2 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestBinaryDocValuesUpdates.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestBinaryDocValuesUpdates.java
+@@ -88,7 +88,7 @@ public class TestBinaryDocValuesUpdates extends LuceneTestCase {
+     return doc;
+   }
+   
+-  public void testUpdatesAreFlushed() throws IOException {
++  public void testUpdatesAreFlushed() throws IOException, InterruptedException {
+     Directory dir = newDirectory();
+     IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig(new MockAnalyzer(random(), MockTokenizer.WHITESPACE, false))
+                                                 .setRAMBufferSizeMB(0.00000001));
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestReaderPool.java b/lucene/core/src/test/org/apache/lucene/index/TestReaderPool.java
+index 36070b59d8..7a858839c2 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestReaderPool.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestReaderPool.java
+@@ -19,6 +19,7 @@ package org.apache.lucene.index;
+ 
+ import java.io.IOException;
+ import java.util.Collections;
++import java.util.List;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ 
+@@ -30,6 +31,7 @@ import org.apache.lucene.document.StringField;
+ import org.apache.lucene.search.DocIdSetIterator;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.IOContext;
++import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.IOSupplier;
+ import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.LuceneTestCase;
+@@ -278,4 +280,34 @@ public class TestReaderPool extends LuceneTestCase {
+     writer.close();
+     return writer.globalFieldNumberMap;
+   }
++
++  public void testGetReaderByRam() throws IOException {
++    Directory directory = newDirectory();
++    FieldInfos.FieldNumbers fieldNumbers = buildIndex(directory);
++    StandardDirectoryReader reader = (StandardDirectoryReader) DirectoryReader.open(directory);
++    SegmentInfos segmentInfos = reader.segmentInfos.clone();
++    ReaderPool pool = new ReaderPool(directory, directory, segmentInfos, fieldNumbers, () -> 0l,
++        new NullInfoStream(), null, null);
++    assertEquals(0, pool.getReadersByRam().size());
++
++    int ord = 0;
++    for (SegmentCommitInfo commitInfo : segmentInfos) {
++      ReadersAndUpdates readersAndUpdates = pool.get(commitInfo, true);
++      BinaryDocValuesFieldUpdates test = new BinaryDocValuesFieldUpdates(0, "test", commitInfo.info.maxDoc());
++      test.add(0, new BytesRef(new byte[ord++]));
++      test.finish();
++      readersAndUpdates.addDVUpdate(test);
++    }
++
++    List<ReadersAndUpdates> readersByRam = pool.getReadersByRam();
++    assertEquals(segmentInfos.size(), readersByRam.size());
++    long previousRam = Long.MAX_VALUE;
++    for (ReadersAndUpdates rld : readersByRam) {
++      assertTrue("previous: " + previousRam + " now: " + rld.ramBytesUsed.get(), previousRam >= rld.ramBytesUsed.get());
++      previousRam = rld.ramBytesUsed.get();
++      rld.dropChanges();
++      pool.drop(rld.info);
++    }
++    IOUtils.close(pool, reader, directory);
++  }
+ }

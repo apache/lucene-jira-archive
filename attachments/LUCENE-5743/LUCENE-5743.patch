@@ -1,0 +1,631 @@
+Index: lucene/core/src/java/org/apache/lucene/codecs/lucene49/Lucene49Codec.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/lucene49/Lucene49Codec.java	(revision 1600984)
++++ lucene/core/src/java/org/apache/lucene/codecs/lucene49/Lucene49Codec.java	(working copy)
+@@ -131,7 +131,7 @@
+   private final PostingsFormat defaultFormat = PostingsFormat.forName("Lucene41");
+   private final DocValuesFormat defaultDVFormat = DocValuesFormat.forName("Lucene49");
+ 
+-  private final NormsFormat normsFormat = new Lucene42NormsFormat();
++  private final NormsFormat normsFormat = new Lucene49NormsFormat();
+ 
+   @Override
+   public final NormsFormat normsFormat() {
+Index: lucene/core/src/java/org/apache/lucene/codecs/lucene49/Lucene49NormsConsumer.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/lucene49/Lucene49NormsConsumer.java	(revision 0)
++++ lucene/core/src/java/org/apache/lucene/codecs/lucene49/Lucene49NormsConsumer.java	(working copy)
+@@ -0,0 +1,206 @@
++package org.apache.lucene.codecs.lucene49;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.HashMap;
++import java.util.HashSet;
++
++import org.apache.lucene.codecs.CodecUtil;
++import org.apache.lucene.codecs.DocValuesConsumer;
++import org.apache.lucene.index.FieldInfo;
++import org.apache.lucene.index.IndexFileNames;
++import org.apache.lucene.index.SegmentWriteState;
++import org.apache.lucene.store.IndexOutput;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.IOUtils;
++import org.apache.lucene.util.packed.BlockPackedWriter;
++import org.apache.lucene.util.packed.PackedInts;
++
++import static org.apache.lucene.codecs.lucene49.Lucene49NormsFormat.VERSION_CURRENT;
++
++/**
++ * Writer for {@link Lucene49NormsFormat}
++ */
++class Lucene49NormsConsumer extends DocValuesConsumer { 
++  static final byte DELTA_COMPRESSED = 0;
++  static final byte TABLE_COMPRESSED = 1;
++  static final byte CONST_COMPRESSED = 2;
++  static final byte UNCOMPRESSED = 3;
++  static final int BLOCK_SIZE = 16384;
++
++  IndexOutput data, meta;
++  final int maxDoc;
++  
++  Lucene49NormsConsumer(SegmentWriteState state, String dataCodec, String dataExtension, String metaCodec, String metaExtension) throws IOException {
++    maxDoc = state.segmentInfo.getDocCount();
++    boolean success = false;
++    try {
++      String dataName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, dataExtension);
++      data = state.directory.createOutput(dataName, state.context);
++      CodecUtil.writeHeader(data, dataCodec, VERSION_CURRENT);
++      String metaName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, metaExtension);
++      meta = state.directory.createOutput(metaName, state.context);
++      CodecUtil.writeHeader(meta, metaCodec, VERSION_CURRENT);
++      success = true;
++    } finally {
++      if (!success) {
++        IOUtils.closeWhileHandlingException(this);
++      }
++    }
++  }
++  
++  // we explicitly use only certain bits per value and a specified format, so we statically check this will work
++  static {
++    assert PackedInts.Format.PACKED_SINGLE_BLOCK.isSupported(1);
++    assert PackedInts.Format.PACKED_SINGLE_BLOCK.isSupported(2);
++    assert PackedInts.Format.PACKED_SINGLE_BLOCK.isSupported(4);
++  }
++
++  @Override
++  public void addNumericField(FieldInfo field, Iterable<Number> values) throws IOException {
++    meta.writeVInt(field.number);
++    long minValue = Long.MAX_VALUE;
++    long maxValue = Long.MIN_VALUE;
++    // TODO: more efficient?
++    HashSet<Long> uniqueValues = null;
++    uniqueValues = new HashSet<>();
++    
++    long count = 0;
++    for (Number nv : values) {
++      if (nv == null) {
++        throw new IllegalStateException("illegal norms data for field " + field.name + ", got null for value: " + count);
++      }
++      final long v = nv.longValue();
++      
++      minValue = Math.min(minValue, v);
++      maxValue = Math.max(maxValue, v);
++      
++      if (uniqueValues != null) {
++        if (uniqueValues.add(v)) {
++          if (uniqueValues.size() > 256) {
++            uniqueValues = null;
++          }
++        }
++      }
++      ++count;
++    }
++    
++    if (count != maxDoc) {
++      throw new IllegalStateException("illegal norms data for field " + field.name + ", expected " + maxDoc + " values, got " + count);
++    }
++    
++    if (uniqueValues != null && uniqueValues.size() == 1) {
++      // 0 bpv
++      meta.writeByte(CONST_COMPRESSED);
++      meta.writeLong(minValue);
++    } else if (uniqueValues != null) {
++      // small number of unique values: this is the typical case:
++      // we only use bpv=1,2,4,8     
++      PackedInts.Format format = PackedInts.Format.PACKED_SINGLE_BLOCK;
++      int bitsPerValue = PackedInts.bitsRequired(uniqueValues.size()-1);
++      if (bitsPerValue == 3) {
++        bitsPerValue = 4;
++      } else if (bitsPerValue > 4) {
++        bitsPerValue = 8;
++      }
++      
++      if (bitsPerValue == 8 && minValue >= Byte.MIN_VALUE && maxValue <= Byte.MAX_VALUE) {
++        meta.writeByte(UNCOMPRESSED); // uncompressed byte[]
++        meta.writeLong(data.getFilePointer());
++        for (Number nv : values) {
++          data.writeByte(nv == null ? 0 : (byte) nv.longValue());
++        }
++      } else {
++        meta.writeByte(TABLE_COMPRESSED); // table-compressed
++        meta.writeLong(data.getFilePointer());
++        data.writeVInt(PackedInts.VERSION_CURRENT);
++        
++        Long[] decode = uniqueValues.toArray(new Long[uniqueValues.size()]);
++        final HashMap<Long,Integer> encode = new HashMap<>();
++        // upgrade to power of two sized array
++        int size = 1 << bitsPerValue;
++        data.writeVInt(size);
++        for (int i = 0; i < decode.length; i++) {
++          data.writeLong(decode[i]);
++          encode.put(decode[i], i);
++        }
++        for (int i = decode.length; i < size; i++) {
++          data.writeLong(0);
++        }
++
++        data.writeVInt(format.getId());
++        data.writeVInt(bitsPerValue);
++
++        final PackedInts.Writer writer = PackedInts.getWriterNoHeader(data, format, maxDoc, bitsPerValue, PackedInts.DEFAULT_BUFFER_SIZE);
++        for(Number nv : values) {
++          writer.add(encode.get(nv.longValue()));
++        }
++        writer.finish();
++      }
++    } else {
++      meta.writeByte(DELTA_COMPRESSED); // delta-compressed
++      meta.writeLong(data.getFilePointer());
++      data.writeVInt(PackedInts.VERSION_CURRENT);
++      data.writeVInt(BLOCK_SIZE);
++
++      final BlockPackedWriter writer = new BlockPackedWriter(data, BLOCK_SIZE);
++      for (Number nv : values) {
++        writer.add(nv.longValue());
++      }
++      writer.finish();
++    }
++  }
++  
++  @Override
++  public void close() throws IOException {
++    boolean success = false;
++    try {
++      if (meta != null) {
++        meta.writeVInt(-1); // write EOF marker
++        CodecUtil.writeFooter(meta); // write checksum
++      }
++      if (data != null) {
++        CodecUtil.writeFooter(data); // write checksum
++      }
++      success = true;
++    } finally {
++      if (success) {
++        IOUtils.close(data, meta);
++      } else {
++        IOUtils.closeWhileHandlingException(data, meta);
++      }
++      meta = data = null;
++    }
++  }
++
++  @Override
++  public void addBinaryField(FieldInfo field, final Iterable<BytesRef> values) throws IOException {
++    throw new UnsupportedOperationException();
++  }
++  
++  @Override
++  public void addSortedField(FieldInfo field, Iterable<BytesRef> values, Iterable<Number> docToOrd) throws IOException {
++    throw new UnsupportedOperationException();
++  }
++
++  @Override
++  public void addSortedSetField(FieldInfo field, Iterable<BytesRef> values, final Iterable<Number> docToOrdCount, final Iterable<Number> ords) throws IOException {
++    throw new UnsupportedOperationException();
++  }
++}
+
+Property changes on: lucene/core/src/java/org/apache/lucene/codecs/lucene49/Lucene49NormsConsumer.java
+___________________________________________________________________
+Added: svn:eol-style
+## -0,0 +1 ##
++native
+\ No newline at end of property
+Index: lucene/core/src/java/org/apache/lucene/codecs/lucene49/Lucene49NormsFormat.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/lucene49/Lucene49NormsFormat.java	(revision 0)
++++ lucene/core/src/java/org/apache/lucene/codecs/lucene49/Lucene49NormsFormat.java	(working copy)
+@@ -0,0 +1,121 @@
++package org.apache.lucene.codecs.lucene49;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++
++import org.apache.lucene.codecs.CodecUtil;
++import org.apache.lucene.codecs.DocValuesConsumer;
++import org.apache.lucene.codecs.DocValuesProducer;
++import org.apache.lucene.codecs.NormsFormat;
++import org.apache.lucene.index.SegmentReadState;
++import org.apache.lucene.index.SegmentWriteState;
++import org.apache.lucene.store.DataOutput;
++import org.apache.lucene.util.SmallFloat;
++import org.apache.lucene.util.packed.BlockPackedWriter;
++import org.apache.lucene.util.packed.PackedInts;
++
++/**
++ * Lucene 4.9 Score normalization format.
++ * <p>
++ * Encodes normalization values with these strategies:
++ * <p>
++ * <ul>
++ *    <li>Uncompressed: when values fit into a single byte and would require more than 4 bits
++ *        per value, they are just encoded as an uncompressed byte array.
++ *    <li>Constant: when there is only one value present for the entire field, no actual data
++ *        is written: this constant is encoded in the metadata
++ *    <li>Table-compressed: when the number of unique values is very small (&lt; 64), and
++ *        when there are unused "gaps" in the range of values used (such as {@link SmallFloat}), 
++ *        a lookup table is written instead. Each per-document entry is instead the ordinal 
++ *        to this table, and those ordinals are compressed with bitpacking ({@link PackedInts}). 
++ *    <li>Delta-compressed: per-document integers written as deltas from the minimum value,
++ *        compressed with bitpacking. For more information, see {@link BlockPackedWriter}.
++ *        This is only used when norms of larger than one byte are present.
++ * </ul>
++ * <p>
++ * Files:
++ * <ol>
++ *   <li><tt>.nvd</tt>: Norms data</li>
++ *   <li><tt>.nvm</tt>: Norms metadata</li>
++ * </ol>
++ * <ol>
++ *   <li><a name="nvm" id="nvm"></a>
++ *   <p>The Norms metadata or .nvm file.</p>
++ *   <p>For each norms field, this stores metadata, such as the offset into the 
++ *      Norms data (.nvd)</p>
++ *   <p>Norms metadata (.dvm) --&gt; Header,&lt;Entry&gt;<sup>NumFields</sup>,Footer</p>
++ *   <ul>
++ *     <li>Header --&gt; {@link CodecUtil#writeHeader CodecHeader}</li>
++ *     <li>Entry --&gt; FieldNumber,Type,Offset</li>
++ *     <li>FieldNumber --&gt; {@link DataOutput#writeVInt vInt}</li>
++ *     <li>Type --&gt; {@link DataOutput#writeByte Byte}</li>
++ *     <li>Offset --&gt; {@link DataOutput#writeLong Int64}</li>
++ *     <li>Footer --&gt; {@link CodecUtil#writeFooter CodecFooter}</li>
++ *   </ul>
++ *   <p>FieldNumber of -1 indicates the end of metadata.</p>
++ *   <p>Offset is the pointer to the start of the data in the norms data (.nvd), or the singleton value for Constant</p>
++ *   <p>Type indicates how Numeric values will be compressed:
++ *      <ul>
++ *         <li>0 --&gt; delta-compressed. For each block of 16k integers, every integer is delta-encoded
++ *             from the minimum value within the block. 
++ *         <li>1 --&gt; table-compressed. When the number of unique numeric values is small and it would save space,
++ *             a lookup table of unique values is written, followed by the ordinal for each document.
++ *         <li>2 --&gt; constant. When there is a single value for the entire field.
++ *         <li>3 --&gt; uncompressed: Values written as a simple byte[].
++ *      </ul>
++ *   <li><a name="nvd" id="nvd"></a>
++ *   <p>The Norms data or .nvd file.</p>
++ *   <p>For each Norms field, this stores the actual per-document data (the heavy-lifting)</p>
++ *   <p>Norms data (.nvd) --&gt; Header,&lt;Uncompressed | TableCompressed | DeltaCompressed&gt;<sup>NumFields</sup>,Footer</p>
++ *   <ul>
++ *     <li>Header --&gt; {@link CodecUtil#writeHeader CodecHeader}</li>
++ *     <li>Uncompressed --&gt;  {@link DataOutput#writeByte Byte}<sup>maxDoc</sup></li>
++ *     <li>TableCompressed --&gt; PackedIntsVersion,Table,BitPackedData</li>
++ *     <li>Table --&gt; TableSize, {@link DataOutput#writeLong int64}<sup>TableSize</sup></li>
++ *     <li>BitpackedData --&gt; {@link PackedInts}</li>
++ *     <li>DeltaCompressed --&gt; PackedIntsVersion,BlockSize,DeltaCompressedData</li>
++ *     <li>DeltaCompressedData --&gt; {@link BlockPackedWriter BlockPackedWriter(blockSize=16k)}</li>
++ *     <li>PackedIntsVersion,BlockSize,TableSize --&gt; {@link DataOutput#writeVInt vInt}</li>
++ *     <li>Footer --&gt; {@link CodecUtil#writeFooter CodecFooter}</li>
++ *   </ul>
++ * </ol>
++ * @lucene.experimental
++ */
++public class Lucene49NormsFormat extends NormsFormat {
++
++  /** Sole Constructor */
++  public Lucene49NormsFormat() {}
++  
++  @Override
++  public DocValuesConsumer normsConsumer(SegmentWriteState state) throws IOException {
++    return new Lucene49NormsConsumer(state, DATA_CODEC, DATA_EXTENSION, METADATA_CODEC, METADATA_EXTENSION);
++  }
++
++  @Override
++  public DocValuesProducer normsProducer(SegmentReadState state) throws IOException {
++    return new Lucene49NormsProducer(state, DATA_CODEC, DATA_EXTENSION, METADATA_CODEC, METADATA_EXTENSION);
++  }
++  
++  private static final String DATA_CODEC = "Lucene49NormsData";
++  private static final String DATA_EXTENSION = "nvd";
++  private static final String METADATA_CODEC = "Lucene49NormsMetadata";
++  private static final String METADATA_EXTENSION = "nvm";
++  static final int VERSION_START = 0;
++  static final int VERSION_CURRENT = VERSION_START;
++}
+
+Property changes on: lucene/core/src/java/org/apache/lucene/codecs/lucene49/Lucene49NormsFormat.java
+___________________________________________________________________
+Added: svn:eol-style
+## -0,0 +1 ##
++native
+\ No newline at end of property
+Index: lucene/core/src/java/org/apache/lucene/codecs/lucene49/Lucene49NormsProducer.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/lucene49/Lucene49NormsProducer.java	(revision 0)
++++ lucene/core/src/java/org/apache/lucene/codecs/lucene49/Lucene49NormsProducer.java	(working copy)
+@@ -0,0 +1,233 @@
++package org.apache.lucene.codecs.lucene49;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.concurrent.atomic.AtomicLong;
++
++import org.apache.lucene.codecs.CodecUtil;
++import org.apache.lucene.codecs.DocValuesProducer;
++import org.apache.lucene.index.BinaryDocValues;
++import org.apache.lucene.index.CorruptIndexException;
++import org.apache.lucene.index.FieldInfo;
++import org.apache.lucene.index.FieldInfos;
++import org.apache.lucene.index.IndexFileNames;
++import org.apache.lucene.index.NumericDocValues;
++import org.apache.lucene.index.SegmentReadState;
++import org.apache.lucene.index.SortedDocValues;
++import org.apache.lucene.index.SortedSetDocValues;
++import org.apache.lucene.store.ChecksumIndexInput;
++import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.util.Bits;
++import org.apache.lucene.util.IOUtils;
++import org.apache.lucene.util.RamUsageEstimator;
++import org.apache.lucene.util.packed.BlockPackedReader;
++import org.apache.lucene.util.packed.PackedInts;
++
++import static org.apache.lucene.codecs.lucene49.Lucene49NormsFormat.VERSION_START;
++import static org.apache.lucene.codecs.lucene49.Lucene49NormsFormat.VERSION_CURRENT;
++import static org.apache.lucene.codecs.lucene49.Lucene49NormsConsumer.CONST_COMPRESSED;
++import static org.apache.lucene.codecs.lucene49.Lucene49NormsConsumer.DELTA_COMPRESSED;
++import static org.apache.lucene.codecs.lucene49.Lucene49NormsConsumer.TABLE_COMPRESSED;
++import static org.apache.lucene.codecs.lucene49.Lucene49NormsConsumer.UNCOMPRESSED;
++
++/**
++ * Reader for {@link Lucene49NormsFormat}
++ */
++class Lucene49NormsProducer extends DocValuesProducer {
++  // metadata maps (just file pointers and minimal stuff)
++  private final Map<Integer,NormsEntry> norms = new HashMap<>();
++  private final IndexInput data;
++  private final int version;
++  
++  // ram instances we have already loaded
++  final Map<Integer,NumericDocValues> instances = new HashMap<>();
++  
++  private final int maxDoc;
++  private final AtomicLong ramBytesUsed;
++    
++  Lucene49NormsProducer(SegmentReadState state, String dataCodec, String dataExtension, String metaCodec, String metaExtension) throws IOException {
++    maxDoc = state.segmentInfo.getDocCount();
++    String metaName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, metaExtension);
++    // read in the entries from the metadata file.
++    ChecksumIndexInput in = state.directory.openChecksumInput(metaName, state.context);
++    boolean success = false;
++    ramBytesUsed = new AtomicLong(RamUsageEstimator.shallowSizeOfInstance(getClass()));
++    try {
++      version = CodecUtil.checkHeader(in, metaCodec, VERSION_START, VERSION_CURRENT);
++      readFields(in, state.fieldInfos);
++      CodecUtil.checkFooter(in);
++      success = true;
++    } finally {
++      if (success) {
++        IOUtils.close(in);
++      } else {
++        IOUtils.closeWhileHandlingException(in);
++      }
++    }
++
++    String dataName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, dataExtension);
++    this.data = state.directory.openInput(dataName, state.context);
++    success = false;
++    try {
++      final int version2 = CodecUtil.checkHeader(data, dataCodec, VERSION_START, VERSION_CURRENT);
++      if (version != version2) {
++        throw new CorruptIndexException("Format versions mismatch");
++      }
++
++      success = true;
++    } finally {
++      if (!success) {
++        IOUtils.closeWhileHandlingException(this.data);
++      }
++    }
++  }
++  
++  private void readFields(IndexInput meta, FieldInfos infos) throws IOException {
++    int fieldNumber = meta.readVInt();
++    while (fieldNumber != -1) {
++      FieldInfo info = infos.fieldInfo(fieldNumber);
++      if (info == null) {
++        throw new CorruptIndexException("Invalid field number: " + fieldNumber + " (resource=" + meta + ")");
++      } else if (!info.hasNorms()) {
++        throw new CorruptIndexException("Invalid field: " + info.name + " (resource=" + meta + ")");
++      }
++      NormsEntry entry = new NormsEntry();
++      entry.format = meta.readByte();
++      entry.offset = meta.readLong();
++      switch(entry.format) {
++        case CONST_COMPRESSED:
++        case UNCOMPRESSED:
++        case TABLE_COMPRESSED:
++        case DELTA_COMPRESSED:
++          break;
++        default:
++          throw new CorruptIndexException("Unknown format: " + entry.format + ", input=" + meta);
++      }
++      norms.put(fieldNumber, entry);
++      fieldNumber = meta.readVInt();
++    }
++  }
++
++  @Override
++  public synchronized NumericDocValues getNumeric(FieldInfo field) throws IOException {
++    NumericDocValues instance = instances.get(field.number);
++    if (instance == null) {
++      instance = loadNorms(field);
++      instances.put(field.number, instance);
++    }
++    return instance;
++  }
++  
++  @Override
++  public long ramBytesUsed() {
++    return ramBytesUsed.get();
++  }
++  
++  @Override
++  public void checkIntegrity() throws IOException {
++    CodecUtil.checksumEntireFile(data);
++  }
++
++  private NumericDocValues loadNorms(FieldInfo field) throws IOException {
++    NormsEntry entry = norms.get(field.number);
++    switch(entry.format) {
++      case CONST_COMPRESSED:
++        final long v = entry.offset;
++        return new NumericDocValues() {
++          @Override
++          public long get(int docID) {
++            return v;
++          }
++        };
++      case UNCOMPRESSED:
++        data.seek(entry.offset);
++        final byte bytes[] = new byte[maxDoc];
++        data.readBytes(bytes, 0, bytes.length);
++        ramBytesUsed.addAndGet(RamUsageEstimator.sizeOf(bytes));
++        return new NumericDocValues() {
++          @Override
++          public long get(int docID) {
++            return bytes[docID];
++          }
++        };
++      case DELTA_COMPRESSED:
++        data.seek(entry.offset);
++        int packedIntsVersion = data.readVInt();
++        int blockSize = data.readVInt();
++        final BlockPackedReader reader = new BlockPackedReader(data, packedIntsVersion, blockSize, maxDoc, false);
++        ramBytesUsed.addAndGet(reader.ramBytesUsed());
++        return reader;
++      case TABLE_COMPRESSED:
++        data.seek(entry.offset);
++        int packedVersion = data.readVInt();
++        int size = data.readVInt();
++        if (size > 256) {
++          throw new CorruptIndexException("TABLE_COMPRESSED cannot have more than 256 distinct values, input=" + data);
++        }
++        final long decode[] = new long[size];
++        for (int i = 0; i < decode.length; i++) {
++          decode[i] = data.readLong();
++        }
++        final int formatID = data.readVInt();
++        final int bitsPerValue = data.readVInt();
++        final PackedInts.Reader ordsReader = PackedInts.getReaderNoHeader(data, PackedInts.Format.byId(formatID), packedVersion, maxDoc, bitsPerValue);
++        ramBytesUsed.addAndGet(RamUsageEstimator.sizeOf(decode) + ordsReader.ramBytesUsed());
++        return new NumericDocValues() {
++          @Override
++          public long get(int docID) {
++            return decode[(int)ordsReader.get(docID)];
++          }
++        };
++      default:
++        throw new AssertionError();
++    }
++  }
++
++  @Override
++  public BinaryDocValues getBinary(FieldInfo field) throws IOException {
++    throw new IllegalStateException();
++  }
++  
++  @Override
++  public SortedDocValues getSorted(FieldInfo field) throws IOException {
++    throw new IllegalStateException();
++  }
++  
++  @Override
++  public SortedSetDocValues getSortedSet(FieldInfo field) throws IOException {
++    throw new IllegalStateException();
++  }
++  
++  @Override
++  public Bits getDocsWithField(FieldInfo field) throws IOException {
++    throw new IllegalStateException();
++  }
++
++  @Override
++  public void close() throws IOException {
++    data.close();
++  }
++  
++  static class NormsEntry {
++    byte format;
++    long offset;
++  }
++}
+
+Property changes on: lucene/core/src/java/org/apache/lucene/codecs/lucene49/Lucene49NormsProducer.java
+___________________________________________________________________
+Added: svn:eol-style
+## -0,0 +1 ##
++native
+\ No newline at end of property
+Index: lucene/core/src/java/org/apache/lucene/codecs/lucene49/package.html
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/codecs/lucene49/package.html	(revision 1600984)
++++ lucene/core/src/java/org/apache/lucene/codecs/lucene49/package.html	(working copy)
+@@ -173,7 +173,7 @@
+ all documents omit position data.
+ </li>
+ <li>
+-{@link org.apache.lucene.codecs.lucene42.Lucene42NormsFormat Normalization factors}. 
++{@link org.apache.lucene.codecs.lucene49.Lucene49NormsFormat Normalization factors}. 
+ For each field in each document, a value is stored
+ that is multiplied into the score for hits on that field.
+ </li>
+@@ -289,7 +289,7 @@
+ <td>Stores additional per-position metadata information such as character offsets and user payloads</td>
+ </tr>
+ <tr>
+-<td>{@link org.apache.lucene.codecs.lucene42.Lucene42NormsFormat Norms}</td>
++<td>{@link org.apache.lucene.codecs.lucene49.Lucene49NormsFormat Norms}</td>
+ <td>.nvd, .nvm</td>
+ <td>Encodes length and boost factors for docs and fields</td>
+ </tr>

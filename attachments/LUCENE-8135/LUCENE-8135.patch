@@ -1,0 +1,2672 @@
+diff --git a/lucene/core/src/java/org/apache/lucene/index/Sorter.java b/lucene/core/src/java/org/apache/lucene/index/Sorter.java
+index 876a034..c47f9a1 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/Sorter.java
++++ b/lucene/core/src/java/org/apache/lucene/index/Sorter.java
+@@ -466,7 +466,7 @@ final class Sorter {
+     }
+ 
+     @Override
+-    public float maxScore() {
++    public float getMaxScore(int upTo) throws IOException {
+       return Float.POSITIVE_INFINITY;
+     }
+   };
+diff --git a/lucene/core/src/java/org/apache/lucene/search/BlockMaxConjunctionScorer.java b/lucene/core/src/java/org/apache/lucene/search/BlockMaxConjunctionScorer.java
+new file mode 100644
+index 0000000..070b6c4
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/search/BlockMaxConjunctionScorer.java
+@@ -0,0 +1,243 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.search;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.Comparator;
++
++/**
++ * Scorer for conjunctions that checks the maximum scores of each clause in
++ * order to potentially skip over blocks that can'h have competitive matches.
++ */
++final class BlockMaxConjunctionScorer extends Scorer {
++
++  final Scorer[] scorers;
++  final MaxScoreSumPropagator maxScorePropagator;
++  float minScore;
++  final double[] minScores; // stores the min value of the sum of scores between 0..i for a hit to be competitive
++  double score;
++
++  /** Create a new {@link BlockMaxConjunctionScorer} from scoring clauses. */
++  BlockMaxConjunctionScorer(Weight weight, Collection<Scorer> scorersList) throws IOException {
++    super(weight);
++    this.scorers = scorersList.toArray(new Scorer[scorersList.size()]);
++    this.maxScorePropagator = new MaxScoreSumPropagator(scorersList);
++
++    // Put scorers with the higher max scores first
++    // We tie-break on cost
++    Comparator<Scorer> comparator = (s1, s2) -> {
++      int cmp;
++      try {
++        cmp = Float.compare(s2.getMaxScore(DocIdSetIterator.NO_MORE_DOCS), s1.getMaxScore(DocIdSetIterator.NO_MORE_DOCS));
++      } catch (IOException e) {
++        throw new RuntimeException(e);
++      }
++      if (cmp == 0) {
++        cmp = Long.compare(s1.iterator().cost(), s2.iterator().cost());
++      }
++      return cmp;
++    };
++    Arrays.sort(this.scorers, comparator);
++    minScores = new double[this.scorers.length];
++  }
++
++  @Override
++  public DocIdSetIterator iterator() {
++    // TODO: support two-phase
++    final Scorer leadScorer = this.scorers[0]; // higher max score
++    final DocIdSetIterator[] iterators = Arrays.stream(this.scorers)
++        .map(Scorer::iterator)
++        .toArray(DocIdSetIterator[]::new);
++    final DocIdSetIterator lead = iterators[0];
++
++    return new DocIdSetIterator() {
++
++      float maxScore;
++      int upTo = -1;
++
++      @Override
++      public int docID() {
++        return lead.docID();
++      }
++
++      @Override
++      public long cost() {
++        return lead.cost();
++      }
++
++      private void moveToNextBlock(int target) throws IOException {
++        upTo = advanceShallow(target);
++        maxScore = getMaxScore(upTo);
++
++        // Also compute the minimum required scores for a hit to be competitive
++        // A double that is less than 'score' might still be converted to 'score'
++        // when casted to a float, so we go to the previous float to avoid this issue
++        minScores[minScores.length - 1] = minScore > 0 ? Math.nextDown(minScore) : 0;
++        for (int i = scorers.length - 1; i > 0; --i) {
++          double minScore = minScores[i];
++          float clauseMaxScore = scorers[i].getMaxScore(upTo);
++          if (minScore > clauseMaxScore) {
++            minScores[i - 1] = minScore - clauseMaxScore;
++            assert minScores[i - 1] + clauseMaxScore <= minScore;
++          } else {
++            minScores[i - 1] = 0;
++          }
++        }
++      }
++
++      private int advanceTarget(int target) throws IOException {
++        if (target > upTo) {
++          moveToNextBlock(target);
++        }
++
++        while (true) {
++          assert upTo >= target;
++
++          if (maxScore >= minScore) {
++            return target;
++          }
++
++          if (upTo == NO_MORE_DOCS) {
++            return NO_MORE_DOCS;
++          }
++
++          target = upTo + 1;
++
++          moveToNextBlock(target);
++        }
++      }
++
++      @Override
++      public int nextDoc() throws IOException {
++        return advance(docID() + 1);
++      }
++
++      @Override
++      public int advance(int target) throws IOException {
++        return doNext(lead.advance(advanceTarget(target)));
++      }
++
++      private int doNext(int doc) throws IOException {
++        advanceHead: for(;;) {
++          assert doc == lead.docID();
++
++          if (doc == NO_MORE_DOCS) {
++            return NO_MORE_DOCS;
++          }
++
++          if (minScore > 0) {
++            score = leadScorer.score();
++            if (score < minScores[0]) {
++              // computing a score is usually less costly than advancing other clauses
++              doc = lead.advance(advanceTarget(doc + 1));
++              continue;
++            }
++          }
++
++          // then find agreement with other iterators
++          for (int i = 1; i < iterators.length; ++i) {
++            final DocIdSetIterator other = iterators[i];
++            // other.doc may already be equal to doc if we "continued advanceHead"
++            // on the previous iteration and the advance on the lead scorer exactly matched.
++            if (other.docID() < doc) {
++              final int next = other.advance(doc);
++
++              if (next > doc) {
++                // iterator beyond the current doc - advance lead and continue to the new highest doc.
++                doc = lead.advance(advanceTarget(next));
++                continue advanceHead;
++              }
++            }
++
++            assert other.docID() == doc;
++            if (minScore > 0) {
++              score += scorers[i].score();
++
++              if (score < minScores[i]) {
++                // computing a score is usually less costly than advancing the next clause
++                doc = lead.advance(advanceTarget(doc + 1));
++                continue advanceHead;
++              }
++            }
++          }
++
++          if (minScore > 0 == false) {
++            // the score hasn't been computed on the fly, do it now
++            score = 0;
++            for (Scorer scorer : scorers) {
++              score += scorer.score();
++            }
++          }
++
++          // success - all iterators are on the same doc and the score is competitive
++          return doc;
++        }
++      }
++    };
++  }
++
++  @Override
++  public int docID() {
++    return scorers[0].docID();
++  }
++
++  @Override
++  public float score() throws IOException {
++    return (float) score;
++  }
++
++  @Override
++  public int advanceShallow(int target) throws IOException {
++    // We use block boundaries of the lead scorer.
++    // It is tempting to fold in other clauses as well to have better bounds of
++    // the score, but then there is a risk of not progressing fast enough.
++    int result = scorers[0].advanceShallow(target);
++    // But we still need to shallow-advance other clauses, in order to have
++    // better score upper bounds
++    for (int i = 1; i < scorers.length; ++i) {
++      scorers[i].advanceShallow(target);
++    }
++    return result;
++  }
++
++  @Override
++  public float getMaxScore(int upTo) throws IOException {
++    double sum = 0;
++    for (Scorer scorer : scorers) {
++      sum += scorer.getMaxScore(upTo);
++    }
++    return (float) sum;
++  }
++
++  @Override
++  public void setMinCompetitiveScore(float score) {
++    minScore = score;
++  }
++
++  @Override
++  public Collection<ChildScorer> getChildren() {
++    ArrayList<ChildScorer> children = new ArrayList<>();
++    for (Scorer scorer : scorers) {
++      children.add(new ChildScorer(scorer, "MUST"));
++    }
++    return children;
++  }
++
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/search/Boolean2ScorerSupplier.java b/lucene/core/src/java/org/apache/lucene/search/Boolean2ScorerSupplier.java
+index 5956836..3401215 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/Boolean2ScorerSupplier.java
++++ b/lucene/core/src/java/org/apache/lucene/search/Boolean2ScorerSupplier.java
+@@ -20,6 +20,7 @@ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
++import java.util.Collections;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.OptionalLong;
+@@ -135,7 +136,7 @@ final class Boolean2ScorerSupplier extends ScorerSupplier {
+             return 0f;
+           }
+           @Override
+-          public float maxScore() {
++          public float getMaxScore(int upTo) throws IOException {
+             return 0f;
+           }
+         };
+@@ -150,9 +151,16 @@ final class Boolean2ScorerSupplier extends ScorerSupplier {
+       }
+       for (ScorerSupplier s : requiredScoring) {
+         Scorer scorer = s.get(leadCost);
+-        requiredScorers.add(scorer);
+         scoringScorers.add(scorer);
+       }
++      if (scoreMode == ScoreMode.TOP_SCORES && scoringScorers.size() > 1) {
++        Scorer blockMaxScorer = new BlockMaxConjunctionScorer(weight, scoringScorers);
++        if (requiredScorers.isEmpty()) {
++          return blockMaxScorer;
++        }
++        scoringScorers = Collections.singletonList(blockMaxScorer);
++      }
++      requiredScorers.addAll(scoringScorers);
+       return new ConjunctionScorer(weight, requiredScorers, scoringScorers);
+     }
+   }
+diff --git a/lucene/core/src/java/org/apache/lucene/search/CachingCollector.java b/lucene/core/src/java/org/apache/lucene/search/CachingCollector.java
+index 9853772..3bed88d 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/CachingCollector.java
++++ b/lucene/core/src/java/org/apache/lucene/search/CachingCollector.java
+@@ -68,7 +68,7 @@ public abstract class CachingCollector extends FilterCollector {
+     public final float score() { return score; }
+ 
+     @Override
+-    public float maxScore() {
++    public float getMaxScore(int upTo) throws IOException {
+       return Float.POSITIVE_INFINITY;
+     }
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/search/ConjunctionScorer.java b/lucene/core/src/java/org/apache/lucene/search/ConjunctionScorer.java
+index 75895fc..7a1b956 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/ConjunctionScorer.java
++++ b/lucene/core/src/java/org/apache/lucene/search/ConjunctionScorer.java
+@@ -30,7 +30,7 @@ class ConjunctionScorer extends Scorer {
+   final MaxScoreSumPropagator maxScorePropagator;
+ 
+   /** Create a new {@link ConjunctionScorer}, note that {@code scorers} must be a subset of {@code required}. */
+-  ConjunctionScorer(Weight weight, Collection<Scorer> required, Collection<Scorer> scorers) {
++  ConjunctionScorer(Weight weight, Collection<Scorer> required, Collection<Scorer> scorers) throws IOException {
+     super(weight);
+     assert required.containsAll(scorers);
+     this.disi = ConjunctionDISI.intersectScorers(required);
+@@ -64,14 +64,32 @@ class ConjunctionScorer extends Scorer {
+   }
+ 
+   @Override
+-  public float maxScore() {
+-    return maxScorePropagator.maxScore();
++  public float getMaxScore(int upTo) throws IOException {
++    // This scorer is only used for TOP_SCORES when there is at most one scoring clause
++    switch (scorers.length) {
++      case 0:
++        return 0;
++      case 1:
++        return scorers[0].getMaxScore(upTo);
++      default:
++        return Float.POSITIVE_INFINITY;
++    }
++  }
++
++  @Override
++  public int advanceShallow(int target) throws IOException {
++    if (scorers.length == 1) {
++      return scorers[0].advanceShallow(target);
++    }
++    return super.advanceShallow(target);
+   }
+ 
+   @Override
+-  public void setMinCompetitiveScore(float score) {
+-    // Propagate to sub clauses.
+-    maxScorePropagator.setMinCompetitiveScore(score);
++  public void setMinCompetitiveScore(float minScore) {
++    // This scorer is only used for TOP_SCORES when there is a single scoring clause
++    if (scorers.length == 1) {
++      scorers[0].setMinCompetitiveScore(minScore);
++    }
+   }
+ 
+   @Override
+diff --git a/lucene/core/src/java/org/apache/lucene/search/ConstantScoreQuery.java b/lucene/core/src/java/org/apache/lucene/search/ConstantScoreQuery.java
+index 9334f66..464cde6 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/ConstantScoreQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/ConstantScoreQuery.java
+@@ -95,7 +95,7 @@ public final class ConstantScoreQuery extends Query {
+               return theScore;
+             }
+             @Override
+-            public float maxScore() {
++            public float getMaxScore(int upTo) throws IOException {
+               return theScore;
+             }
+           });
+@@ -141,7 +141,7 @@ public final class ConstantScoreQuery extends Query {
+                   return score;
+                 }
+                 @Override
+-                public float maxScore() {
++                public float getMaxScore(int upTo) throws IOException {
+                   return score;
+                 }
+                 @Override
+diff --git a/lucene/core/src/java/org/apache/lucene/search/ConstantScoreScorer.java b/lucene/core/src/java/org/apache/lucene/search/ConstantScoreScorer.java
+index 5c57746..45a6bdb 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/ConstantScoreScorer.java
++++ b/lucene/core/src/java/org/apache/lucene/search/ConstantScoreScorer.java
+@@ -54,7 +54,7 @@ public final class ConstantScoreScorer extends Scorer {
+   }
+ 
+   @Override
+-  public float maxScore() {
++  public float getMaxScore(int upTo) throws IOException {
+     return score;
+   }
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/search/DisiWrapper.java b/lucene/core/src/java/org/apache/lucene/search/DisiWrapper.java
+index 6412d41..fac94180 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/DisiWrapper.java
++++ b/lucene/core/src/java/org/apache/lucene/search/DisiWrapper.java
+@@ -38,7 +38,7 @@ public class DisiWrapper {
+   // two-phase iteration
+   public final TwoPhaseIterator twoPhaseView;
+ 
+-  // For MaxScoreScorer
++  // For WANDScorer
+   long maxScore;
+ 
+   // FOR SPANS
+diff --git a/lucene/core/src/java/org/apache/lucene/search/DisjunctionMaxScorer.java b/lucene/core/src/java/org/apache/lucene/search/DisjunctionMaxScorer.java
+index c5c3640..3b86068 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/DisjunctionMaxScorer.java
++++ b/lucene/core/src/java/org/apache/lucene/search/DisjunctionMaxScorer.java
+@@ -43,7 +43,7 @@ final class DisjunctionMaxScorer extends DisjunctionScorer {
+    * @param subScorers
+    *          The sub scorers this Scorer should iterate on
+    */
+-  DisjunctionMaxScorer(Weight weight, float tieBreakerMultiplier, List<Scorer> subScorers, boolean needsScores) {
++  DisjunctionMaxScorer(Weight weight, float tieBreakerMultiplier, List<Scorer> subScorers, boolean needsScores) throws IOException {
+     super(weight, subScorers, needsScores);
+     this.tieBreakerMultiplier = tieBreakerMultiplier;
+     if (tieBreakerMultiplier < 0 || tieBreakerMultiplier > 1) {
+@@ -53,7 +53,7 @@ final class DisjunctionMaxScorer extends DisjunctionScorer {
+     float scoreMax = 0;
+     double otherScoreSum = 0;
+     for (Scorer scorer : subScorers) {
+-      float subScore = scorer.maxScore();
++      float subScore = scorer.getMaxScore(DocIdSetIterator.NO_MORE_DOCS);
+       if (subScore >= scoreMax) {
+         otherScoreSum += scoreMax;
+         scoreMax = subScore;
+@@ -91,7 +91,7 @@ final class DisjunctionMaxScorer extends DisjunctionScorer {
+   }
+ 
+   @Override
+-  public float maxScore() {
++  public float getMaxScore(int upTo) throws IOException {
+     return maxScore;
+   }
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/search/DisjunctionSumScorer.java b/lucene/core/src/java/org/apache/lucene/search/DisjunctionSumScorer.java
+index 7e22991..fa92fcd 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/DisjunctionSumScorer.java
++++ b/lucene/core/src/java/org/apache/lucene/search/DisjunctionSumScorer.java
+@@ -32,11 +32,11 @@ final class DisjunctionSumScorer extends DisjunctionScorer {
+    * @param weight The weight to be used.
+    * @param subScorers Array of at least two subscorers.
+    */
+-  DisjunctionSumScorer(Weight weight, List<Scorer> subScorers, boolean needsScores) {
++  DisjunctionSumScorer(Weight weight, List<Scorer> subScorers, boolean needsScores) throws IOException {
+     super(weight, subScorers, needsScores);
+     double maxScore = 0;
+     for (Scorer scorer : subScorers) {
+-      maxScore += scorer.maxScore();
++      maxScore += scorer.getMaxScore(DocIdSetIterator.NO_MORE_DOCS);
+     }
+     // The error of sums depends on the order in which values are summed up. In
+     // order to avoid this issue, we compute an upper bound of the value that
+@@ -57,7 +57,7 @@ final class DisjunctionSumScorer extends DisjunctionScorer {
+   }
+ 
+   @Override
+-  public float maxScore() {
++  public float getMaxScore(int upTo) throws IOException {
+     return maxScore;
+   }
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/search/ExactPhraseScorer.java b/lucene/core/src/java/org/apache/lucene/search/ExactPhraseScorer.java
+index e2d6d80..d7c4f9f 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/ExactPhraseScorer.java
++++ b/lucene/core/src/java/org/apache/lucene/search/ExactPhraseScorer.java
+@@ -121,7 +121,7 @@ final class ExactPhraseScorer extends Scorer {
+   }
+ 
+   @Override
+-  public float maxScore() {
++  public float getMaxScore(int upTo) throws IOException {
+     return docScorer.maxScore();
+   }
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/search/FakeScorer.java b/lucene/core/src/java/org/apache/lucene/search/FakeScorer.java
+index 07b5048..c8b3438 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/FakeScorer.java
++++ b/lucene/core/src/java/org/apache/lucene/search/FakeScorer.java
+@@ -17,6 +17,7 @@
+ package org.apache.lucene.search;
+ 
+ 
++import java.io.IOException;
+ import java.util.Collection;
+ 
+ /** Used by {@link BulkScorer}s that need to pass a {@link
+@@ -40,7 +41,7 @@ final class FakeScorer extends Scorer {
+   }
+ 
+   @Override
+-  public float maxScore() {
++  public float getMaxScore(int upTo) throws IOException {
+     return Float.POSITIVE_INFINITY;
+   }
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/search/MaxScoreSumPropagator.java b/lucene/core/src/java/org/apache/lucene/search/MaxScoreSumPropagator.java
+index 27c8933..6c204ed 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/MaxScoreSumPropagator.java
++++ b/lucene/core/src/java/org/apache/lucene/search/MaxScoreSumPropagator.java
+@@ -16,9 +16,9 @@
+  */
+ package org.apache.lucene.search;
+ 
++import java.io.IOException;
+ import java.util.Collection;
+ 
+-import org.apache.lucene.util.InPlaceMergeSorter;
+ import org.apache.lucene.util.MathUtil;
+ 
+ /**
+@@ -28,114 +28,33 @@ import org.apache.lucene.util.MathUtil;
+  */
+ final class MaxScoreSumPropagator {
+ 
+-  /**
+-   * Return an array which, at index i, stores the sum of all entries of
+-   * {@code v} except the one at index i.
+-   */
+-  private static double[] computeSumOfComplement(float[] v) {
+-    // We do not use subtraction on purpose because it would defeat the
+-    // upperbound formula that we use for sums.
+-    // Naive approach would be O(n^2), but we can do O(n) by computing the
+-    // sum for i<j and i>j and then sum them.
+-    double[] sum1 = new double[v.length];
+-    for (int i = 1; i < sum1.length; ++i) {
+-      sum1[i] = sum1[i-1] + v[i-1];
+-    }
+-
+-    double[] sum2 = new double[v.length];
+-    for (int i = sum2.length - 2; i >= 0; --i) {
+-      sum2[i] = sum2[i+1] + v[i+1];
+-    }
+-
+-    double[] result = new double[v.length];
+-    for (int i = 0; i < result.length; ++i) {
+-      result[i] = sum1[i] + sum2[i];
+-    }
+-    return result;
+-  }
+-
+   private final int numClauses;
+-  private final float maxScore;
+   private final Scorer[] scorers;
+-  private final double[] sumOfOtherMaxScores;
+ 
+-  MaxScoreSumPropagator(Collection<? extends Scorer> scorerList) {
++  MaxScoreSumPropagator(Collection<? extends Scorer> scorerList) throws IOException {
+     numClauses = scorerList.size();
+     scorers = scorerList.toArray(new Scorer[numClauses]);
+-    // We'll need max scores multiple times so we cache them
+-    float[] maxScores = new float[numClauses];
+-    for (int i = 0; i < numClauses; ++i) {
+-      maxScores[i] = scorers[i].maxScore();
+-    }
+-    // Sort by decreasing max score
+-    new InPlaceMergeSorter() {
+-      @Override
+-      protected void swap(int i, int j) {
+-        Scorer tmp = scorers[i];
+-        scorers[i] = scorers[j];
+-        scorers[j] = tmp;
+-        float tmpF = maxScores[i];
+-        maxScores[i] = maxScores[j];
+-        maxScores[j] = tmpF;
+-      }
+-      @Override
+-      protected int compare(int i, int j) {
+-        return Float.compare(maxScores[j], maxScores[i]);
+-      }
+-    }.sort(0, scorers.length);
+-
+-    sumOfOtherMaxScores = computeSumOfComplement(maxScores);
+-    if (numClauses == 0) {
+-      maxScore = 0;
+-    } else {
+-      maxScore = sumUpperBound(maxScores[0] + sumOfOtherMaxScores[0]);
+-    }
+-  }
+-
+-  public float maxScore() {
+-    return maxScore;
+   }
+ 
+-  public void setMinCompetitiveScore(float minScoreSum) {
+-    for (int i = 0; i < numClauses; ++i) {
+-      double sumOfOtherMaxScores = this.sumOfOtherMaxScores[i];
+-      float minCompetitiveScore = getMinCompetitiveScore(minScoreSum, sumOfOtherMaxScores);
+-      if (minCompetitiveScore <= 0) {
+-        // given that scorers are sorted by decreasing max score, next scorers will
+-        // have 0 as a minimum competitive score too
+-        break;
++  void advanceShallow(int target) throws IOException {
++    for (Scorer s : scorers) {
++      if (s.docID() < target) {
++        s.advanceShallow(target);
+       }
+-      scorers[i].setMinCompetitiveScore(minCompetitiveScore);
+     }
+   }
+ 
+-  /**
+-   * Return the minimum score that a Scorer must produce in order for a hit to
+-   * be competitive.
+-   */
+-  private float getMinCompetitiveScore(float minScoreSum, double sumOfOtherMaxScores) {
+-    assert numClauses > 0;
+-    if (minScoreSum <= sumOfOtherMaxScores) {
+-      return 0f;
+-    }
+-
+-    // We need to find a value 'minScore' so that 'minScore + sumOfOtherMaxScores <= minScoreSum'
+-    // TODO: is there an efficient way to find the greatest value that meets this requirement?
+-    float minScore = (float) (minScoreSum - sumOfOtherMaxScores);
+-    int iters = 0;
+-    while (sumUpperBound(minScore + sumOfOtherMaxScores) > minScoreSum) {
+-      // Important: use ulp of minScoreSum and not minScore to make sure that we
+-      // converge quickly.
+-      minScore -= Math.ulp(minScoreSum);
+-      // this should converge in at most two iterations:
+-      //  - one because of the subtraction rounding error
+-      //  - one because of the error introduced by sumUpperBound
+-      assert ++iters <= 2: iters;
++  float getMaxScore(int upTo) throws IOException {
++    double maxScore = 0;
++    for (Scorer s : scorers) {
++      if (s.docID() <= upTo) {
++        maxScore += s.getMaxScore(upTo);
++      }
+     }
+-    return Math.max(minScore, 0f);
++    return scoreSumUpperBound(maxScore);
+   }
+ 
+-  private float sumUpperBound(double sum) {
++  private float scoreSumUpperBound(double sum) {
+     if (numClauses <= 2) {
+       // When there are only two clauses, the sum is always the same regardless
+       // of the order.
+diff --git a/lucene/core/src/java/org/apache/lucene/search/MinShouldMatchSumScorer.java b/lucene/core/src/java/org/apache/lucene/search/MinShouldMatchSumScorer.java
+index ead2604..6ffbe34 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/MinShouldMatchSumScorer.java
++++ b/lucene/core/src/java/org/apache/lucene/search/MinShouldMatchSumScorer.java
+@@ -326,7 +326,7 @@ final class MinShouldMatchSumScorer extends Scorer {
+   }
+ 
+   @Override
+-  public float maxScore() {
++  public float getMaxScore(int upTo) throws IOException {
+     // TODO: implement but be careful about floating-point errors.
+     return Float.POSITIVE_INFINITY;
+   }
+diff --git a/lucene/core/src/java/org/apache/lucene/search/ReqExclScorer.java b/lucene/core/src/java/org/apache/lucene/search/ReqExclScorer.java
+index 3714d49..987293e 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/ReqExclScorer.java
++++ b/lucene/core/src/java/org/apache/lucene/search/ReqExclScorer.java
+@@ -77,8 +77,8 @@ class ReqExclScorer extends Scorer {
+   }
+ 
+   @Override
+-  public float maxScore() {
+-    return reqScorer.maxScore();
++  public float getMaxScore(int upTo) throws IOException {
++    return reqScorer.getMaxScore(upTo);
+   }
+ 
+   @Override
+diff --git a/lucene/core/src/java/org/apache/lucene/search/ReqOptSumScorer.java b/lucene/core/src/java/org/apache/lucene/search/ReqOptSumScorer.java
+index b91d253..6d93a54 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/ReqOptSumScorer.java
++++ b/lucene/core/src/java/org/apache/lucene/search/ReqOptSumScorer.java
+@@ -44,7 +44,7 @@ class ReqOptSumScorer extends Scorer {
+    */
+   public ReqOptSumScorer(
+       Scorer reqScorer,
+-      Scorer optScorer)
++      Scorer optScorer) throws IOException
+   {
+     super(reqScorer.weight);
+     assert reqScorer != null;
+@@ -52,7 +52,7 @@ class ReqOptSumScorer extends Scorer {
+     this.reqScorer = reqScorer;
+     this.optScorer = optScorer;
+ 
+-    this.reqMaxScore = reqScorer.maxScore();
++    this.reqMaxScore = reqScorer.getMaxScore(DocIdSetIterator.NO_MORE_DOCS);
+     this.maxScorePropagator = new MaxScoreSumPropagator(Arrays.asList(reqScorer, optScorer));
+ 
+     final TwoPhaseIterator reqTwoPhase = reqScorer.twoPhaseIterator();
+@@ -210,8 +210,12 @@ class ReqOptSumScorer extends Scorer {
+   }
+ 
+   @Override
+-  public float maxScore() {
+-    return maxScorePropagator.maxScore();
++  public float getMaxScore(int upTo) throws IOException {
++    float maxScore = reqScorer.getMaxScore(upTo);
++    if (optScorer.docID() <= upTo) {
++      maxScore += optScorer.getMaxScore(upTo);
++    }
++    return maxScore;
+   }
+ 
+   @Override
+@@ -220,8 +224,6 @@ class ReqOptSumScorer extends Scorer {
+     if (optIsRequired == false && minScore > reqMaxScore) {
+       optIsRequired = true;
+     }
+-    // And also propagate to sub clauses.
+-    maxScorePropagator.setMinCompetitiveScore(minScore);
+   }
+ 
+   @Override
+diff --git a/lucene/core/src/java/org/apache/lucene/search/ScoreCachingWrappingScorer.java b/lucene/core/src/java/org/apache/lucene/search/ScoreCachingWrappingScorer.java
+index 1384cbe..d775c37 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/ScoreCachingWrappingScorer.java
++++ b/lucene/core/src/java/org/apache/lucene/search/ScoreCachingWrappingScorer.java
+@@ -54,8 +54,13 @@ public final class ScoreCachingWrappingScorer extends FilterScorer {
+   }
+ 
+   @Override
+-  public float maxScore() {
+-    return in.maxScore();
++  public float getMaxScore(int upTo) throws IOException {
++    return in.getMaxScore(upTo);
++  }
++
++  @Override
++  public int advanceShallow(int target) throws IOException {
++    return in.advanceShallow(target);
+   }
+ 
+   @Override
+diff --git a/lucene/core/src/java/org/apache/lucene/search/Scorer.java b/lucene/core/src/java/org/apache/lucene/search/Scorer.java
+index 2fb0d26..81624cc 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/Scorer.java
++++ b/lucene/core/src/java/org/apache/lucene/search/Scorer.java
+@@ -157,7 +157,25 @@ public abstract class Scorer {
+     // no-op by default
+   }
+ 
+-  /** Return the maximum score that this scorer may produce. If scores are not
+-   *  bounded, {@link Float#POSITIVE_INFINITY} must be returned. */
+-  public abstract float maxScore();
++  /**
++   * Advance to the block of documents that contains {@code target} in order to
++   * get scoring information about this block. This method is implicitly called
++   * by {@link DocIdSetIterator#advance(int)} and
++   * {@link DocIdSetIterator#nextDoc()}. Calling this method doesn't modify the
++   * current {@link DocIdSetIterator#docID()}.
++   * It returns a number that is greater than or equal to all documents
++   * contained in the current block, but less than any doc IDS of the next block.
++   * {@code target} must be &gt;= {@link #docID()} as well as all targets that
++   * have been passed to {@link #advanceShallow(int)} so far.
++   */
++  public int advanceShallow(int target) throws IOException {
++    return DocIdSetIterator.NO_MORE_DOCS;
++  }
++
++  /**
++   * Return the maximum score that documents between the last {@code target}
++   * that this iterator was {@link #advanceShallow(int) shallow-advanced} to
++   * included and {@code upTo} included.
++   */
++  public abstract float getMaxScore(int upTo) throws IOException;
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/search/SloppyPhraseScorer.java b/lucene/core/src/java/org/apache/lucene/search/SloppyPhraseScorer.java
+index 60b77c5..7587b37 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/SloppyPhraseScorer.java
++++ b/lucene/core/src/java/org/apache/lucene/search/SloppyPhraseScorer.java
+@@ -556,7 +556,7 @@ final class SloppyPhraseScorer extends Scorer {
+   }
+ 
+   @Override
+-  public float maxScore() {
++  public float getMaxScore(int upTo) throws IOException {
+     return docScorer.maxScore();
+   }
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/search/SynonymQuery.java b/lucene/core/src/java/org/apache/lucene/search/SynonymQuery.java
+index 1eba910..2a7c450 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/SynonymQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/SynonymQuery.java
+@@ -254,7 +254,7 @@ public final class SynonymQuery extends Query {
+     }
+ 
+     @Override
+-    public float maxScore() {
++    public float getMaxScore(int upTo) throws IOException {
+       return similarity.maxScore();
+     }
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/search/TermScorer.java b/lucene/core/src/java/org/apache/lucene/search/TermScorer.java
+index fc426da..d51626f 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/TermScorer.java
++++ b/lucene/core/src/java/org/apache/lucene/search/TermScorer.java
+@@ -21,12 +21,14 @@ import java.io.IOException;
+ 
+ import org.apache.lucene.index.ImpactsEnum;
+ import org.apache.lucene.index.PostingsEnum;
++import org.apache.lucene.index.SlowImpactsEnum;
+ import org.apache.lucene.index.TermsEnum;
+ 
+ /** Expert: A <code>Scorer</code> for documents matching a <code>Term</code>.
+  */
+ final class TermScorer extends Scorer {
+   private final PostingsEnum postingsEnum;
++  private final ImpactsEnum impactsEnum;
+   private final DocIdSetIterator iterator;
+   private final LeafSimScorer docScorer;
+   private float minCompetitiveScore;
+@@ -45,7 +47,7 @@ final class TermScorer extends Scorer {
+     super(weight);
+     this.docScorer = docScorer;
+     if (scoreMode == ScoreMode.TOP_SCORES) {
+-      ImpactsEnum impactsEnum = te.impacts(docScorer.getSimScorer(), PostingsEnum.FREQS);
++      impactsEnum = te.impacts(docScorer.getSimScorer(), PostingsEnum.FREQS);
+       postingsEnum = impactsEnum;
+       iterator = new DocIdSetIterator() {
+ 
+@@ -103,6 +105,7 @@ final class TermScorer extends Scorer {
+       };
+     } else {
+       postingsEnum = te.postings(null, scoreMode.needsScores() ? PostingsEnum.FREQS : PostingsEnum.NONE);
++      impactsEnum = new SlowImpactsEnum(postingsEnum, docScorer.getSimScorer().score(Float.MAX_VALUE, 1));
+       iterator = postingsEnum;
+     }
+   }
+@@ -128,8 +131,13 @@ final class TermScorer extends Scorer {
+   }
+ 
+   @Override
+-  public float maxScore() {
+-    return docScorer.maxScore();
++  public int advanceShallow(int target) throws IOException {
++    return impactsEnum.advanceShallow(target);
++  }
++
++  @Override
++  public float getMaxScore(int upTo) throws IOException {
++    return impactsEnum.getMaxScore(upTo);
+   }
+ 
+   @Override
+diff --git a/lucene/core/src/java/org/apache/lucene/search/WANDScorer.java b/lucene/core/src/java/org/apache/lucene/search/WANDScorer.java
+index 314ccf1..adadf54 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/WANDScorer.java
++++ b/lucene/core/src/java/org/apache/lucene/search/WANDScorer.java
+@@ -29,10 +29,12 @@ import java.util.OptionalInt;
+ /**
+  * This implements the WAND (Weak AND) algorithm for dynamic pruning
+  * described in "Efficient Query Evaluation using a Two-Level Retrieval
+- * Process" by Broder, Carmel, Herscovici, Soffer and Zien.
++ * Process" by Broder, Carmel, Herscovici, Soffer and Zien. Enhanced with
++ * techniques described in "Faster Top-k Document Retrieval Using Block-Max
++ * Indexes" by Ding and Suel.
+  * This scorer maintains a feedback loop with the collector in order to
+  * know at any time the minimum score that is required in order for a hit
+- * to be competitive. Then it leverages the {@link Scorer#maxScore() max score}
++ * to be competitive. Then it leverages the {@link Scorer#getMaxScore(int) max score}
+  * from each scorer in order to know when it may call
+  * {@link DocIdSetIterator#advance} rather than {@link DocIdSetIterator#nextDoc}
+  * to move to the next competitive hit.
+@@ -122,19 +124,22 @@ final class WANDScorer extends Scorer {
+   final long cost;
+   final MaxScoreSumPropagator maxScorePropagator;
+ 
+-  WANDScorer(Weight weight, Collection<Scorer> scorers) {
++  int upTo; // upper bound for which max scores are valid
++
++  WANDScorer(Weight weight, Collection<Scorer> scorers) throws IOException {
+     super(weight);
+ 
+     this.minCompetitiveScore = 0;
+     this.doc = -1;
++    this.upTo = -1; // will be computed on the first call to nextDoc/advance
+ 
+     head = new DisiPriorityQueue(scorers.size());
+     // there can be at most num_scorers - 1 scorers beyond the current position
+-    tail = new DisiWrapper[scorers.size() - 1];
++    tail = new DisiWrapper[scorers.size()];
+ 
+     OptionalInt scalingFactor = OptionalInt.empty();
+     for (Scorer scorer : scorers) {
+-      float maxScore = scorer.maxScore();
++      float maxScore = scorer.getMaxScore(DocIdSetIterator.NO_MORE_DOCS);
+       if (maxScore != 0 && Float.isFinite(maxScore)) {
+         // 0 and +Infty should not impact the scale
+         scalingFactor = OptionalInt.of(Math.min(scalingFactor.orElse(Integer.MAX_VALUE), scalingFactor(maxScore)));
+@@ -142,17 +147,12 @@ final class WANDScorer extends Scorer {
+     }
+     // Use a scaling factor of 0 if all max scores are either 0 or +Infty
+     this.scalingFactor = scalingFactor.orElse(0);
+-    
+-    for (Scorer scorer : scorers) {
+-      DisiWrapper w = new DisiWrapper(scorer);
+-      float maxScore = scorer.maxScore();
+-      w.maxScore = scaleMaxScore(maxScore, this.scalingFactor);
+-      addLead(w);
+-    }
+ 
+     long cost = 0;
+-    for (DisiWrapper w = lead; w != null; w = w.next) {
++    for (Scorer scorer : scorers) {
++      DisiWrapper w = new DisiWrapper(scorer);
+       cost += w.cost;
++      addLead(w);
+     }
+     this.cost = cost;
+     this.maxScorePropagator = new MaxScoreSumPropagator(scorers);
+@@ -179,7 +179,7 @@ final class WANDScorer extends Scorer {
+       assert w.doc > doc;
+     }
+ 
+-    assert tailSize == 0 || tailMaxScore < minCompetitiveScore;
++    assert minCompetitiveScore == 0 || tailMaxScore < minCompetitiveScore;
+ 
+     return true;
+   }
+@@ -192,15 +192,12 @@ final class WANDScorer extends Scorer {
+     long scaledMinScore = scaleMinScore(minScore, scalingFactor);
+     assert scaledMinScore >= minCompetitiveScore;
+     minCompetitiveScore = scaledMinScore;
+-
+-    // And also propagate to sub clauses.
+-    maxScorePropagator.setMinCompetitiveScore(minScore);
+   }
+ 
+   @Override
+   public final Collection<ChildScorer> getChildren() throws IOException {
+     List<ChildScorer> matchingChildren = new ArrayList<>();
+-    updateFreq();
++    advanceAllTail();
+     for (DisiWrapper s = lead; s != null; s = s.next) {
+       matchingChildren.add(new ChildScorer(s.scorer, "SHOULD"));
+     }
+@@ -236,13 +233,17 @@ final class WANDScorer extends Scorer {
+         // Advance 'head' as well
+         advanceHead(target);
+ 
+-        // Pop the new 'lead' from the 'head'
+-        setDocAndFreq();
++        // Pop the new 'lead' from 'head'
++        moveToNextCandidate(target);
++
++        if (doc == DocIdSetIterator.NO_MORE_DOCS) {
++          return DocIdSetIterator.NO_MORE_DOCS;
++        }
+ 
+         assert ensureConsistent();
+ 
+         // Advance to the next possible match
+-        return doNextCandidate();
++        return doNextCompetitiveCandidate();
+       }
+ 
+       @Override
+@@ -275,12 +276,14 @@ final class WANDScorer extends Scorer {
+     };
+   }
+ 
++  /** Add a disi to the linked list of leads. */
+   private void addLead(DisiWrapper lead) {
+     lead.next = this.lead;
+     this.lead = lead;
+     leadMaxScore += lead.maxScore;
+   }
+ 
++  /** Move disis that are in 'lead' back to the tail.  */
+   private void pushBackLeads(int target) throws IOException {
+     for (DisiWrapper s = lead; s != null; s = s.next) {
+       final DisiWrapper evicted = insertTailWithOverFlow(s);
+@@ -289,11 +292,13 @@ final class WANDScorer extends Scorer {
+         head.add(evicted);
+       }
+     }
++    lead = null;
+   }
+ 
++  /** Make sure all disis in 'head' are on or after 'target'. */
+   private void advanceHead(int target) throws IOException {
+     DisiWrapper headTop = head.top();
+-    while (headTop.doc < target) {
++    while (headTop != null && headTop.doc < target) {
+       final DisiWrapper evicted = insertTailWithOverFlow(headTop);
+       if (evicted != null) {
+         evicted.doc = evicted.iterator.advance(target);
+@@ -314,14 +319,83 @@ final class WANDScorer extends Scorer {
+     }
+   }
+ 
++  /** Pop the entry from the 'tail' that has the greatest score contribution,
++   *  advance it to the current doc and then add it to 'lead' or 'head'
++   *  depending on whether it matches. */
+   private void advanceTail() throws IOException {
+     final DisiWrapper top = popTail();
+     advanceTail(top);
+   }
+ 
+-  /** Reinitializes head, freq and doc from 'head' */
+-  private void setDocAndFreq() {
+-    assert head.size() > 0;
++  private void updateMaxScores(int target) throws IOException {
++    if (head.size() == 0) {
++      // If the head is empty we use the greatest score contributor as a lead
++      // like for conjunctions.
++      upTo = tail[0].scorer.advanceShallow(target);
++    } else {
++      // If we still have entries in 'head', we treat them all as leads and
++      // take the minimum of their next block boundaries as a next boundary.
++      // We don't take entries in 'tail' into account on purpose: 'tail' is
++      // supposed to contain the least score contributors, and taking them
++      // into account might not move the boundary fast enough, so we'll waste
++      // CPU re-computing the next boundary all the time.
++      int newUpTo = DocIdSetIterator.NO_MORE_DOCS;
++      for (DisiWrapper w : head) {
++        if (w.doc <= newUpTo) {
++          newUpTo = Math.min(w.scorer.advanceShallow(w.doc), newUpTo);
++          w.maxScore = scaleMaxScore(w.scorer.getMaxScore(newUpTo), scalingFactor);
++        }
++      }
++      upTo = newUpTo;
++    }
++
++    tailMaxScore = 0;
++    for (int i = 0; i < tailSize; ++i) {
++      DisiWrapper w = tail[i];
++      w.scorer.advanceShallow(target);
++      w.maxScore = scaleMaxScore(w.scorer.getMaxScore(upTo), scalingFactor);
++      upHeapMaxScore(tail, i); // the heap might need to be reordered
++      tailMaxScore += w.maxScore;
++    }
++
++    // We need to make sure that entries in 'tail' alone cannot match
++    // a competitive hit.
++    while (tailSize > 0 && tailMaxScore >= minCompetitiveScore) {
++      DisiWrapper w = popTail();
++      w.doc = w.iterator.advance(target);
++      head.add(w);
++    }
++  }
++
++  private void updateMaxScoresIfNecessary(int target) throws IOException {
++    assert lead == null;
++
++    if (head.size() == 0) { // no matches in the current block
++      if (upTo != DocIdSetIterator.NO_MORE_DOCS) {
++        updateMaxScores(Math.max(target, upTo + 1));
++      }
++    } else if (head.top().doc > upTo) { // the next candidate is in a different block
++      assert head.top().doc >= target;
++      updateMaxScores(target);
++    }
++  }
++
++  /** Set 'doc' to the next potential match, and move all disis of 'head' that
++   *  are on this doc into 'lead'. */
++  private void moveToNextCandidate(int target) throws IOException {
++    // Update score bounds if necessary so
++    updateMaxScoresIfNecessary(target);
++    assert upTo >= target;
++
++    // If the head is empty, it means that the sum of all max scores is not
++    // enough to produce a competitive score. So we jump to the next block.
++    while (head.size() == 0) {
++      if (upTo == DocIdSetIterator.NO_MORE_DOCS) {
++        doc = DocIdSetIterator.NO_MORE_DOCS;
++        return;
++      }
++      updateMaxScores(upTo + 1);
++    }
+ 
+     // The top of `head` defines the next potential match
+     // pop all documents which are on this doc
+@@ -332,19 +406,20 @@ final class WANDScorer extends Scorer {
+     while (head.size() > 0 && head.top().doc == doc) {
+       addLead(head.pop());
+     }
++
++    return;
+   }
+ 
+   /** Move iterators to the tail until there is a potential match. */
+-  private int doNextCandidate() throws IOException {
++  private int doNextCompetitiveCandidate() throws IOException {
+     while (leadMaxScore + tailMaxScore < minCompetitiveScore) {
+       // no match on doc is possible, move to the next potential match
+-      if (head.size() == 0) {
+-        // special case: the total max score is less than the min competitive score, there are no more matches
+-        return doc = DocIdSetIterator.NO_MORE_DOCS;
+-      }
+       pushBackLeads(doc + 1);
+-      setDocAndFreq();
++      moveToNextCandidate(doc + 1);
+       assert ensureConsistent();
++      if (doc == DocIdSetIterator.NO_MORE_DOCS) {
++        break;
++      }
+     }
+ 
+     return doc;
+@@ -352,15 +427,12 @@ final class WANDScorer extends Scorer {
+ 
+   /** Advance all entries from the tail to know about all matches on the
+    *  current doc. */
+-  private void updateFreq() throws IOException {
++  private void advanceAllTail() throws IOException {
+     // we return the next doc when the sum of the scores of the potential
+     // matching clauses is high enough but some of the clauses in 'tail' might
+     // match as well
+-    // in general we want to advance least-costly clauses first in order to
+-    // skip over non-matching documents as fast as possible. However here,
+-    // we are advancing everything anyway so iterating over clauses in
+-    // (roughly) cost-descending order might help avoid some permutations in
+-    // the head heap
++    // since we are advancing all clauses in tail, we just iterate the array
++    // without reorganizing the PQ
+     for (int i = tailSize - 1; i >= 0; --i) {
+       advanceTail(tail[i]);
+     }
+@@ -372,7 +444,7 @@ final class WANDScorer extends Scorer {
+   @Override
+   public float score() throws IOException {
+     // we need to know about all matches
+-    updateFreq();
++    advanceAllTail();
+     double score = 0;
+     for (DisiWrapper s = lead; s != null; s = s.next) {
+       score += s.scorer.score();
+@@ -381,8 +453,19 @@ final class WANDScorer extends Scorer {
+   }
+ 
+   @Override
+-  public float maxScore() {
+-    return maxScorePropagator.maxScore();
++  public int advanceShallow(int target) throws IOException {
++    // Propagate to improve score bounds
++    maxScorePropagator.advanceShallow(target);
++    if (target <= upTo) {
++      return upTo;
++    }
++    // TODO: implement
++    return DocIdSetIterator.NO_MORE_DOCS;
++  }
++
++  @Override
++  public float getMaxScore(int upTo) throws IOException {
++    return maxScorePropagator.getMaxScore(upTo);
+   }
+ 
+   @Override
+@@ -392,7 +475,7 @@ final class WANDScorer extends Scorer {
+ 
+   /** Insert an entry in 'tail' and evict the least-costly scorer if full. */
+   private DisiWrapper insertTailWithOverFlow(DisiWrapper s) {
+-    if (tailSize < tail.length && tailMaxScore + s.maxScore < minCompetitiveScore) {
++    if (tailMaxScore + s.maxScore < minCompetitiveScore) {
+       // we have free room for this new entry
+       addTail(s);
+       tailMaxScore += s.maxScore;
+diff --git a/lucene/core/src/java/org/apache/lucene/search/spans/SpanScorer.java b/lucene/core/src/java/org/apache/lucene/search/spans/SpanScorer.java
+index 044ac7a..666f163 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/spans/SpanScorer.java
++++ b/lucene/core/src/java/org/apache/lucene/search/spans/SpanScorer.java
+@@ -135,7 +135,7 @@ public class SpanScorer extends Scorer {
+   }
+ 
+   @Override
+-  public float maxScore() {
++  public float getMaxScore(int upTo) throws IOException {
+     return Float.POSITIVE_INFINITY;
+   }
+ 
+diff --git a/lucene/core/src/test/org/apache/lucene/search/JustCompileSearch.java b/lucene/core/src/test/org/apache/lucene/search/JustCompileSearch.java
+index c85732e..1657f9b 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/JustCompileSearch.java
++++ b/lucene/core/src/test/org/apache/lucene/search/JustCompileSearch.java
+@@ -176,7 +176,7 @@ final class JustCompileSearch {
+     }
+ 
+     @Override
+-    public float maxScore() {
++    public float getMaxScore(int upTo) throws IOException {
+       throw new UnsupportedOperationException(UNSUPPORTED_MSG);
+     }
+ 
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestBlockMaxConjunction.java b/lucene/core/src/test/org/apache/lucene/search/TestBlockMaxConjunction.java
+new file mode 100644
+index 0000000..8f9976d
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/search/TestBlockMaxConjunction.java
+@@ -0,0 +1,83 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.search;
++
++import java.io.IOException;
++
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.StringField;
++import org.apache.lucene.document.Field.Store;
++import org.apache.lucene.index.DirectoryReader;
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.IndexWriter;
++import org.apache.lucene.index.Term;
++import org.apache.lucene.search.BooleanClause.Occur;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util.TestUtil;
++
++public class TestBlockMaxConjunction extends LuceneTestCase {
++
++  private Query maybeWrap(Query query) {
++    if (random().nextBoolean()) {
++      query = new BlockScoreQueryWrapper(query, TestUtil.nextInt(random(), 2, 8));
++      query = new AssertingQuery(random(), query);
++    }
++    return query;
++  }
++
++  public void testRandom() throws IOException {
++    Directory dir = newDirectory();
++    IndexWriter w = new IndexWriter(dir, newIndexWriterConfig());
++    int numDocs = atLeast(1000);
++    for (int i = 0; i < numDocs; ++i) {
++      Document doc = new Document();
++      int numValues = random().nextInt(1 << random().nextInt(5));
++      int start = random().nextInt(10);
++      for (int j = 0; j < numValues; ++j) {
++        doc.add(new StringField("foo", Integer.toString(start + j), Store.NO));
++      }
++      w.addDocument(doc);
++    }
++    IndexReader reader = DirectoryReader.open(w);
++    w.close();
++    IndexSearcher searcher = newSearcher(reader);
++
++    for (int iter = 0; iter < 100; ++iter) {
++      int start = random().nextInt(10);
++      int numClauses = random().nextInt(1 << random().nextInt(5));
++      BooleanQuery.Builder builder = new BooleanQuery.Builder();
++      for (int i = 0; i < numClauses; ++i) {
++        builder.add(maybeWrap(new TermQuery(new Term("foo", Integer.toString(start + i)))), Occur.MUST);
++      }
++      Query query = builder.build();
++
++      CheckHits.checkTopScores(random(), query, searcher);
++
++      int filterTerm = random().nextInt(30);
++      Query filteredQuery = new BooleanQuery.Builder()
++          .add(query, Occur.MUST)
++          .add(new TermQuery(new Term("foo", Integer.toString(filterTerm))), Occur.FILTER)
++          .build();
++
++      CheckHits.checkTopScores(random(), filteredQuery, searcher);
++    }
++    reader.close();
++    dir.close();
++  }
++
++}
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestBoolean2ScorerSupplier.java b/lucene/core/src/test/org/apache/lucene/search/TestBoolean2ScorerSupplier.java
+index fa835ab..3118fa8 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestBoolean2ScorerSupplier.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestBoolean2ScorerSupplier.java
+@@ -51,7 +51,7 @@ public class TestBoolean2ScorerSupplier extends LuceneTestCase {
+     }
+ 
+     @Override
+-    public float maxScore() {
++    public float getMaxScore(int upTo) throws IOException {
+       return 1;
+     }
+ 
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestCachingCollector.java b/lucene/core/src/test/org/apache/lucene/search/TestCachingCollector.java
+index 24038f5..12136b5 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestCachingCollector.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestCachingCollector.java
+@@ -35,7 +35,7 @@ public class TestCachingCollector extends LuceneTestCase {
+     public float score() throws IOException { return 0; }
+ 
+     @Override
+-    public float maxScore() { return 0; }
++    public float getMaxScore(int upTo) throws IOException { return 0; }
+ 
+     @Override
+     public int docID() { return 0; }
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestConjunctionDISI.java b/lucene/core/src/test/org/apache/lucene/search/TestConjunctionDISI.java
+index 544c6da..083ac24 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestConjunctionDISI.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestConjunctionDISI.java
+@@ -147,7 +147,7 @@ public class TestConjunctionDISI extends LuceneTestCase {
+       }
+ 
+       @Override
+-      public float maxScore() {
++      public float getMaxScore(int upTo) throws IOException {
+         return 0;
+       }
+     };
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestMaxScoreSumPropagator.java b/lucene/core/src/test/org/apache/lucene/search/TestMaxScoreSumPropagator.java
+deleted file mode 100644
+index e52a490..0000000
+--- a/lucene/core/src/test/org/apache/lucene/search/TestMaxScoreSumPropagator.java
++++ /dev/null
+@@ -1,198 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.lucene.search;
+-
+-import java.io.IOException;
+-import java.util.ArrayList;
+-import java.util.Arrays;
+-import java.util.Collection;
+-import java.util.Collections;
+-import java.util.List;
+-
+-import org.apache.lucene.util.LuceneTestCase;
+-import org.apache.lucene.util.TestUtil;
+-
+-public class TestMaxScoreSumPropagator extends LuceneTestCase {
+-
+-  private static class FakeScorer extends Scorer {
+-    
+-    final float maxScore;
+-    float minCompetitiveScore;
+-    
+-    FakeScorer(float maxScore) {
+-      super(null);
+-      this.maxScore = maxScore;
+-    }
+-
+-    @Override
+-    public int docID() {
+-      throw new UnsupportedOperationException();
+-    }
+-
+-    @Override
+-    public float score() throws IOException {
+-      throw new UnsupportedOperationException();
+-    }
+-
+-    @Override
+-    public DocIdSetIterator iterator() {
+-      throw new UnsupportedOperationException();
+-    }
+-
+-    @Override
+-    public float maxScore() {
+-      return maxScore;
+-    }
+-
+-    @Override
+-    public void setMinCompetitiveScore(float minCompetitiveScore) {
+-      this.minCompetitiveScore = minCompetitiveScore;
+-    }
+-  }
+-
+-  public void test0Clause() {
+-    MaxScoreSumPropagator p = new MaxScoreSumPropagator(Collections.emptyList());
+-    assertEquals(0f, p.maxScore(), 0f);
+-    p.setMinCompetitiveScore(0f); // no exception
+-    p.setMinCompetitiveScore(0.5f); // no exception
+-  }
+-
+-  public void test1Clause() {
+-    FakeScorer a = new FakeScorer(1);
+-
+-    MaxScoreSumPropagator p = new MaxScoreSumPropagator(Collections.singletonList(a));
+-    assertEquals(1f, p.maxScore(), 0f);
+-    p.setMinCompetitiveScore(0f);
+-    assertEquals(0f, a.minCompetitiveScore, 0f);
+-    p.setMinCompetitiveScore(0.5f);
+-    assertEquals(0.5f, a.minCompetitiveScore, 0f);
+-    p.setMinCompetitiveScore(1f);
+-    assertEquals(1f, a.minCompetitiveScore, 0f);
+-  }
+-
+-  public void test2Clauses() {
+-    FakeScorer a = new FakeScorer(1);
+-    FakeScorer b = new FakeScorer(2);
+-
+-    MaxScoreSumPropagator p = new MaxScoreSumPropagator(Arrays.asList(a, b));
+-    assertEquals(3f, p.maxScore(), 0f);
+-
+-    p.setMinCompetitiveScore(1f);
+-    assertEquals(0f, a.minCompetitiveScore, 0f);
+-    assertEquals(0f, b.minCompetitiveScore, 0f);
+-    
+-    p.setMinCompetitiveScore(2f);
+-    assertEquals(0f, a.minCompetitiveScore, 0f);
+-    assertEquals(1f, b.minCompetitiveScore, 0f);
+-    
+-    p.setMinCompetitiveScore(2.5f);
+-    assertEquals(0.5f, a.minCompetitiveScore, 0f);
+-    assertEquals(1.5f, b.minCompetitiveScore, 0f);
+-    
+-    p.setMinCompetitiveScore(3f);
+-    assertEquals(1f, a.minCompetitiveScore, 0f);
+-    assertEquals(2f, b.minCompetitiveScore, 0f);
+-  }
+-
+-  public void test3Clauses() {
+-    FakeScorer a = new FakeScorer(1);
+-    FakeScorer b = new FakeScorer(2);
+-    FakeScorer c = new FakeScorer(1.5f);
+-
+-    MaxScoreSumPropagator p = new MaxScoreSumPropagator(Arrays.asList(a, b, c));
+-    assertEquals(4.5f, p.maxScore(), 0f);
+-
+-    p.setMinCompetitiveScore(1f);
+-    assertEquals(0f, a.minCompetitiveScore, 0f);
+-    assertEquals(0f, b.minCompetitiveScore, 0f);
+-    assertEquals(0f, c.minCompetitiveScore, 0f);
+-    
+-    p.setMinCompetitiveScore(2f);
+-    assertEquals(0f, a.minCompetitiveScore, 0f);
+-    assertEquals(0f, b.minCompetitiveScore, 0f);
+-    assertEquals(0f, c.minCompetitiveScore, 0f);
+-    
+-    p.setMinCompetitiveScore(3f);
+-    assertEquals(0f, a.minCompetitiveScore, 0f);
+-    assertEquals(0.5f, b.minCompetitiveScore, 0f);
+-    assertEquals(0f, c.minCompetitiveScore, 0f);
+-
+-    p.setMinCompetitiveScore(4f);
+-    assertEquals(0.5f, a.minCompetitiveScore, 0f);
+-    assertEquals(1.5f, b.minCompetitiveScore, 0f);
+-    assertEquals(1f, c.minCompetitiveScore, 0f);
+-  }
+-
+-  public void test2ClausesRandomScore() {
+-    for (int iter = 0; iter < 10; ++iter) {
+-      FakeScorer a = new FakeScorer(random().nextFloat());
+-      FakeScorer b = new FakeScorer(Math.nextUp(a.maxScore()) + random().nextFloat());
+-
+-      MaxScoreSumPropagator p = new MaxScoreSumPropagator(Arrays.asList(a, b));
+-      assertEquals(a.maxScore() + b.maxScore(), p.maxScore(), 0f);
+-      assertMinCompetitiveScore(Arrays.asList(a, b), p, Math.nextUp(a.maxScore()));
+-      assertMinCompetitiveScore(Arrays.asList(a, b), p, (a.maxScore() + b.maxScore()) / 2);
+-      assertMinCompetitiveScore(Arrays.asList(a, b), p, Math.nextDown(a.maxScore() + b.maxScore()));
+-      assertMinCompetitiveScore(Arrays.asList(a, b), p, a.maxScore() + b.maxScore());
+-    }
+-  }
+-
+-  public void testNClausesRandomScore() {
+-    for (int iter = 0; iter < 100; ++iter) {
+-      List<FakeScorer> scorers = new ArrayList<>();
+-      int numScorers = TestUtil.nextInt(random(), 3, 4 << random().nextInt(8));
+-      double sumOfMaxScore = 0;
+-      for (int i = 0; i < numScorers; ++i) {
+-        float maxScore = random().nextFloat();
+-        scorers.add(new FakeScorer(maxScore));
+-        sumOfMaxScore += maxScore;
+-      }
+-
+-      MaxScoreSumPropagator p = new MaxScoreSumPropagator(scorers);
+-      assertTrue(p.maxScore() >= (float) sumOfMaxScore);
+-      for (int i = 0; i < 10; ++i) {
+-        final float minCompetitiveScore = random().nextFloat() * numScorers;
+-        assertMinCompetitiveScore(scorers, p, minCompetitiveScore);
+-        // reset
+-        for (FakeScorer scorer : scorers) {
+-          scorer.minCompetitiveScore = 0;
+-        }
+-      }
+-    }
+-  }
+-
+-  private void assertMinCompetitiveScore(Collection<FakeScorer> scorers, MaxScoreSumPropagator p, float minCompetitiveScore) {
+-    p.setMinCompetitiveScore(minCompetitiveScore);
+-
+-    for (FakeScorer scorer : scorers) {
+-      if (scorer.minCompetitiveScore == 0f) {
+-        // no propagation is performed, still visiting all hits
+-        break;
+-      }
+-      double scoreSum = scorer.minCompetitiveScore;
+-      for (FakeScorer scorer2 : scorers) {
+-        if (scorer2 != scorer) {
+-          scoreSum += scorer2.maxScore();
+-        }
+-      }
+-      assertTrue(
+-          "scoreSum=" + scoreSum + ", minCompetitiveScore=" + minCompetitiveScore,
+-          (float) scoreSum <= minCompetitiveScore);
+-    }
+-  }
+-
+-}
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestMinShouldMatch2.java b/lucene/core/src/test/org/apache/lucene/search/TestMinShouldMatch2.java
+index 30b03ac..f60435c 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestMinShouldMatch2.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestMinShouldMatch2.java
+@@ -345,7 +345,7 @@ public class TestMinShouldMatch2 extends LuceneTestCase {
+     }
+ 
+     @Override
+-    public float maxScore() {
++    public float getMaxScore(int upTo) throws IOException {
+       return Float.POSITIVE_INFINITY;
+     }
+ 
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestPositiveScoresOnlyCollector.java b/lucene/core/src/test/org/apache/lucene/search/TestPositiveScoresOnlyCollector.java
+index bf19b12..9fbd6a4 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestPositiveScoresOnlyCollector.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestPositiveScoresOnlyCollector.java
+@@ -17,6 +17,8 @@
+ package org.apache.lucene.search;
+ 
+ 
++import java.io.IOException;
++
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.RandomIndexWriter;
+@@ -38,7 +40,7 @@ public class TestPositiveScoresOnlyCollector extends LuceneTestCase {
+     }
+ 
+     @Override
+-    public float maxScore() {
++    public float getMaxScore(int upTo) throws IOException {
+       return Float.POSITIVE_INFINITY;
+     }
+ 
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestQueryRescorer.java b/lucene/core/src/test/org/apache/lucene/search/TestQueryRescorer.java
+index d4aa9cf..d1f307d 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestQueryRescorer.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestQueryRescorer.java
+@@ -481,7 +481,7 @@ public class TestQueryRescorer extends LuceneTestCase {
+             }
+ 
+             @Override
+-            public float maxScore() {
++            public float getMaxScore(int upTo) throws IOException {
+               return Float.POSITIVE_INFINITY;
+             }
+           };
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestScoreCachingWrappingScorer.java b/lucene/core/src/test/org/apache/lucene/search/TestScoreCachingWrappingScorer.java
+index fa852b6..2573101 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestScoreCachingWrappingScorer.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestScoreCachingWrappingScorer.java
+@@ -44,7 +44,7 @@ public class TestScoreCachingWrappingScorer extends LuceneTestCase {
+     }
+     
+     @Override
+-    public float maxScore() {
++    public float getMaxScore(int upTo) throws IOException {
+       return Float.POSITIVE_INFINITY;
+     }
+ 
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestTopDocsCollector.java b/lucene/core/src/test/org/apache/lucene/search/TestTopDocsCollector.java
+index 035003e..17c5f85 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestTopDocsCollector.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestTopDocsCollector.java
+@@ -237,7 +237,7 @@ public class TestTopDocsCollector extends LuceneTestCase {
+     }
+ 
+     @Override
+-    public float maxScore() {
++    public float getMaxScore(int upTo) throws IOException {
+       return Float.POSITIVE_INFINITY;
+     }
+ 
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestTopFieldCollector.java b/lucene/core/src/test/org/apache/lucene/search/TestTopFieldCollector.java
+index d8363f7..f12e910 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestTopFieldCollector.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestTopFieldCollector.java
+@@ -251,8 +251,8 @@ public class TestTopFieldCollector extends LuceneTestCase {
+                     }
+ 
+                     @Override
+-                    public float maxScore() {
+-                      return scorer.maxScore();
++                    public float getMaxScore(int upTo) throws IOException {
++                      return scorer.getMaxScore(upTo);
+                     }
+ 
+                     @Override
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestWANDScorer.java b/lucene/core/src/test/org/apache/lucene/search/TestWANDScorer.java
+index b4a4eda..5367dbc 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestWANDScorer.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestWANDScorer.java
+@@ -30,6 +30,7 @@ import org.apache.lucene.index.Term;
+ import org.apache.lucene.search.BooleanClause.Occur;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util.TestUtil;
+ 
+ public class TestWANDScorer extends LuceneTestCase {
+ 
+@@ -53,6 +54,14 @@ public class TestWANDScorer extends LuceneTestCase {
+     assertTrue(""+scaled, scaled <= 1 << 16);
+   }
+ 
++  private Query maybeWrap(Query query) {
++    if (random().nextBoolean()) {
++      query = new BlockScoreQueryWrapper(query, TestUtil.nextInt(random(), 2, 8));
++      query = new AssertingQuery(random(), query);
++    }
++    return query;
++  }
++
+   public void testBasics() throws Exception {
+     Directory dir = newDirectory();
+     IndexWriter w = new IndexWriter(dir, newIndexWriterConfig().setMergePolicy(newLogMergePolicy()));
+@@ -127,7 +136,7 @@ public class TestWANDScorer extends LuceneTestCase {
+ 
+     assertEquals(DocIdSetIterator.NO_MORE_DOCS, scorer.iterator().nextDoc());
+ 
+-    // Now test a filtered disjunction
++    //  test a filtered disjunction
+     query = new BooleanQuery.Builder()
+         .add(
+             new BooleanQuery.Builder()
+@@ -216,19 +225,14 @@ public class TestWANDScorer extends LuceneTestCase {
+ 
+     for (int iter = 0; iter < 100; ++iter) {
+       int start = random().nextInt(10);
+-      int numClauses = random().nextInt(1 << random().nextInt(5));
++      int numClauses = 2;//random().nextInt(1 << random().nextInt(5));
+       BooleanQuery.Builder builder = new BooleanQuery.Builder();
+       for (int i = 0; i < numClauses; ++i) {
+-        builder.add(new TermQuery(new Term("foo", Integer.toString(start + i))), Occur.SHOULD);
++        builder.add(maybeWrap(new TermQuery(new Term("foo", Integer.toString(start + i)))), Occur.SHOULD);
+       }
+       Query query = builder.build();
+ 
+-      TopScoreDocCollector collector1 = TopScoreDocCollector.create(10, null, true); // COMPLETE
+-      TopScoreDocCollector collector2 = TopScoreDocCollector.create(10, null, false); // TOP_SCORES
+-      
+-      searcher.search(query, collector1);
+-      searcher.search(query, collector2);
+-      assertTopDocsEquals(collector1.topDocs(), collector2.topDocs());
++      CheckHits.checkTopScores(random(), query, searcher);
+ 
+       int filterTerm = random().nextInt(30);
+       Query filteredQuery = new BooleanQuery.Builder()
+@@ -236,11 +240,7 @@ public class TestWANDScorer extends LuceneTestCase {
+           .add(new TermQuery(new Term("foo", Integer.toString(filterTerm))), Occur.FILTER)
+           .build();
+ 
+-      collector1 = TopScoreDocCollector.create(10, null, true); // COMPLETE
+-      collector2 = TopScoreDocCollector.create(10, null, false); // TOP_SCORES
+-      searcher.search(filteredQuery, collector1);
+-      searcher.search(filteredQuery, collector2);
+-      assertTopDocsEquals(collector1.topDocs(), collector2.topDocs());
++      CheckHits.checkTopScores(random(), filteredQuery, searcher);
+     }
+     reader.close();
+     dir.close();
+@@ -276,11 +276,7 @@ public class TestWANDScorer extends LuceneTestCase {
+       }
+       Query query = builder.build();
+ 
+-      TopScoreDocCollector collector1 = TopScoreDocCollector.create(10, null, true); // COMPLETE
+-      TopScoreDocCollector collector2 = TopScoreDocCollector.create(10, null, false); // TOP_SCORES
+-      searcher.search(query, collector1);
+-      searcher.search(query, collector2);
+-      assertTopDocsEquals(collector1.topDocs(), collector2.topDocs());
++      CheckHits.checkTopScores(random(), query, searcher);
+ 
+       int filterTerm = random().nextInt(30);
+       Query filteredQuery = new BooleanQuery.Builder()
+@@ -288,11 +284,7 @@ public class TestWANDScorer extends LuceneTestCase {
+           .add(new TermQuery(new Term("foo", Integer.toString(filterTerm))), Occur.FILTER)
+           .build();
+ 
+-      collector1 = TopScoreDocCollector.create(10, null, true); // COMPLETE
+-      collector2 = TopScoreDocCollector.create(10, null, false); // TOP_SCORES
+-      searcher.search(filteredQuery, collector1);
+-      searcher.search(filteredQuery, collector2);
+-      assertTopDocsEquals(collector1.topDocs(), collector2.topDocs());
++      CheckHits.checkTopScores(random(), filteredQuery, searcher);
+     }
+     reader.close();
+     dir.close();
+@@ -305,7 +297,7 @@ public class TestWANDScorer extends LuceneTestCase {
+     }
+ 
+     @Override
+-    public float maxScore() {
++    public float getMaxScore(int upTo) throws IOException {
+       return Float.POSITIVE_INFINITY;
+     }
+ 
+@@ -378,17 +370,6 @@ public class TestWANDScorer extends LuceneTestCase {
+         }
+       };
+     }
+-
+-  }
+-
+-  private static void assertTopDocsEquals(TopDocs td1, TopDocs td2) {
+-    assertEquals(td1.scoreDocs.length, td2.scoreDocs.length);
+-    for (int i = 0; i < td1.scoreDocs.length; ++i) {
+-      ScoreDoc sd1 = td1.scoreDocs[i];
+-      ScoreDoc sd2 = td2.scoreDocs[i];
+-      assertEquals(sd1.doc, sd2.doc);
+-      assertEquals(sd1.score, sd2.score, 0f);
+-    }
+   }
+ 
+ }
+diff --git a/lucene/expressions/src/java/org/apache/lucene/expressions/FakeScorer.java b/lucene/expressions/src/java/org/apache/lucene/expressions/FakeScorer.java
+index 4ba905a..026c789 100644
+--- a/lucene/expressions/src/java/org/apache/lucene/expressions/FakeScorer.java
++++ b/lucene/expressions/src/java/org/apache/lucene/expressions/FakeScorer.java
+@@ -47,7 +47,7 @@ class FakeScorer extends Scorer {
+   }
+ 
+   @Override
+-  public float maxScore() {
++  public float getMaxScore(int upTo) throws IOException {
+     return Float.POSITIVE_INFINITY;
+   }
+ }
+diff --git a/lucene/facet/src/java/org/apache/lucene/facet/DrillSidewaysScorer.java b/lucene/facet/src/java/org/apache/lucene/facet/DrillSidewaysScorer.java
+index eaf1ffe..c5f3f76 100644
+--- a/lucene/facet/src/java/org/apache/lucene/facet/DrillSidewaysScorer.java
++++ b/lucene/facet/src/java/org/apache/lucene/facet/DrillSidewaysScorer.java
+@@ -602,7 +602,7 @@ class DrillSidewaysScorer extends BulkScorer {
+     }
+ 
+     @Override
+-    public float maxScore() {
++    public float getMaxScore(int upTo) throws IOException {
+       return Float.POSITIVE_INFINITY;
+     }
+ 
+diff --git a/lucene/grouping/src/java/org/apache/lucene/search/grouping/FakeScorer.java b/lucene/grouping/src/java/org/apache/lucene/search/grouping/FakeScorer.java
+index 8c06f94..b46662d 100644
+--- a/lucene/grouping/src/java/org/apache/lucene/search/grouping/FakeScorer.java
++++ b/lucene/grouping/src/java/org/apache/lucene/search/grouping/FakeScorer.java
+@@ -46,7 +46,7 @@ class FakeScorer extends Scorer {
+   }
+ 
+   @Override
+-  public float maxScore() {
++  public float getMaxScore(int upTo) throws IOException {
+     return Float.POSITIVE_INFINITY;
+   }
+ }
+diff --git a/lucene/join/src/java/org/apache/lucene/search/join/BaseGlobalOrdinalScorer.java b/lucene/join/src/java/org/apache/lucene/search/join/BaseGlobalOrdinalScorer.java
+index 29df3a7..c1d3ab2 100644
+--- a/lucene/join/src/java/org/apache/lucene/search/join/BaseGlobalOrdinalScorer.java
++++ b/lucene/join/src/java/org/apache/lucene/search/join/BaseGlobalOrdinalScorer.java
+@@ -43,7 +43,7 @@ abstract class BaseGlobalOrdinalScorer extends Scorer {
+   }
+ 
+   @Override
+-  public float maxScore() {
++  public float getMaxScore(int upTo) throws IOException {
+     return Float.POSITIVE_INFINITY;
+   }
+ 
+diff --git a/lucene/join/src/java/org/apache/lucene/search/join/FakeScorer.java b/lucene/join/src/java/org/apache/lucene/search/join/FakeScorer.java
+index 7ad69fa..125ce88 100644
+--- a/lucene/join/src/java/org/apache/lucene/search/join/FakeScorer.java
++++ b/lucene/join/src/java/org/apache/lucene/search/join/FakeScorer.java
+@@ -46,7 +46,7 @@ class FakeScorer extends Scorer {
+   }
+ 
+   @Override
+-  public float maxScore() {
++  public float getMaxScore(int upTo) throws IOException {
+     return Float.POSITIVE_INFINITY;
+   }
+ }
+diff --git a/lucene/join/src/java/org/apache/lucene/search/join/ParentChildrenBlockJoinQuery.java b/lucene/join/src/java/org/apache/lucene/search/join/ParentChildrenBlockJoinQuery.java
+index bc65e8c..7ce1c29 100644
+--- a/lucene/join/src/java/org/apache/lucene/search/join/ParentChildrenBlockJoinQuery.java
++++ b/lucene/join/src/java/org/apache/lucene/search/join/ParentChildrenBlockJoinQuery.java
+@@ -184,7 +184,7 @@ public class ParentChildrenBlockJoinQuery extends Query {
+           }
+ 
+           @Override
+-          public float maxScore() {
++          public float getMaxScore(int upTo) throws IOException {
+             return Float.POSITIVE_INFINITY;
+           }
+           @Override
+diff --git a/lucene/join/src/java/org/apache/lucene/search/join/PointInSetIncludingScoreQuery.java b/lucene/join/src/java/org/apache/lucene/search/join/PointInSetIncludingScoreQuery.java
+index 57389ab..02b7e86 100644
+--- a/lucene/join/src/java/org/apache/lucene/search/join/PointInSetIncludingScoreQuery.java
++++ b/lucene/join/src/java/org/apache/lucene/search/join/PointInSetIncludingScoreQuery.java
+@@ -170,7 +170,7 @@ abstract class PointInSetIncludingScoreQuery extends Query {
+           }
+ 
+           @Override
+-          public float maxScore() {
++          public float getMaxScore(int upTo) throws IOException {
+             return Float.POSITIVE_INFINITY;
+           }
+ 
+diff --git a/lucene/join/src/java/org/apache/lucene/search/join/TermsIncludingScoreQuery.java b/lucene/join/src/java/org/apache/lucene/search/join/TermsIncludingScoreQuery.java
+index 98bf5b3..43ddd52 100644
+--- a/lucene/join/src/java/org/apache/lucene/search/join/TermsIncludingScoreQuery.java
++++ b/lucene/join/src/java/org/apache/lucene/search/join/TermsIncludingScoreQuery.java
+@@ -186,7 +186,7 @@ class TermsIncludingScoreQuery extends Query {
+     }
+ 
+     @Override
+-    public float maxScore() {
++    public float getMaxScore(int upTo) throws IOException {
+       return Float.POSITIVE_INFINITY;
+     }
+ 
+diff --git a/lucene/join/src/java/org/apache/lucene/search/join/ToChildBlockJoinQuery.java b/lucene/join/src/java/org/apache/lucene/search/join/ToChildBlockJoinQuery.java
+index 8c75274..9de319b 100644
+--- a/lucene/join/src/java/org/apache/lucene/search/join/ToChildBlockJoinQuery.java
++++ b/lucene/join/src/java/org/apache/lucene/search/join/ToChildBlockJoinQuery.java
+@@ -281,8 +281,8 @@ public class ToChildBlockJoinQuery extends Query {
+     }
+ 
+     @Override
+-    public float maxScore() {
+-      return parentScorer.maxScore();
++    public float getMaxScore(int upTo) throws IOException {
++      return parentScorer.getMaxScore(DocIdSetIterator.NO_MORE_DOCS);
+     }
+     
+     int getParentDoc() {
+diff --git a/lucene/join/src/java/org/apache/lucene/search/join/ToParentBlockJoinQuery.java b/lucene/join/src/java/org/apache/lucene/search/join/ToParentBlockJoinQuery.java
+index 6b4acff..9f2bd90 100644
+--- a/lucene/join/src/java/org/apache/lucene/search/join/ToParentBlockJoinQuery.java
++++ b/lucene/join/src/java/org/apache/lucene/search/join/ToParentBlockJoinQuery.java
+@@ -287,11 +287,11 @@ public class ToParentBlockJoinQuery extends Query {
+     }
+ 
+     @Override
+-    public float maxScore() {
++    public float getMaxScore(int upTo) throws IOException {
+       switch(scoreMode) {
+         case Max:
+         case Min:
+-          return childScorer.maxScore();
++          return childScorer.getMaxScore(DocIdSetIterator.NO_MORE_DOCS);
+         default:
+           return Float.POSITIVE_INFINITY;
+       }
+diff --git a/lucene/join/src/test/org/apache/lucene/search/join/TestJoinUtil.java b/lucene/join/src/test/org/apache/lucene/search/join/TestJoinUtil.java
+index 088bb87..23c785b 100644
+--- a/lucene/join/src/test/org/apache/lucene/search/join/TestJoinUtil.java
++++ b/lucene/join/src/test/org/apache/lucene/search/join/TestJoinUtil.java
+@@ -543,7 +543,7 @@ public class TestJoinUtil extends LuceneTestCase {
+                   return (float) price.longValue();
+                 }
+                 @Override
+-                public float maxScore() {
++                public float getMaxScore(int upTo) throws IOException {
+                   return Float.POSITIVE_INFINITY;
+                 }
+               };
+diff --git a/lucene/misc/src/test/org/apache/lucene/search/TestDiversifiedTopDocsCollector.java b/lucene/misc/src/test/org/apache/lucene/search/TestDiversifiedTopDocsCollector.java
+index 5e98349f..db17a90 100644
+--- a/lucene/misc/src/test/org/apache/lucene/search/TestDiversifiedTopDocsCollector.java
++++ b/lucene/misc/src/test/org/apache/lucene/search/TestDiversifiedTopDocsCollector.java
+@@ -505,7 +505,7 @@ public class TestDiversifiedTopDocsCollector extends LuceneTestCase {
+             }
+             
+             @Override
+-            public float maxScore() {
++            public float getMaxScore(int upTo) throws IOException {
+               return Float.POSITIVE_INFINITY;
+             }
+             
+diff --git a/lucene/queries/src/java/org/apache/lucene/queries/function/FunctionQuery.java b/lucene/queries/src/java/org/apache/lucene/queries/function/FunctionQuery.java
+index da41246..f996306 100644
+--- a/lucene/queries/src/java/org/apache/lucene/queries/function/FunctionQuery.java
++++ b/lucene/queries/src/java/org/apache/lucene/queries/function/FunctionQuery.java
+@@ -125,7 +125,7 @@ public class FunctionQuery extends Query {
+     }
+ 
+     @Override
+-    public float maxScore() {
++    public float getMaxScore(int upTo) throws IOException {
+       return Float.POSITIVE_INFINITY;
+     }
+ 
+diff --git a/lucene/queries/src/java/org/apache/lucene/queries/function/FunctionScoreQuery.java b/lucene/queries/src/java/org/apache/lucene/queries/function/FunctionScoreQuery.java
+index 09a592b..0d39e8b 100644
+--- a/lucene/queries/src/java/org/apache/lucene/queries/function/FunctionScoreQuery.java
++++ b/lucene/queries/src/java/org/apache/lucene/queries/function/FunctionScoreQuery.java
+@@ -209,7 +209,7 @@ public final class FunctionScoreQuery extends Query {
+           return 0;
+         }
+         @Override
+-        public float maxScore() {
++        public float getMaxScore(int upTo) throws IOException {
+           return Float.POSITIVE_INFINITY;
+         }
+       };
+diff --git a/lucene/queries/src/java/org/apache/lucene/queries/function/ValueSource.java b/lucene/queries/src/java/org/apache/lucene/queries/function/ValueSource.java
+index 4b8111e..5290dcc 100644
+--- a/lucene/queries/src/java/org/apache/lucene/queries/function/ValueSource.java
++++ b/lucene/queries/src/java/org/apache/lucene/queries/function/ValueSource.java
+@@ -107,7 +107,7 @@ public abstract class ValueSource {
+     }
+ 
+     @Override
+-    public float maxScore() {
++    public float getMaxScore(int upTo) throws IOException {
+       return Float.POSITIVE_INFINITY;
+     }
+ 
+diff --git a/lucene/queries/src/java/org/apache/lucene/queries/function/ValueSourceScorer.java b/lucene/queries/src/java/org/apache/lucene/queries/function/ValueSourceScorer.java
+index 9e8534b..509f454 100644
+--- a/lucene/queries/src/java/org/apache/lucene/queries/function/ValueSourceScorer.java
++++ b/lucene/queries/src/java/org/apache/lucene/queries/function/ValueSourceScorer.java
+@@ -90,7 +90,7 @@ public abstract class ValueSourceScorer extends Scorer {
+   }
+ 
+   @Override
+-  public float maxScore() {
++  public float getMaxScore(int upTo) throws IOException {
+     return Float.POSITIVE_INFINITY;
+   }
+ 
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/CoveringScorer.java b/lucene/sandbox/src/java/org/apache/lucene/search/CoveringScorer.java
+index eb3255e..a9743be 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/search/CoveringScorer.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/search/CoveringScorer.java
+@@ -212,7 +212,7 @@ final class CoveringScorer extends Scorer {
+   }
+ 
+   @Override
+-  public float maxScore() {
++  public float getMaxScore(int upTo) throws IOException {
+     // TODO: implement but beware of floating-point errors
+     return Float.POSITIVE_INFINITY;
+   }
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/TermAutomatonScorer.java b/lucene/sandbox/src/java/org/apache/lucene/search/TermAutomatonScorer.java
+index 6094c01..f1ab32f 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/search/TermAutomatonScorer.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/search/TermAutomatonScorer.java
+@@ -360,7 +360,7 @@ class TermAutomatonScorer extends Scorer {
+   }
+ 
+   @Override
+-  public float maxScore() {
++  public float getMaxScore(int upTo) throws IOException {
+     return docScorer.maxScore();
+   }
+ 
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/search/AssertingScorer.java b/lucene/test-framework/src/java/org/apache/lucene/search/AssertingScorer.java
+index b6062a2..80cd4da 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/search/AssertingScorer.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/search/AssertingScorer.java
+@@ -24,7 +24,7 @@ import java.util.Random;
+ /** Wraps a Scorer with additional checks */
+ public class AssertingScorer extends Scorer {
+ 
+-  static enum IteratorState { START, APPROXIMATING, ITERATING, FINISHED };
++  static enum IteratorState { APPROXIMATING, ITERATING, SHALLOW_ADVANCING, FINISHED };
+ 
+   public static Scorer wrap(Random random, Scorer other, ScoreMode scoreMode) {
+     if (other == null) {
+@@ -37,9 +37,10 @@ public class AssertingScorer extends Scorer {
+   final Scorer in;
+   final ScoreMode scoreMode;
+ 
+-  IteratorState state = IteratorState.START;
++  IteratorState state = IteratorState.ITERATING;
+   int doc;
+   float minCompetitiveScore = 0;
++  int lastShallowTarget;
+ 
+   private AssertingScorer(Random random, Scorer in, ScoreMode scoreMode) {
+     super(in.weight);
+@@ -60,7 +61,7 @@ public class AssertingScorer extends Scorer {
+     case DocIdSetIterator.NO_MORE_DOCS:
+       return false;
+     default:
+-      return state != IteratorState.APPROXIMATING; // Matches must be confirmed before calling freq() or score()
++      return state == IteratorState.ITERATING;
+     }
+   }
+ 
+@@ -74,19 +75,30 @@ public class AssertingScorer extends Scorer {
+   }
+ 
+   @Override
+-  public float maxScore() {
+-    float maxScore = in.maxScore();
+-    assert Float.isNaN(maxScore) == false;
++  public int advanceShallow(int target) throws IOException {
++    assert target >= lastShallowTarget : "called on decreasing targets: target = " + target + " < last target = " + lastShallowTarget;
++    assert target >= docID() : "target = " + target + " < docID = " + docID();
++    int upTo = in.advanceShallow(target);
++    assert upTo >= target : "upTo = " + upTo + " < target = " + target;
++    lastShallowTarget = target;
++    state = target != doc ? IteratorState.SHALLOW_ADVANCING : state;
++    return upTo;
++  }
++
++  @Override
++  public float getMaxScore(int upTo) throws IOException {
++    assert upTo >= lastShallowTarget : "uTo = " + upTo + " < last target = " + lastShallowTarget;
++    float maxScore = in.getMaxScore(upTo);
+     return maxScore;
+   }
+ 
+   @Override
+   public float score() throws IOException {
+     assert scoreMode.needsScores();
+-    assert iterating();
++    assert iterating() : state;
+     final float score = in.score();
+     assert !Float.isNaN(score) : "NaN score for in="+in;
+-    assert score <= maxScore();
++    assert score <= getMaxScore(DocIdSetIterator.NO_MORE_DOCS);
+     assert Float.compare(score, 0f) >= 0 : score;
+     return score;
+   }
+@@ -125,6 +137,7 @@ public class AssertingScorer extends Scorer {
+       @Override
+       public int nextDoc() throws IOException {
+         assert state != IteratorState.FINISHED : "nextDoc() called after NO_MORE_DOCS";
++        assert docID() + 1 >= lastShallowTarget;
+         int nextDoc = in.nextDoc();
+         assert nextDoc > doc : "backwards nextDoc from " + doc + " to " + nextDoc + " " + in;
+         if (nextDoc == DocIdSetIterator.NO_MORE_DOCS) {
+@@ -141,6 +154,7 @@ public class AssertingScorer extends Scorer {
+       public int advance(int target) throws IOException {
+         assert state != IteratorState.FINISHED : "advance() called after NO_MORE_DOCS";
+         assert target > doc : "target must be > docID(), got " + target + " <= " + doc;
++        assert target >= lastShallowTarget;
+         int advanced = in.advance(target);
+         assert advanced >= target : "backwards advance from: " + target + " to: " + advanced;
+         if (advanced == DocIdSetIterator.NO_MORE_DOCS) {
+@@ -178,6 +192,7 @@ public class AssertingScorer extends Scorer {
+       @Override
+       public int nextDoc() throws IOException {
+         assert state != IteratorState.FINISHED : "advance() called after NO_MORE_DOCS";
++        assert docID() + 1 >= lastShallowTarget;
+         final int nextDoc = inApproximation.nextDoc();
+         assert nextDoc > doc : "backwards advance from: " + doc + " to: " + nextDoc;
+         if (nextDoc == NO_MORE_DOCS) {
+@@ -193,6 +208,7 @@ public class AssertingScorer extends Scorer {
+       public int advance(int target) throws IOException {
+         assert state != IteratorState.FINISHED : "advance() called after NO_MORE_DOCS";
+         assert target > doc : "target must be > docID(), got " + target + " <= " + doc;
++        assert target >= lastShallowTarget;
+         final int advanced = inApproximation.advance(target);
+         assert advanced >= target : "backwards advance from: " + target + " to: " + advanced;
+         if (advanced == NO_MORE_DOCS) {
+@@ -213,7 +229,7 @@ public class AssertingScorer extends Scorer {
+     return new TwoPhaseIterator(assertingApproximation) {
+       @Override
+       public boolean matches() throws IOException {
+-        assert state == IteratorState.APPROXIMATING;
++        assert state == IteratorState.APPROXIMATING : state;
+         final boolean matches = in.matches();
+         if (matches) {
+           assert AssertingScorer.this.in.iterator().docID() == inApproximation.docID() : "Approximation and scorer don't advance synchronously";
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/search/BlockScoreQueryWrapper.java b/lucene/test-framework/src/java/org/apache/lucene/search/BlockScoreQueryWrapper.java
+new file mode 100644
+index 0000000..40cb521
+--- /dev/null
++++ b/lucene/test-framework/src/java/org/apache/lucene/search/BlockScoreQueryWrapper.java
+@@ -0,0 +1,213 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.search;
++
++import java.io.IOException;
++import java.util.Arrays;
++import java.util.Objects;
++import java.util.Set;
++
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.LeafReaderContext;
++import org.apache.lucene.index.Term;
++import org.apache.lucene.util.ArrayUtil;
++
++/**
++ * Query wrapper that reduces the size of max-score blocks to more easily detect
++ * problems with the max-score logic.
++ */
++public final class BlockScoreQueryWrapper extends Query {
++
++  private final Query query;
++  private final int blockLength;
++
++  
++  public BlockScoreQueryWrapper(Query query, int blockLength) {
++    this.query = Objects.requireNonNull(query);
++    this.blockLength = blockLength;
++  }
++
++  @Override
++  public String toString(String field) {
++    return query.toString(field);
++  }
++
++  @Override
++  public boolean equals(Object obj) {
++    if (obj == null || getClass() != obj.getClass()) {
++      return false;
++    }
++    BlockScoreQueryWrapper that = (BlockScoreQueryWrapper) obj;
++    return Objects.equals(query, that.query) && blockLength == that.blockLength;
++  }
++
++  @Override
++  public int hashCode() {
++    int h = classHash();
++    h = 31 * h + query.hashCode();
++    h = 31 * h + blockLength;
++    return h;
++  }
++
++  @Override
++  public Query rewrite(IndexReader reader) throws IOException {
++    final Query rewritten = query.rewrite(reader);
++    if (rewritten != query) {
++      return new BlockScoreQueryWrapper(rewritten, blockLength);
++    }
++    return super.rewrite(reader);
++  }
++
++  @Override
++  public Weight createWeight(IndexSearcher searcher, ScoreMode scoreMode, float boost) throws IOException {
++    final Weight inWeight = query.createWeight(searcher, scoreMode, boost);
++    if (scoreMode.needsScores() == false) {
++      return inWeight;
++    }
++    return new Weight(this) {
++      @Override
++      public boolean isCacheable(LeafReaderContext ctx) {
++        return inWeight.isCacheable(ctx);
++      }
++
++      @Override
++      public Scorer scorer(LeafReaderContext context) throws IOException {
++        Scorer inScorer = inWeight.scorer(context);
++        if (inScorer == null) {
++          return null;
++        }
++
++        int[] tmpDocs = new int[2];
++        float[] tmpScores = new float[2];
++        tmpDocs[0] = -1;
++        DocIdSetIterator it = inScorer.iterator();
++        int i = 1;
++        for (int doc = it.nextDoc(); ; doc = it.nextDoc()) {
++          if (i == tmpDocs.length) {
++            tmpDocs = ArrayUtil.grow(tmpDocs);
++            tmpScores = Arrays.copyOf(tmpScores, tmpDocs.length);
++          }
++          tmpDocs[i] = doc;
++          if (doc == DocIdSetIterator.NO_MORE_DOCS) {
++            i++;
++            break;
++          }
++          tmpScores[i] = inScorer.score();
++          i++;
++        }
++        final int[] docs = Arrays.copyOf(tmpDocs, i);
++        final float[] scores = Arrays.copyOf(tmpScores, i);
++
++        return new Scorer(inWeight) {
++
++          int i = 0;
++
++          @Override
++          public int docID() {
++            return docs[i];
++          }
++
++          @Override
++          public float score() throws IOException {
++            return scores[i];
++          }
++
++          @Override
++          public DocIdSetIterator iterator() {
++            return new DocIdSetIterator() {
++
++              @Override
++              public int nextDoc() throws IOException {
++                assert docs[i] != NO_MORE_DOCS;
++                return docs[++i];
++              }
++
++              @Override
++              public int docID() {
++                return docs[i];
++              }
++
++              @Override
++              public long cost() {
++                return docs.length - 2;
++              }
++
++              @Override
++              public int advance(int target) throws IOException {
++                i = Arrays.binarySearch(docs, target);
++                if (i < 0) {
++                  i = -1 - i;
++                }
++                assert docs[i] >= target;
++                return docs[i];
++              }
++            };
++          }
++
++          private int startOfBlock(int target) {
++            int i = Arrays.binarySearch(docs, target);
++            if (i < 0) {
++              i = -1 - i;
++            }
++            return i - i % blockLength;
++          }
++
++          private int endOfBlock(int target) {
++            return Math.min(startOfBlock(target) + blockLength, docs.length - 1);
++          }
++
++          int lastShallowTarget = -1;
++
++          @Override
++          public int advanceShallow(int target) throws IOException {
++            lastShallowTarget = target;
++            if (target == DocIdSetIterator.NO_MORE_DOCS) {
++              return DocIdSetIterator.NO_MORE_DOCS;
++            }
++            return docs[endOfBlock(target)] - 1;
++          }
++
++          @Override
++          public float getMaxScore(int upTo) throws IOException {
++            float max = 0;
++            for (int j = startOfBlock(Math.max(docs[i], lastShallowTarget)); ; ++j) {
++              if (docs[j] > upTo) {
++                break;
++              }
++              max = Math.max(max, scores[j]);
++              if (j == docs.length - 1) {
++                break;
++              }
++            }
++            return max;
++          }
++
++        };
++      }
++
++      @Override
++      public void extractTerms(Set<Term> terms) {
++        inWeight.extractTerms(terms);
++      }
++
++      @Override
++      public Explanation explain(LeafReaderContext context, int doc) throws IOException {
++        return inWeight.explain(context, doc);
++      }
++    };
++  }
++}
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/search/BulkScorerWrapperScorer.java b/lucene/test-framework/src/java/org/apache/lucene/search/BulkScorerWrapperScorer.java
+index db1de52..9206b04 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/search/BulkScorerWrapperScorer.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/search/BulkScorerWrapperScorer.java
+@@ -70,7 +70,7 @@ public class BulkScorerWrapperScorer extends Scorer {
+   }
+ 
+   @Override
+-  public float maxScore() {
++  public float getMaxScore(int upTo) throws IOException {
+     return Float.POSITIVE_INFINITY;
+   }
+ 
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/search/CheckHits.java b/lucene/test-framework/src/java/org/apache/lucene/search/CheckHits.java
+index 9c8943d..8d8b60b 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/search/CheckHits.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/search/CheckHits.java
+@@ -16,6 +16,9 @@
+  */
+ package org.apache.lucene.search;
+ 
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++
+ import java.io.IOException;
+ import java.util.Locale;
+ import java.util.Set;
+@@ -520,6 +523,150 @@ public class CheckHits {
+     }
+   }
+ 
+-}
++  public static void checkTopScores(Random random, Query query, IndexSearcher searcher) throws IOException {
++    // Check it computed the top hits correctly
++    doCheckTopScores(query, searcher, 1);
++    doCheckTopScores(query, searcher, 10);
++
++    // Now check that the exposed max scores and block boundaries are valid
++    doCheckMaxScores(random, query, searcher);
++  }
++
++  private static void doCheckTopScores(Query query, IndexSearcher searcher, int numHits) throws IOException {
++    TopScoreDocCollector collector1 = TopScoreDocCollector.create(numHits, null, true); // COMPLETE
++    TopScoreDocCollector collector2 = TopScoreDocCollector.create(numHits, null, false); // TOP_SCORES
++    searcher.search(query, collector1);
++    searcher.search(query, collector2);
++    checkEqual(query, collector1.topDocs().scoreDocs, collector2.topDocs().scoreDocs);
++  }
++
++  private static void doCheckMaxScores(Random random, Query query, IndexSearcher searcher) throws IOException {
++    Weight w1 = searcher.createNormalizedWeight(query, ScoreMode.COMPLETE);
++    Weight w2 = searcher.createNormalizedWeight(query, ScoreMode.TOP_SCORES);
++
++    // Check boundaries and max scores when iterating all matches
++    for (LeafReaderContext ctx : searcher.getIndexReader().leaves()) {
++      Scorer s1 = w1.scorer(ctx);
++      Scorer s2 = w2.scorer(ctx);
++      if (s1 == null) {
++        Assert.assertTrue(s2 == null || s2.iterator().nextDoc() == DocIdSetIterator.NO_MORE_DOCS);
++        continue;
++      }
++      TwoPhaseIterator twoPhase1 = s1.twoPhaseIterator();
++      TwoPhaseIterator twoPhase2 = s2.twoPhaseIterator();
++      DocIdSetIterator approx1 = twoPhase1 == null ? s1.iterator() : twoPhase1.approximation;
++      DocIdSetIterator approx2 = twoPhase2 == null ? s2.iterator() : twoPhase2.approximation;
++      int upTo = -1;
++      float maxScore = 0;
++      float minScore = 0;
++      for (int doc2 = approx2.nextDoc(); ; doc2 = approx2.nextDoc()) {
++        int doc1;
++        for (doc1 = approx1.nextDoc(); doc1 < doc2; doc1 = approx1.nextDoc()) {
++          if (twoPhase1 == null || twoPhase1.matches()) {
++            Assert.assertTrue(s1.score() < minScore);
++          }
++        }
++        Assert.assertEquals(doc1, doc2);
++        if (doc2 == DocIdSetIterator.NO_MORE_DOCS) {
++          break;
++        }
++
++        if (doc2 > upTo) {
++          upTo = s2.advanceShallow(doc2);
++          Assert.assertTrue(upTo >= doc2);
++          maxScore = s2.getMaxScore(upTo);
++        }
++
++        if (twoPhase2 == null || twoPhase2.matches()) {
++          Assert.assertTrue(twoPhase1 == null || twoPhase1.matches());
++          float score = s2.score();
++          Assert.assertEquals(s1.score(), score);
++          Assert.assertTrue(score <= maxScore);
++
++          if (score >= minScore && random.nextInt(10) == 0) {
++            // On some scorers, changing the min score changes the way that docs are iterated
++            minScore = score;
++            s2.setMinCompetitiveScore(minScore);
++          }
++        }
++      }
++    }
++
++    // Now check advancing
++    for (LeafReaderContext ctx : searcher.getIndexReader().leaves()) {
++      Scorer s1 = w1.scorer(ctx);
++      Scorer s2 = w2.scorer(ctx);
++      if (s1 == null) {
++        Assert.assertTrue(s2 == null || s2.iterator().nextDoc() == DocIdSetIterator.NO_MORE_DOCS);
++        continue;
++      }
++      TwoPhaseIterator twoPhase1 = s1.twoPhaseIterator();
++      TwoPhaseIterator twoPhase2 = s2.twoPhaseIterator();
++      DocIdSetIterator approx1 = twoPhase1 == null ? s1.iterator() : twoPhase1.approximation;
++      DocIdSetIterator approx2 = twoPhase2 == null ? s2.iterator() : twoPhase2.approximation;
++
++      int upTo = -1;
++      float minScore = 0;
++      float maxScore = 0;
++      while (true) {
++        int doc2 = s2.docID();
++        boolean advance;
++        int target;
++        if (random.nextBoolean()) {
++          advance = false;
++          target = doc2 + 1;
++        } else {
++          advance = true;
++          int delta = Math.min(1 + random.nextInt(512), DocIdSetIterator.NO_MORE_DOCS - doc2);
++          target = s2.docID() + delta;
++        }
++
++        if (target > upTo && random.nextBoolean()) {
++          int delta = Math.min(random.nextInt(512), DocIdSetIterator.NO_MORE_DOCS - target);
++          upTo = target + delta;
++          int m = s2.advanceShallow(target);
++          assertTrue(m >= target);
++          maxScore = s2.getMaxScore(upTo);
++        }
+ 
++        if (advance) {
++          doc2 = approx2.advance(target);
++        } else {
++          doc2 = approx2.nextDoc();
++        }
++
++        int doc1;
++        for (doc1 = approx1.advance(target); doc1 < doc2; doc1 = approx1.nextDoc()) {
++          if (twoPhase1 == null || twoPhase1.matches()) {
++            Assert.assertTrue(s1.score() < minScore);
++          }
++        }
++        assertEquals(doc1, doc2);
++
++        if (doc2 == DocIdSetIterator.NO_MORE_DOCS) {
++          break;
++        }
+ 
++        if (twoPhase2 == null || twoPhase2.matches()) {
++          Assert.assertTrue(twoPhase1 == null || twoPhase1.matches());
++          float score = s2.score();
++          Assert.assertEquals(s1.score(), score);
++
++          if (doc2 > upTo) {
++            upTo = s2.advanceShallow(doc2);
++            Assert.assertTrue(upTo >= doc2);
++            maxScore = s2.getMaxScore(upTo);
++          }
++
++          Assert.assertTrue(score <= maxScore);
++
++          if (score >= minScore && random.nextInt(10) == 0) {
++            // On some scorers, changing the min score changes the way that docs are iterated
++            minScore = score;
++            s2.setMinCompetitiveScore(minScore);
++          }
++        }
++      }
++    }
++  }
++}
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/search/RandomApproximationQuery.java b/lucene/test-framework/src/java/org/apache/lucene/search/RandomApproximationQuery.java
+index e88afa7..a050b50 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/search/RandomApproximationQuery.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/search/RandomApproximationQuery.java
+@@ -109,8 +109,13 @@ public class RandomApproximationQuery extends Query {
+     }
+ 
+     @Override
+-    public float maxScore() {
+-      return scorer.maxScore();
++    public int advanceShallow(int target) throws IOException {
++      return scorer.advanceShallow(target);
++    }
++
++    @Override
++    public float getMaxScore(int upTo) throws IOException {
++      return scorer.getMaxScore(upTo);
+     }
+ 
+     @Override
+diff --git a/solr/contrib/ltr/src/java/org/apache/solr/ltr/LTRScoringQuery.java b/solr/contrib/ltr/src/java/org/apache/solr/ltr/LTRScoringQuery.java
+index cf564bb..c143d81 100644
+--- a/solr/contrib/ltr/src/java/org/apache/solr/ltr/LTRScoringQuery.java
++++ b/solr/contrib/ltr/src/java/org/apache/solr/ltr/LTRScoringQuery.java
+@@ -523,7 +523,7 @@ public class LTRScoringQuery extends Query {
+       }
+ 
+       @Override
+-      public float maxScore() {
++      public float getMaxScore(int upTo) throws IOException {
+         return Float.POSITIVE_INFINITY;
+       }
+ 
+@@ -582,7 +582,7 @@ public class LTRScoringQuery extends Query {
+         }
+ 
+         @Override
+-        public float maxScore() {
++        public float getMaxScore(int upTo) throws IOException {
+           return Float.POSITIVE_INFINITY;
+         }
+ 
+@@ -669,7 +669,7 @@ public class LTRScoringQuery extends Query {
+         }
+ 
+         @Override
+-        public float maxScore() {
++        public float getMaxScore(int upTo) throws IOException {
+           return Float.POSITIVE_INFINITY;
+         }
+         
+diff --git a/solr/contrib/ltr/src/java/org/apache/solr/ltr/feature/Feature.java b/solr/contrib/ltr/src/java/org/apache/solr/ltr/feature/Feature.java
+index 026f760..066d281 100644
+--- a/solr/contrib/ltr/src/java/org/apache/solr/ltr/feature/Feature.java
++++ b/solr/contrib/ltr/src/java/org/apache/solr/ltr/feature/Feature.java
+@@ -328,7 +328,7 @@ public abstract class Feature extends Query {
+       }
+ 
+       @Override
+-      public float maxScore() {
++      public float getMaxScore(int upTo) throws IOException {
+         return constScore;
+       }
+     }
+diff --git a/solr/contrib/ltr/src/java/org/apache/solr/ltr/feature/FieldLengthFeature.java b/solr/contrib/ltr/src/java/org/apache/solr/ltr/feature/FieldLengthFeature.java
+index f8b544f..b2fc154 100644
+--- a/solr/contrib/ltr/src/java/org/apache/solr/ltr/feature/FieldLengthFeature.java
++++ b/solr/contrib/ltr/src/java/org/apache/solr/ltr/feature/FieldLengthFeature.java
+@@ -147,7 +147,7 @@ public class FieldLengthFeature extends Feature {
+       }
+ 
+       @Override
+-      public float maxScore() {
++      public float getMaxScore(int upTo) throws IOException {
+         return Float.POSITIVE_INFINITY;
+       }
+     }
+diff --git a/solr/contrib/ltr/src/java/org/apache/solr/ltr/feature/FieldValueFeature.java b/solr/contrib/ltr/src/java/org/apache/solr/ltr/feature/FieldValueFeature.java
+index d9e7f02..78cdbaa 100644
+--- a/solr/contrib/ltr/src/java/org/apache/solr/ltr/feature/FieldValueFeature.java
++++ b/solr/contrib/ltr/src/java/org/apache/solr/ltr/feature/FieldValueFeature.java
+@@ -142,7 +142,7 @@ public class FieldValueFeature extends Feature {
+       }
+ 
+       @Override
+-      public float maxScore() {
++      public float getMaxScore(int upTo) throws IOException {
+         return Float.POSITIVE_INFINITY;
+       }
+     }
+diff --git a/solr/contrib/ltr/src/java/org/apache/solr/ltr/feature/OriginalScoreFeature.java b/solr/contrib/ltr/src/java/org/apache/solr/ltr/feature/OriginalScoreFeature.java
+index d351a04..b538b86 100644
+--- a/solr/contrib/ltr/src/java/org/apache/solr/ltr/feature/OriginalScoreFeature.java
++++ b/solr/contrib/ltr/src/java/org/apache/solr/ltr/feature/OriginalScoreFeature.java
+@@ -109,7 +109,7 @@ public class OriginalScoreFeature extends Feature {
+       }
+ 
+       @Override
+-      public float maxScore() {
++      public float getMaxScore(int upTo) throws IOException {
+         return Float.POSITIVE_INFINITY;
+       }
+ 
+diff --git a/solr/contrib/ltr/src/java/org/apache/solr/ltr/feature/SolrFeature.java b/solr/contrib/ltr/src/java/org/apache/solr/ltr/feature/SolrFeature.java
+index b616bd5..612085d 100644
+--- a/solr/contrib/ltr/src/java/org/apache/solr/ltr/feature/SolrFeature.java
++++ b/solr/contrib/ltr/src/java/org/apache/solr/ltr/feature/SolrFeature.java
+@@ -288,7 +288,7 @@ public class SolrFeature extends Feature {
+       }
+ 
+       @Override
+-      public float maxScore() {
++      public float getMaxScore(int upTo) throws IOException {
+         return Float.POSITIVE_INFINITY;
+       }
+     }
+diff --git a/solr/core/src/java/org/apache/solr/handler/component/QueryComponent.java b/solr/core/src/java/org/apache/solr/handler/component/QueryComponent.java
+index 71ac9c0..be32f06 100644
+--- a/solr/core/src/java/org/apache/solr/handler/component/QueryComponent.java
++++ b/solr/core/src/java/org/apache/solr/handler/component/QueryComponent.java
+@@ -1481,7 +1481,7 @@ public class QueryComponent extends SearchComponent
+     }
+ 
+     @Override
+-    public float maxScore() {
++    public float getMaxScore(int upTo) throws IOException {
+       return Float.POSITIVE_INFINITY;
+     }
+ 
+diff --git a/solr/core/src/java/org/apache/solr/schema/LatLonType.java b/solr/core/src/java/org/apache/solr/schema/LatLonType.java
+index 8cf86b8..9f9dcd1 100644
+--- a/solr/core/src/java/org/apache/solr/schema/LatLonType.java
++++ b/solr/core/src/java/org/apache/solr/schema/LatLonType.java
+@@ -486,7 +486,7 @@ class SpatialDistanceQuery extends ExtendedQueryBase implements PostFilter {
+     }
+ 
+     @Override
+-    public float maxScore() {
++    public float getMaxScore(int upTo) throws IOException {
+       return Float.POSITIVE_INFINITY;
+     }
+ 
+diff --git a/solr/core/src/java/org/apache/solr/search/CollapsingQParserPlugin.java b/solr/core/src/java/org/apache/solr/search/CollapsingQParserPlugin.java
+index 974df90..289f32d 100644
+--- a/solr/core/src/java/org/apache/solr/search/CollapsingQParserPlugin.java
++++ b/solr/core/src/java/org/apache/solr/search/CollapsingQParserPlugin.java
+@@ -452,7 +452,7 @@ public class CollapsingQParserPlugin extends QParserPlugin {
+     }
+ 
+     @Override
+-    public float maxScore() {
++    public float getMaxScore(int upTo) throws IOException {
+       return Float.POSITIVE_INFINITY;
+     }
+ 
+diff --git a/solr/core/src/java/org/apache/solr/search/join/GraphQuery.java b/solr/core/src/java/org/apache/solr/search/join/GraphQuery.java
+index 5842e92..4402a26 100644
+--- a/solr/core/src/java/org/apache/solr/search/join/GraphQuery.java
++++ b/solr/core/src/java/org/apache/solr/search/join/GraphQuery.java
+@@ -307,7 +307,7 @@ public class GraphQuery extends Query {
+     }
+ 
+     @Override
+-    public float maxScore() {
++    public float getMaxScore(int upTo) throws IOException {
+       return score;
+     }
+ 
+diff --git a/solr/core/src/test/org/apache/solr/search/TestRankQueryPlugin.java b/solr/core/src/test/org/apache/solr/search/TestRankQueryPlugin.java
+index 19373f0..dc6e1c3 100644
+--- a/solr/core/src/test/org/apache/solr/search/TestRankQueryPlugin.java
++++ b/solr/core/src/test/org/apache/solr/search/TestRankQueryPlugin.java
+@@ -458,7 +458,7 @@ public class TestRankQueryPlugin extends QParserPlugin {
+       }
+ 
+       @Override
+-      public float maxScore() {
++      public float getMaxScore(int upTo) throws IOException {
+         return score;
+       }
+ 

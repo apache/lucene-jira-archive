@@ -1,0 +1,577 @@
+Index: src/java/org/apache/lucene/index/SegmentReader.java
+===================================================================
+--- src/java/org/apache/lucene/index/SegmentReader.java	(revision 883245)
++++ src/java/org/apache/lucene/index/SegmentReader.java	(working copy)
+@@ -23,13 +23,13 @@
+ import java.util.Collection;
+ import java.util.HashMap;
+ import java.util.HashSet;
+-
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+ 
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.FieldSelector;
++import org.apache.lucene.index.IndexWriter.Deletes;
+ import org.apache.lucene.search.DefaultSimilarity;
+ import org.apache.lucene.store.BufferedIndexInput;
+ import org.apache.lucene.store.Directory;
+@@ -68,7 +68,19 @@
+   private Ref singleNormRef;
+ 
+   CoreReaders core;
+-
++  private Deletes bufferedDeletes;
++  
++  synchronized void clearDeletes() {
++    bufferedDeletes = null;
++  }
++  
++  synchronized Deletes getDeletes() {
++    if (bufferedDeletes == null) {
++      bufferedDeletes = new Deletes();
++    }
++    return bufferedDeletes;
++  }
++  
+   // Holds core readers that are shared (unchanged) when
+   // SegmentReader is cloned or reopened
+   static final class CoreReaders {
+Index: src/java/org/apache/lucene/index/DocumentsWriter.java
+===================================================================
+--- src/java/org/apache/lucene/index/DocumentsWriter.java	(revision 883245)
++++ src/java/org/apache/lucene/index/DocumentsWriter.java	(working copy)
+@@ -433,7 +433,6 @@
+    *  currently buffered docs.  This resets our state,
+    *  discarding any docs added since last flush. */
+   synchronized void abort() throws IOException {
+-
+     try {
+       if (infoStream != null) {
+         message("docWriter: now abort");
+@@ -459,6 +458,8 @@
+         }
+ 
+         deletesInRAM.clear();
++        
++        writer.ramBufferAborted();
+ 
+         openFiles.clear();
+ 
+Index: src/java/org/apache/lucene/index/IndexWriter.java
+===================================================================
+--- src/java/org/apache/lucene/index/IndexWriter.java	(revision 883245)
++++ src/java/org/apache/lucene/index/IndexWriter.java	(working copy)
+@@ -17,32 +17,37 @@
+  * limitations under the License.
+  */
+ 
++import java.io.Closeable;
++import java.io.IOException;
++import java.io.PrintStream;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.Iterator;
++import java.util.LinkedList;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.TreeMap;
++
+ import org.apache.lucene.analysis.Analyzer;
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.index.DocumentsWriter.IndexingChain;
++import org.apache.lucene.search.DocIdSetIterator;
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.Query;
++import org.apache.lucene.search.Scorer;
+ import org.apache.lucene.search.Similarity;
+-import org.apache.lucene.search.Query;
++import org.apache.lucene.search.Weight;
++import org.apache.lucene.store.AlreadyClosedException;
++import org.apache.lucene.store.BufferedIndexInput;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.Lock;
+ import org.apache.lucene.store.LockObtainFailedException;
+-import org.apache.lucene.store.AlreadyClosedException;
+-import org.apache.lucene.store.BufferedIndexInput;
+ import org.apache.lucene.util.Constants;
+ import org.apache.lucene.util.ThreadInterruptedException;
+ 
+-import java.io.IOException;
+-import java.io.Closeable;
+-import java.io.PrintStream;
+-import java.util.List;
+-import java.util.Collection;
+-import java.util.ArrayList;
+-import java.util.HashMap;
+-import java.util.Set;
+-import java.util.HashSet;
+-import java.util.LinkedList;
+-import java.util.Iterator;
+-import java.util.Map;
+-
+ /**
+   An <code>IndexWriter</code> creates and maintains an index.
+ 
+@@ -412,7 +417,14 @@
+   class ReaderPool {
+ 
+     private final Map<SegmentInfo,SegmentReader> readerMap = new HashMap<SegmentInfo,SegmentReader>();
+-
++    
++    synchronized void clearUpdateDeletes() {
++      for (Map.Entry<SegmentInfo,SegmentReader> ent: readerMap.entrySet()) {
++        SegmentReader reader = ent.getValue();
++        reader.getDeletes().clearUpdates();
++      }
++    }
++    
+     /** Forcefully clear changes for the specified segments,
+      *  and remove from the pool.   This is called on successful merge. */
+     synchronized void clear(SegmentInfos infos) throws IOException {
+@@ -476,7 +488,8 @@
+         // not pooling readers, we release it:
+         readerMap.remove(sr.getSegmentInfo());
+ 
+-        assert !sr.hasChanges || Thread.holdsLock(IndexWriter.this);
++        //assert !sr.hasChanges;
++        //assert Thread.holdsLock(IndexWriter.this);
+ 
+         // Drop our ref -- this will commit any pending
+         // changes to the dir
+@@ -1965,6 +1978,9 @@
+   public void deleteDocuments(Term term) throws CorruptIndexException, IOException {
+     ensureOpen();
+     try {
++      if (poolReaders) {
++        deleteTermsLive(term);
++      }
+       boolean doFlush = docWriter.bufferDeleteTerm(term);
+       if (doFlush)
+         flush(true, false, false);
+@@ -1989,6 +2005,9 @@
+   public void deleteDocuments(Term... terms) throws CorruptIndexException, IOException {
+     ensureOpen();
+     try {
++      if (poolReaders) {
++        deleteTermsLive(terms);
++      }
+       boolean doFlush = docWriter.bufferDeleteTerms(terms);
+       if (doFlush)
+         flush(true, false, false);
+@@ -1996,7 +2015,21 @@
+       handleOOM(oom, "deleteDocuments(Term..)");
+     }
+   }
+-
++  
++  private void deleteTermsLive(Term... terms) throws IOException {
++    synchronized (this) {
++      for (SegmentInfo info : segmentInfos) {
++        SegmentReader reader = readerPool.get(info, false);
++        try {
++          reader.getDeletes().addTerms(terms);
++        } finally {
++          readerPool.release(reader);
++        }
++      }
++    }
++    applyReaderDeletes();
++  }
++  
+   /**
+    * Deletes the document(s) matching the provided query.
+    *
+@@ -2010,6 +2043,9 @@
+    */
+   public void deleteDocuments(Query query) throws CorruptIndexException, IOException {
+     ensureOpen();
++    if (poolReaders) {
++      deleteQueriesLive(query);
++    }
+     boolean doFlush = docWriter.bufferDeleteQuery(query);
+     if (doFlush)
+       flush(true, false, false);
+@@ -2030,12 +2066,289 @@
+    */
+   public void deleteDocuments(Query... queries) throws CorruptIndexException, IOException {
+     ensureOpen();
++    if (poolReaders) {
++      deleteQueriesLive(queries);
++    }
+     boolean doFlush = docWriter.bufferDeleteQueries(queries);
+     if (doFlush)
+       flush(true, false, false);
+   }
+-
++  
++  private void deleteQueriesLive(Query... queries) throws IOException {
++    synchronized (this) {
++      for (SegmentInfo info : segmentInfos) {
++        SegmentReader reader = readerPool.get(info, false);
++        try {
++          reader.getDeletes().addQueries(queries);
++        } finally {
++          readerPool.release(reader);
++        }
++      }
++    }
++    applyReaderDeletes();
++  }
++  
++  synchronized SegmentReader[] getReaders(boolean openDocStore) throws IOException {
++    SegmentReader[] readers = new SegmentReader[segmentInfos.size()];
++    for (int x=0; x < segmentInfos.size(); x++) {
++      readers[x] = readerPool.get(segmentInfos.info(x), openDocStore);
++    }
++    return readers;
++  }
++  
+   /**
++   * Deletes are added to readers synchronized on writer to insure
++   * all current readers receive the delete (or update).  However
++   * the resolution of the delete to the doc id occurs un-synchronized.
++   * 
++   * commitMerge is synchronized, and so no new deletes arrive, all
++   * unresolved deletes are resolved, and the queued deletes are merged 
++   * into the queue of the merged reader.
++   * 
++   * For example a call to deleteDocument will add the deleted term to all 
++   * SR delete queues.  Then all pending deletes in the queues of the readers
++   * will be applied regardless of whether or not they are the term/query 
++   * of the call to deleteDocument.  We try to apply the deletes as much as possible
++   * however it's ok, if they're not applied immediately, because eventually they will.
++   * The most important thing is to not lose deletes, which would happen if we 
++   * did not synchronize on writer when adding the delete term/query to the 
++   * SR deletes queue.
++   */
++  private void applyReaderDeletes() throws IOException {
++    SegmentReader[] readers = getReaders(false);
++    for (SegmentReader reader : readers) {
++      try {
++        applyReaderDeletes(reader);
++      } finally {
++        readerPool.release(reader);
++      }
++    }
++  }
++  
++  /**
++   * Iteratively deletes the terms and queries
++   * un-synchronized on writer.
++   */
++  private void applyReaderDeletes(SegmentReader reader) throws IOException {
++    deleteQueriesLive(reader);
++    deleteTermsLive(reader);
++    resolveUpdatesDeletes(reader);
++  }
++  
++  /**
++   * Called after flush is successful.  
++   */
++  private synchronized void applyUpdateDeleteDocIDs() throws IOException {
++    SegmentReader[] readers = getReaders(false);
++    for (SegmentReader reader : readers) {
++      try {
++        for (int docId : reader.getDeletes().docIds) {
++          reader.deleteDocument(docId);
++        }
++      } finally {
++        readerPool.release(reader);
++      }
++    }
++  }
++  
++  private void deleteTermsLive(SegmentReader reader) throws IOException {
++    while (deleteTermLive(reader)) {}
++  }
++  
++  // resolve delete term un-synchronized
++  private boolean deleteTermLive(SegmentReader reader) throws IOException {
++    Term term = reader.getDeletes().pollTerm();
++    if (term == null) return false;
++    TermDocs docs = reader.termDocs();
++    try {
++      docs.seek(term);
++      while (docs.next()) {
++        int docID = docs.doc();
++        reader.deleteDocument(docID);
++      }
++    } finally {
++      docs.close();
++    }
++    return true;
++  }
++  
++  /**
++   * During the merge, new buffered deletes could have come in, we can't apply
++   * them right now, so we need to merge the reader's deletes.
++   */
++  protected synchronized void mergeBufferedDeletes(MergePolicy.OneMerge merge, int[][] docMap, SegmentReader mergedReader) {
++    Deletes mergedDeletes = mergedReader.getDeletes();
++    int start = 0;
++    for (int x=0; x < merge.readers.length; x++) {
++      mergedDeletes.addTerms(merge.readers[x].getDeletes().termMap.values());
++      mergedDeletes.addQueries(merge.readers[x].getDeletes().queryMap.values());
++      mergedDeletes.addUpdateTerms(merge.readers[x].getDeletes().updateTermMap.values());
++      // if we have a doc map, map the ids to the new
++      // merged reader
++      if (docMap != null) {
++        int[] docs = docMap[x];
++        for (int docId : merge.readers[x].getDeletes().docIds) {
++          int mdocid = docs[docId];
++          if (mdocid != -1) {
++            mergedDeletes.addDocID(mdocid);
++          }
++        }
++      } else {
++        // if there isn't a doc map, we simply map
++        // the doc ids directly to the merged reader
++        for (int docId : merge.readers[x].getDeletes().docIds) {
++          int mdocid = docId + start;
++          if (mdocid != -1) {
++            mergedDeletes.addDocID(mdocid);
++          }
++        }
++      }
++      start += merge.readers[x].maxDoc();
++    }
++  }
++  
++  private void resolveUpdatesDeletes(SegmentReader reader) throws IOException {
++    while (resolveUpdateDeletes(reader)) {}
++  }
++  
++  // resolve doc ids un-synchronized
++  private boolean resolveUpdateDeletes(SegmentReader reader) throws IOException {
++    Term term = reader.getDeletes().pollUpdateTerm();
++    if (term == null) return false;
++    TermDocs docs = reader.termDocs();
++    try {
++      docs.seek(term);
++      while (docs.next()) {
++        int docID = docs.doc();
++        reader.getDeletes().addDocID(docID);
++      }
++    } finally {
++      docs.close();
++    }
++    return true;
++  }
++  
++  private void deleteQueriesLive(SegmentReader reader) throws IOException {
++    while (deleteQueryLive(reader)) {}
++  }
++  
++  private boolean deleteQueryLive(SegmentReader reader) throws IOException {
++    Query query = reader.getDeletes().pollQuery();
++    if (query == null) return false;
++    IndexSearcher searcher = new IndexSearcher(reader);
++    Weight weight = query.weight(searcher);
++    Scorer scorer = weight.scorer(reader, true, false);
++    if (scorer != null) {
++      while(true)  {
++        int docID = scorer.nextDoc();
++        if (docID != DocIdSetIterator.NO_MORE_DOCS) {
++          reader.deleteDocument(docID);
++          break;
++        }
++      }
++    }
++    searcher.close();
++    return true;
++  }
++  
++  public static class Deletes {
++    Map<Term,Term> updateTermMap = new TreeMap<Term,Term>();
++    Map<Term,Term> termMap = new TreeMap<Term,Term>();
++    Map<Query,Query> queryMap = new HashMap<Query,Query>();
++    List<Integer> docIds = new ArrayList<Integer>();
++    
++    public synchronized void clearUpdates() {
++      updateTermMap.clear();
++      docIds.clear();
++    }
++    
++    public synchronized void addTerms(Collection<Term> terms) {
++      for (Term term : terms) {
++        termMap.put(term, term);
++      }
++    }
++    
++    public synchronized void addQueries(Collection<Query> queries) {
++      for (Query query : queries) {
++        queryMap.put(query, query);
++      }
++    }
++    
++    public synchronized void addUpdateTerms(Collection<Term> terms) {
++      for (Term term : terms) {
++        updateTermMap.put(term, term);
++      }
++    }
++    
++    public synchronized void addUpdateTerm(Term term) {
++      updateTermMap.put(term, term);
++    }
++    
++    private synchronized Object remove(Map map) {
++      if (map.size() > 0) {
++        Object obj = map.values().iterator().next();
++        map.remove(obj);
++        return obj;
++      }
++      return null;
++    }
++    
++    public synchronized Term pollUpdateTerm() {
++      return (Term)remove(updateTermMap);
++    }
++    
++    public synchronized void addDocID(int docID) {
++      docIds.add(docID);
++    }
++    
++    public synchronized Query pollQuery() {
++      return (Query)remove(queryMap);
++    }
++    
++    public synchronized Term pollTerm() {
++      return (Term)remove(termMap);
++    }
++    
++    public synchronized void removeUpdateTerm(Term term) {
++      updateTermMap.remove(term);
++    }
++    
++    public synchronized void removeTerm(Term term) {
++      termMap.remove(term);
++    }
++    
++    public synchronized void removeQuery(Query query) {
++      queryMap.remove(query);
++    }
++    
++    public synchronized void addTerms(Term... terms) {
++      for (Term term : terms) {
++        termMap.put(term, term);
++      }
++    }
++    
++    public synchronized void addQueries(Query... queries) {
++      for (Query query : queries) {
++        queryMap.put(query, query);
++      }
++    }
++  }
++  
++  synchronized SegmentReader[] getSegmentReaders() throws IOException {
++    SegmentReader[] readers = new SegmentReader[segmentInfos.size()];
++    for (int x=0; x < segmentInfos.size(); x++) {
++      SegmentInfo info = segmentInfos.info(x);
++      readers[x] = readerPool.get(info, true);
++    }
++    return readers;
++  }
++  
++  // the ram buffer is aborted, clear out queued update deletes
++  void ramBufferAborted() throws IOException {
++    readerPool.clearUpdateDeletes();
++  }
++  
++  /**
+    * Updates a document by first deleting the document(s)
+    * containing <code>term</code> and then adding the new
+    * document.  The delete and then add are atomic as seen
+@@ -2082,7 +2395,18 @@
+       boolean doFlush = false;
+       boolean success = false;
+       try {
++        synchronized (this) {
++          for (SegmentInfo info : segmentInfos) {
++            SegmentReader reader = readerPool.get(info, false);
++            try {
++              reader.getDeletes().addUpdateTerm(term);
++            } finally {
++              readerPool.release(reader);
++            }
++          }
++        }
+         doFlush = docWriter.updateDocument(term, doc, analyzer);
++        applyReaderDeletes();
+         success = true;
+       } finally {
+         if (!success) {
+@@ -3637,8 +3961,25 @@
+ 
+       if (flushDeletes) {
+         flushDeletesCount++;
+-        applyDeletes();
++        if (newSegment != null && poolReaders) {
++            // if we're pooling readers
++            // we apply the buffered deletes to the
++            // new segment only
++            // TODO: we need to handle pool reader being switched
++            // part way through
++            SegmentInfos newSegmentInfos = new SegmentInfos();
++            newSegmentInfos.add(newSegment);
++            applyDeletes(newSegmentInfos);
++        } else if (!poolReaders) {
++          applyDeletes(segmentInfos);
++        }
+       }
++      // apply the buffered deletes
++      // which also resolves update terms
++      // to doc ids
++      applyReaderDeletes();
++      // apply the updated doc ids to the readers
++      applyUpdateDeleteDocIDs();
+       
+       if (flushDocs)
+         checkpoint();
+@@ -3799,8 +4140,11 @@
+     }
+ 
+     final int start = ensureContiguousMerge(merge);
++    
++    applyReaderDeletes();
++    mergeBufferedDeletes(merge, merger.getDocMaps(), mergedReader);
++    commitMergedDeletes(merge, mergedReader);
+ 
+-    commitMergedDeletes(merge, mergedReader);
+     docWriter.remapDeletes(segmentInfos, merger.getDocMaps(), merger.getDelCounts(), merge, mergedDocCount);
+       
+     // Simple optimization: if the doc store we are using
+@@ -4017,8 +4361,6 @@
+     if (merge.isAborted())
+       return;
+ 
+-    applyDeletes();
+-
+     final SegmentInfos sourceSegments = merge.segments;
+     final int end = sourceSegments.size();
+ 
+@@ -4402,14 +4744,16 @@
+       mergeExceptions.add(merge);
+   }
+ 
+-  // Apply buffered deletes to all segments.
+-  private final synchronized boolean applyDeletes() throws CorruptIndexException, IOException {
++  // Apply buffered deletes only to the flushed segment
++  private final synchronized boolean applyDeletes(SegmentInfos infos) throws CorruptIndexException, IOException {
+     assert testPoint("startApplyDeletes");
++    //SegmentInfos applyDeletesInfos = new SegmentInfos();
++    //applyDeletesInfos.add(info);
+     SegmentInfos rollback = (SegmentInfos) segmentInfos.clone();
+     boolean success = false;
+     boolean changed;
+     try {
+-      changed = docWriter.applyDeletes(segmentInfos);
++      changed = docWriter.applyDeletes(infos);
+       success = true;
+     } finally {
+       if (!success) {

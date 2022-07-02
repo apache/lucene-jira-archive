@@ -1,0 +1,227 @@
+diff --git a/lucene/core/src/java/org/apache/lucene/index/FilterCodecReader.java b/lucene/core/src/java/org/apache/lucene/index/FilterCodecReader.java
+index fd36ecb6d6..4187051006 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/FilterCodecReader.java
++++ b/lucene/core/src/java/org/apache/lucene/index/FilterCodecReader.java
+@@ -127,4 +127,27 @@ public abstract class FilterCodecReader extends CodecReader {
+     in.checkIntegrity();
+   }
+ 
++  /**
++   * Returns a filtered codec reader with the given live docs and numDocs.
++   */
++  static FilterCodecReader wrapLiveDocs(CodecReader reader, Bits liveDocs, int numDocs) {
++    return new FilterCodecReader(reader) {
++      @Override
++      public CacheHelper getCoreCacheHelper() {
++        return reader.getCoreCacheHelper();
++      }
++      @Override
++      public CacheHelper getReaderCacheHelper() {
++        return null; // we are altering live docs
++      }
++      @Override
++      public Bits getLiveDocs() {
++        return liveDocs;
++      }
++      @Override
++      public int numDocs() {
++        return numDocs;
++      }
++    };
++  }
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java b/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java
+index 509eadbb21..316bddb42e 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java
++++ b/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java
+@@ -48,6 +48,7 @@ import org.apache.lucene.index.DocValuesUpdate.BinaryDocValuesUpdate;
+ import org.apache.lucene.index.DocValuesUpdate.NumericDocValuesUpdate;
+ import org.apache.lucene.index.FieldInfos.FieldNumbers;
+ import org.apache.lucene.index.IndexWriterConfig.OpenMode;
++import org.apache.lucene.search.DocIdSetIterator;
+ import org.apache.lucene.search.DocValuesFieldExistsQuery;
+ import org.apache.lucene.search.MatchAllDocsQuery;
+ import org.apache.lucene.search.Query;
+@@ -4382,25 +4383,51 @@ public class IndexWriter implements Closeable, TwoPhaseCommit, Accountable,
+ 
+       // Let the merge wrap readers
+       List<CodecReader> mergeReaders = new ArrayList<>();
+-      int numSoftDeleted = 0;
+-      for (SegmentReader reader : merge.readers) {
++      int softDeleteCount = 0;
++      for (int r = 0; r < merge.readers.size(); r++) {
++        SegmentReader reader = merge.readers.get(r);
+         CodecReader wrappedReader = merge.wrapForMerge(reader);
+         validateMergeReader(wrappedReader);
+-        mergeReaders.add(wrappedReader);
+         if (softDeletesEnabled) {
+           if (reader != wrappedReader) { // if we don't have a wrapped reader we won't preserve any soft-deletes
+-            Bits liveDocs = wrappedReader.getLiveDocs();
+-            numSoftDeleted += PendingSoftDeletes.countSoftDeletes(
+-                DocValuesFieldExistsQuery.getDocValuesDocIdSetIterator(config.getSoftDeletesField(), wrappedReader),
+-                liveDocs);
++            Bits hardLiveDocs = merge.hardLiveDocs.get(r);
++            Bits wrappedLiveDocs = wrappedReader.getLiveDocs();
++            int hardDeletedCount = 0;
++            DocIdSetIterator softDeletedDocs = DocValuesFieldExistsQuery.getDocValuesDocIdSetIterator(config.getSoftDeletesField(), wrappedReader);
++            if (softDeletedDocs != null) {
++              int docId;
++              while ((docId = softDeletedDocs.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
++                if (wrappedLiveDocs == null || wrappedLiveDocs.get(docId)) {
++                  if (hardLiveDocs == null || hardLiveDocs.get(docId)) {
++                    softDeleteCount++;
++                  } else {
++                    hardDeletedCount++;
++                  }
++                }
++              }
++            }
++            // Wrap the wrapped reader again if we have excluded some hard-deleted docs
++            if (hardLiveDocs != null && hardDeletedCount > 0) {
++              wrappedReader = FilterCodecReader.wrapLiveDocs(wrappedReader, new Bits() {
++                @Override
++                public boolean get(int index) {
++                  return hardLiveDocs.get(index) && (wrappedLiveDocs == null || wrappedLiveDocs.get(index));
++                }
++                @Override
++                public int length() {
++                  return reader.maxDoc();
++                }
++              }, wrappedReader.numDocs() - hardDeletedCount);
++            }
+           }
+         }
++        mergeReaders.add(wrappedReader);
+       }
+       final SegmentMerger merger = new SegmentMerger(mergeReaders,
+                                                      merge.info.info, infoStream, dirWrapper,
+                                                      globalFieldNumberMap, 
+                                                      context);
+-      merge.info.setSoftDelCount(numSoftDeleted);
++      merge.info.setSoftDelCount(softDeleteCount);
+       merge.checkAborted();
+ 
+       merge.mergeStartNS = System.nanoTime();
+diff --git a/lucene/core/src/java/org/apache/lucene/index/SoftDeletesRetentionMergePolicy.java b/lucene/core/src/java/org/apache/lucene/index/SoftDeletesRetentionMergePolicy.java
+index 515068c207..b6f9a57420 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/SoftDeletesRetentionMergePolicy.java
++++ b/lucene/core/src/java/org/apache/lucene/index/SoftDeletesRetentionMergePolicy.java
+@@ -74,7 +74,7 @@ public final class SoftDeletesRetentionMergePolicy extends OneMergeWrappingMerge
+   public boolean keepFullyDeletedSegment(IOSupplier<CodecReader> readerIOSupplier) throws IOException {
+     CodecReader reader = readerIOSupplier.get();
+     /* we only need a single hit to keep it no need for soft deletes to be checked*/
+-    Scorer scorer = getScorer(retentionQuerySupplier.get(), wrapLiveDocs(reader, null, reader.maxDoc()));
++    Scorer scorer = getScorer(retentionQuerySupplier.get(), FilterCodecReader.wrapLiveDocs(reader, null, reader.maxDoc()));
+     if (scorer != null) {
+       DocIdSetIterator iterator = scorer.iterator();
+       boolean atLeastOneHit = iterator.nextDoc() != DocIdSetIterator.NO_MORE_DOCS;
+@@ -89,7 +89,7 @@ public final class SoftDeletesRetentionMergePolicy extends OneMergeWrappingMerge
+     if (liveDocs == null) { // no deletes - just keep going
+       return reader;
+     }
+-    CodecReader wrappedReader = wrapLiveDocs(reader, new Bits() { // only search deleted
++    CodecReader wrappedReader = FilterCodecReader.wrapLiveDocs(reader, new Bits() { // only search deleted
+       @Override
+       public boolean get(int index) {
+         return liveDocs.get(index) == false;
+@@ -115,7 +115,7 @@ public final class SoftDeletesRetentionMergePolicy extends OneMergeWrappingMerge
+         }
+       }
+       assert reader.numDocs() + numExtraLiveDocs <= reader.maxDoc() : "numDocs: " + reader.numDocs() + " numExtraLiveDocs: " + numExtraLiveDocs + " maxDoc: " + reader.maxDoc();
+-      return wrapLiveDocs(reader, cloneLiveDocs, reader.numDocs() + numExtraLiveDocs);
++      return FilterCodecReader.wrapLiveDocs(reader, cloneLiveDocs, reader.numDocs() + numExtraLiveDocs);
+     } else {
+       return reader;
+     }
+@@ -145,33 +145,6 @@ public final class SoftDeletesRetentionMergePolicy extends OneMergeWrappingMerge
+     return weight.scorer(reader.getContext());
+   }
+ 
+-  /**
+-   * Returns a codec reader with the given live docs
+-   */
+-  private static CodecReader wrapLiveDocs(CodecReader reader, Bits liveDocs, int numDocs) {
+-    return new FilterCodecReader(reader) {
+-      @Override
+-      public CacheHelper getCoreCacheHelper() {
+-        return reader.getCoreCacheHelper();
+-      }
+-
+-      @Override
+-      public CacheHelper getReaderCacheHelper() {
+-        return null; // we are altering live docs
+-      }
+-
+-      @Override
+-      public Bits getLiveDocs() {
+-        return liveDocs;
+-      }
+-
+-      @Override
+-      public int numDocs() {
+-        return numDocs;
+-      }
+-    };
+-  }
+-
+   @Override
+   public int numDeletesToMerge(SegmentCommitInfo info, int delCount, IOSupplier<CodecReader> readerSupplier) throws IOException {
+     final int numDeletesToMerge = super.numDeletesToMerge(info, delCount, readerSupplier);
+@@ -181,7 +154,7 @@ public final class SoftDeletesRetentionMergePolicy extends OneMergeWrappingMerge
+         BooleanQuery.Builder builder = new BooleanQuery.Builder();
+         builder.add(new DocValuesFieldExistsQuery(field), BooleanClause.Occur.FILTER);
+         builder.add(retentionQuerySupplier.get(), BooleanClause.Occur.FILTER);
+-        Scorer scorer = getScorer(builder.build(), wrapLiveDocs(reader, null, reader.maxDoc()));
++        Scorer scorer = getScorer(builder.build(), FilterCodecReader.wrapLiveDocs(reader, null, reader.maxDoc()));
+         if (scorer != null) {
+           DocIdSetIterator iterator = scorer.iterator();
+           Bits liveDocs = reader.getLiveDocs();
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestSoftDeletesRetentionMergePolicy.java b/lucene/core/src/test/org/apache/lucene/index/TestSoftDeletesRetentionMergePolicy.java
+index be1f7ac16a..bb36ba300f 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestSoftDeletesRetentionMergePolicy.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestSoftDeletesRetentionMergePolicy.java
+@@ -569,6 +569,44 @@ public class TestSoftDeletesRetentionMergePolicy extends LuceneTestCase {
+     IOUtils.close(writer, dir);
+   }
+ 
++  public void testMergeSoftDeleteAndHardDelete() throws Exception {
++    Directory dir = newDirectory();
++    String softDelete = "soft_delete";
++    IndexWriterConfig config = newIndexWriterConfig()
++        .setSoftDeletesField(softDelete)
++        .setMergePolicy(new SoftDeletesRetentionMergePolicy("soft_delete",
++            MatchAllDocsQuery::new, new LogDocMergePolicy()));
++    config.setReaderPooling(true);
++    IndexWriter writer = new IndexWriter(dir, config);
++    Document d = new Document();
++    d.add(new StringField("id", "0", Field.Store.YES));
++    writer.addDocument(d);
++    d = new Document();
++    d.add(new StringField("id", "1", Field.Store.YES));
++    d.add(new NumericDocValuesField("soft_delete", 1));
++    writer.addDocument(d);
++    try (DirectoryReader reader = writer.getReader()) {
++      assertEquals(2, reader.maxDoc());
++      assertEquals(1, reader.numDocs());
++    }
++    while (true) {
++      try (DirectoryReader reader = writer.getReader()) {
++        TopDocs topDocs = new IndexSearcher(new NoDeletesWrapper(reader)).search(new TermQuery(new Term("id", "1")), 1);
++        assertEquals(1, topDocs.totalHits);
++        if (writer.tryDeleteDocument(reader, topDocs.scoreDocs[0].doc) > 0) {
++          break;
++        }
++      }
++    }
++    writer.forceMergeDeletes(true);
++    assertEquals(1, writer.segmentInfos.size());
++    SegmentCommitInfo si = writer.segmentInfos.info(0);
++    assertEquals(0, si.getSoftDelCount()); // hard-delete should supersede the soft-delete
++    assertEquals(0, si.getDelCount());
++    assertEquals(1, si.info.maxDoc());
++    IOUtils.close(writer, dir);
++  }
++
+   static void doUpdate(Term doc, IndexWriter writer, Field... fields) throws IOException {
+     long seqId = -1;
+     do { // retry if we just committing a merge

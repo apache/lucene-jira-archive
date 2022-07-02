@@ -1,0 +1,618 @@
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index eea5bf70f7..6ba32ed4af 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -16,7 +16,11 @@ Bug fixes:
+   it's inaccessible. (Dawid Weiss)
+ 
+ ======================= Lucene 8.1.0 =======================
+-(No Changes)
++
++New Features
++
++* LUCENE-8670: Add LatLonShapePointQuery to support Point / MultiPoint
++  queries on indexed LatLonShape fields. (Nick Knize)
+ 
+ ======================= Lucene 8.0.0 =======================
+ 
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/document/LatLonShape.java b/lucene/sandbox/src/java/org/apache/lucene/document/LatLonShape.java
+index ee41ffa51f..9ffa30070f 100644
+--- a/lucene/sandbox/src/java/org/apache/lucene/document/LatLonShape.java
++++ b/lucene/sandbox/src/java/org/apache/lucene/document/LatLonShape.java
+@@ -94,6 +94,12 @@ public class LatLonShape {
+     return new Field[] {new LatLonTriangle(fieldName, lat, lon, lat, lon, lat, lon)};
+   }
+ 
++  /** create a query to find all polygons that intersect the provided point(s)
++   **/
++  public static Query newPointQuery(String field, QueryRelation queryRelation, double[][] points) {
++    return new LatLonShapePointQuery(field, queryRelation, points);
++  }
++
+   /** create a query to find all polygons that intersect a defined bounding box
+    **/
+   public static Query newBoxQuery(String field, QueryRelation queryRelation, double minLatitude, double maxLatitude, double minLongitude, double maxLongitude) {
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/document/LatLonShapePointQuery.java b/lucene/sandbox/src/java/org/apache/lucene/document/LatLonShapePointQuery.java
+new file mode 100644
+index 0000000000..b2fe434f29
+--- /dev/null
++++ b/lucene/sandbox/src/java/org/apache/lucene/document/LatLonShapePointQuery.java
+@@ -0,0 +1,193 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.document;
++
++import java.util.Arrays;
++
++import org.apache.lucene.document.LatLonShape.QueryRelation;
++import org.apache.lucene.geo.Rectangle;
++import org.apache.lucene.geo.Tessellator;
++import org.apache.lucene.index.PointValues.Relation;
++import org.apache.lucene.util.NumericUtils;
++
++import static org.apache.lucene.geo.GeoEncodingUtils.decodeLatitude;
++import static org.apache.lucene.geo.GeoEncodingUtils.decodeLongitude;
++import static org.apache.lucene.geo.GeoEncodingUtils.encodeLatitude;
++import static org.apache.lucene.geo.GeoEncodingUtils.encodeLongitude;
++
++/**
++ * Finds all previously indexed shapes that intersect the specified arbitrary multi points.
++ *
++ * <p>The field must be indexed using
++ * {@link org.apache.lucene.document.LatLonShape#createIndexableFields} added per document.
++ *
++ *  @lucene.experimental
++ **/
++public class LatLonShapePointQuery extends LatLonShapeQuery {
++  final int[][] points;
++  final int minX;
++  final int maxX;
++  final int minY;
++  final int maxY;
++
++  public LatLonShapePointQuery(String field, QueryRelation queryRelation, double[][] points) {
++    super(field, queryRelation);
++    /** point queries do not support within relations, only intersects and disjoint */
++    if (queryRelation == QueryRelation.WITHIN) {
++      throw new IllegalArgumentException("LatLonShapePointQuery does not support " + QueryRelation.WITHIN + " queries");
++    }
++
++    if (points == null) {
++      throw new IllegalArgumentException("points must not be null");
++    }
++    if (points.length == 0) {
++      throw new IllegalArgumentException("points must not be empty");
++    }
++
++    int xMin = Integer.MAX_VALUE;
++    int xMax = Integer.MIN_VALUE;
++    int yMin = Integer.MAX_VALUE;
++    int yMax = Integer.MIN_VALUE;
++
++    int latEncoded, lonEncoded;
++    this.points = new int[points.length][2];
++    for (int i = 0; i < points.length; ++i) {
++      if (points[i] == null) {
++        throw new IllegalArgumentException("points[" + i + "] must not be null");
++      }
++      latEncoded = encodeLatitude(points[i][0]);
++      lonEncoded = encodeLongitude(points[i][1]);
++      this.points[i][0] = latEncoded;
++      this.points[i][1] = lonEncoded;
++
++      yMin = Math.min(yMin, latEncoded);
++      yMax = Math.max(yMax, latEncoded);
++      xMin = Math.min(xMin, lonEncoded);
++      xMax = Math.max(xMax, lonEncoded);
++    }
++    this.minX = xMin;
++    this.maxX = xMax;
++    this.minY = yMin;
++    this.maxY = yMax;
++  }
++
++  @Override
++  protected Relation relateRangeBBoxToQuery(int minXOffset, int minYOffset, byte[] minTriangle,
++                                            int maxXOffset, int maxYOffset, byte[] maxTriangle) {
++    int minY = NumericUtils.sortableBytesToInt(minTriangle, minYOffset);
++    int minX = NumericUtils.sortableBytesToInt(minTriangle, minXOffset);
++    int maxY = NumericUtils.sortableBytesToInt(maxTriangle, maxYOffset);
++    int maxX = NumericUtils.sortableBytesToInt(maxTriangle, maxXOffset);
++
++    // check point bounding box against range box
++    if (boxesAreDisjoint(minX, maxX, minY, maxY, this.minX, this.maxX, this.minY, this.maxY)) {
++      return Relation.CELL_OUTSIDE_QUERY;
++    }
++
++    // check points against query
++    for (int i = 0; i < this.points.length; ++i) {
++      if (Rectangle.containsPoint(this.points[i][0], this.points[i][1], minY, maxY, minX, maxX)) {
++        return Relation.CELL_CROSSES_QUERY;
++      }
++    }
++    return Relation.CELL_OUTSIDE_QUERY;
++  }
++
++  @Override
++  protected boolean queryMatches(byte[] t, int[] scratchTriangle, QueryRelation queryRelation) {
++    LatLonShape.decodeTriangle(t, scratchTriangle);
++
++    int aX = scratchTriangle[1];
++    int bX = scratchTriangle[3];
++    int cX = scratchTriangle[5];
++    int aY = scratchTriangle[0];
++    int bY = scratchTriangle[2];
++    int cY = scratchTriangle[4];
++
++    int minX = Math.min(aX, Math.min(bX, cX));
++    int maxX = Math.max(aX, Math.max(bX, cX));
++    int minY = Math.min(aY, Math.min(bY, cY));
++    int maxY = Math.max(aY, Math.max(bY, cY));
++
++    // check triangle bounding box against points bounding box
++    if (boxesAreDisjoint(minX, maxX, minY, maxY, this.minX, this.maxX, this.minY, this.maxY)) {
++      return false;
++    }
++
++    // check points against triangle
++    int x, y;
++    for (int i = 0; i < this.points.length; ++i) {
++      x = this.points[i][1];
++      y = this.points[i][0];
++      // first check point against triangle bounding box
++      if (y < minY || y > maxY || x < minX || x > maxX) {
++        continue;
++      }
++      // check the more expensive operation (pointInTriangle)
++      if (Tessellator.pointInTriangle(x, y, aX, aY, bX, bY, cX, cY)) {
++        return true;
++      }
++    }
++    return false;
++  }
++
++  /** utility method to check if two boxes are disjoint */
++  public static boolean boxesAreDisjoint(final int aMinX, final int aMaxX, final int aMinY, final int aMaxY,
++                                         final int bMinX, final int bMaxX, final int bMinY, final int bMaxY) {
++    return (aMaxX < bMinX || aMinX > bMaxX || aMaxY < bMinY || aMinY > bMaxY);
++  }
++
++  @Override
++  public String toString(String field) {
++    final StringBuilder sb = new StringBuilder();
++    sb.append(getClass().getSimpleName());
++    sb.append(':');
++    if (this.field.equals(field) == false) {
++      sb.append(" field=");
++      sb.append(this.field);
++      sb.append(':');
++    }
++    sb.append("Point(" + pointsToGeoJSON() + ")");
++    return sb.toString();
++  }
++
++  private String pointsToGeoJSON() {
++    StringBuilder sb = new StringBuilder();
++    sb.append('[');
++    sb.append(decodeLongitude(points[0][1]) + ", " + decodeLatitude(points[0][0]) + "]");
++    for (int i = 1; i < points.length; ++i) {
++      sb.append(", [");
++      sb.append(decodeLongitude(points[i][1]));
++      sb.append(", ");
++      sb.append(decodeLatitude(points[i][0]));
++      sb.append(']');
++    }
++    return sb.toString();
++  }
++
++  @Override
++  protected boolean equalsTo(Object o) {
++    return super.equalsTo(o) && Arrays.equals(points, ((LatLonShapePointQuery)o).points);
++  }
++
++  @Override
++  public int hashCode() {
++    int hash = super.hashCode();
++    hash = 31 * hash + Arrays.hashCode(points);
++    return hash;
++  }
++}
+diff --git a/lucene/sandbox/src/test/org/apache/lucene/document/BaseLatLonShapeTestCase.java b/lucene/sandbox/src/test/org/apache/lucene/document/BaseLatLonShapeTestCase.java
+index 1631373ee5..eada794eee 100644
+--- a/lucene/sandbox/src/test/org/apache/lucene/document/BaseLatLonShapeTestCase.java
++++ b/lucene/sandbox/src/test/org/apache/lucene/document/BaseLatLonShapeTestCase.java
+@@ -21,9 +21,11 @@ import java.util.Arrays;
+ import java.util.HashSet;
+ import java.util.Set;
+ 
++import com.carrotsearch.randomizedtesting.generators.RandomNumbers;
+ import com.carrotsearch.randomizedtesting.generators.RandomPicks;
+ import org.apache.lucene.document.LatLonShape.QueryRelation;
+ import org.apache.lucene.geo.GeoTestUtil;
++import org.apache.lucene.geo.GeoUtils;
+ import org.apache.lucene.geo.Line;
+ import org.apache.lucene.geo.Line2D;
+ import org.apache.lucene.geo.Polygon;
+@@ -109,6 +111,30 @@ public abstract class BaseLatLonShapeTestCase extends LuceneTestCase {
+     return decoded;
+   }
+ 
++  protected double[][] randomQueryPoints() {
++    int numPoints = RandomNumbers.randomIntBetween(random(), 10, 100);
++    double[][] points = new double[numPoints][2];
++    for (int i = 0; i < numPoints; ++i) {
++      points[i][0] = GeoTestUtil.nextLatitude();
++      points[i][1] = GeoTestUtil.nextLongitude();
++    }
++    return points;
++  }
++
++  private static String pointsToGeoJSON(double[][] points) {
++    StringBuilder sb = new StringBuilder();
++    sb.append('[');
++    sb.append(points[0][1] + ", " + points[0][0] + "]");
++    for (int i = 1; i < points.length; ++i) {
++      sb.append(", [");
++      sb.append(points[i][1]);
++      sb.append(", ");
++      sb.append(points[i][0]);
++      sb.append(']');
++    }
++    return sb.toString();
++  }
++
+   /** use {@link GeoTestUtil#nextPolygon()} to create a random line; TODO: move to GeoTestUtil */
+   public Line nextLine() {
+     Polygon poly = GeoTestUtil.nextPolygon();
+@@ -140,6 +166,11 @@ public abstract class BaseLatLonShapeTestCase extends LuceneTestCase {
+     }
+   }
+ 
++  /** factory method to create a new point query */
++  protected Query newPointQuery(String field, QueryRelation queryRelation, double[][] points) {
++    return LatLonShape.newPointQuery(field, queryRelation, points);
++  }
++
+   /** factory method to create a new bounding box query */
+   protected Query newRectQuery(String field, QueryRelation queryRelation, double minLat, double maxLat, double minLon, double maxLon) {
+     return LatLonShape.newBoxQuery(field, queryRelation, minLat, maxLat, minLon, maxLon);
+@@ -229,6 +260,8 @@ public abstract class BaseLatLonShapeTestCase extends LuceneTestCase {
+     // query testing
+     final IndexReader reader = DirectoryReader.open(w);
+ 
++    // test random point queries
++    verifyRandomPointQueries(reader, shapes);
+     // test random bbox queries
+     verifyRandomBBoxQueries(reader, shapes);
+     // test random line queries
+@@ -264,6 +297,91 @@ public abstract class BaseLatLonShapeTestCase extends LuceneTestCase {
+     }
+   }
+ 
++  protected void verifyRandomPointQueries(IndexReader reader, Object... shapes) throws Exception {
++    IndexSearcher s = newSearcher(reader);
++
++    final int iters = atLeast(75);
++
++    Bits liveDocs = MultiBits.getLiveDocs(s.getIndexReader());
++    int maxDoc = s.getIndexReader().maxDoc();
++
++    for (int iter = 0; iter < iters; ++iter) {
++      if (VERBOSE) {
++        System.out.println("\nTEST: iter=" + (iter + 1) + " of " + iters + " s=" + s);
++      }
++
++      // points
++      double[][] queryPoints = randomQueryPoints();
++      QueryRelation queryRelation = RandomPicks.randomFrom(random(), POINT_LINE_RELATIONS);
++      Query query = newPointQuery(FIELD_NAME, queryRelation, queryPoints);
++
++      if (VERBOSE) {
++        System.out.println("  query=" + query + ", relation=" + queryRelation);
++      }
++
++      final FixedBitSet hits = new FixedBitSet(maxDoc);
++      s.search(query, new SimpleCollector() {
++
++        private int docBase;
++
++        @Override
++        public ScoreMode scoreMode() {
++          return ScoreMode.COMPLETE_NO_SCORES;
++        }
++
++        @Override
++        protected void doSetNextReader(LeafReaderContext context) throws IOException {
++          docBase = context.docBase;
++        }
++
++        @Override
++        public void collect(int doc) throws IOException {
++          hits.set(docBase+doc);
++        }
++      });
++
++      boolean fail = false;
++      NumericDocValues docIDToID = MultiDocValues.getNumericValues(reader, "id");
++      for (int docID = 0; docID < maxDoc; ++docID) {
++        assertEquals(docID, docIDToID.nextDoc());
++        int id = (int) docIDToID.longValue();
++        boolean expected;
++        if (liveDocs != null && liveDocs.get(docID) == false) {
++          // document is deleted
++          expected = false;
++        } else if (shapes[id] == null) {
++          expected = false;
++        } else {
++          expected = getValidator(queryRelation).testPointQuery(queryPoints, shapes[id]);
++        }
++
++        if (hits.get(docID) != expected) {
++          StringBuilder b = new StringBuilder();
++
++          if (expected) {
++            b.append("FAIL: id=" + id + " should match but did not\n");
++          } else {
++            b.append("FAIL: id=" + id + " should not match but did\n");
++          }
++          b.append("  relation=" + queryRelation + "\n");
++          b.append("  query=" + query + " docID=" + docID + "\n");
++          b.append("  shape=" + shapes[id] + "\n");
++          b.append("  deleted?=" + (liveDocs != null && liveDocs.get(docID) == false));
++          b.append("  queryPoints=" + pointsToGeoJSON(queryPoints));
++          if (true) {
++            fail("wrong hit (first of possibly more):\n\n" + b);
++          } else {
++            System.out.println(b.toString());
++            fail = true;
++          }
++        }
++      }
++      if (fail) {
++        fail("some hits were wrong");
++      }
++    }
++  }
++
+   /** test random generated bounding boxes */
+   protected void verifyRandomBBoxQueries(IndexReader reader, Object... shapes) throws Exception {
+     IndexSearcher s = newSearcher(reader);
+@@ -636,6 +754,7 @@ public abstract class BaseLatLonShapeTestCase extends LuceneTestCase {
+   /** validator class used to test query results against "ground truth" */
+   protected static abstract class Validator {
+     protected QueryRelation queryRelation = QueryRelation.INTERSECTS;
++    public abstract boolean testPointQuery(double[][] points, Object shape);
+     public abstract boolean testBBoxQuery(double minLat, double maxLat, double minLon, double maxLon, Object shape);
+     public abstract boolean testLineQuery(Line2D line2d, Object shape);
+     public abstract boolean testPolygonQuery(Polygon2D poly2d, Object shape);
+diff --git a/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonLineShapeQueries.java b/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonLineShapeQueries.java
+index 7e6d9958ac..ef44286287 100644
+--- a/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonLineShapeQueries.java
++++ b/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonLineShapeQueries.java
+@@ -20,7 +20,9 @@ package org.apache.lucene.document;
+ import com.carrotsearch.randomizedtesting.generators.RandomNumbers;
+ import org.apache.lucene.document.LatLonShape.QueryRelation;
+ import org.apache.lucene.geo.EdgeTree;
++import org.apache.lucene.geo.GeoEncodingUtils;
+ import org.apache.lucene.geo.GeoTestUtil;
++import org.apache.lucene.geo.GeoUtils;
+ import org.apache.lucene.geo.Line;
+ import org.apache.lucene.geo.Line2D;
+ import org.apache.lucene.geo.Polygon2D;
+@@ -77,6 +79,29 @@ public class TestLatLonLineShapeQueries extends BaseLatLonShapeTestCase {
+   }
+ 
+   protected static class LineValidator extends Validator {
++    @Override
++    public boolean testPointQuery(double[][] points, Object shape) {
++      Line line = (Line) shape;
++      int ax, ay, bx, by;
++      int x, y;
++      for (int i = 0, j = 1; j < line.numPoints(); ++i, ++j) {
++        ax = GeoEncodingUtils.encodeLongitude(line.getLon(i));
++        ay = GeoEncodingUtils.encodeLatitude(line.getLat(i));
++        bx = GeoEncodingUtils.encodeLongitude(line.getLon(j));
++        by = GeoEncodingUtils.encodeLatitude(line.getLat(j));
++        for (int p = 0; p < points.length; ++p) {
++          x = GeoEncodingUtils.encodeLongitude(points[p][1]);
++          y = GeoEncodingUtils.encodeLatitude(points[p][0]);
++          if (GeoUtils.orient(ax, ay, bx, by, x, y) == 0) {
++            if (x <= Math.max(ax, bx) && x >= Math.min(ax, bx)
++                && y <= Math.max(ay, by) && y >= Math.min(ay, by))
++            return queryRelation != QueryRelation.DISJOINT;
++          }
++        }
++      }
++      return queryRelation == QueryRelation.DISJOINT;
++    }
++
+     @Override
+     public boolean testBBoxQuery(double minLat, double maxLat, double minLon, double maxLon, Object shape) {
+       Line line = (Line)shape;
+diff --git a/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonMultiLineShapeQueries.java b/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonMultiLineShapeQueries.java
+index 5c9c42ee33..b19653187c 100644
+--- a/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonMultiLineShapeQueries.java
++++ b/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonMultiLineShapeQueries.java
+@@ -66,6 +66,22 @@ public class TestLatLonMultiLineShapeQueries extends BaseLatLonShapeTestCase {
+   }
+ 
+   protected class MultiLineValidator extends Validator {
++    @Override
++    public boolean testPointQuery(double[][] points, Object shape) {
++      Line[] lines = (Line[]) shape;
++      for (Line l : lines) {
++        boolean b = LINEVALIDATOR.testPointQuery(points, l);
++        if (b == true && queryRelation == QueryRelation.INTERSECTS) {
++          return true;
++        } else if (b == false && queryRelation == QueryRelation.DISJOINT) {
++          return false;
++        } else if (b == false && queryRelation == QueryRelation.WITHIN) {
++          return false;
++        }
++      }
++      return queryRelation != QueryRelation.INTERSECTS;
++    }
++
+     @Override
+     public boolean testBBoxQuery(double minLat, double maxLat, double minLon, double maxLon, Object shape) {
+       Line[] lines = (Line[])shape;
+diff --git a/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonMultiPointShapeQueries.java b/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonMultiPointShapeQueries.java
+index 44d095d2d1..709a003916 100644
+--- a/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonMultiPointShapeQueries.java
++++ b/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonMultiPointShapeQueries.java
+@@ -66,6 +66,22 @@ public class TestLatLonMultiPointShapeQueries extends BaseLatLonShapeTestCase {
+   }
+ 
+   protected class MultiPointValidator extends Validator {
++    @Override
++    public boolean testPointQuery(double[][] queryPts, Object shape) {
++      Point[] indexedPoints = (Point[])shape;
++      for (Point p : indexedPoints) {
++        boolean b = POINTVALIDATOR.testPointQuery(queryPts, indexedPoints);
++        if (b == true && queryRelation == QueryRelation.INTERSECTS) {
++          return true;
++        } else if (b == false && queryRelation == QueryRelation.DISJOINT) {
++          return false;
++        } else if (b == false && queryRelation == QueryRelation.WITHIN) {
++          return false;
++        }
++      }
++      return queryRelation != QueryRelation.INTERSECTS;
++    }
++
+     @Override
+     public boolean testBBoxQuery(double minLat, double maxLat, double minLon, double maxLon, Object shape) {
+       Point[] points = (Point[]) shape;
+diff --git a/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonMultiPolygonShapeQueries.java b/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonMultiPolygonShapeQueries.java
+index 3729bbad08..c1c70ef21c 100644
+--- a/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonMultiPolygonShapeQueries.java
++++ b/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonMultiPolygonShapeQueries.java
+@@ -78,6 +78,22 @@ public class TestLatLonMultiPolygonShapeQueries extends BaseLatLonShapeTestCase
+   }
+ 
+   protected class MultiPolygonValidator extends Validator {
++    @Override
++    public boolean testPointQuery(double[][] queryPoints, Object shape) {
++      Polygon[] polygons = (Polygon[])shape;
++      for (Polygon p : polygons) {
++        boolean b = POLYGONVALIDATOR.testPointQuery(queryPoints, p);
++        if (b == true && queryRelation == QueryRelation.INTERSECTS) {
++          return true;
++        } else if (b == false && queryRelation == QueryRelation.DISJOINT) {
++          return false;
++        } else if (b == false && queryRelation == QueryRelation.WITHIN) {
++          return false;
++        }
++      }
++      return queryRelation != QueryRelation.INTERSECTS;
++    }
++
+     @Override
+     public boolean testBBoxQuery(double minLat, double maxLat, double minLon, double maxLon, Object shape) {
+       Polygon[] polygons = (Polygon[])shape;
+diff --git a/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonPointShapeQueries.java b/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonPointShapeQueries.java
+index d894aed7c9..80198e9cf9 100644
+--- a/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonPointShapeQueries.java
++++ b/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonPointShapeQueries.java
+@@ -20,6 +20,7 @@ import com.carrotsearch.randomizedtesting.generators.RandomNumbers;
+ import org.apache.lucene.document.LatLonShape.QueryRelation;
+ import org.apache.lucene.geo.EdgeTree;
+ import org.apache.lucene.geo.GeoTestUtil;
++import org.apache.lucene.geo.GeoUtils;
+ import org.apache.lucene.geo.Line;
+ import org.apache.lucene.geo.Line2D;
+ import org.apache.lucene.geo.Polygon2D;
+@@ -73,6 +74,32 @@ public class TestLatLonPointShapeQueries extends BaseLatLonShapeTestCase {
+   }
+ 
+   protected static class PointValidator extends Validator {
++    @Override
++    public boolean testPointQuery(double[][] points, Object shape) {
++      Point point = (Point) shape;
++      double x, y;
++      double qLat = quantizeLat(point.lat);
++      double qLon = quantizeLon(point.lon);
++      for (int p = 0; p < points.length; ++p) {
++        x = quantizeLon(points[p][1]);
++        y = quantizeLat(points[p][0]);
++        if (pointEquals(x, y, qLon, qLat)) {
++          return queryRelation != QueryRelation.DISJOINT;
++        }
++      }
++      return queryRelation == QueryRelation.DISJOINT;
++    }
++
++    private boolean pointEquals(double aX, double aY, double bX, double bY) {
++      if (aY != bY) {
++        return false;
++      }
++      if (aX == GeoUtils.MIN_LON_INCL || aX == GeoUtils.MAX_LON_INCL) {
++        return Math.abs(aX) == Math.abs(bX);
++      }
++      return aX == bX;
++    }
++
+     @Override
+     public boolean testBBoxQuery(double minLat, double maxLat, double minLon, double maxLon, Object shape) {
+       Point p = (Point)shape;
+diff --git a/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonPolygonShapeQueries.java b/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonPolygonShapeQueries.java
+index a3e060c9ae..813e3006ac 100644
+--- a/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonPolygonShapeQueries.java
++++ b/lucene/sandbox/src/test/org/apache/lucene/document/TestLatLonPolygonShapeQueries.java
+@@ -20,6 +20,7 @@ import java.util.List;
+ 
+ import org.apache.lucene.document.LatLonShape.QueryRelation;
+ import org.apache.lucene.geo.EdgeTree;
++import org.apache.lucene.geo.GeoEncodingUtils;
+ import org.apache.lucene.geo.Line2D;
+ import org.apache.lucene.geo.Polygon;
+ import org.apache.lucene.geo.Polygon2D;
+@@ -65,6 +66,34 @@ public class TestLatLonPolygonShapeQueries extends BaseLatLonShapeTestCase {
+   }
+ 
+   protected static class PolygonValidator extends Validator {
++    @Override
++    public boolean testPointQuery(double[][] points, Object shape) {
++      Polygon poly = (Polygon)shape;
++      int pMinLat = GeoEncodingUtils.encodeLatitude(poly.minLat);
++      int pMaxLat = GeoEncodingUtils.encodeLatitude(poly.maxLat);
++      int pMinLon = GeoEncodingUtils.encodeLongitude(poly.minLon);
++      int pMaxLon = GeoEncodingUtils.encodeLongitude(poly.maxLon);
++
++      List<Tessellator.Triangle> tessellation = Tessellator.tessellate(poly);
++      for (Tessellator.Triangle t : tessellation) {
++        int[] decoded = encodeDecodeTriangle(t.getLon(0), t.getLat(0), t.getLon(1), t.getLat(1), t.getLon(2), t.getLat(2));
++        for (int p = 0; p < points.length; ++p) {
++          int x = GeoEncodingUtils.encodeLongitude(points[p][1]);
++          int y = GeoEncodingUtils.encodeLatitude(points[p][0]);
++
++          if ((y >= pMinLat && y <= pMaxLat && x >= pMinLon && x <= pMaxLon)
++            && Tessellator.pointInTriangle(x, y, decoded[1], decoded[0], decoded[3], decoded[2], decoded[5], decoded[4])) {
++            if (queryRelation == QueryRelation.DISJOINT) {
++              return false;
++            } else {
++              return true;
++            }
++          }
++        }
++      }
++      return queryRelation == QueryRelation.DISJOINT;
++    }
++
+     @Override
+     public boolean testBBoxQuery(double minLat, double maxLat, double minLon, double maxLon, Object shape) {
+       Polygon p = (Polygon)shape;

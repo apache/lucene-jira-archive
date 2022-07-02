@@ -1,0 +1,140 @@
+Index: lucene/CHANGES.txt
+===================================================================
+--- lucene/CHANGES.txt	(revision 1505808)
++++ lucene/CHANGES.txt	(working copy)
+@@ -80,6 +80,10 @@
+ * LUCENE-5114: Remove unused boolean useCache parameter from
+   TermsEnum.seekCeil and .seekExact (Mike McCandless)
+ 
++* LUCENE-5128: IndexSearcher.searchAfter throws IllegalArgumentException if 
++  searchAfter exceeds the number of documents in the reader. 
++  (Crocket via Shai Erera)
++
+ Optimizations
+ 
+ * LUCENE-5088: Added TermFilter to filter docs by a specific term.
+Index: lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java
+===================================================================
+--- lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java	(revision 1505808)
++++ lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java	(working copy)
+@@ -430,6 +430,10 @@
+     if (limit == 0) {
+       limit = 1;
+     }
++    if (after != null && after.doc >= limit) {
++      throw new IllegalArgumentException("after.doc exceeds the number of documents in that reader: after.doc="
++          + after.doc + " limit=" + limit);
++    }
+     nDocs = Math.min(nDocs, limit);
+     
+     if (executor == null) {
+@@ -440,8 +444,7 @@
+       final ExecutionHelper<TopDocs> runner = new ExecutionHelper<TopDocs>(executor);
+     
+       for (int i = 0; i < leafSlices.length; i++) { // search each sub
+-        runner.submit(
+-                      new SearcherCallableNoSort(lock, this, leafSlices[i], weight, after, nDocs, hq));
++        runner.submit(new SearcherCallableNoSort(lock, this, leafSlices[i], weight, after, nDocs, hq));
+       }
+ 
+       int totalHits = 0;
+@@ -920,7 +923,7 @@
+    */
+   public TermStatistics termStatistics(Term term, TermContext context) throws IOException {
+     return new TermStatistics(term.bytes(), context.docFreq(), context.totalTermFreq());
+-  };
++  }
+   
+   /**
+    * Returns {@link CollectionStatistics} for a field.
+Index: lucene/core/src/test/org/apache/lucene/search/TestIndexSearcher.java
+===================================================================
+--- lucene/core/src/test/org/apache/lucene/search/TestIndexSearcher.java	(revision 1505808)
++++ lucene/core/src/test/org/apache/lucene/search/TestIndexSearcher.java	(working copy)
+@@ -29,9 +29,11 @@
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.LuceneTestCase;
+ import org.apache.lucene.util.NamedThreadFactory;
+ import org.apache.lucene.util._TestUtil;
++import org.junit.Test;
+ 
+ public class TestIndexSearcher extends LuceneTestCase {
+   Directory dir;
+@@ -116,4 +118,25 @@
+     
+     _TestUtil.shutdownExecutorService(service);
+   }
++  
++  @Test
++  public void testSearchAfterPassedMaxDoc() throws Exception {
++    // LUCENE-5128: ensure we get a meaningful message if searchAfter exceeds maxDoc
++    Directory dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++    w.addDocument(new Document());
++    IndexReader r = w.getReader();
++    w.close();
++    
++    IndexSearcher s = new IndexSearcher(r);
++    try {
++      s.searchAfter(new ScoreDoc(r.maxDoc(), 0.54f), new MatchAllDocsQuery(), 10);
++      fail("should have hit IllegalArgumentException when searchAfter exceeds maxDoc");
++    } catch (IllegalArgumentException e) {
++      // ok
++    } finally {
++      IOUtils.close(r, dir);
++    }
++  }
++  
+ }
+Index: lucene/test-framework/src/java/org/apache/lucene/search/ShardSearchingTestBase.java
+===================================================================
+--- lucene/test-framework/src/java/org/apache/lucene/search/ShardSearchingTestBase.java	(revision 1505808)
++++ lucene/test-framework/src/java/org/apache/lucene/search/ShardSearchingTestBase.java	(working copy)
+@@ -370,20 +370,35 @@
+       @Override
+       public TopDocs searchAfter(ScoreDoc after, Query query, int numHits) throws IOException {
+         final TopDocs[] shardHits = new TopDocs[nodeVersions.length];
++        // results are merged in that order: score, shardIndex, doc. therefore we set
++        // after to after.score and depending on the nodeID we set doc to either:
++        // - not collect any more documents with that score (only with worse score)
++        // - collect more documents with that score (and worse) following the last collected document
++        // - collect all documents with that score (and worse)
+         ScoreDoc shardAfter = new ScoreDoc(after.doc, after.score);
+-        for(int nodeID=0;nodeID<nodeVersions.length;nodeID++) {
++        for (int nodeID = 0; nodeID < nodeVersions.length; nodeID++) {
+           if (nodeID < after.shardIndex) {
+-            // If score is tied then no docs in this shard
+-            // should be collected:
+-            shardAfter.doc = Integer.MAX_VALUE;
++            // all documents with after.score were already collected, so collect
++            // only documents with worse scores.
++            final NodeState.ShardIndexSearcher s = nodes[nodeID].acquire(nodeVersions);
++            try {
++              // Setting after.doc to reader.maxDoc-1 is a way to tell
++              // TopScoreDocCollector that no more docs with that score should
++              // be collected. note that in practice the shard which sends the
++              // request to a remote shard won't have reader.maxDoc at hand, so
++              // it will send some arbitrary value which will be fixed on the
++              // other end.
++              shardAfter.doc = s.getIndexReader().maxDoc() - 1;
++            } finally {
++              nodes[nodeID].release(s);
++            }
+           } else if (nodeID == after.shardIndex) {
+-            // If score is tied then we break according to
+-            // docID (like normal):  
++            // collect all documents following the last collected doc with
++            // after.score + documents with worse scores.  
+             shardAfter.doc = after.doc;
+           } else {
+-            // If score is tied then all docs in this shard
+-            // should be collected, because they come after
+-            // the previous bottom:
++            // all documents with after.score (and worse) should be collected
++            // because they didn't make it to top-N in the previous round.
+             shardAfter.doc = -1;
+           }
+           if (nodeID == myNodeID) {
