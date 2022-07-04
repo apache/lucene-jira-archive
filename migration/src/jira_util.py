@@ -174,7 +174,7 @@ JIRA_EMOJI_TO_UNICODE = {
     "(flagoff)": "\U0001F3F3"
 }
 
-REGEX_CRLF = re.compile(r"\r\n\s*")
+REGEX_CRLF = re.compile(r"\r\n")
 REGEX_JIRA_KEY = re.compile(r"[^/]LUCENE-\d+")
 REGEX_MENTION = re.compile(r"@\w+")
 REGEX_LINK = re.compile(r"\[([^\]]+)\]\(([^\)]+)\)")
@@ -191,6 +191,7 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}) -> str:
         return res
 
     text = re.sub(REGEX_CRLF, "\n", text)
+
     for emoji, unicode in JIRA_EMOJI_TO_UNICODE.items():
         text = text.replace(emoji, unicode)
     text = jira2markdown.convert(text)
