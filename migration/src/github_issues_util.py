@@ -95,3 +95,14 @@ def get_import_status(token: str, url: str, logger: Logger) -> Optional[tuple[st
         logger.error(f"Failed to get import status for {url}; status code={res.status_code}, message={res.text}")
         return None
     return (res.json().get("status"), res.json().get("issue_url", ""), res.json().get("errors", []))
+
+
+def check_if_can_be_assigned(token: str, repo: str, assignee: str, logger: Logger) -> bool:
+    url = GITHUB_API_BASE + f"/repos/{repo}/assignees/{assignee}"
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+    res = requests.get(url, headers=headers)
+    if res.status_code == 204:
+        return True
+    else:
+        logger.warning(f"Assignee {assignee} cannot be assigned; status code={res.status_code}, message={res.text}")
+        return False
