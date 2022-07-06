@@ -30,22 +30,26 @@ source .env
 
 ## Usage
 
+All logs are saved in `migration/log`.
+
 ### 1. Download Jira issues
 
 `src/download_jira.py` downloads Jira issues and dumps them as JSON files in `migration/jira-dump`. This also downloads attached files in each issue.
 
 ```
-(.venv) migration $ python src/download_jira.py --min 10500 --max 10600
-[2022-06-26 01:57:02,408] INFO:download_jira: Downloading Jira issues in /mnt/hdd/repo/sandbox-lucene-10557/migration/jira-dump
-[2022-06-26 01:57:17,843] INFO:download_jira: Done.
+(.venv) migration $ python src/download_jira.py --min 10500 --max 10510
+[2022-07-06 15:43:00,864] INFO:download_jira: Downloading Jira issues in /mnt/hdd/repo/lucene-jira-archive/migration/jira-dump. Attachments are saved in ..
+[2022-07-06 15:43:16,247] INFO:download_jira: Done.
 
-(.venv) migration $ cat log/jira2github_import_2022-06-26T01\:34\:22.log 
-[2022-06-26 01:34:22,300] INFO:jira2github_import: Converting Jira issues to GitHub issues in /mnt/hdd/repo/sandbox-lucene-10557/migration/github-import-data
-[2022-06-26 01:34:23,355] DEBUG:jira2github_import: GitHub issue data created: /mnt/hdd/repo/sandbox-lucene-10557/migration/github-import-data/GH-LUCENE-10500.json
-[2022-06-26 01:34:23,519] DEBUG:jira2github_import: GitHub issue data created: /mnt/hdd/repo/sandbox-lucene-10557/migration/github-import-data/GH-LUCENE-10501.json
-[2022-06-26 01:34:24,894] DEBUG:jira2github_import: GitHub issue data created: /mnt/hdd/repo/sandbox-lucene-10557/migration/github-import-data/GH-LUCENE-10502.json
+(.venv) migration $ ls jira-dump/
+LUCENE-10500.json
+LUCENE-10501.json
+LUCENE-10502.json
 ...
 ```
+
+Downloaded attachments should be committed to a dedicated repo/branch for them.
+
 
 ### 2. Convert Jira issues to GitHub issues
 
@@ -54,14 +58,14 @@ source .env
 Also this resolves all Jira user ID - GitHub account alignment if the account mapping is given in `mapping-data/account-map.csv`. 
 
 ```
-(.venv) migration $ python src/jira2github_import.py --min 10500 --max 10600
-[2022-06-26 01:34:22,300] INFO:jira2github_import: Converting Jira issues to GitHub issues in /mnt/hdd/repo/sandbox-lucene-10557/migration/github-import-data
-[2022-06-26 01:36:27,739] INFO:jira2github_import: Done.
+(.venv) migration $ python src/jira2github_import.py --min 10500 --max 10510
+[2022-07-06 15:46:38,837] INFO:jira2github_import: Converting Jira issues to GitHub issues in /mnt/hdd/repo/lucene-jira-archive/migration/github-import-data
+[2022-07-06 15:46:48,761] INFO:jira2github_import: Done.
 
-(.venv) migration $ cat log/jira2github_import_2022-06-26T01\:34\:22.log
-[2022-06-26 01:34:22,300] INFO:jira2github_import: Converting Jira issues to GitHub issues in /mnt/hdd/repo/sandbox-lucene-10557/migration/github-import-data
-[2022-06-26 01:34:23,355] DEBUG:jira2github_import: GitHub issue data created: /mnt/hdd/repo/sandbox-lucene-10557/migration/github-import-data/GH-LUCENE-10500.json
-[2022-06-26 01:34:23,519] DEBUG:jira2github_import: GitHub issue data created: /mnt/hdd/repo/sandbox-lucene-10557/migration/github-import-data/GH-LUCENE-10501.json
+(.venv) migration $ ls github-import-data/
+GH-LUCENE-10500.json
+GH-LUCENE-10501.json
+GH-LUCENE-10502.json
 ...
 ```
 
@@ -72,47 +76,40 @@ First pass: `src/import_github_issues.py` imports GitHub issues and comments via
 We confirmed this script does not trigger any notifications.
 
 ```
-(.venv) migration $ python src/import_github_issues.py --min 10500 --max 10600
-[2022-06-26 01:36:46,749] INFO:import_github_issues: Importing GitHub issues
-[2022-06-26 01:47:35,979] INFO:import_github_issues: Done.
-
-(.venv) migration $ cat log/import_github_issues_2022-06-26T01\:36\:46.log
-[2022-06-26 01:36:46,749] INFO:import_github_issues: Importing GitHub issues
-[2022-06-26 01:36:52,299] DEBUG:import_github_issues: Import GitHub issue https://github.com/mocobeta/migration-test-2/issues/1 was successfully completed.
-[2022-06-26 01:36:57,883] DEBUG:import_github_issues: Import GitHub issue https://github.com/mocobeta/migration-test-2/issues/2 was successfully completed.
-[2022-06-26 01:37:03,405] DEBUG:import_github_issues: Import GitHub issue https://github.com/mocobeta/migration-test-2/issues/3 was successfully completed.
+(.venv) migration $ python src/import_github_issues.py --min 10500 --max 10510
+[2022-07-06 15:47:48,230] INFO:import_github_issues: Importing GitHub issues
+[2022-07-06 15:52:06,314] INFO:import_github_issues: Done.
 ...
 
 (.venv) migration $ cat mappings-data/issue-map.csv
 JiraKey,GitHubUrl,GitHubNumber
-LUCENE-10500,https://github.com/mocobeta/migration-test-2/issues/1,1
-LUCENE-10501,https://github.com/mocobeta/migration-test-2/issues/2,2
-LUCENE-10502,https://github.com/mocobeta/migration-test-2/issues/3,3
+LUCENE-10500,https://github.com/mocobeta/migration-test-3/issues/42,42
+LUCENE-10501,https://github.com/mocobeta/migration-test-3/issues/43,43
+LUCENE-10502,https://github.com/mocobeta/migration-test-3/issues/44,44
 ...
 ```
 
-### 4. Update GitHub issues and comments
+### 4. Re-map cross-issue links on GitHub
 
-Second pass: `src/update_issue_links.py` 1) iterates all imported GitHub issue descriptions and comments; 2) embed correct GitHub issue number next to the corresponding Jira issue key with previously created issue number mapping; 3) updates them if the texts are changed.
-
-e.g.: if `LUCENE-10500` is mapped to GitHub issue `#100`, then all text fragments `LUCENE-10500`  in issue descriptions and comments will be updated to `LUCENE-10500 (#100)`.
-
-We confirmed this script does not trigger any notifications.
+`src/remap_cross_issue_links.py` exports issues and comments from GitHub and save updated issue/comment bodies to `migration/github-remapped-data`.
 
 ```
-(.venv) migration $ python src/update_issue_links.py
-[2022-06-26 01:59:43,324] INFO:update_issue_links: Updating GitHub issues
-[2022-06-26 02:17:38,332] INFO:update_issue_links: Done.
+(.venv) migration $ python src/remap_cross_issue_links.py --issues 40 41
+[2022-07-06 15:32:39,895] INFO:remap_cross_issue_links: Remapping cross-issue links
+[2022-07-06 15:32:47,729] INFO:remap_cross_issue_links: Done.
 
-(.venv) migration $ cat log/update_issue_links_2022-06-26T01\:59\:43.log
-[2022-06-26 01:59:43,324] INFO:update_issue_links: Updating GitHub issues
-[2022-06-26 01:59:45,586] DEBUG:update_issue_links: Issue 1 does not contain any cross-issue links; nothing to do.
-[2022-06-26 01:59:50,062] DEBUG:update_issue_links: # comments in issue 1 = 3
-[2022-06-26 01:59:52,601] DEBUG:update_issue_links: Comment 1166321470 was successfully updated.
-[2022-06-26 01:59:55,164] DEBUG:update_issue_links: Comment 1166321472 was successfully updated.
-[2022-06-26 01:59:55,165] DEBUG:update_issue_links: Comment 1166321473 does not contain any cross-issue links; nothing to do.
-[2022-06-26 01:59:57,426] DEBUG:update_issue_links: Issue 2 does not contain any cross-issue links; nothing to do.
-...
+(.venv) migration $ ls github-remapped-data/
+COMMENT-1175792003.json  COMMENT-1175792076.json  COMMENT-1175797378.json  COMMENT-1175797444.json  COMMENT-1175797570.json  ISSUE-40.json  ISSUE-41.json
+```
+
+### 5. Update GitHub issues and comments
+
+Second pass: `src/update_issues.py` updates issues and comments with updated issue/comment bodies.
+
+```
+(.venv) migration $ python src/update_issues.py --issues 40 41 --comments 1175797570 1175797444
+[2022-07-06 15:34:59,537] INFO:update_issues: Updating issues/comments
+[2022-07-06 15:35:06,532] INFO:update_issues: Done.
 ```
 
 ## Already implemented things

@@ -11,6 +11,7 @@ LOG_DIRNAME = "log"
 JIRA_DUMP_DIRNAME = "jira-dump"
 JIRA_ATTACHMENTS_DIRPATH = os.getenv("ATTACHMENTS_DL_DIR", str(Path(tempfile.gettempdir()).joinpath("attachments")))
 GITHUB_IMPORT_DATA_DIRNAME = "github-import-data"
+GITHUB_REMAPPED_DATA_DIRNAME = "github-remapped-data"
 MAPPINGS_DATA_DIRNAME = "mappings-data"
 
 ISSUE_MAPPING_FILENAME = "issue-map.csv"
@@ -58,6 +59,14 @@ def jira_attachments_dir(data_dir: Path, issue_number: int) -> Path:
 def github_data_file(data_dir: Path, issue_number: int) -> Path:
     issue_id = jira_issue_id(issue_number)
     return data_dir.joinpath(f"GH-{issue_id}.json")
+
+
+def github_remapped_issue_data_file(data_dir: Path, issue_number: int) -> Path:
+    return data_dir.joinpath(f"ISSUE-{issue_number}.json")
+
+
+def github_remapped_comment_data_file(data_dir: Path, comment_id: int) -> Path:
+    return data_dir.joinpath(f"COMMENT-{comment_id}.json")
 
 
 def make_github_title(summary: str, jira_id: str) -> str:
