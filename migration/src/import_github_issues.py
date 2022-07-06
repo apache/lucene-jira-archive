@@ -31,10 +31,9 @@ def import_issue_with_comments(num: int, data_dir: Path, token: str, repo: str) 
     with open(data_file) as fp:
         issue_data = json.load(fp)
         assignee = issue_data["issue"].get("assignee")
-        if assignee:
-            if not check_if_can_be_assigned(token, repo, assignee, logger):
-                # this field should be removed; otherwise an error occurs.
-                del issue_data["issue"]["assignee"]
+        if assignee and not check_if_can_be_assigned(token, repo, assignee, logger):
+            # this field should be removed; otherwise an error occurs.
+            del issue_data["issue"]["assignee"]
         url = import_issue(token, repo, issue_data, logger)
         (status, issue_url, errors) = ("pending", "", [])
         while not status or status == "pending":
