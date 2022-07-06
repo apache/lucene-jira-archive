@@ -9,7 +9,7 @@ import tempfile
 LOG_DIRNAME = "log"
 
 JIRA_DUMP_DIRNAME = "jira-dump"
-JIRA_ATTACHMENTS_DIRPATH = os.getenv("ATTACHMENTS_DL_DIR", str(Path(tempfile.gettempdir()).joinpath("attachments")))
+JIRA_ATTACHMENTS_DIRPATH = os.getenv("ATTACHMENTS_DL_DIR")
 GITHUB_IMPORT_DATA_DIRNAME = "github-import-data"
 GITHUB_REMAPPED_DATA_DIRNAME = "github-remapped-data"
 MAPPINGS_DATA_DIRNAME = "mappings-data"

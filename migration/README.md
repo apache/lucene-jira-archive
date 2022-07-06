@@ -38,13 +38,19 @@ All logs are saved in `migration/log`.
 
 ```
 (.venv) migration $ python src/download_jira.py --min 10500 --max 10510
-[2022-07-06 15:43:00,864] INFO:download_jira: Downloading Jira issues in /mnt/hdd/repo/lucene-jira-archive/migration/jira-dump. Attachments are saved in ..
-[2022-07-06 15:43:16,247] INFO:download_jira: Done.
+[2022-07-06 16:22:01,994] INFO:download_jira: Downloading Jira issues in /mnt/hdd/repo/lucene-jira-archive/migration/jira-dump. Attachments are saved in /tmp/attachments.
+[2022-07-06 16:22:17,172] INFO:download_jira: Done.
 
-(.venv) migration $ ls jira-dump/
+(.venv) migration $ ls -1 jira-dump/
 LUCENE-10500.json
 LUCENE-10501.json
 LUCENE-10502.json
+
+(.venv) migration $ ls -1 /tmp/attachments/
+LUCENE-10500
+LUCENE-10501
+LUCENE-10502
+...
 ...
 ```
 

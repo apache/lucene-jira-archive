@@ -10,6 +10,7 @@ from pathlib import Path
 import json
 import time
 from dataclasses import dataclass
+import tempfile
 
 import requests
 
@@ -94,7 +95,7 @@ if __name__ == "__main__":
         dump_dir.mkdir()
     assert dump_dir.exists()
 
-    att_data_dir = Path(JIRA_ATTACHMENTS_DIRPATH)
+    att_data_dir = Path(JIRA_ATTACHMENTS_DIRPATH) if JIRA_ATTACHMENTS_DIRPATH else Path(tempfile.gettempdir()).joinpath("attachments")
     if not att_data_dir.exists():
         att_data_dir.mkdir()
     assert att_data_dir.exists()
