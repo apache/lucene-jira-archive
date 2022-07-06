@@ -1,7 +1,7 @@
 #
 # Convert Jira issues to GitHub issues for Import Issues API (https://gist.github.com/jonmagic/5282384165e0f86ef105)
 # Usage:
-#   python src/jira2github_import.py --issues <issue number list>
+#   python src/jira2github_import.py --issues <jira issue number list>
 #   python src/jira2github_import.py --min <min issue number> --max <max issue number>
 #
 

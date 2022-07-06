@@ -1,7 +1,7 @@
 #
 # Create local dump of Jira issues 
 # Usage:
-#   python src/download_jira.py --issues <issue number list>
+#   python src/download_jira.py --issues <jira issue number list>
 #   python src/download_jira.py --min <min issue number> --max <max issue number>
 #
 
