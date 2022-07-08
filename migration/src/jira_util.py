@@ -4,7 +4,10 @@ from collections import defaultdict
 from typing import Optional
 
 import jira2markdown
+from jira2markdown.elements import MarkupElements
+from jira2markdown.markup.lists import UnorderedList, OrderedList
 
+from markup.lists import UnorderedTweakedList, OrderedTweakedList
 
 @dataclass
 class Attachment(object):
@@ -190,11 +193,17 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}) -> str:
                 res = f"[{m.group(1)}]({repl})"
         return res
 
-    text = re.sub(REGEX_CRLF, "\n", text)
+    text = re.sub(REGEX_CRLF, "\n", text)  # jira2markup does not support carriage return (?)
 
+    # convert Jira special emojis into corresponding or similar Unicode characters
     for emoji, unicode in JIRA_EMOJI_TO_UNICODE.items():
         text = text.replace(emoji, unicode)
-    text = jira2markdown.convert(text)
+
+    # convert Jira markup into Markdown with customization
+    elements = MarkupElements()
+    elements.replace(UnorderedList, UnorderedTweakedList)
+    elements.replace(OrderedList, OrderedTweakedList)
+    text = jira2markdown.convert(text, elements=elements)
 
     # markup @ mentions with ``
     mentions = re.findall(REGEX_MENTION, text)
