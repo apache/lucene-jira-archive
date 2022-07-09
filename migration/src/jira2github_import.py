@@ -120,8 +120,7 @@ Pull Requests:
                 "body": f"""{convert_text(comment_body, att_replace_map, account_map)}
 
 Author: {comment_author(comment_author_name, comment_author_dispname)}
-Created: {comment_created}
-Updated: {comment_updated}
+Created: {comment_created} / Updated: {comment_updated}
 """
             }
             if comment_created:
