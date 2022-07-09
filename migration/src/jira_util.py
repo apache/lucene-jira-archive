@@ -184,11 +184,11 @@ JIRA_EMOJI_TO_UNICODE = {
 
 REGEX_CRLF = re.compile(r"\r\n")
 REGEX_JIRA_KEY = re.compile(r"[^/]LUCENE-\d+")
-REGEX_MENTION = re.compile(r"@\w+")
+REGEX_MENTION = re.compile(r"((?<=^)@\w+|(?<=[\s\(\"'])@\w+)(?=[\s\)\"'\?!,\.$])")  # this regex may capture only "@" + "<username>" mentions
 REGEX_LINK = re.compile(r"\[([^\]]+)\]\(([^\)]+)\)")
 
 
-def convert_text(text: str, att_replace_map: dict[str, str] = {}) -> str:
+def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: dict[str, str] = {}) -> str:
     """Convert Jira markup to Markdown
     """
     def repl_att(m: re.Match):
@@ -220,8 +220,10 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}) -> str:
     if mentions:
         mentions = set(mentions)
         for m in mentions:
-            with_backtick = f"`{m}`"
-            text = text.replace(m, with_backtick)
+            jira_id = m[1:]
+            gh_m = account_map.get(jira_id)
+            # replace Jira name with GitHub account if it is available, othewise show Jira name with `` to avoid unintentional mentions
+            text = text.replace(m, f"`@{jira_id}`" if not gh_m else f"@{gh_m}")
     
     text = re.sub(REGEX_LINK, repl_att, text)
 

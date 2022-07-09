@@ -85,7 +85,7 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         # make pull requests list
         pull_requests_list = [f"- {x}\n" for x in pull_requests]
 
-        body = f"""{convert_text(description, att_replace_map)}
+        body = f"""{convert_text(description, att_replace_map, account_map)}
 
 ---
 ### Jira information
@@ -117,7 +117,7 @@ Pull Requests:
         comments_data = []
         for (comment_author_name, comment_author_dispname, comment_body, comment_created, comment_updated) in comments:
             data = {
-                "body": f"""{convert_text(comment_body, att_replace_map)}
+                "body": f"""{convert_text(comment_body, att_replace_map, account_map)}
 
 Author: {comment_author(comment_author_name, comment_author_dispname)}
 Created: {comment_created}
