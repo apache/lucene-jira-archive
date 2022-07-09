@@ -4,16 +4,11 @@ from pyparsing import (
     ParserElement,
     ParseResults,
     QuotedString,
-    StringEnd,
     StringStart,
     SkipTo,
     Literal,
     LineEnd,
-    Optional,
     Combine,
-    White,
-    OneOrMore,
-    nums,
     replaceWith,
 
 )
@@ -49,3 +44,16 @@ class TweakedQuote(AbstractMarkup):
             Literal("bq. ").setParseAction(replaceWith("> "))
             + SkipTo(LineEnd()) + LineEnd().setParseAction(replaceWith("\n\n")) # needs additional line feed at the end of quotation to preserve indentation
         )
+
+
+class TweakedMonospaced(AbstractMarkup):
+    def action(self, tokens: ParseResults) -> str:
+        # remove extra brackets in {{monospaced}}
+        # e.g. {{{}BooleanScorer{}}}
+        token = re.sub(r"^[{}]+", "", tokens[0])
+        token = re.sub(r"[{}]+$", "", token)
+        return f"`{token}`"
+
+    @property
+    def expr(self) -> ParserElement:
+        return QuotedString("{{", endQuoteChar="}}").setParseAction(self.action)
