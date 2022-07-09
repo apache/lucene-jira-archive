@@ -6,8 +6,10 @@ from typing import Optional
 import jira2markdown
 from jira2markdown.elements import MarkupElements
 from jira2markdown.markup.lists import UnorderedList, OrderedList
+from jira2markdown.markup.text_effects import BlockQuote, Quote
 
 from markup.lists import UnorderedTweakedList, OrderedTweakedList
+from markup.text_effects import TweakedBlockQuote, TweakedQuote
 
 @dataclass
 class Attachment(object):
@@ -203,6 +205,8 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}) -> str:
     elements = MarkupElements()
     elements.replace(UnorderedList, UnorderedTweakedList)
     elements.replace(OrderedList, OrderedTweakedList)
+    elements.replace(BlockQuote, TweakedBlockQuote)
+    elements.replace(Quote, TweakedQuote)
     text = jira2markdown.convert(text, elements=elements)
 
     # markup @ mentions with ``
