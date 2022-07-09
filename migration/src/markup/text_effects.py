@@ -9,8 +9,8 @@ from pyparsing import (
     Literal,
     LineEnd,
     Combine,
+    Literal,
     replaceWith,
-
 )
 
 from jira2markdown.markup.base import AbstractMarkup
@@ -57,3 +57,13 @@ class TweakedMonospaced(AbstractMarkup):
     @property
     def expr(self) -> ParserElement:
         return QuotedString("{{", endQuoteChar="}}").setParseAction(self.action)
+
+
+class EscapeHtml(AbstractMarkup):
+    """
+    Escapes HTML characters that are not a part of any expression grammar
+    """
+
+    @property
+    def expr(self) -> ParserElement:
+        return Literal("<").setParseAction(replaceWith("&lt;")) ^ Literal(">").setParseAction(replaceWith("&gt;")) ^ Literal("&").setParseAction(replaceWith("&amp;"))
