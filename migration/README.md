@@ -15,7 +15,7 @@ source .venv/bin/activate
 (.venv) pip install -r requirements.txt
 ```
 
-You need a GitHub repository and personal access token for testing. Set `GITHUB_PAT` and `GITHUB_REPO` environment variables. See `.env.example` for other variables.
+You need a GitHub repository and [personal access token (PAT)](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-personal-access-token) for testing. Set `GITHUB_PAT` and `GITHUB_REPO` environment variables. See `.env.example` for other variables.
 
 On Linux/MacOS:
 ```
@@ -27,6 +27,8 @@ export GITHUB_REPO=<your repository location> # e.g. "mocobeta/sandbox-lucene-10
 
 source .env
 ```
+
+You must first manually create the repository yourself using GitHub.  Consider naming your repository with `stargazers-` prefix as this [might prevent Web crawlers from indexing your migrated issues](https://github.com/apache/lucene-jira-archive/issues/1#issuecomment-1173701233), thus confusing the daylights out of future Googlers.
 
 ## Usage
 
@@ -54,14 +56,14 @@ LUCENE-10502
 ...
 ```
 
-Downloaded attachments should be committed to a dedicated repo/branch for them.
+Downloaded attachments should be separatly committed to a dedicated branch named `attachments` (or matching the `GITHUB_ATT_BRANCH` env variable) for them.
 
 
 ### 2. Convert Jira issues to GitHub issues
 
 `src/jira2github_import.py` converts Jira dumps into GitHub data that are importable to [issue import API](https://gist.github.com/jonmagic/5282384165e0f86ef105). Converted JSON data is saved in `migration/github-import-data`.
 
-Also this resolves all Jira user ID - GitHub account alignment if the account mapping is given in `mapping-data/account-map.csv`. 
+This also resolves all Jira user ID - GitHub account alignment if the account mapping is given in `mapping-data/account-map.csv`.  If you have no mapping, `cp mapping-data/account-map.csv{.example,}`.
 
 ```
 (.venv) migration $ python src/jira2github_import.py --min 10500 --max 10510
@@ -77,9 +79,9 @@ GH-LUCENE-10502.json
 
 ### 3. Import GitHub issues
 
-First pass: `src/import_github_issues.py` imports GitHub issues and comments via issue import API. This also writes Jira issue key - GitHub issue number mappings to a file in migration/mappings-data.
+First pass: `src/import_github_issues.py` imports GitHub issues and comments via issue import API. This also writes Jira issue key - GitHub issue number mappings to local file `migration/mappings-data/issue-map.csv`.
 
-We confirmed this script does not trigger any notifications.
+We confirmed this script does not trigger any GitHub notifications.
 
 ```
 (.venv) migration $ python src/import_github_issues.py --min 10500 --max 10510
