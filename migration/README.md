@@ -28,7 +28,7 @@ export GITHUB_REPO=<your repository location> # e.g. "mocobeta/sandbox-lucene-10
 source .env
 ```
 
-You must first manually create the repository yourself using GitHub.  Consider naming your repository with `stargazers-` prefix as this [might prevent Web crawlers from indexing your migrated issues](https://github.com/apache/lucene-jira-archive/issues/1#issuecomment-1173701233), thus confusing the daylights out of future Googlers.
+ou must first manually create the repository yourself using GitHub.  Consider naming your repository with `stargazers-` prefix as this [might prevent Web crawlers from indexing your migrated issues](https://github.com/apache/lucene-jira-archive/issues/1#issuecomment-1173701233), thus confusing the daylights out of future Googlers.
 
 ## Usage
 
@@ -56,7 +56,7 @@ LUCENE-10502
 ...
 ```
 
-Downloaded attachments should be separatly committed to a dedicated branch named `attachments` (or matching the `GITHUB_ATT_BRANCH` env variable) for them.
+Downloaded attachments should be separately committed to a dedicated branch named `attachments` (or matching the `GITHUB_ATT_BRANCH` env variable) for them.
 
 
 ### 2. Convert Jira issues to GitHub issues
