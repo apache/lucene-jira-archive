@@ -4,7 +4,6 @@ from datetime import datetime
 import functools
 import time
 import os
-import tempfile
 
 LOG_DIRNAME = "log"
 WORK_DIRNAME = "work"
@@ -16,6 +15,7 @@ GITHUB_REMAPPED_DATA_DIRNAME = "github-remapped-data"
 MAPPINGS_DATA_DIRNAME = "mappings-data"
 
 JIRA_USERS_FILENAME = "jira-users.csv"
+GITHUB_USERS_FILENAME = "github-users.csv"
 
 ISSUE_MAPPING_FILENAME = "issue-map.csv"
 ACCOUNT_MAPPING_FILENAME = "account-map.csv"

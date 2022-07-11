@@ -2,8 +2,12 @@ from pathlib import Path
 import json
 from collections import defaultdict
 
-from common import JIRA_DUMP_DIRNAME, WORK_DIRNAME, JIRA_USERS_FILENAME
+from common import JIRA_DUMP_DIRNAME, LOG_DIRNAME, WORK_DIRNAME, JIRA_USERS_FILENAME, logging_setup
 from jira_util import *
+
+
+log_dir = Path(__file__).resolve().parent.parent.joinpath(LOG_DIRNAME)
+logger = logging_setup(log_dir, "list_jira_users")
 
 
 def extract_authors(jira_dump_file: Path) -> set[tuple[str, str]]:
@@ -33,6 +37,7 @@ if __name__ == "__main__":
     assert work_dir.exists()
     jira_user_file = work_dir.joinpath(JIRA_USERS_FILENAME)
 
+    logger.info("Listing Jira users")
     counts = defaultdict(int)
     for child in dump_dir.iterdir():
         if child.is_file() and child.name.endswith(".json"):
@@ -47,3 +52,6 @@ if __name__ == "__main__":
             if len(a[0]) == 0:
                 continue
             fp.write(f"{a[0]},{a[1]}\n")
+    
+    logger.info(f"All Jira usernames and display names were saved in {jira_user_file}.")
+    logger.info("Done.")

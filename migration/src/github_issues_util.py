@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 import time
 from logging import Logger
+from urllib.parse import quote_plus
 import requests
 
 
@@ -106,3 +107,25 @@ def check_if_can_be_assigned(token: str, repo: str, assignee: str, logger: Logge
     else:
         logger.warning(f"Assignee {assignee} cannot be assigned; status code={res.status_code}, message={res.text}")
         return False
+
+
+def search_users(token: str, q: str, logger: Logger) -> list[str]:
+    url = GITHUB_API_BASE + f"/search/users?q={quote_plus(q)}"
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+    res = requests.get(url, headers=headers)
+    if res.status_code != 200:
+        logger.error(f"Failed to search users with query {q}; status_code={res.status_code}, message={res.text}")
+        return []
+    time.sleep(INTERVAL_IN_SECONDS)
+    return [item["login"] for item in res.json()["items"]]
+
+
+def get_user(token: str, username: str, logger: Logger) -> Optional[dict[str, Any]]:
+    url = GITHUB_API_BASE + f"/users/{username}"
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+    res = requests.get(url, headers=headers)
+    if res.status_code != 200:
+        logger.error(f"Failed to get user {username}; status_code={res.status_code}, message={res.text}")
+        return None
+    time.sleep(INTERVAL_IN_SECONDS)
+    return res.json()
