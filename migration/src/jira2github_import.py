@@ -212,7 +212,7 @@ if __name__ == "__main__":
         output_dir.mkdir()
     assert output_dir.exists()
 
-    account_map = read_account_map(account_mapping_file) if account_mapping_file else {}
+    account_map = read_account_map(account_mapping_file) if account_mapping_file.exists() else {}
 
     issues = []
     if args.issues:
