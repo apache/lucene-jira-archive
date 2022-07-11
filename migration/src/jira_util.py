@@ -10,7 +10,7 @@ from jira2markdown.markup.text_effects import BlockQuote, Quote, Monospaced
 from jira2markdown.markup.text_breaks import Ruler
 
 from markup.lists import UnorderedTweakedList, OrderedTweakedList
-from markup.text_effects import EscapeHtml, TweakedBlockQuote, TweakedQuote, TweakedMonospaced
+from markup.text_effects import EscapeHtmlTag, TweakedBlockQuote, TweakedQuote, TweakedMonospaced
 from markup.text_breaks import LongRuler
 
 
@@ -212,7 +212,7 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: d
     elements.replace(Quote, TweakedQuote)
     elements.replace(Monospaced, TweakedMonospaced)
     elements.insert_after(Ruler, LongRuler)
-    elements.append(EscapeHtml)
+    elements.append(EscapeHtmlTag)
     text = jira2markdown.convert(text, elements=elements)
 
     # markup @ mentions with ``

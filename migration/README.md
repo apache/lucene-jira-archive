@@ -15,7 +15,7 @@ source .venv/bin/activate
 (.venv) pip install -r requirements.txt
 ```
 
-You need a GitHub repository and personal access token for testing. Set `GITHUB_PAT` and `GITHUB_REPO` environment variables. See `.env.example` for other variables.
+You need a GitHub repository and [personal access token (PAT)](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-personal-access-token) for testing. Set `GITHUB_PAT` and `GITHUB_REPO` environment variables. See `.env.example` for other variables.
 
 On Linux/MacOS:
 ```
@@ -27,6 +27,8 @@ export GITHUB_REPO=<your repository location> # e.g. "mocobeta/sandbox-lucene-10
 
 source .env
 ```
+
+You must first manually create the repository yourself using GitHub.  Consider naming your repository with `stargazers-` prefix as this [might prevent Web crawlers from indexing your migrated issues](https://github.com/apache/lucene-jira-archive/issues/1#issuecomment-1173701233), thus confusing the daylights out of future Googlers.
 
 ## Usage
 
@@ -54,7 +56,7 @@ LUCENE-10502
 ...
 ```
 
-Downloaded attachments should be committed to a dedicated repo/branch for them.
+Downloaded attachments should be separately committed to a dedicated branch named `attachments` (or matching the `GITHUB_ATT_BRANCH` env variable) for them.
 
 ### 2. (Optional) Generate Jira username - GitHub account mapping
 
@@ -64,7 +66,7 @@ See "How to Generate Account Mapping" seciton.
 
 `src/jira2github_import.py` converts Jira dumps into GitHub data that are importable to [issue import API](https://gist.github.com/jonmagic/5282384165e0f86ef105). Converted JSON data is saved in `migration/github-import-data`.
 
-Also this resolves all Jira username - GitHub account alignment if the account mapping is given in `mapping-data/account-map.csv`. 
+This also resolves all Jira user ID - GitHub account alignment if the account mapping is given in `mapping-data/account-map.csv`.
 
 ```
 (.venv) migration $ python src/jira2github_import.py --min 10500 --max 10510
@@ -80,9 +82,9 @@ GH-LUCENE-10502.json
 
 ### 4. Import GitHub issues
 
-First pass: `src/import_github_issues.py` imports GitHub issues and comments via issue import API. This also writes Jira issue key - GitHub issue number mappings to a file in migration/mappings-data.
+First pass: `src/import_github_issues.py` imports GitHub issues and comments via issue import API. This also writes Jira issue key - GitHub issue number mappings to local file `migration/mappings-data/issue-map.csv`.
 
-We confirmed this script does not trigger any notifications.
+We confirmed this script does not trigger any GitHub notifications.
 
 ```
 (.venv) migration $ python src/import_github_issues.py --min 10500 --max 10510
@@ -125,7 +127,7 @@ Second pass: `src/update_issues.py` updates issues and comments with updated iss
 
 This optional step creates Jira username - GitHub account mapping. To associate Jira user with GitHub account, Jira user's "Full Name" and GitHub account's "Name" needs to be set to exactly the same value. See https://github.com/apache/lucene-jira-archive/issues/3.
 
-Note that these scripts would not generate a correct mapping - you should manually check/edit the output file to create the final mapping (see step 4.).
+Note that this tool would not generate a correct mapping - you should manually check/edit the output file to create the final mapping (see step 4.).
 
 1. List all Jira users
 
@@ -137,7 +139,8 @@ You need to download all Jira issues (see "1. Download Jira issues") in advance.
 [2022-07-11 23:54:34,179] INFO:list_jira_users: All Jira usernames and display names were saved in /mnt/hdd/repo/lucene-jira-archive/migration/work/jira-users.csv.
 [2022-07-11 23:54:34,179] INFO:list_jira_users: Done.
 
-(.venv) migration $ less work/jira-users.csv
+# the Jira users are sorted by activity counts
+(.venv) migration $ cat work/jira-users.csv
 JiraName,DispName
 jira-bot,ASF subversion and git services
 mikemccand,Michael McCandless
@@ -159,7 +162,6 @@ sarowe,Steven Rowe
 
 (.venv) migration $ cat work/github-users.csv 
 GitHubAccount,Name
-RobertMMuir,Robert Muir
 rmuir,Robert Muir
 jpountz,Adrien Grand
 mikemccand,Michael McCandless
@@ -168,7 +170,7 @@ mikemccand,Michael McCandless
 
 3. Generate a candidate account map
 
-Note that this script emits lots of warnings, please ignore them (the warnings are emitted when checking if the candidate GitHub account has push access on `apache/lucene` repo).
+Note that this script emits lots of warnings, please ignore them (the warnings are emitted when checking if the candidate GitHub account has push access on `apache/lucene` repository; if you want to apply this script to another repo, modfy the repo name in the script).
 
 ```
 (.venv) migration $ python src/map_jira_github_account.py 
@@ -179,7 +181,7 @@ Note that this script emits lots of warnings, please ignore them (the warnings a
 [2022-07-12 00:01:51,239] INFO:map_jira_github_account: Done.
 ```
 
-4. Manually check/edit the generated account map
+4. Manually create the final account mapping
 
 ```
 # remove false mappings, add/edit correct mappings
