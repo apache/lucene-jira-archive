@@ -59,11 +59,11 @@ class TweakedMonospaced(AbstractMarkup):
         return QuotedString("{{", endQuoteChar="}}").setParseAction(self.action)
 
 
-class EscapeHtml(AbstractMarkup):
+class EscapeHtmlTag(AbstractMarkup):
     """
     Escapes HTML characters that are not a part of any expression grammar
     """
 
     @property
     def expr(self) -> ParserElement:
-        return Literal("<").setParseAction(replaceWith("&lt;")) ^ Literal(">").setParseAction(replaceWith("&gt;")) ^ Literal("&").setParseAction(replaceWith("&amp;"))
+        return Literal("<").setParseAction(replaceWith("&lt;")) + SkipTo(Literal(">")) + Literal(">").setParseAction(replaceWith("&gt;"))
