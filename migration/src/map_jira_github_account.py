@@ -70,10 +70,3 @@ if __name__ == "__main__":
             fp.write(f"{jira_user.username},{gh_user},{jira_user.dispname},{'yes' if has_push_access else 'no'}\n")
     logger.info(f"Candidate account mapping was written in {account_mapping_file}.")
     logger.info("Done.")
-
-
-
-
-
-
-

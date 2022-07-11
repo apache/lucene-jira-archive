@@ -59,4 +59,3 @@ if __name__ == "__main__":
 
     logger.info(f"{len(candidates)} candidate accounts were found; saved in {github_user_file}")
     logger.info("Done.")
-
