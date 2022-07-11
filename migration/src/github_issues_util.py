@@ -6,7 +6,7 @@ import requests
 
 
 GITHUB_API_BASE = "https://api.github.com"
-INTERVAL = 1
+INTERVAL_IN_SECONDS = 1.0
 
 
 @dataclass
@@ -29,7 +29,7 @@ def get_issue_body(token: str, repo: str, issue_number: int, logger: Logger) -> 
     if res.status_code != 200:
         logger.error(f"Failed to get issue {issue_number}; status_code={res.status_code}, message={res.text}")
         return None
-    time.sleep(INTERVAL)
+    time.sleep(INTERVAL_IN_SECONDS)
     return res.json().get("body")
 
 
@@ -41,7 +41,7 @@ def update_issue_body(token: str, repo: str, issue_number: int, body: str, logge
     if res.status_code != 200:
         logger.error(f"Failed to update issue {issue_number}; status_code={res.status_code}, message={res.text}")
         return False
-    time.sleep(INTERVAL)
+    time.sleep(INTERVAL_IN_SECONDS)
     return True
 
 
@@ -62,7 +62,7 @@ def get_issue_comments(token: str, repo: str, issue_number: int, logger: Logger)
         for comment in res.json():
             li.append(GHIssueComment(id=comment.get("id"), body=comment.get("body")))
         page += 1
-        time.sleep(INTERVAL)
+        time.sleep(INTERVAL_IN_SECONDS)
     return li
 
 
@@ -74,7 +74,7 @@ def update_comment_body(token: str, repo: str, comment_id: int, body: str, logge
     if res.status_code != 200:
         logger.error(f"Failed to update comment {comment_id}; status_code={res.status_code}, message={res.text}")
         return False
-    time.sleep(INTERVAL)
+    time.sleep(INTERVAL_IN_SECONDS)
     return True
 
 
@@ -84,7 +84,7 @@ def import_issue(token: str, repo: str, issue_data: dict, logger: Logger) -> str
     res = requests.post(url, headers=headers, json=issue_data)
     if res.status_code != 202:
         logger.error(f"Failed to import issue {issue_data['issue']['title']}; status_code={res.status_code}, message={res.text}")
-    time.sleep(INTERVAL)
+    time.sleep(INTERVAL_IN_SECONDS)
     return res.json().get("url")
 
 
