@@ -73,6 +73,7 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         for (filename, cnt) in attachments:
             attachment_list_items.append(f"[{filename}]({attachment_url(num, filename, att_repo, att_branch)})" + (f" (versions: {cnt})" if cnt > 1 else ""))
             att_replace_map[filename] = attachment_url(num, filename, att_repo, att_branch)
+            print(f'{jira_id}: attachments: {attachment_list_items}')
 
         # embed github issue number next to linked issue keys
         linked_issues_list_items = []
