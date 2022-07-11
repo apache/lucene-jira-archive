@@ -63,7 +63,7 @@ Downloaded attachments should be separately committed to a dedicated branch name
 
 `src/jira2github_import.py` converts Jira dumps into GitHub data that are importable to [issue import API](https://gist.github.com/jonmagic/5282384165e0f86ef105). Converted JSON data is saved in `migration/github-import-data`.
 
-This also resolves all Jira user ID - GitHub account alignment if the account mapping is given in `mapping-data/account-map.csv`.  If you have no mapping, `cp mapping-data/account-map.csv{.example,}`.
+This also resolves all Jira user ID - GitHub account alignment if the account mapping is given in `mapping-data/account-map.csv`.
 
 ```
 (.venv) migration $ python src/jira2github_import.py --min 10500 --max 10510
