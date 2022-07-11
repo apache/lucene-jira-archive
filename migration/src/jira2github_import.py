@@ -72,7 +72,6 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         for (filename, cnt) in attachments:
             attachment_list_items.append(f"[{filename}]({attachment_url(num, filename, att_repo, att_branch)})" + (f" (versions: {cnt})" if cnt > 1 else ""))
             att_replace_map[filename] = attachment_url(num, filename, att_repo, att_branch)
-            print(f'{jira_id}: attachments: {attachment_list_items}')
 
         # embed github issue number next to linked issue keys
         linked_issues_list_items = []
@@ -113,7 +112,6 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
             body += f'\nSub-tasks: {", ".join(subtasks_list_items)}'
 
         if len(pull_requests) > 0:
-            print(f'{jira_id} PRs: {pull_requests}')
             body += f'\nPull requests: {", ".join([str(x) for x in pull_requests])}'
 
         body += '\n'
@@ -125,6 +123,8 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         comments = extract_comments(o)
         comments_data = []
         for (comment_author_name, comment_author_dispname, comment_body, comment_created, comment_updated) in comments:
+            # TODO: since we now have accurate created_at reflected in the github comment, mabye we remove these
+            #       timestamps?  also, if the account id mapped over to known GH account, we can drop Jira footer entirely?
             comment_created_datetime = dateutil.parser.parse(comment_created)
             comment_time = f'{comment_created_datetime.strftime("%b %d %Y")}'
             if comment_updated != comment_created:
