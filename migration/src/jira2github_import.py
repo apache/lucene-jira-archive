@@ -129,7 +129,7 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
             comment_time = f'{comment_created_datetime.strftime("%b %d %Y")}'
             if comment_updated != comment_created:
                 comment_updated_datetime = dateutil.parser.parse(comment_updated)
-                comment_time += f' [updated: {commented_updated_datetime.strftime("%b %d %Y")}]'
+                comment_time += f' [updated: {comment_updated_datetime.strftime("%b %d %Y")}]'
             comment_body = f"""{convert_text(comment_body, att_replace_map, account_map)}
 
 [Jira: {comment_author(comment_author_name, comment_author_dispname)} on {comment_time}]
@@ -225,7 +225,13 @@ if __name__ == "__main__":
 
     logger.info(f"Converting Jira issues to GitHub issues in {output_dir}")
     for num in issues:
-        convert_issue(num, dump_dir, output_dir, account_map, github_att_repo, github_att_branch)
+        try:
+            convert_issue(num, dump_dir, output_dir, account_map, github_att_repo, github_att_branch)
+        except KeyboardInterrupt:
+            raise
+        except:
+            print(f'\nERROR: unhandled exception while converting {jira_issue_id(num)}\n')
+            raise
     
     logger.info("Done.")
 
