@@ -10,6 +10,7 @@ from pathlib import Path
 import json
 import sys
 from urllib.parse import quote
+import dateutil.parser
 import os
 import traceback
 
@@ -70,45 +71,60 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         attachment_list_items = []
         att_replace_map = {}
         for (filename, cnt) in attachments:
-            attachment_list_items.append(f"- [{filename}]({attachment_url(num, filename, att_repo, att_branch)})" + (f" (versions: {cnt})\n" if cnt > 1 else "\n"))
+            attachment_list_items.append(f"[{filename}]({attachment_url(num, filename, att_repo, att_branch)})" + (f" (versions: {cnt})" if cnt > 1 else ""))
             att_replace_map[filename] = attachment_url(num, filename, att_repo, att_branch)
+            print(f'{jira_id}: attachments: {attachment_list_items}')
 
         # embed github issue number next to linked issue keys
         linked_issues_list_items = []
         for jira_key in linked_issues:
-            linked_issues_list_items.append(f"- {jira_key} : [Jira link]({jira_issue_url(jira_key)})\n")
+            linked_issues_list_items.append(f"{jira_key} : [Jira link]({jira_issue_url(jira_key)})")
         
         # embed github issue number next to sub task keys
         subtasks_list_items = []
         for jira_key in subtasks:
-            subtasks_list_items.append(f"- {jira_key} : [Jira link]({jira_issue_url(jira_key)})\n")
+            subtasks_list_items.append(f"{jira_key} : [Jira link]({jira_issue_url(jira_key)})")
 
-        # make pull requests list
-        pull_requests_list = [f"- {x}\n" for x in pull_requests]
+        created_datetime = dateutil.parser.parse(created)
+        updated_datetime = dateutil.parser.parse(updated)
+        if resolutiondate is not None:
+            resolutiondate_datetime = dateutil.parser.parse(resolutiondate)
+        else:
+            resolutiondate_datetime = None
 
-        body = f"""{convert_text(description, att_replace_map, account_map)}
+        try:
+            body = f'{convert_text(description, att_replace_map, account_map)}\n\n'
+        except Exception as e:
+            logger.error(traceback.format_exc(limit=100))
+            logger.error(f"Failed to convert opening issue description on {jira_issue_id(num)} due to above exception, ({str(e)}); falling back to original Jira description as code block.")
+            logger.error(f"Original description: {description}")
+            body = f"```\n{description}```\n\n"
+
+        body += """
 
 ---
-### Jira information
+### Legacy Jira details
 
-Original Jira: {jira_issue_url(jira_id)}
-Reporter: {reporter}
-Assignee: {assignee}
-Created: {created}
-Updated: {updated}
-Resolved: {resolutiondate}
+[{jira_id}]({jira_issue_url(jira_id)}) by {reporter} on {created_datetime.strftime('%b %d %Y')}"""
 
-Attachments:
-{"".join(attachment_list_items)}
+        if resolutiondate_datetime is not None:
+            body += f", resolved {resolutiondate_datetime.strftime('%b %d %Y')}"
+        elif created_datetime.date() != updated_datetime.date():
+            body += f", updated {updated_datetime.strftime('%b %d %Y')}"
 
-Issue Links:
-{"".join(linked_issues_list_items)}
-Sub-Tasks:
-{"".join(subtasks_list_items)}
+        if len(attachment_list_items) > 0:
+            body += f'\nAttachments: {", ".join(attachment_list_items)}'
 
-Pull Requests:
-{"".join(pull_requests_list)}
-"""
+        if len(linked_issues_list_items) > 0:
+            body += f'\nLinked issues: {", ".join(linked_issues_list_items)}'
+
+        if len(subtasks_list_items) > 0:
+            body += f'\nSub-tasks: {", ".join(subtasks_list_items)}'
+
+        if len(pull_requests) > 0:
+            body += f'\nPull requests: {", ".join([str(x) for x in pull_requests])}'
+
+        body += '\n'
 
         def comment_author(author_name, author_dispname):
             author_gh = account_map.get(author_name)
@@ -117,12 +133,24 @@ Pull Requests:
         comments = extract_comments(o)
         comments_data = []
         for (comment_author_name, comment_author_dispname, comment_body, comment_created, comment_updated) in comments:
+            # TODO: since we now have accurate created_at reflected in the github comment, mabye we remove these
+            #       timestamps?  also, if the account id mapped over to known GH account, we can drop Jira footer entirely?
+            comment_created_datetime = dateutil.parser.parse(comment_created)
+            comment_time = f'{comment_created_datetime.strftime("%b %d %Y")}'
+            if comment_updated != comment_created:
+                comment_updated_datetime = dateutil.parser.parse(comment_updated)
+                comment_time += f' [updated: {comment_updated_datetime.strftime("%b %d %Y")}]'
+            try:
+                comment_body = f'{convert_text(comment_body, att_replace_map, account_map)}\n\n'
+            except Exception as e:
+                logger.error(traceback.format_exc(limit=100))
+                logger.error(f"Failed to convert comment on {jira_issue_id(num)} due to above exception ({str(e)}); falling back to original Jira comment as code block.")
+                logger.error(f"Original text: {comment_body}")
+                comment_body = f"```\n{comment_body}```\n\n"
+                
+            comment_body += f'Jira: {comment_author(comment_author_name, comment_author_dispname)} on {comment_time}]\n'
             data = {
-                "body": f"""{convert_text(comment_body, att_replace_map, account_map)}
-
-Author: {comment_author(comment_author_name, comment_author_dispname)}
-Created: {comment_created} / Updated: {comment_updated}
-"""
+                "body": comment_body
             }
             if comment_created:
                 data["created_at"] = jira_timestamp_to_github_timestamp(comment_created)
