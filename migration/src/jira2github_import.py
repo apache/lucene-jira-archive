@@ -92,7 +92,15 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         else:
             resolutiondate_datetime = None
 
-        body = f"""{convert_text(description, att_replace_map, account_map)}
+        try:
+            body = f'{convert_text(description, att_replace_map, account_map)}\n\n'
+        except Exception as e:
+            logger.error(traceback.format_exc(limit=100))
+            logger.error(f"Failed to convert opening issue description on {jira_issue_id(num)} due to above exception, ({str(e)}); falling back to original Jira description as code block.")
+            logger.error(f"Original description: {description}")
+            body = f"```\n{description}```\n\n"
+
+        body += """
 
 ---
 ### Legacy Jira details
@@ -132,10 +140,15 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
             if comment_updated != comment_created:
                 comment_updated_datetime = dateutil.parser.parse(comment_updated)
                 comment_time += f' [updated: {comment_updated_datetime.strftime("%b %d %Y")}]'
-            comment_body = f"""{convert_text(comment_body, att_replace_map, account_map)}
-
-[Jira: {comment_author(comment_author_name, comment_author_dispname)} on {comment_time}]
-"""
+            try:
+                comment_body = f'{convert_text(comment_body, att_replace_map, account_map)}\n\n'
+            except Exception as e:
+                logger.error(traceback.format_exc(limit=100))
+                logger.error(f"Failed to convert comment on {jira_issue_id(num)} due to above exception ({str(e)}); falling back to original Jira comment as code block.")
+                logger.error(f"Original text: {comment_body}")
+                comment_body = f"```\n{comment_body}```\n\n"
+                
+            comment_body += f'Jira: {comment_author(comment_author_name, comment_author_dispname)} on {comment_time}]\n'
             data = {
                 "body": comment_body
             }
