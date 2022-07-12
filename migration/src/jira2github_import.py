@@ -11,6 +11,7 @@ import json
 import sys
 from urllib.parse import quote
 import os
+import traceback
 
 from common import LOG_DIRNAME, JIRA_DUMP_DIRNAME, GITHUB_IMPORT_DATA_DIRNAME, MAPPINGS_DATA_DIRNAME, ACCOUNT_MAPPING_FILENAME, ISSUE_TYPE_TO_LABEL_MAP, COMPONENT_TO_LABEL_MAP, \
     logging_setup, jira_issue_url, jira_dump_file, jira_issue_id, github_data_file, make_github_title, read_account_map
@@ -211,7 +212,11 @@ if __name__ == "__main__":
 
     logger.info(f"Converting Jira issues to GitHub issues in {output_dir}")
     for num in issues:
-        convert_issue(num, dump_dir, output_dir, account_map, github_att_repo, github_att_branch)
+        try:
+            convert_issue(num, dump_dir, output_dir, account_map, github_att_repo, github_att_branch)
+        except Exception as e:
+            logger.error(traceback.format_exc(limit=100))
+            logger.error(f"Failed to convert Jira issue. An error '{str(e)}' occurred; skipped {jira_issue_id(num)}.")
     
     logger.info("Done.")
 
