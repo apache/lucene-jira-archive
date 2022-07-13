@@ -77,7 +77,7 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         # embed github issue number next to linked issue keys
         linked_issues_list_items = []
         for jira_key in linked_issues:
-            linked_issues_list_items.append(f"{jira_key} : [Jira link]({jira_issue_url(jira_key)})")
+            linked_issues_list_items.append(f"[{jira_key}]({jira_issue_url(jira_key)})")
         
         # embed github issue number next to sub task keys
         subtasks_list_items = []
@@ -131,7 +131,7 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         
         comments = extract_comments(o)
         comments_data = []
-        for (comment_author_name, comment_author_dispname, comment_body, comment_created, comment_updated) in comments:
+        for (comment_author_name, comment_author_dispname, comment_body, comment_created, comment_updated, comment_id) in comments:
             # TODO: since we now have accurate created_at reflected in the github comment, mabye we remove these
             #       timestamps?  also, if the account id mapped over to known GH account, we can drop Jira footer entirely?
             comment_created_datetime = dateutil.parser.parse(comment_created)
@@ -146,8 +146,10 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
                 logger.error(f"Failed to convert comment on {jira_issue_id(num)} due to above exception ({str(e)}); falling back to original Jira comment as code block.")
                 logger.error(f"Original text: {comment_body}")
                 comment_body = f"```\n{comment_body}```\n\n"
+
+            jira_comment_link = f'https://issues.apache.org/jira/browse/{jira_id}?focusedCommentId={comment_id}&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-{comment_id}'
                 
-            comment_body += f'Jira: {comment_author(comment_author_name, comment_author_dispname)} on {comment_time}]\n'
+            comment_body += f'[Legacy Jira: [{comment_author(comment_author_name, comment_author_dispname)} on {comment_time}]({jira_comment_link})]\n'
             data = {
                 "body": comment_body
             }

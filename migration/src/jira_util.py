@@ -133,7 +133,8 @@ def extract_comments(o: dict) -> list[str, str, str, str, str]:
         body = c.get("body", "")
         created = c.get("created", "")
         updated = c.get("updated", "")
-        res.append((name, disp_name, body, created, updated))
+        comment_id = c.get("id", "")
+        res.append((name, disp_name, body, created, updated, comment_id))
     return res
 
 
