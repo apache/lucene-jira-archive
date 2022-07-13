@@ -1,11 +1,12 @@
 #
 # Convert Jira issues to GitHub issues for Import Issues API (https://gist.github.com/jonmagic/5282384165e0f86ef105)
 # Usage:
-#   python src/jira2github_import.py --issues <jira issue number list>
-#   python src/jira2github_import.py --min <min issue number> --max <max issue number>
+#   python src/jira2github_import.py --issues <jira issue number list> [--num-workers <# worker processes>]
+#   python src/jira2github_import.py --min <min issue number> --max <max issue number> [--num-workers <# worker processes>]
 #
 
 import argparse
+from logging import Logger
 from pathlib import Path
 import json
 import sys
@@ -13,21 +14,17 @@ from urllib.parse import quote
 import dateutil.parser
 import os
 import traceback
+import multiprocessing
 
-from common import LOG_DIRNAME, JIRA_DUMP_DIRNAME, GITHUB_IMPORT_DATA_DIRNAME, MAPPINGS_DATA_DIRNAME, ACCOUNT_MAPPING_FILENAME, ISSUE_TYPE_TO_LABEL_MAP, COMPONENT_TO_LABEL_MAP, \
-    logging_setup, jira_issue_url, jira_dump_file, jira_issue_id, github_data_file, make_github_title, read_account_map
+from common import *
 from jira_util import *
 
-log_dir = Path(__file__).resolve().parent.parent.joinpath(LOG_DIRNAME)
-logger = logging_setup(log_dir, "jira2github_import")
+#log_dir = Path(__file__).resolve().parent.parent.joinpath(LOG_DIRNAME)
+#logger = logging_setup(log_dir, "jira2github_import")
 
 
 def attachment_url(issue_num: int, filename: str, att_repo: str, att_branch: str) -> str:
     return f"https://raw.githubusercontent.com/{att_repo}/{att_branch}/attachments/{jira_issue_id(issue_num)}/{quote(filename)}"
-
-
-#def may_markup(gh_account: str) -> bool:
-#    return gh_account if gh_account in ["@mocobeta", "@dweiss"] else f"`{gh_account}`"
 
 
 def jira_timestamp_to_github_timestamp(ts: str) -> str:
@@ -36,7 +33,7 @@ def jira_timestamp_to_github_timestamp(ts: str) -> str:
     return ts[:-9] + "Z"
 
 
-def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[str, str], att_repo: str, att_branch: str) -> bool:
+def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[str, str], att_repo: str, att_branch: str, logger: Logger) -> bool:
     jira_id = jira_issue_id(num)
     dump_file = jira_dump_file(dump_dir, num)
     if not dump_file.exists():
@@ -73,7 +70,6 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         for (filename, cnt) in attachments:
             attachment_list_items.append(f"[{filename}]({attachment_url(num, filename, att_repo, att_branch)})" + (f" (versions: {cnt})" if cnt > 1 else ""))
             att_replace_map[filename] = attachment_url(num, filename, att_repo, att_branch)
-            print(f'{jira_id}: attachments: {attachment_list_items}')
 
         # embed github issue number next to linked issue keys
         linked_issues_list_items = []
@@ -212,11 +208,12 @@ if __name__ == "__main__":
     parser.add_argument('--issues', type=int, required=False, nargs='*', help='Jira issue number list to be downloaded')
     parser.add_argument('--min', type=int, dest='min', required=False, default=1, help='Minimum Jira issue number to be converted')
     parser.add_argument('--max', type=int, dest='max', required=False, help='Maximum Jira issue number to be converted')
+    parser.add_argument('--num_workers', type=int, dest='num_workers', required=False, default=1, help='Number of worker processes')
     args = parser.parse_args()
 
     dump_dir = Path(__file__).resolve().parent.parent.joinpath(JIRA_DUMP_DIRNAME)
     if not dump_dir.exists():
-        logger.error(f"Jira dump dir not exists: {dump_dir}")
+        print(f"Jira dump dir not exists: {dump_dir}")
         sys.exit(1)
 
     mappings_dir = Path(__file__).resolve().parent.parent.joinpath(MAPPINGS_DATA_DIRNAME)
@@ -237,14 +234,31 @@ if __name__ == "__main__":
             issues.extend(list(range(args.min, args.max + 1)))
         else:
             issues.append(args.min)
+    num_workers = args.num_workers
 
-    logger.info(f"Converting Jira issues to GitHub issues in {output_dir}")
-    for num in issues:
+    log_dir = Path(__file__).resolve().parent.parent.joinpath(LOG_DIRNAME)
+    name = "jira2github_import"
+    (listener, queue) = log_listener(log_dir, name)
+    listener.start()
+    logger = logging_setup_worker(name, queue)
+
+    logger.info(f"Converting Jira issues to GitHub issues in {output_dir}. num_workers={num_workers}")
+
+    def worker(num):
         try:
-            convert_issue(num, dump_dir, output_dir, account_map, github_att_repo, github_att_branch)
+            convert_issue(num, dump_dir, output_dir, account_map, github_att_repo, github_att_branch, logger)
         except Exception as e:
             logger.error(traceback.format_exc(limit=100))
             logger.error(f"Failed to convert Jira issue. An error '{str(e)}' occurred; skipped {jira_issue_id(num)}.")
-    
-    logger.info("Done.")
 
+    results = []
+    with multiprocessing.Pool(num_workers) as pool:
+        for num in issues:
+            result = pool.apply_async(worker, (num,))
+            results.append(result)
+        for res in results:
+            res.get()
+
+    logger.info("Done.")
+    queue.put_nowait(None)
+    listener.join()
