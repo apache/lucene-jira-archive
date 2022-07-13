@@ -242,7 +242,7 @@ if __name__ == "__main__":
 
     logger.info(f"Converting Jira issues to GitHub issues in {output_dir}. num_workers={num_workers}")
 
-    def worker(num):
+    def task(num):
         logger = logging.getLogger(name)
         try:
             convert_issue(num, dump_dir, output_dir, account_map, github_att_repo, github_att_branch, logger)
@@ -254,7 +254,7 @@ if __name__ == "__main__":
     # Try to support Windows: The worker configuration is done at the start of the worker process run.
     with multiprocessing.Pool(num_workers, initializer=logging_setup_worker, initargs=(queue,)) as pool:
         for num in issues:
-            result = pool.apply_async(worker, (num,))
+            result = pool.apply_async(task, (num,))
             results.append(result)
         for res in results:
             res.get()
