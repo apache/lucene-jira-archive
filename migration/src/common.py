@@ -34,6 +34,7 @@ def logging_setup(log_dir: Path, name: str) -> logging.Logger:
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(LOGGING_FOMATTER)
     logger = logging.getLogger(name)
+    logger.handlers = []  # clear current handlers
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
     return logger
@@ -74,12 +75,12 @@ def log_listener(log_dir: Path, name: str) -> tuple[multiprocessing.Process, mul
     return (listener, queue)
 
 
-def logging_setup_worker(name: str, queue: multiprocessing.Queue) -> logging.Logger:
-    logger = logging.getLogger(name)
+def logging_setup_worker(queue: multiprocessing.Queue):
+    logger = logging.getLogger()
     queue_handler = QueueHandler(queue)
+    logger.handlers = []  # clear current handlers
     logger.addHandler(queue_handler)
     logger.setLevel(logging.DEBUG)
-    return logger
 
 
 def jira_issue_url(issue_id: str) -> str:
