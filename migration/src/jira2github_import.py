@@ -19,9 +19,6 @@ import multiprocessing
 from common import *
 from jira_util import *
 
-#log_dir = Path(__file__).resolve().parent.parent.joinpath(LOG_DIRNAME)
-#logger = logging_setup(log_dir, "jira2github_import")
-
 
 def attachment_url(issue_num: int, filename: str, att_repo: str, att_branch: str) -> str:
     return f"https://raw.githubusercontent.com/{att_repo}/{att_branch}/attachments/{jira_issue_id(issue_num)}/{quote(filename)}"
