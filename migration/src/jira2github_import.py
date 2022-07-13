@@ -99,7 +99,7 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
             logger.error(f"Original description: {description}")
             body = f"```\n{description}```\n\n"
 
-        body += """
+        body += f"""
 
 ---
 ### Legacy Jira details
