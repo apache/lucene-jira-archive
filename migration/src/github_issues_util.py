@@ -7,8 +7,10 @@ import requests
 
 
 GITHUB_API_BASE = "https://api.github.com"
+# https://docs.github.com/en/rest/overview/resources-in-the-rest-api#rate-limiting
 INTERVAL_IN_SECONDS = 1.0
-
+# https://docs.github.com/en/rest/search#rate-limit
+SEARCH_INTERVAL_IN_SECONDS = 5
 
 @dataclass
 class GHIssueComment:
@@ -116,7 +118,7 @@ def search_users(token: str, q: str, logger: Logger) -> list[str]:
     if res.status_code != 200:
         logger.error(f"Failed to search users with query {q}; status_code={res.status_code}, message={res.text}")
         return []
-    time.sleep(INTERVAL_IN_SECONDS)
+    time.sleep(SEARCH_INTERVAL_IN_SECONDS)
     return [item["login"] for item in res.json()["items"]]
 
 
