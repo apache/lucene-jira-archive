@@ -40,6 +40,11 @@ class TweakedList(AbstractMarkup):
 
         for line in tokens:
             # print(repr(line))
+            if line == "\n":
+                # can't really explain but if this is the first item, an empty string should be added to preserve line feed
+                if len(result) == 0:
+                    result.append("")
+                continue
             bullets, text = line.split(" ", maxsplit=1)
 
             nested_indent = 0
@@ -66,12 +71,11 @@ class TweakedList(AbstractMarkup):
         NL = LineEnd()
         LIST_BREAK = NL + Optional(White(" \t")) + NL | StringEnd()
         IGNORE = BlockQuote(**self.init_kwargs).expr | Panel(**self.init_kwargs).expr | Color(**self.init_kwargs).expr
-        ROW = Optional(LineStart()) + Combine(
-            Optional(White(" \t"))
+        ROW = (LineStart() ^ LineEnd()) + Combine(
+            Optional(NL)
             + Optional(self.nested_token, default="")
             + ListIndent(self.indent_state, self.tokens)
             + SkipTo(NL + Optional(White(" \t")) + Char(self.nested_token + self.tokens) | LIST_BREAK, ignore=IGNORE)
-            + Optional(NL),
         )
 
         return OneOrMore(ROW, stopOn=LIST_BREAK).setParseAction(self.action)

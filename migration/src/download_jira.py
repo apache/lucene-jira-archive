@@ -86,8 +86,9 @@ def download_attachments(num: int, dump_dir: Path, att_data_dir: Path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--issues', type=int, required=False, nargs='*', help='Jira issue number list to be downloaded')    
-    parser.add_argument('--min', type=int, dest='min', required=False, default=1, help='Minimum Jira issue number to be donloaded')
-    parser.add_argument('--max', type=int, dest='max', required=False, help='Maximum Jira issue number to be donloaded')
+    parser.add_argument('--min', type=int, dest='min', required=False, default=1, help='Minimum (inclusive) Jira issue number to be downloaded')
+    parser.add_argument('--max', type=int, dest='max', required=False, help='Maximum (inclusive) Jira issue number to be downloaded')
+    parser.add_argument('--skip_attachments', type=bool, dest='skip_attachments', required=False, help='Do not download attachments (they are already (mostly?) cached in this repo)', action=argparse.BooleanOptionalAction)
     args = parser.parse_args()
 
     dump_dir = Path(__file__).resolve().parent.parent.joinpath(JIRA_DUMP_DIRNAME)
@@ -111,7 +112,7 @@ if __name__ == "__main__":
     
     logger.info(f"Downloading Jira issues in {dump_dir}. Attachments are saved in {att_data_dir}.")
     for num in issues:
-        if download_issue(num, dump_dir):
+        if download_issue(num, dump_dir) and not args.skip_attachments:
             download_attachments(num, dump_dir, att_data_dir)
         time.sleep(DOWNLOAD_INTERVAL_SEC)
     
