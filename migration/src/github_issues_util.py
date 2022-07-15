@@ -2,12 +2,15 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 import time
 from logging import Logger
+from urllib.parse import quote_plus
 import requests
 
 
 GITHUB_API_BASE = "https://api.github.com"
-INTERVAL = 1
-
+# https://docs.github.com/en/rest/overview/resources-in-the-rest-api#rate-limiting
+INTERVAL_IN_SECONDS = 1.0
+# https://docs.github.com/en/rest/search#rate-limit
+SEARCH_INTERVAL_IN_SECONDS = 5
 
 @dataclass
 class GHIssueComment:
@@ -29,7 +32,7 @@ def get_issue_body(token: str, repo: str, issue_number: int, logger: Logger) -> 
     if res.status_code != 200:
         logger.error(f"Failed to get issue {issue_number}; status_code={res.status_code}, message={res.text}")
         return None
-    time.sleep(INTERVAL)
+    time.sleep(INTERVAL_IN_SECONDS)
     return res.json().get("body")
 
 
@@ -41,7 +44,7 @@ def update_issue_body(token: str, repo: str, issue_number: int, body: str, logge
     if res.status_code != 200:
         logger.error(f"Failed to update issue {issue_number}; status_code={res.status_code}, message={res.text}")
         return False
-    time.sleep(INTERVAL)
+    time.sleep(INTERVAL_IN_SECONDS)
     return True
 
 
@@ -62,7 +65,7 @@ def get_issue_comments(token: str, repo: str, issue_number: int, logger: Logger)
         for comment in res.json():
             li.append(GHIssueComment(id=comment.get("id"), body=comment.get("body")))
         page += 1
-        time.sleep(INTERVAL)
+        time.sleep(INTERVAL_IN_SECONDS)
     return li
 
 
@@ -74,7 +77,7 @@ def update_comment_body(token: str, repo: str, comment_id: int, body: str, logge
     if res.status_code != 200:
         logger.error(f"Failed to update comment {comment_id}; status_code={res.status_code}, message={res.text}")
         return False
-    time.sleep(INTERVAL)
+    time.sleep(INTERVAL_IN_SECONDS)
     return True
 
 
@@ -84,7 +87,7 @@ def import_issue(token: str, repo: str, issue_data: dict, logger: Logger) -> str
     res = requests.post(url, headers=headers, json=issue_data)
     if res.status_code != 202:
         logger.error(f"Failed to import issue {issue_data['issue']['title']}; status_code={res.status_code}, message={res.text}")
-    time.sleep(INTERVAL)
+    time.sleep(INTERVAL_IN_SECONDS)
     return res.json().get("url")
 
 
@@ -101,8 +104,73 @@ def check_if_can_be_assigned(token: str, repo: str, assignee: str, logger: Logge
     url = GITHUB_API_BASE + f"/repos/{repo}/assignees/{assignee}"
     headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
     res = requests.get(url, headers=headers)
+    time.sleep(INTERVAL_IN_SECONDS)
     if res.status_code == 204:
         return True
     else:
         logger.warning(f"Assignee {assignee} cannot be assigned; status code={res.status_code}, message={res.text}")
         return False
+
+
+def search_users(token: str, q: str, logger: Logger) -> list[str]:
+    url = GITHUB_API_BASE + f"/search/users?q={quote_plus(q)}"
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+    res = requests.get(url, headers=headers)
+    if res.status_code != 200:
+        logger.error(f"Failed to search users with query {q}; status_code={res.status_code}, message={res.text}")
+        return []
+    time.sleep(SEARCH_INTERVAL_IN_SECONDS)
+    return [item["login"] for item in res.json()["items"]]
+
+
+def get_user(token: str, username: str, logger: Logger) -> Optional[dict[str, Any]]:
+    url = GITHUB_API_BASE + f"/users/{username}"
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+    res = requests.get(url, headers=headers)
+    if res.status_code != 200:
+        logger.error(f"Failed to get user {username}; status_code={res.status_code}, message={res.text}")
+        return None
+    time.sleep(INTERVAL_IN_SECONDS)
+    return res.json()
+
+
+def list_organization_members(token: str, org: str, logger: Logger) -> list[str]:
+    url = GITHUB_API_BASE + f"/orgs/{org}/members?per_page=100"
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+    page = 1
+    users = []
+    while True:
+        res = requests.get(f"{url}&page={page}", headers=headers)
+        if len(res.json()) == 0:
+            break
+        if res.status_code != 200:
+            logger.error(f"Failed to get organization members for {org}; status_code={res.status_code}, message={res.text}")
+            return users
+        users.extend(x["login"] for x in res.json())
+        logger.debug(f"{len(users)} members found.")
+        page += 1
+        time.sleep(INTERVAL_IN_SECONDS)
+    return users
+
+
+def list_commit_authors(token: str, repo: str, logger: Logger) -> list[str]:
+    url = GITHUB_API_BASE + f"/repos/{repo}/commits?per_page=100"
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+    page = 1
+    authors = set([])
+    while True:
+        res = requests.get(f"{url}&page={page}", headers=headers)
+        if len(res.json()) == 0:
+            break
+        if res.status_code != 200:
+            logger.error(f"Failed to get commits for {repo}; status_code={res.status_code}, message={res.text}")
+            return authors
+        for commit in res.json():
+            author = commit.get("author")
+            if author:
+                authors.add(author["login"])
+        logger.debug(f"{len(authors)} authors found.")
+        page += 1
+        time.sleep(INTERVAL_IN_SECONDS)
+    return authors
+
