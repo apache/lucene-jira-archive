@@ -168,20 +168,7 @@ mikemccand,Michael McCandless
 ...
 ```
 
-3. Generate a candidate account map
-
-Note that this script emits lots of warnings, please ignore them (the warnings are emitted when checking if the candidate GitHub account has push access on `apache/lucene` repository; if you want to apply this script to another repo, modfy the repo name in the script).
-
-```
-(.venv) migration $ python src/map_jira_github_account.py 
-[2022-07-12 00:01:45,637] INFO:map_jira_github_account: Generating Jira-GitHub account map
-[2022-07-12 00:01:46,153] WARNING:github_issues_util: Assignee RobertMMuir cannot be assigned; status code=404, message={"message":"Not Found","documentation_url":"https://docs.github.com/rest/reference/issues#check-if-a-user-can-be-assigned"}
-
-[2022-07-12 00:01:51,238] INFO:map_jira_github_account: Candidate account mapping was written in /mnt/hdd/repo/lucene-jira-archive/migration/mappings-data/account-map.csv.20220712.000145.
-[2022-07-12 00:01:51,239] INFO:map_jira_github_account: Done.
-```
-
-4. List GitHub accounts that have push access on `apache/lucene` repository
+3. List GitHub accounts that have push access on `apache/lucene` repository
 
 This lists committers' GitHub accounts. The result file would be used for manual check/verification.
 
@@ -196,7 +183,7 @@ arafalov,Alexandre Rafalovitch
 ...
 ```
 
-5. List commit authors' accounts in `apache/lucene` repository
+4. List commit authors' accounts in `apache/lucene` repository
 
 This lists GitHub accounts that have been logged as author of commit(s) in the commit history. The result file would be used for manual check/verification.
 
@@ -210,6 +197,19 @@ risdenk
 spike-liu
 sejal-pawar
 ...
+```
+
+5. Generate a candidate account map
+
+Note that this script emits lots of warnings, please ignore them (the warnings are emitted when checking if the candidate GitHub account has push access on `apache/lucene` repository; if you want to apply this script to another repo, modfy the repo name in the script).
+
+```
+(.venv) migration $ python src/map_jira_github_account.py 
+[2022-07-12 00:01:45,637] INFO:map_jira_github_account: Generating Jira-GitHub account map
+[2022-07-12 00:01:46,153] WARNING:github_issues_util: Assignee RobertMMuir cannot be assigned; status code=404, message={"message":"Not Found","documentation_url":"https://docs.github.com/rest/reference/issues#check-if-a-user-can-be-assigned"}
+
+[2022-07-12 00:01:51,238] INFO:map_jira_github_account: Candidate account mapping was written in /mnt/hdd/repo/lucene-jira-archive/migration/mappings-data/account-map.csv.20220712.000145.
+[2022-07-12 00:01:51,239] INFO:map_jira_github_account: Done.
 ```
 
 6. Manually create the final account mapping
