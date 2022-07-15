@@ -181,7 +181,38 @@ Note that this script emits lots of warnings, please ignore them (the warnings a
 [2022-07-12 00:01:51,239] INFO:map_jira_github_account: Done.
 ```
 
-4. Manually create the final account mapping
+4. List GitHub accounts that have push access on `apache/lucene` repository
+
+This lists committers' GitHub accounts. The result file would be used for manual check/verification.
+
+```
+(.venv) migration $ python src/list_github_lucene_committers.py
+
+(.venv) migration $ cat work/github-lucene-committers.csv 
+GitHubAccount,Name
+alessandrobenedetti,Alessandro Benedetti
+anshumg,Anshum Gupta
+arafalov,Alexandre Rafalovitch
+...
+```
+
+5. List commit authors' accounts in `apache/lucene` repository
+
+This lists GitHub accounts that have been logged as author of commit(s) in the commit history. The result file would be used for manual check/verification.
+
+```
+(.venv) migration $ python src/list_github_lucene_commit_authors.py
+
+(.venv) migration $ cat work/github-lucene-commit-authors.csv
+GitHubAccount
+vigyasharma
+risdenk
+spike-liu
+sejal-pawar
+...
+```
+
+6. Manually create the final account mapping
 
 ```
 # remove false mappings, add/edit correct mappings
