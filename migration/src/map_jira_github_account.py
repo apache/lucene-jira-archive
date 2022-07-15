@@ -4,7 +4,7 @@ import os
 from collections import namedtuple, defaultdict
 from datetime import datetime
 
-from common import GITHUB_USERS_FILENAME, LOG_DIRNAME, WORK_DIRNAME, JIRA_USERS_FILENAME, MAPPINGS_DATA_DIRNAME, ACCOUNT_MAPPING_FILENAME, logging_setup
+from common import GITHUB_USERS_FILENAME, GITHUB_LUCENE_COMMIT_AUTHORS, LOG_DIRNAME, WORK_DIRNAME, JIRA_USERS_FILENAME, MAPPINGS_DATA_DIRNAME, ACCOUNT_MAPPING_FILENAME, logging_setup
 from github_issues_util import *
 
 log_dir = Path(__file__).resolve().parent.parent.joinpath(LOG_DIRNAME)
@@ -14,15 +14,12 @@ logger = logging_setup(log_dir, "map_jira_github_account")
 JiraUser = namedtuple("JiraUser", ['username', 'dispname'])
 
 
-def make_mapping_with_dups(jira_user: JiraUser, github_users: defaultdict[list[str]], token: str) -> list[(str, bool)]:
+def make_mapping_with_dups(jira_user: JiraUser, github_users: defaultdict[list[str]], token: str) -> list[str]:
     res: list[(JiraUser, str, bool)] = []
     github_accounts = github_users.get(jira_user.dispname)
     if not github_accounts:
         return []
-    for account in github_accounts:
-        has_push_access = check_if_can_be_assigned(token, "apache/lucene", account, logger)
-        res.append((account, has_push_access))
-    return res
+    return github_accounts
 
 
 if __name__ == "__main__":
@@ -37,7 +34,9 @@ if __name__ == "__main__":
     jira_user_file = work_dir.joinpath(JIRA_USERS_FILENAME)
     assert jira_user_file.exists()
     github_user_file = work_dir.joinpath(GITHUB_USERS_FILENAME)
-    assert github_user_file
+    assert github_user_file.exists()
+    gihtub_lucene_authors_file = work_dir.joinpath(GITHUB_LUCENE_COMMIT_AUTHORS)
+    assert gihtub_lucene_authors_file.exists()
 
     mappings_dir = Path(__file__).resolve().parent.parent.joinpath(MAPPINGS_DATA_DIRNAME)
     if not mappings_dir.exists():
@@ -60,13 +59,24 @@ if __name__ == "__main__":
             cols = line.strip().split(",")
             github_users[cols[1]].append(cols[0])
     
+    commit_authors = []
+    with open(gihtub_lucene_authors_file) as fp:
+        fp.readline()  # skip header
+        for line in fp:
+            author = line.strip()
+            commit_authors.append(author)
+    
     logger.info("Generating Jira-GitHub account map")
-    #account_map = make_mapping_with_dups(jira_users, github_users, github_token)
     
     with open(account_mapping_file, "w") as fp:
-        fp.write("JiraName,GitHubAccount,JiraDispName,HasPushAccess\n")
+        fp.write("JiraName,GitHubAccount,JiraDispName,LoggedAsAuthor,HasPushAccess\n")
         for jira_user in jira_users:
-            for gh_user, has_push_access in make_mapping_with_dups(jira_user, github_users, github_token):
-                fp.write(f"{jira_user.username},{gh_user},{jira_user.dispname},{'yes' if has_push_access else 'no'}\n")
+            github_accounts = github_users.get(jira_user.dispname)
+            if not github_accounts:
+                continue
+            for account in github_accounts:
+                is_author = account in commit_authors
+                has_push_access = check_if_can_be_assigned(github_token, "apache/lucene", account, logger)
+                fp.write(f"{jira_user.username},{account},{jira_user.dispname},{'yes' if is_author else 'no'},{'yes' if has_push_access else 'no'}\n")
     logger.info(f"Candidate account mapping was written in {account_mapping_file}.")
     logger.info("Done.")

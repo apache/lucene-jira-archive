@@ -151,3 +151,26 @@ def list_organization_members(token: str, org: str, logger: Logger) -> list[str]
         page += 1
         time.sleep(INTERVAL_IN_SECONDS)
     return users
+
+
+def list_commit_authors(token: str, repo: str, logger: Logger) -> list[str]:
+    url = GITHUB_API_BASE + f"/repos/{repo}/commits?per_page=100"
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+    page = 1
+    authors = set([])
+    while True:
+        res = requests.get(f"{url}&page={page}", headers=headers)
+        if len(res.json()) == 0:
+            break
+        if res.status_code != 200:
+            logger.error(f"Failed to get commits for {repo}; status_code={res.status_code}, message={res.text}")
+            return authors
+        for commit in res.json():
+            author = commit.get("author")
+            if author:
+                authors.add(author["login"])
+        logger.debug(f"{len(authors)} authors found.")
+        page += 1
+        time.sleep(INTERVAL_IN_SECONDS)
+    return authors
+
