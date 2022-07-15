@@ -18,6 +18,7 @@ MAPPINGS_DATA_DIRNAME = "mappings-data"
 
 JIRA_USERS_FILENAME = "jira-users.csv"
 GITHUB_USERS_FILENAME = "github-users.csv"
+GITHUB_LUCENE_COMMITTERS_FILENAME = "github-lucene-committers.csv"
 
 ISSUE_MAPPING_FILENAME = "issue-map.csv"
 ACCOUNT_MAPPING_FILENAME = "account-map.csv"

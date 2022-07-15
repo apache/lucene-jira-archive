@@ -132,3 +132,22 @@ def get_user(token: str, username: str, logger: Logger) -> Optional[dict[str, An
         return None
     time.sleep(INTERVAL_IN_SECONDS)
     return res.json()
+
+
+def list_organization_members(token: str, org: str, logger: Logger) -> list[str]:
+    url = GITHUB_API_BASE + f"/orgs/{org}/members?per_page=100"
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+    page = 1
+    users = []
+    while True:
+        res = requests.get(f"{url}&page={page}", headers=headers)
+        if len(res.json()) == 0:
+            break
+        if res.status_code != 200:
+            logger.error(f"Failed to get organization members for {org}; status_code={res.status_code}, message={res.text}")
+            return users
+        users.extend(x["login"] for x in res.json())
+        logger.debug(f"{len(users)} members found.")
+        page += 1
+        time.sleep(INTERVAL_IN_SECONDS)
+    return users
