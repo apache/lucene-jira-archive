@@ -14,15 +14,14 @@ logger = logging_setup(log_dir, "map_jira_github_account")
 JiraUser = namedtuple("JiraUser", ['username', 'dispname'])
 
 
-def make_mapping_with_dups(jira_users: list[JiraUser], github_users: defaultdict[list[str]], token: str) -> list[(JiraUser, str, bool)]:
+def make_mapping_with_dups(jira_user: JiraUser, github_users: defaultdict[list[str]], token: str) -> list[(str, bool)]:
     res: list[(JiraUser, str, bool)] = []
-    for jira_user in jira_users:
-        github_accounts = github_users.get(jira_user.dispname)
-        if not github_accounts:
-            continue
-        for account in github_accounts:
-            has_push_access = check_if_can_be_assigned(token, "apache/lucene", account, logger)
-            res.append((jira_user, account, has_push_access))
+    github_accounts = github_users.get(jira_user.dispname)
+    if not github_accounts:
+        return []
+    for account in github_accounts:
+        has_push_access = check_if_can_be_assigned(token, "apache/lucene", account, logger)
+        res.append((account, has_push_access))
     return res
 
 
@@ -62,11 +61,12 @@ if __name__ == "__main__":
             github_users[cols[1]].append(cols[0])
     
     logger.info("Generating Jira-GitHub account map")
-    account_map = make_mapping_with_dups(jira_users, github_users, github_token)
+    #account_map = make_mapping_with_dups(jira_users, github_users, github_token)
     
     with open(account_mapping_file, "w") as fp:
         fp.write("JiraName,GitHubAccount,JiraDispName,HasPushAccess\n")
-        for jira_user, gh_user, has_push_access in account_map:
-            fp.write(f"{jira_user.username},{gh_user},{jira_user.dispname},{'yes' if has_push_access else 'no'}\n")
+        for jira_user in jira_users:
+            for gh_user, has_push_access in make_mapping_with_dups(jira_user, github_users, github_token):
+                fp.write(f"{jira_user.username},{gh_user},{jira_user.dispname},{'yes' if has_push_access else 'no'}\n")
     logger.info(f"Candidate account mapping was written in {account_mapping_file}.")
     logger.info("Done.")

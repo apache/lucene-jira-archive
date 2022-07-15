@@ -104,6 +104,7 @@ def check_if_can_be_assigned(token: str, repo: str, assignee: str, logger: Logge
     url = GITHUB_API_BASE + f"/repos/{repo}/assignees/{assignee}"
     headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
     res = requests.get(url, headers=headers)
+    time.sleep(INTERVAL_IN_SECONDS)
     if res.status_code == 204:
         return True
     else:
