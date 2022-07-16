@@ -68,10 +68,12 @@ See "How to Generate Account Mapping" seciton.
 
 This also resolves all Jira user ID - GitHub account alignment if the account mapping is given in `mapping-data/account-map.csv`.
 
+Optionally, you can pass `--num_workers` option to specifiy the number of worker processes (the default value is `1`).
+
 ```
-(.venv) migration $ python src/jira2github_import.py --min 10500 --max 10510
-[2022-07-06 15:46:38,837] INFO:jira2github_import: Converting Jira issues to GitHub issues in /mnt/hdd/repo/lucene-jira-archive/migration/github-import-data
-[2022-07-06 15:46:48,761] INFO:jira2github_import: Done.
+(.venv) migration $ python src/jira2github_import.py --min 10500 --max 10510 --num_workers 2
+[2022-07-16 09:32:42,288] INFO:jira2github_import: Converting Jira issues to GitHub issues in /mnt/hdd/repo/lucene-jira-archive/migration/github-import-data. num_workers=2
+[2022-07-16 09:32:48,286] INFO:jira2github_import: Done.
 
 (.venv) migration $ ls github-import-data/
 GH-LUCENE-10500.json
@@ -138,7 +140,7 @@ Done.
 
 This optional step creates Jira username - GitHub account mapping. To associate Jira user with GitHub account, Jira user's "Full Name" and GitHub account's "Name" needs to be set to exactly the same value. See https://github.com/apache/lucene-jira-archive/issues/3.
 
-Note that this tool would not generate a correct mapping - you should manually check/edit the output file to create the final mapping (see step 4.).
+Note that this tool would not generate a correct mapping - you should manually check/edit the output file to create the final mapping.
 
 1. List all Jira users
 
@@ -244,8 +246,7 @@ You can:
 * map Jira user ids to GitHub accounts if the mapping is given.
 * set assignee field if the account mapping is given.
 * convert Jira markups to Markdown with parser library.
-   * not perfect - there can be many conversion errors
-
+   * best effort - there may be conversion errors
 
 
 ## Limitations
