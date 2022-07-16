@@ -15,15 +15,16 @@ source .venv/bin/activate
 (.venv) pip install -r requirements.txt
 ```
 
-You need a GitHub repository and [personal access token (PAT)](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-personal-access-token) for testing. Set `GITHUB_PAT` and `GITHUB_REPO` environment variables. See `.env.example` for other variables.
+You need a GitHub repository and [personal access token (PAT)](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-personal-access-token) for testing. Set `GITHUB_PAT` and `GITHUB_REPO` environment variables. For adding "moved to GitHub" comments to Jira side, you also need Jira [personal access token](https://confluence.atlassian.com/enterprise/using-personal-access-tokens-1026032365.html). See `.env.example` for other variables.
 
 On Linux/MacOS:
 ```
 cp .env.example .env
 
 vi .env
-export GITHUB_PAT=<your token>
+export GITHUB_PAT=<your GitHub token>
 export GITHUB_REPO=<your repository location> # e.g. "mocobeta/sandbox-lucene-10557"
+export JIRA_PAT=<your Jira token>
 
 source .env
 ```
@@ -135,6 +136,19 @@ Second pass: `src/update_issues.py` updates issues and comments with updated iss
 [2022-07-16 09:18:42,274] INFO:update_issue_labels: 63 labels are found.
 Done.
 ```
+
+### 8. Add "Moved to" comments to Jira issues
+
+`src/add_comments_jira_issues.py` adds a comment to each Jira issue to guide users to the corresponding GitHub issue.
+
+```
+(.venv) migration $ python src/add_comments_jira_issues.py
+[2022-07-16 10:35:34,440] INFO:add_comments_jira_issues: Add comments to Jira issues.
+[2022-07-16 10:35:36,338] INFO:add_comments_jira_issues: Done.
+```
+
+Note that this may trigger Jira notfication mails.
+
 
 ### How to Generate Account Mapping
 
