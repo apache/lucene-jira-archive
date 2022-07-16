@@ -123,6 +123,17 @@ Second pass: `src/update_issues.py` updates issues and comments with updated iss
 [2022-07-06 15:35:06,532] INFO:update_issues: Done.
 ```
 
+### 7. Update issue labels
+
+`src/update_issue_labels.py` updates issue colors and descriptions.
+
+```
+(.venv) migration $ python src/update_issue_labels.py 
+[2022-07-16 09:18:39,764] INFO:update_issue_labels: Retrieving labels.
+[2022-07-16 09:18:42,274] INFO:update_issue_labels: 63 labels are found.
+Done.
+```
+
 ### How to Generate Account Mapping
 
 This optional step creates Jira username - GitHub account mapping. To associate Jira user with GitHub account, Jira user's "Full Name" and GitHub account's "Name" needs to be set to exactly the same value. See https://github.com/apache/lucene-jira-archive/issues/3.

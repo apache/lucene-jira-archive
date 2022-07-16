@@ -29,10 +29,10 @@ def get_issue_body(token: str, repo: str, issue_number: int, logger: Logger) -> 
     url = GITHUB_API_BASE + f"/repos/{repo}/issues/{issue_number}"
     headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
     res = requests.get(url, headers=headers)
+    time.sleep(INTERVAL_IN_SECONDS)
     if res.status_code != 200:
         logger.error(f"Failed to get issue {issue_number}; status_code={res.status_code}, message={res.text}")
         return None
-    time.sleep(INTERVAL_IN_SECONDS)
     return res.json().get("body")
 
 
@@ -41,10 +41,10 @@ def update_issue_body(token: str, repo: str, issue_number: int, body: str, logge
     headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
     data = {"body": body}
     res = requests.patch(url, headers=headers, json=data)
+    time.sleep(INTERVAL_IN_SECONDS)
     if res.status_code != 200:
         logger.error(f"Failed to update issue {issue_number}; status_code={res.status_code}, message={res.text}")
         return False
-    time.sleep(INTERVAL_IN_SECONDS)
     return True
 
 
@@ -57,6 +57,7 @@ def get_issue_comments(token: str, repo: str, issue_number: int, logger: Logger)
     while not stop:
         url_with_paging = url + f"&page={page}"
         res = requests.get(url_with_paging, headers=headers)
+        time.sleep(INTERVAL_IN_SECONDS)
         if res.status_code != 200:
             logger.error(f"Failed to get issue comments for {issue_number}; status_code={res.status_code}, message={res.text}")
             break
@@ -65,7 +66,6 @@ def get_issue_comments(token: str, repo: str, issue_number: int, logger: Logger)
         for comment in res.json():
             li.append(GHIssueComment(id=comment.get("id"), body=comment.get("body")))
         page += 1
-        time.sleep(INTERVAL_IN_SECONDS)
     return li
 
 
@@ -74,10 +74,10 @@ def update_comment_body(token: str, repo: str, comment_id: int, body: str, logge
     headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
     data = {"body": body}
     res = requests.patch(url, headers=headers, json=data)
+    time.sleep(INTERVAL_IN_SECONDS)
     if res.status_code != 200:
         logger.error(f"Failed to update comment {comment_id}; status_code={res.status_code}, message={res.text}")
         return False
-    time.sleep(INTERVAL_IN_SECONDS)
     return True
 
 
@@ -85,9 +85,9 @@ def import_issue(token: str, repo: str, issue_data: dict, logger: Logger) -> str
     url = GITHUB_API_BASE + f"/repos/{repo}/import/issues"
     headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.golden-comet-preview+json"}
     res = requests.post(url, headers=headers, json=issue_data)
+    time.sleep(INTERVAL_IN_SECONDS)
     if res.status_code != 202:
         logger.error(f"Failed to import issue {issue_data['issue']['title']}; status_code={res.status_code}, message={res.text}")
-    time.sleep(INTERVAL_IN_SECONDS)
     return res.json().get("url")
 
 
@@ -116,10 +116,10 @@ def search_users(token: str, q: str, logger: Logger) -> list[str]:
     url = GITHUB_API_BASE + f"/search/users?q={quote_plus(q)}"
     headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
     res = requests.get(url, headers=headers)
+    time.sleep(SEARCH_INTERVAL_IN_SECONDS)    
     if res.status_code != 200:
         logger.error(f"Failed to search users with query {q}; status_code={res.status_code}, message={res.text}")
         return []
-    time.sleep(SEARCH_INTERVAL_IN_SECONDS)
     return [item["login"] for item in res.json()["items"]]
 
 
@@ -127,10 +127,10 @@ def get_user(token: str, username: str, logger: Logger) -> Optional[dict[str, An
     url = GITHUB_API_BASE + f"/users/{username}"
     headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
     res = requests.get(url, headers=headers)
+    time.sleep(INTERVAL_IN_SECONDS)
     if res.status_code != 200:
         logger.error(f"Failed to get user {username}; status_code={res.status_code}, message={res.text}")
         return None
-    time.sleep(INTERVAL_IN_SECONDS)
     return res.json()
 
 
@@ -141,15 +141,15 @@ def list_organization_members(token: str, org: str, logger: Logger) -> list[str]
     users = []
     while True:
         res = requests.get(f"{url}&page={page}", headers=headers)
-        if len(res.json()) == 0:
-            break
+        time.sleep(INTERVAL_IN_SECONDS)
         if res.status_code != 200:
             logger.error(f"Failed to get organization members for {org}; status_code={res.status_code}, message={res.text}")
             return users
+        if len(res.json()) == 0:
+            break
         users.extend(x["login"] for x in res.json())
         logger.debug(f"{len(users)} members found.")
         page += 1
-        time.sleep(INTERVAL_IN_SECONDS)
     return users
 
 
@@ -160,17 +160,49 @@ def list_commit_authors(token: str, repo: str, logger: Logger) -> list[str]:
     authors = set([])
     while True:
         res = requests.get(f"{url}&page={page}", headers=headers)
-        if len(res.json()) == 0:
-            break
+        time.sleep(INTERVAL_IN_SECONDS)
         if res.status_code != 200:
             logger.error(f"Failed to get commits for {repo}; status_code={res.status_code}, message={res.text}")
             return authors
+        if len(res.json()) == 0:
+            break
         for commit in res.json():
             author = commit.get("author")
             if author:
                 authors.add(author["login"])
         logger.debug(f"{len(authors)} authors found.")
         page += 1
-        time.sleep(INTERVAL_IN_SECONDS)
     return authors
 
+
+def list_labels(token: str, repo: str, logger: Logger) -> list[str]:
+    url = GITHUB_API_BASE + f"/repos/{repo}/labels?per_page=100"
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+    page = 1
+    labels = []
+    while True:
+        res = requests.get(f"{url}&page={page}", headers=headers)
+        time.sleep(INTERVAL_IN_SECONDS)
+        if res.status_code != 200:
+            logger.error(f"Failed to get labels for {repo}; status_code={res.status_code}, message={res.text}")
+            return labels
+        if len(res.json()) == 0:
+            break
+        for l in res.json():
+            name = l["name"]
+            labels.append(name)
+        page += 1
+    return labels
+
+
+def update_label(token: str, repo: str, name: str, color: str, description: str, logger: Logger) -> bool:
+    url = GITHUB_API_BASE + f"/repos/{repo}/labels/{name}"
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+    data = {"color": color, "description": description}
+    res = requests.patch(url, headers=headers, json=data)
+    time.sleep(INTERVAL_IN_SECONDS)
+    if res.status_code != 200:
+        logger.error(f"Failed to update label {name}; status_code={res.status_code}, message={res.text}")
+        return False
+    logger.debug(f"Label {name} updated.")
+    return True
