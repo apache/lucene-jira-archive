@@ -142,8 +142,7 @@ Done.
 `src/add_comments_jira_issues.py` adds a comment to each Jira issue to guide users to the corresponding GitHub issue.
 
 ```
-[2022-07-16 10:35:12,684] INFO:add_comments_jira_issues: Done.
-(.venv) migration $ python src/add_comments_jira_issues.py --issues 10622
+(.venv) migration $ python src/add_comments_jira_issues.py
 [2022-07-16 10:35:34,440] INFO:add_comments_jira_issues: Add comments to Jira issues.
 [2022-07-16 10:35:36,338] INFO:add_comments_jira_issues: Done.
 ```

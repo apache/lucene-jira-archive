@@ -27,24 +27,24 @@ def __read_issue_url_map(issue_mapping_file: Path) -> dict[str, int]:
     return url_map
 
 
-def __add_comment(token: str, issue_number: int, comment: str, logger: Logger) -> bool:
-    url = JIRA_API_BASE + f"/issue/{jira_issue_id(issue_number)}/comment"
+def __add_comment(token: str, issue_id: str, comment: str, logger: Logger) -> bool:
+    url = JIRA_API_BASE + f"/issue/{issue_id}/comment"
     headers = {"Authorization": f"Bearer {token}"}
     data = {"body": comment}
     res = requests.post(url, headers=headers, json=data)
     time.sleep(INTERVAL_IN_SECONDS)
     if res.status_code != 201:
-        logger.error(f"Failed to add a comment to {jira_issue_id(issue_number)}")
+        logger.error(f"Failed to add a comment to {issue_id}; status_code={res.status_code}, message={res.text}")
         return False
     return True
 
 
 @retry_upto(3, 1.0, logger)
-def add_moved_to_comment(token: str, issue_number: int, github_url: str) -> bool:
+def add_moved_to_comment(token: str, issue_id: str, github_url: str) -> bool:
     comment = f"""[TEST] This was moved to GitHub issue: {github_url}."""
-    res = __add_comment(token, issue_number, comment, logger)
+    res = __add_comment(token, issue_id, comment, logger)
     if res:
-        logger.debug(f"Added a comment to {jira_issue_id(issue_number)}")
+        logger.debug(f"Added a comment to {issue_id}")
     return res
 
 
@@ -56,8 +56,6 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--issues', type=int, required=False, nargs='*', help='Jira issue number list to be downloaded')    
-    parser.add_argument('--min', type=int, dest='min', required=False, default=1, help='Minimum (inclusive) Jira issue number to be downloaded')
-    parser.add_argument('--max', type=int, dest='max', required=False, help='Maximum (inclusive) Jira issue number to be downloaded')
     args = parser.parse_args()
 
     mapping_data_dir = Path(__file__).resolve().parent.parent.joinpath(MAPPINGS_DATA_DIRNAME)
@@ -67,25 +65,21 @@ if __name__ == "__main__":
         sys.exit(1)
     issue_url_map = __read_issue_url_map(issue_mapping_file)
 
-    issues = []
+    issue_ids = []
     if args.issues:
-        issues = args.issues
+        issue_ids = [jira_issue_id(num) for num in args.issues]
     else:
-        if args.max:
-            issues.extend(list(range(args.min, args.max + 1)))
-        else:
-            issues.append(args.min)
+        issue_ids = list(issue_url_map.keys())
 
     logger.info("Add comments to Jira issues.")
 
-    for num in issues:
-        issue_id = jira_issue_id(num)
+    for issue_id in issue_ids:
         github_url = issue_url_map.get(issue_id)
         if not github_url:
             logger.warning(f"No corresponding GitHub issue for {issue_id}.")
             continue
         try:
-            add_moved_to_comment(jira_token, num, github_url)
+            add_moved_to_comment(jira_token, issue_id, github_url)
         except MaxRetryLimitExceedException:
             logger.error(f"Failed to update issue comments. Skipped {issue_id}.")
 
