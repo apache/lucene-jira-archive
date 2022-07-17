@@ -76,7 +76,6 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         # embed github issue number next to sub task keys
         subtasks_list_items = []
         for jira_key in subtasks:
-            # subtasks_list_items.append(f"{jira_key} : [Jira link]({jira_issue_url(jira_key)})")
             subtasks_list_items.append(f"[{jira_key}]({jira_issue_url(jira_key)})")
 
         created_datetime = dateutil.parser.parse(created)
