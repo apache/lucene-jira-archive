@@ -160,7 +160,7 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
                 labels.append(f"fix-version:{v}")
         for v in versions:
             if v:
-                labels.append(f"affects-ersion:{v}")
+                labels.append(f"affects-version:{v}")
         for c in components:
             if c.startswith("core"):
                 labels.append(f"module:{c}")
