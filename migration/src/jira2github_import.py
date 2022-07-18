@@ -130,8 +130,8 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
             #       timestamps?  also, if the account id mapped over to known GH account, we can drop Jira footer entirely?
             comment_created_datetime = dateutil.parser.parse(comment_created)
             comment_time = f'{comment_created_datetime.strftime("%b %d %Y")}'
-            if comment_updated != comment_created:
-                comment_updated_datetime = dateutil.parser.parse(comment_updated)
+            comment_updated_datetime = dateutil.parser.parse(comment_updated)
+            if comment_updated_datetime.date() != comment_created_datetime.date():
                 comment_time += f' [updated: {comment_updated_datetime.strftime("%b %d %Y")}]'
             try:
                 comment_body = f'{convert_text(comment_body, att_replace_map, account_map)}\n\n'
