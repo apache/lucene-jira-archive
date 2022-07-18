@@ -234,12 +234,41 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: d
 def embed_gh_issue_link(text: str, issue_id_map: dict[str, str]) -> str:
     """Embed GitHub issue number
     """
-    jira_keys = [m[1:] for m in re.findall(REGEX_JIRA_KEY, text)]
-    if jira_keys:
-        jira_keys = set(jira_keys)
-        for key in jira_keys:
-            gh_number = issue_id_map.get(key)
-            if gh_number:
-                new_key = f"{key} (#{gh_number})"
-                text = text.replace(key, new_key)
+    def repl_simple(m: re.Match):
+        res = m.group(0)
+        gh_number = issue_id_map.get(m.group(2))
+        if gh_number:
+            res = f"{m.group(1)}#{gh_number}{m.group(3)}"
+            # print(res)
+        return res
+    
+    def repl_paren(m: re.Match):
+        res = m.group(0)
+        gh_number = issue_id_map.get(m.group(2))
+        if gh_number:
+            res = f"{m.group(1)}#{gh_number}{m.group(3)}"
+            # print(res)
+        return res
+
+    def repl_bracket(m: re.Match):
+        res = m.group(0)
+        gh_number = issue_id_map.get(m.group(2))
+        if gh_number:
+            res = f"#{gh_number}"
+            # print(res)
+        return res
+    
+    def repl_md_link(m: re.Match):
+        res = m.group(0)
+        gh_number = issue_id_map.get(m.group(1))
+        if gh_number:
+            res = f"{m.group(0)} (#{gh_number})"
+            print(res)
+        return res
+
+    text = re.sub(r"(\s)(LUCENE-\d+)([\s,\?\!\.])", repl_simple, text)
+    text = re.sub(r"(\()(LUCENE-\d+)(\))", repl_paren, text)
+    text = re.sub(r"(\[)(LUCENE-\d+)(\])(?!\()", repl_bracket, text)
+    text = re.sub(r"\[(LUCENE-\d+)\]\(https?[^\)]+LUCENE-\d+\)", repl_md_link, text)
+
     return text
