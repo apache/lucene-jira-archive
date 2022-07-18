@@ -71,12 +71,12 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         # embed github issue number next to linked issue keys
         linked_issues_list_items = []
         for jira_key in linked_issues:
-            linked_issues_list_items.append(f"[{jira_key}]({jira_issue_url(jira_key)})")
+            linked_issues_list_items.append(f"- [{jira_key}]({jira_issue_url(jira_key)})\n")
         
         # embed github issue number next to sub task keys
         subtasks_list_items = []
         for jira_key in subtasks:
-            subtasks_list_items.append(f"[{jira_key}]({jira_issue_url(jira_key)})")
+            subtasks_list_items.append(f"- [{jira_key}]({jira_issue_url(jira_key)})\n")
 
         created_datetime = dateutil.parser.parse(created)
         updated_datetime = dateutil.parser.parse(updated)
@@ -109,10 +109,10 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
             body += f'\nAttachments: {", ".join(attachment_list_items)}'
 
         if len(linked_issues_list_items) > 0:
-            body += f'\nLinked issues: {", ".join(linked_issues_list_items)}'
+            body += f'\nLinked issues:\n {"".join(linked_issues_list_items)}'
 
         if len(subtasks_list_items) > 0:
-            body += f'\nSub-tasks: {", ".join(subtasks_list_items)}'
+            body += f'\nSub-tasks:\n {"".join(subtasks_list_items)}'
 
         if len(pull_requests) > 0:
             body += f'\nPull requests: {", ".join([str(x) for x in pull_requests])}'
