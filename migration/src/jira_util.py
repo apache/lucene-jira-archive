@@ -239,7 +239,6 @@ def embed_gh_issue_link(text: str, issue_id_map: dict[str, str]) -> str:
         gh_number = issue_id_map.get(m.group(2))
         if gh_number:
             res = f"{m.group(1)}#{gh_number}{m.group(3)}"
-            # print(res)
         return res
     
     def repl_paren(m: re.Match):
@@ -247,7 +246,6 @@ def embed_gh_issue_link(text: str, issue_id_map: dict[str, str]) -> str:
         gh_number = issue_id_map.get(m.group(2))
         if gh_number:
             res = f"{m.group(1)}#{gh_number}{m.group(3)}"
-            # print(res)
         return res
 
     def repl_bracket(m: re.Match):
@@ -255,7 +253,6 @@ def embed_gh_issue_link(text: str, issue_id_map: dict[str, str]) -> str:
         gh_number = issue_id_map.get(m.group(2))
         if gh_number:
             res = f"#{gh_number}"
-            # print(res)
         return res
     
     def repl_md_link(m: re.Match):
@@ -263,7 +260,7 @@ def embed_gh_issue_link(text: str, issue_id_map: dict[str, str]) -> str:
         gh_number = issue_id_map.get(m.group(1))
         if gh_number:
             res = f"{m.group(0)} (#{gh_number})"
-            print(res)
+            # print(res)
         return res
 
     text = re.sub(r"(\s)(LUCENE-\d+)([\s,\?\!\.])", repl_simple, text)
