@@ -157,13 +157,13 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         # milestone?
         for v in fix_versions:
             if v:
-                labels.append(f"fixVersion:{v}")
+                labels.append(f"fix-version:{v}")
         for v in versions:
             if v:
-                labels.append(f"affectsVersion:{v}")
+                labels.append(f"affects-version:{v}")
         for c in components:
             if c.startswith("core"):
-                labels.append(f"component:module/{c}")
+                labels.append(f"module:{c}")
             elif c in COMPONENT_TO_LABEL_MAP:
                 labels.append(COMPONENT_TO_LABEL_MAP.get(c))
 
