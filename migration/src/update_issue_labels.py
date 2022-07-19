@@ -11,9 +11,10 @@ logger = logging_setup(log_dir, "update_issue_labels")
 # label prefix -> color, description
 LABEL_DETAILS_MAP = {
     "type:": ("ffbb00", ""),
-    "fixVersion:": ("7ebea5", ""),
-    "affectsVersion:": ("f19072", ""),
-    "component:": ("a0d8ef", "")
+    "fix-version:": ("7ebea5", ""),
+    "affects-version:": ("f19072", ""),
+    "module:": ("a0d8ef", ""),
+    "tool:": ("a0d8ef", "")
 }
 
 
