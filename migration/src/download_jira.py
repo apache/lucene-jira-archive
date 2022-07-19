@@ -43,7 +43,11 @@ def download_issue(num: int, dump_dir: Path) -> bool:
         return False
     dump_file = jira_dump_file(dump_dir, num)
     with open(dump_file, "w") as fp:
-        json.dump(res.json(), fp, indent=2)
+        data = res.json()
+        if data["key"] != issue_id:
+            logger.warning(f"The issue key {data['key']} does not match the request key {issue_id}. Maybe this was moved.")
+            return False
+        json.dump(data, fp, indent=2)
     logger.debug(f"Jira issue {issue_id} was downloaded in {dump_file}.")
     return True
 
