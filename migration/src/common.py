@@ -204,9 +204,9 @@ COMPONENT_TO_LABEL_MAP = {
     "modules/spellchecker": "module:suggest",
     "modules/test-framework": "module:test-framework",
     "luke": "module:luke",
-    "general/build": "build",
-    "general/javadocs": "javadocs",
-    "general/test": "test",
+    "general/build": "tool:build",
+    "general/javadocs": "type:documentation",
+    "general/test": "type:test",
     "general/website": "website",
-    "release wizard": "release wizard",
+    "release wizard": "tool:release-wizard",
 }
