@@ -36,6 +36,20 @@ def get_issue_body(token: str, repo: str, issue_number: int, logger: Logger) -> 
     return res.json().get("body")
 
 
+def create_issue(token: str, repo: str, title: str, body: str, logger: Logger) -> Optional[tuple[str, int]]:
+    url = GITHUB_API_BASE + f"/repos/{repo}/issues"
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+    data = {"title": title, "body": body}
+    res = requests.post(url, headers=headers, json=data)
+    time.sleep(INTERVAL_IN_SECONDS)
+    if res.status_code != 201:
+        logger.error(f"Failed to create issue; status_code={res.status_code}, message={res.text}")
+        return None
+    html_url = res.json()["html_url"]
+    number = res.json()["number"]
+    return (html_url, number)
+
+
 def update_issue_body(token: str, repo: str, issue_number: int, body: str, logger: Logger) -> bool:
     url = GITHUB_API_BASE + f"/repos/{repo}/issues/{issue_number}"
     headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
@@ -67,6 +81,19 @@ def get_issue_comments(token: str, repo: str, issue_number: int, logger: Logger)
             li.append(GHIssueComment(id=comment.get("id"), body=comment.get("body")))
         page += 1
     return li
+
+
+def create_comment(token: str, repo: str, issue_number: int, body: str, logger: Logger) -> Optional[int]:
+    url = GITHUB_API_BASE + f"/repos/{repo}/issues/{issue_number}/comments"
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+    data = {"body": body}
+    res = requests.post(url, headers=headers, json=data)
+    time.sleep(INTERVAL_IN_SECONDS)
+    if res.status_code != 201:
+        logger.error(f"Failed to create comment; status_code={res.status_code}, message={res.text}")
+        return None
+    id = res.json()["id"]
+    return id
 
 
 def update_comment_body(token: str, repo: str, comment_id: int, body: str, logger: Logger) -> bool:
