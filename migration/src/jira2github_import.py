@@ -127,7 +127,7 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
             lines = []
             for line in comment_body.split("\n"):
                 # remove '[' and ']' iff it contains a URL (i.e. link to a commit in ASF GitBox repo).
-                m = re.match(r"\[\s?(https?://\S+)\s?\]", line.strip())
+                m = re.match(r"^\[\s?(https?://\S+)\s?\]$", line.strip())
                 if m:
                     lines.append(m.group(1))
                 else:
