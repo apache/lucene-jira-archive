@@ -123,6 +123,17 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
             author_gh = account_map.get(author_name)
             return f"{author_dispname} (@{author_gh})" if author_gh else author_dispname
         
+        def enable_hyperlink_to_commit(comment_body: str):
+            lines = []
+            for line in comment_body.split("\n"):
+                # remove '[' and ']' iff it contains a URL (i.e. link to a commit in ASF GitBox repo).
+                m = re.match(r"^\[\s?(https?://\S+)\s?\]$", line.strip())
+                if m:
+                    lines.append(m.group(1))
+                else:
+                    lines.append(line)
+            return "\n".join(lines)
+
         comments = extract_comments(o)
         comments_data = []
         for (comment_author_name, comment_author_dispname, comment_body, comment_created, comment_updated, comment_id) in comments:
@@ -135,6 +146,10 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
                 comment_time += f' [updated: {comment_updated_datetime.strftime("%b %d %Y")}]'
             try:
                 comment_body = f'{convert_text(comment_body, att_replace_map, account_map)}\n\n'
+                # apply a special conversion for jira-bot's comments.
+                # see https://github.com/apache/lucene-jira-archive/issues/54
+                if comment_author_name == "jira-bot":
+                    comment_body = enable_hyperlink_to_commit(comment_body)
             except Exception as e:
                 logger.error(traceback.format_exc(limit=100))
                 logger.error(f"Failed to convert comment on {jira_issue_id(num)} due to above exception ({str(e)}); falling back to original Jira comment as code block.")
