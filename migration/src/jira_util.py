@@ -79,6 +79,10 @@ def extract_components(o: dict) -> list[str]:
     return [x.get("name", "") for x in o.get("fields").get("components", [])]
 
 
+def extract_labels(o: dict) -> list[str]:
+    return o.get("fields").get("labels", [])
+
+
 def extract_attachments(o: dict) -> list[tuple[str, int]]:
     attachments = o.get("fields").get("attachment")
     if not attachments:

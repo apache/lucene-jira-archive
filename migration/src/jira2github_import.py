@@ -54,7 +54,8 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         attachments = extract_attachments(o)
         linked_issues = extract_issue_links(o)
         subtasks = extract_subtasks(o)
-        pull_requests =extract_pull_requests(o)
+        pull_requests = extract_pull_requests(o)
+        jira_labels = extract_labels(o)
 
         reporter_gh = account_map.get(reporter_name)
         reporter = f"{reporter_dispname} (@{reporter_gh})" if reporter_gh else f"{reporter_dispname}"
@@ -185,6 +186,8 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
                     labels.append(l)
             else:
                 logger.error(f"Unknown Component: {c}")
+        for label in jira_labels:
+            labels.append(f"legacy-jira-label:{label}")
 
         data = {
             "issue": {
