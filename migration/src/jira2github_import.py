@@ -182,7 +182,7 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
             elif c in COMPONENT_TO_LABEL_MAP:
                 l = COMPONENT_TO_LABEL_MAP[c]
                 if l is not None:
-                    labels.append(COMPONENT_TO_LABEL_MAP.get(c))
+                    labels.append(l)
             else:
                 logger.error(f"Unknown Component: {c}")
 
