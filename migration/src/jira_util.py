@@ -185,11 +185,12 @@ JIRA_EMOJI_TO_UNICODE = {
 
 REGEX_CRLF = re.compile(r"\r\n")
 REGEX_JIRA_KEY = re.compile(r"[^/]LUCENE-\d+")
-REGEX_MENTION = re.compile(r"((?<=^)@\w+|(?<=[\s\(\"'])@\w+)(?=[\s\)\"'\?!,\.$])")  # this regex may capture only "@" + "<username>" mentions
+REGEX_MENTION_ATMARK = re.compile(r"((?<=^)@[\w\.]\+|(?<=[\s\(\"'])@[\w\.]+)(?=[\s\)\"'\?!,\.$])")  # this regex may capture only "@" + "<username>" mentions
+REGEX_MENION_TILDE = re.compile(r"((?<=^)\[~[\w\.]+\]|(?<=[\s\(\"'])\[~[\w\.]+\])(?=[\s\)\"'\?!,\.$])")  # this regex may capture only "[~" + "<username>" + "]" mentions
 REGEX_LINK = re.compile(r"\[([^\]]+)\]\(([^\)]+)\)")
 
 
-def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: dict[str, str] = {}) -> str:
+def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: dict[str, str] = {}, jira_users: dict[str, str] = {}) -> str:
     """Convert Jira markup to Markdown
     """
     def repl_att(m: re.Match):
@@ -216,15 +217,29 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: d
     elements.append(EscapeHtmlTag)
     text = jira2markdown.convert(text, elements=elements)
 
-    # markup @ mentions with ``
-    mentions = re.findall(REGEX_MENTION, text)
+    # convert @ mentions
+    mentions = re.findall(REGEX_MENTION_ATMARK, text)
     if mentions:
         mentions = set(mentions)
         for m in mentions:
             jira_id = m[1:]
+            disp_name = jira_users.get(jira_id)
             gh_m = account_map.get(jira_id)
-            # replace Jira name with GitHub account if it is available, othewise show Jira name with `` to avoid unintentional mentions
-            text = text.replace(m, f"`@{jira_id}`" if not gh_m else f"@{gh_m}")
+            # replace Jira name with GitHub account or Jira display name if it is available, othewise show Jira name with `` to avoid unintentional mentions
+            mention = lambda: f"@{gh_m}" if gh_m else disp_name if disp_name else f"`@{jira_id}`"
+            text = text.replace(m, mention())
+    
+    # convert ~ mentions
+    mentions = re.findall(REGEX_MENION_TILDE, text)
+    if mentions:
+        mentions = set(mentions)
+        for m in mentions:
+            jira_id = m[2:-1]
+            disp_name = jira_users.get(jira_id)
+            gh_m = account_map.get(jira_id)
+            # replace Jira name with GitHub account or Jira display name if it is available, othewise show Jira name with ``
+            mention = lambda: f"@{gh_m}" if gh_m else disp_name if disp_name else f"`~{jira_id}`"
+            text = text.replace(m, mention())
     
     text = re.sub(REGEX_LINK, repl_att, text)
 

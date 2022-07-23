@@ -23,6 +23,7 @@ GITHUB_LUCENE_COMMIT_AUTHORS = "github-lucene-commit-authors.csv"
 
 ISSUE_MAPPING_FILENAME = "issue-map.csv"
 ACCOUNT_MAPPING_FILENAME = "account-map.csv"
+JIRA_USERS_FILENAME = "jira-users.csv"
 
 ASF_JIRA_BASE_URL = "https://issues.apache.org/jira/browse"
 
@@ -146,6 +147,18 @@ def read_account_map(account_mapping_file: Path) -> dict[str, str]:
                 continue
             id_map[cols[0]] = cols[1]  # jira name -> github account
     return id_map
+
+
+def read_jira_users_map(jira_users_file: Path) -> dict[str, str]:
+    users_map = {}
+    with open(jira_users_file) as fp:
+        fp.readline()  # skip header
+        for line in fp:
+            cols = line.strip().split(",")
+            if len(cols) < 2:
+                continue
+            users_map[cols[0]] = cols[1]  # jira name -> jira display name
+    return users_map
 
 
 def retry_upto(max_retry: int, interval: float, logger: logging.Logger):
