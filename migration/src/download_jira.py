@@ -116,8 +116,13 @@ if __name__ == "__main__":
             issues.extend(list(range(args.min, args.max + 1)))
         else:
             issues.append(args.min)
-    
-    logger.info(f"Downloading Jira issues in {dump_dir}. Attachments are saved in {att_data_dir}.")
+
+    message = f"Downloading Jira issues in {dump_dir}."
+    if args.skip_attachments:
+        message += " Attachments will not be saved."
+    else:
+        message += f" Attachments will be saved in {att_data_dir}."
+    logger.info(message)
     for num in issues:
         if download_issue(num, dump_dir) and not args.skip_attachments:
             download_attachments(num, dump_dir, att_data_dir)
