@@ -41,6 +41,11 @@ def extract_issue_type(o: dict) -> str:
     return issuetype.get("name", "") if issuetype else ""
 
 
+def extract_environment(o: dict) -> str:
+    environment = o.get("fields").get("environment", "")
+    return environment if environment else ""
+
+
 def extract_reporter(o: dict) -> tuple[str, str]:
     reporter = o.get("fields").get("reporter")
     name = reporter.get("name", "") if reporter else ""
