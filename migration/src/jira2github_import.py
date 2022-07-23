@@ -30,7 +30,7 @@ def jira_timestamp_to_github_timestamp(ts: str) -> str:
     return ts[:-9] + "Z"
 
 
-def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[str, str], att_repo: str, att_branch: str, logger: Logger) -> bool:
+def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[str, str], jira_users: dict[str, str], att_repo: str, att_branch: str, logger: Logger) -> bool:
     jira_id = jira_issue_id(num)
     dump_file = jira_dump_file(dump_dir, num)
     if not dump_file.exists():
@@ -86,7 +86,7 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
             resolutiondate_datetime = None
 
         try:
-            body = f'{convert_text(description, att_replace_map, account_map)}\n\n'
+            body = f'{convert_text(description, att_replace_map, account_map, jira_users)}\n\n'
         except Exception as e:
             logger.error(traceback.format_exc(limit=100))
             logger.error(f"Failed to convert opening issue description on {jira_issue_id(num)} due to above exception, ({str(e)}); falling back to original Jira description as code block.")
@@ -145,7 +145,7 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
             if comment_updated_datetime.date() != comment_created_datetime.date():
                 comment_time += f' [updated: {comment_updated_datetime.strftime("%b %d %Y")}]'
             try:
-                comment_body = f'{convert_text(comment_body, att_replace_map, account_map)}\n\n'
+                comment_body = f'{convert_text(comment_body, att_replace_map, account_map, jira_users)}\n\n'
                 # apply a special conversion for jira-bot's comments.
                 # see https://github.com/apache/lucene-jira-archive/issues/54
                 if comment_author_name == "jira-bot":
@@ -236,6 +236,7 @@ if __name__ == "__main__":
 
     mappings_dir = Path(__file__).resolve().parent.parent.joinpath(MAPPINGS_DATA_DIRNAME)
     account_mapping_file = mappings_dir.joinpath(ACCOUNT_MAPPING_FILENAME)
+    jira_users_file = mappings_dir.joinpath(JIRA_USERS_FILENAME)
 
     output_dir = Path(__file__).resolve().parent.parent.joinpath(GITHUB_IMPORT_DATA_DIRNAME)
     if not output_dir.exists():
@@ -243,6 +244,7 @@ if __name__ == "__main__":
     assert output_dir.exists()
 
     account_map = read_account_map(account_mapping_file) if account_mapping_file.exists() else {}
+    jira_users = read_jira_users_map(jira_users_file) if jira_users_file.exists() else {}
 
     issues = []
     if args.issues:
@@ -266,7 +268,7 @@ if __name__ == "__main__":
     def task(num):
         logger = logging.getLogger(name)
         try:
-            convert_issue(num, dump_dir, output_dir, account_map, github_att_repo, github_att_branch, logger)
+            convert_issue(num, dump_dir, output_dir, account_map, jira_users, github_att_repo, github_att_branch, logger)
         except Exception as e:
             logger.error(traceback.format_exc(limit=100))
             logger.error(f"Failed to convert Jira issue. An error '{str(e)}' occurred; skipped {jira_issue_id(num)}.")
