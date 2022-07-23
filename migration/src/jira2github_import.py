@@ -43,6 +43,7 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         description = extract_description(o).strip()
         status = extract_status(o)
         issue_type = extract_issue_type(o)
+        environment = extract_environment(o)
         (reporter_name, reporter_dispname) = extract_reporter(o)
         (assignee_name, assignee_dispname) = extract_assignee(o)
         created = extract_created(o)
@@ -104,6 +105,9 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
             body += f", resolved {resolutiondate_datetime.strftime('%b %d %Y')}"
         elif created_datetime.date() != updated_datetime.date():
             body += f", updated {updated_datetime.strftime('%b %d %Y')}"
+
+        if environment:
+            body += f'\nEnvironment:\n```\n{environment}\n```\n'
 
         if len(attachment_list_items) > 0:
             body += f'\nAttachments: {", ".join(attachment_list_items)}'
