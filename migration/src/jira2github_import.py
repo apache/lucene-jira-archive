@@ -180,7 +180,11 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
             if c.startswith("core"):
                 labels.append(f"module:{c}")
             elif c in COMPONENT_TO_LABEL_MAP:
-                labels.append(COMPONENT_TO_LABEL_MAP.get(c))
+                l = COMPONENT_TO_LABEL_MAP[c]
+                if l is not None:
+                    labels.append(l)
+            else:
+                logger.error(f"Unknown Component: {c}")
 
         data = {
             "issue": {
@@ -222,7 +226,7 @@ if __name__ == "__main__":
     parser.add_argument('--issues', type=int, required=False, nargs='*', help='Jira issue number list to be downloaded')
     parser.add_argument('--min', type=int, dest='min', required=False, default=1, help='Minimum Jira issue number to be converted')
     parser.add_argument('--max', type=int, dest='max', required=False, help='Maximum Jira issue number to be converted')
-    parser.add_argument('--num_workers', type=int, dest='num_workers', required=False, default=1, help='Number of worker processes')
+    parser.add_argument('--num-workers', type=int, dest='num_workers', required=False, default=1, help='Number of worker processes')
     args = parser.parse_args()
 
     dump_dir = Path(__file__).resolve().parent.parent.joinpath(JIRA_DUMP_DIRNAME)
