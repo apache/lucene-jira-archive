@@ -69,10 +69,10 @@ See "How to Generate Account Mapping" seciton.
 
 This also map all Jira username to GitHub account (or Jira full name, if the corresponding GitHub account is not available) if the account mapping is given in `mapping-data/account-map.csv` and `mapping-data/jira-users.csv`.
 
-Optionally, you can pass `--num_workers` option to specifiy the number of worker processes (the default value is `1`).
+Optionally, you can pass `--num-workers` option to specifiy the number of worker processes (the default value is `1`).
 
 ```
-(.venv) migration $ python src/jira2github_import.py --min 10500 --max 10510 --num_workers 2
+(.venv) migration $ python src/jira2github_import.py --min 10500 --max 10510 --num-workers 2
 [2022-07-16 09:32:42,288] INFO:jira2github_import: Converting Jira issues to GitHub issues in /mnt/hdd/repo/lucene-jira-archive/migration/github-import-data. num_workers=2
 [2022-07-16 09:32:48,286] INFO:jira2github_import: Done.
 
