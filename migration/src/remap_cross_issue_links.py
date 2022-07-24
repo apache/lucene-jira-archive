@@ -68,11 +68,11 @@ if __name__ == "__main__":
     check_authentication(github_token)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--issues', type=int, required=False, nargs='*', help='GitHub issue number list to be downloaded')
-    args = parser.parse_args()
-    
     mapping_data_dir = Path(__file__).resolve().parent.parent.joinpath(MAPPINGS_DATA_DIRNAME)
     issue_mapping_file = mapping_data_dir.joinpath(ISSUE_MAPPING_FILENAME)
+    parser.add_argument('--issues', type=int, required=False, nargs='*', help=f'GitHub issue number list to be downloaded, else all GitHub issues in {issue_mapping_file.relative_to(Path.cwd())}')
+    args = parser.parse_args()
+    
     if not issue_mapping_file.exists():
         logger.error(f"Jira-GitHub issue id mapping file not found. {issue_mapping_file}")
         sys.exit(1)

@@ -105,7 +105,7 @@ LUCENE-10502,https://github.com/mocobeta/migration-test-3/issues/44,44
 
 ### 5. Re-map cross-issue links on GitHub
 
-`src/remap_cross_issue_links.py` exports issues and comments from GitHub and save updated issue/comment bodies to `migration/github-remapped-data`.
+`src/remap_cross_issue_links.py` exports issues and comments from GitHub and saves updated issue/comment bodies to `migration/github-remapped-data`.  Note that a given body and comment will only be saved into `migration/github-remapped-data` if it contained (now updated) issue cross-links.
 
 ```
 (.venv) migration $ python src/remap_cross_issue_links.py --issues 40 41
