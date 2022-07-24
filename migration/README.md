@@ -59,7 +59,7 @@ LUCENE-10502
 
 Downloaded attachments should be separately committed to a dedicated branch named `attachments` (or matching the `GITHUB_ATT_BRANCH` env variable) for them.
 
-### 2. (Optional) Generate Jira username - GitHub account mapping
+### 2. (Optional) Generate Jira -> GitHub account mapping
 
 See "How to Generate Account Mapping" seciton.
 
@@ -67,7 +67,7 @@ See "How to Generate Account Mapping" seciton.
 
 `src/jira2github_import.py` converts Jira dumps into GitHub data that are importable to [issue import API](https://gist.github.com/jonmagic/5282384165e0f86ef105). Converted JSON data is saved in `migration/github-import-data`.
 
-This also resolves all Jira user ID - GitHub account alignment if the account mapping is given in `mapping-data/account-map.csv`.
+This also map all Jira username to GitHub account (or Jira full name, if the corresponding GitHub account is not available) if the account mapping is given in `mapping-data/account-map.csv` and `mapping-data/jira-users.csv`.
 
 Optionally, you can pass `--num_workers` option to specifiy the number of worker processes (the default value is `1`).
 
@@ -176,6 +176,9 @@ uschindler,Uwe Schindler
 jpountz,Adrien Grand
 sarowe,Steven Rowe
 ...
+
+# copy the result file to `mapping-data` directory - this is used in "3. Convert Jira issues to GitHub issues" section.
+(.venv) migration $ cp work/jira-users.csv mapping-data/jira-users.csv
 ```
 
 2. List candidate GitHub accounts
