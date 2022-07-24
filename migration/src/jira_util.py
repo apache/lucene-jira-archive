@@ -46,6 +46,13 @@ def extract_environment(o: dict) -> str:
     return environment if environment else ""
 
 
+def extract_resolution(o: dict) -> Optional[str]:
+    resolution = o.get("fields").get("resolution")
+    if resolution:
+        return resolution.get("name")
+    return None
+
+
 def extract_reporter(o: dict) -> tuple[str, str]:
     reporter = o.get("fields").get("reporter")
     name = reporter.get("name", "") if reporter else ""
