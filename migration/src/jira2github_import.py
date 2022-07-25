@@ -60,7 +60,7 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         resolution = extract_resolution(o)
         priority = extract_priority(o)
         vote_count = extract_vote_count(o)
-        parent_issue_key, parent_url = extract_parent(o)
+        parent_issue_key = extract_parent_key(o)
 
         reporter_gh = account_map.get(reporter_name)
         reporter = f"{reporter_dispname} (@{reporter_gh})" if reporter_gh else f"{reporter_dispname}"
@@ -117,7 +117,7 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
             body += f", updated {updated_datetime.strftime('%b %d %Y')}"
 
         if parent_issue_key:
-            body += f'\nParent: [{parent_issue_key}]({parent_url})'
+            body += f'\nParent: [{parent_issue_key}](https://issues.apache.org/jira/browse/{parent_issue_key})'
 
         if environment:
             body += f'\nEnvironment:\n```\n{environment}\n```\n'
