@@ -53,6 +53,22 @@ def extract_resolution(o: dict) -> Optional[str]:
     return None
 
 
+def extract_priority(o: dict) -> Optional[str]:
+    priority = o.get("fields").get("priority")
+    if priority:
+        return priority.get("name")
+    return None
+
+
+def extract_vote_count(o: dict) -> Optional[str]:
+    votes = o.get("fields").get("votes")
+    if votes:
+        vote_count = votes.get("votes")
+        if vote_count > 0:
+            return vote_count
+    return None
+
+
 def extract_reporter(o: dict) -> tuple[str, str]:
     reporter = o.get("fields").get("reporter")
     name = reporter.get("name", "") if reporter else ""
