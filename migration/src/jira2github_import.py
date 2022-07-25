@@ -60,7 +60,8 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         resolution = extract_resolution(o)
         priority = extract_priority(o)
         vote_count = extract_vote_count(o)
-            
+        parent_issue_key, parent_url = extract_parent(o)
+
         reporter_gh = account_map.get(reporter_name)
         reporter = f"{reporter_dispname} (@{reporter_gh})" if reporter_gh else f"{reporter_dispname}"
         assignee_gh = account_map.get(assignee_name)
@@ -101,7 +102,7 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         body += f"""
 
 ---
-### Legacy Jira details
+### Legacy Jira
 
 [{jira_id}]({jira_issue_url(jira_id)}) by {reporter} on {created_datetime.strftime('%b %d %Y')}"""
 
@@ -114,6 +115,9 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
             body += f", resolved {resolutiondate_datetime.strftime('%b %d %Y')}"
         elif created_datetime.date() != updated_datetime.date():
             body += f", updated {updated_datetime.strftime('%b %d %Y')}"
+
+        if parent_issue_key:
+            body += f'\nParent: [{parent_issue_key}]({parent_url})'
 
         if environment:
             body += f'\nEnvironment:\n```\n{environment}\n```\n'
