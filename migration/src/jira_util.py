@@ -83,6 +83,15 @@ def extract_assignee(o: dict) -> tuple[str, str]:
     return (name, disp_name)
 
 
+def extract_parent_key(o: dict) -> str:
+    parent = o["fields"].get("parent")
+    if parent:
+        key = parent["key"]
+        if key:
+            return key
+    return None
+
+
 def extract_created(o: dict) -> str:
     return o.get("fields").get("created", "")
 
