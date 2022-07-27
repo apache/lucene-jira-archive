@@ -205,31 +205,11 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         for label in jira_labels:
             # GitHub does not allow commas in labels
             label = label.replace(",","")
-            # several label texts have to be tweaked; otherwise import fails. don't know why.
-            # split tokens with '-'
-            if label == "queryparser":
-                label = "query-parser"
-            if label == "fastvectorhighlighter":
-                label = "fast-vector-highlighter"
-            # capitalize
-            if label == "highlighter":
-                label = "Highlighter"
-            if label.startswith("java"):
-                label = re.sub(r"^java", "Java", label)
-            # uncapitalize
-            if label == "Documentation":
-                label = "documentation"
-            if label == "Sort":
-                label = "sort"
-            if label == "Highlighting":
-                label = "highlighting"
-            if label == "Stemmer":
-                label = "stemmer"
-            if label == "Scorer":
-                label = "scorer"
-            # truncate
-            if label == "spatialrecursiveprefixtreefieldtype":
-                label = "spatialrecursiveprefixtree"
+            # several label texts have to be skipped; otherwise import fails. don't know why.
+            if label in ["queryparser", "fastvectorhighlighter", "highlighter", "Documentation", "Sort", "Highlighting", "Stemmer", "Scorer", "spatialrecursiveprefixtreefieldtype"] or \
+                label.startswith("java"):
+                logger.warning(f"Jira label '{label}' was skipped for {jira_id}. Please manually attach it from GitHub Web GUI.")
+                continue
             labels.append(f"legacy-jira-label:{label}")
         if resolution:
             labels.append(f"legacy-jira-resolution:{resolution}")
