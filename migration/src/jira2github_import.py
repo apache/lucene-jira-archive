@@ -203,6 +203,33 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
             else:
                 logger.error(f"Unknown Component: {c}")
         for label in jira_labels:
+            # GitHub does not allow commas in labels
+            label = label.replace(",","")
+            # several label texts have to be tweaked; otherwise import fails. don't know why.
+            # split tokens with '-'
+            if label == "queryparser":
+                label = "query-parser"
+            if label == "fastvectorhighlighter":
+                label = "fast-vector-highlighter"
+            # capitalize
+            if label == "highlighter":
+                label = "Highlighter"
+            if label.startswith("java"):
+                label = re.sub(r"^java", "Java", label)
+            # uncapitalize
+            if label == "Documentation":
+                label = "documentation"
+            if label == "Sort":
+                label = "sort"
+            if label == "Highlighting":
+                label = "highlighting"
+            if label == "Stemmer":
+                label = "stemmer"
+            if label == "Scorer":
+                label = "scorer"
+            # truncate
+            if label == "spatialrecursiveprefixtreefieldtype":
+                label = "spatialrecursiveprefixtree"
             labels.append(f"legacy-jira-label:{label}")
         if resolution:
             labels.append(f"legacy-jira-resolution:{resolution}")
