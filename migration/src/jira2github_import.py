@@ -58,6 +58,9 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         pull_requests = extract_pull_requests(o)
         jira_labels = extract_labels(o)
         resolution = extract_resolution(o)
+        priority = extract_priority(o)
+        vote_count = extract_vote_count(o)
+        parent_issue_key = extract_parent_key(o)
 
         reporter_gh = account_map.get(reporter_name)
         reporter = f"{reporter_dispname} (@{reporter_gh})" if reporter_gh else f"{reporter_dispname}"
@@ -99,14 +102,22 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         body += f"""
 
 ---
-### Legacy Jira details
+### Legacy Jira
 
 [{jira_id}]({jira_issue_url(jira_id)}) by {reporter} on {created_datetime.strftime('%b %d %Y')}"""
 
+        if vote_count:
+            body += f", {vote_count} vote"
+            if vote_count > 1:
+                body += 's'
+            
         if resolutiondate_datetime is not None:
             body += f", resolved {resolutiondate_datetime.strftime('%b %d %Y')}"
         elif created_datetime.date() != updated_datetime.date():
             body += f", updated {updated_datetime.strftime('%b %d %Y')}"
+
+        if parent_issue_key:
+            body += f'\nParent: [{parent_issue_key}](https://issues.apache.org/jira/browse/{parent_issue_key})'
 
         if environment:
             body += f'\nEnvironment:\n```\n{environment}\n```\n'
@@ -195,6 +206,8 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
             labels.append(f"legacy-jira-label:{label}")
         if resolution:
             labels.append(f"legacy-jira-resolution:{resolution}")
+        if priority:
+            labels.append(f"legacy-jira-priority:{priority}")
 
         data = {
             "issue": {
