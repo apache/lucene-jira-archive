@@ -203,6 +203,13 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
             else:
                 logger.error(f"Unknown Component: {c}")
         for label in jira_labels:
+            # GitHub does not allow commas in labels
+            label = label.replace(",","")
+            # several label texts have to be skipped; otherwise import fails. don't know why.
+            if label in ["queryparser", "fastvectorhighlighter", "highlighter", "Documentation", "Sort", "Highlighting", "Stemmer", "Scorer", "spatialrecursiveprefixtreefieldtype"] or \
+                label.startswith("java"):
+                logger.warning(f"Jira label '{label}' was skipped for {jira_id}. Please manually attach it from GitHub Web GUI.")
+                continue
             labels.append(f"legacy-jira-label:{label}")
         if resolution:
             labels.append(f"legacy-jira-resolution:{resolution}")
