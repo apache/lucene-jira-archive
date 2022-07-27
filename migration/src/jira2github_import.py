@@ -208,6 +208,9 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
             labels.append(f"legacy-jira-resolution:{resolution}")
         if priority:
             labels.append(f"legacy-jira-priority:{priority}")
+        
+        # ensure there are not duplicate labels
+        labels = list(set(labels))
 
         data = {
             "issue": {
