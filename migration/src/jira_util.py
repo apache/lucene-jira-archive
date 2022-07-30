@@ -204,24 +204,25 @@ def extract_pull_requests(o: dict) -> list[str]:
     return res
 
 
+# space character + Jira emoji + space character
 JIRA_EMOJI_TO_UNICODE = {
-    "(y)": "\U0001F44D",
-    "(n)": "\U0001F44E",
-    "(i)": "\U0001F6C8",
-    "(/)": "\u2714",
-    "(x)": "\u274C",
-    "(!)": "\u26A0",
-    "(+)": "\u002B",
-    "(-)": "\u2212",
-    "(?)": "\u003F",
-    "(on)": "\U0001F4A1",
-    "(off)": "\U0001F4A1",
-    "(*)": "\u2B50",
-    "(*r)": "\u2B50",
-    "(*g)": "\u2B50",
-    "(*b)": "\u2B50",
-    "(flag)": "\U0001F3F4",
-    "(flagoff)": "\U0001F3F3"
+    "(?<=\s)\(y\)((?=$)|(?=\s))": "\U0001F44D",
+    "(?<=\s)\(n\)((?=$)|(?=\s))": "\U0001F44E",
+    "(?<=\s)\(i\)((?=$)|(?=\s))": "\U0001F6C8",
+    "(?<=\s)\(/\)((?=$)|(?=\s))": "\u2714",
+    "(?<=\s)\(x\)((?=$)|(?=\s))": "\u274C",
+    "(?<=\s)\(\!\)((?=$)|(?=\s))": "\u26A0",
+    "(?<=\s)\(\+\)((?=$)|(?=\s))": "\u002B",
+    "(?<=\s)\(\-\)((?=$)|(?=\s))": "\u2212",
+    "(?<=\s)\(\?\)((?=$)|(?=\s))": "\u003F",
+    "(?<=\s)\(on\)((?=$)|(?=\s))": "\U0001F4A1",
+    "(?<=\s)\(off\)((?=$)|(?=\s))": "\U0001F4A1",
+    "(?<=\s)\(\*\)((?=$)|(?=\s))": "\u2B50",
+    "(?<=\s)\(\*r\)((?=$)|(?=\s))": "\u2B50",
+    "(?<=\s)\(\*g\)((?=$)|(?=\s))": "\u2B50",
+    "(?<=\s)\(\*b\)((?=$)|(?=\s))": "\u2B50",
+    "(?<=\s)\(flag\)((?=$)|(?=\s))": "\U0001F3F4",
+    "(?<=\s)\(flagoff\)((?=$)|(?=\s))": "\U0001F3F3"
 }
 
 REGEX_CRLF = re.compile(r"\r\n")
@@ -245,7 +246,7 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: d
 
     # convert Jira special emojis into corresponding or similar Unicode characters
     for emoji, unicode in JIRA_EMOJI_TO_UNICODE.items():
-        text = text.replace(emoji, unicode)
+        text = re.sub(emoji, unicode, text)
 
     # convert Jira markup into Markdown with customization
     elements = MarkupElements()
