@@ -175,9 +175,9 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
 
             jira_comment_link = f'https://issues.apache.org/jira/browse/{jira_id}?focusedCommentId={comment_id}&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-{comment_id}'
                 
-            comment_body += f'[Legacy Jira: {comment_author(comment_author_name, comment_author_dispname)} on [{comment_time}]({jira_comment_link})]\n'
+            comment_data = f'[Legacy Jira: by {comment_author(comment_author_name, comment_author_dispname)} on [{comment_time}]({jira_comment_link})]\n\n{comment_body}'
             data = {
-                "body": comment_body
+                "body": comment_data
             }
             if comment_created:
                 data["created_at"] = jira_timestamp_to_github_timestamp(comment_created)
