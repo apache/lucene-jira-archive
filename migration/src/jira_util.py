@@ -1,4 +1,5 @@
 import re
+import itertools
 from dataclasses import dataclass
 from collections import defaultdict
 from typing import Optional
@@ -227,8 +228,8 @@ JIRA_EMOJI_TO_UNICODE = {
 
 REGEX_CRLF = re.compile(r"\r\n")
 REGEX_JIRA_KEY = re.compile(r"[^/]LUCENE-\d+")
-REGEX_MENTION_ATMARK = re.compile(r"((?<=^)@[\w\.]\+|(?<=[\s\(\"'])@[\w\.]+)(?=[\s\)\"'\?!,\.$])")  # this regex may capture only "@" + "<username>" mentions
-REGEX_MENION_TILDE = re.compile(r"((?<=^)\[~[\w\.]+\]|(?<=[\s\(\"'])\[~[\w\.]+\])(?=[\s\)\"'\?!,\.$])")  # this regex may capture only "[~" + "<username>" + "]" mentions
+REGEX_MENTION_ATMARK = re.compile(r"(^@[\w\.]+)|((?<=[\s\(\"'])@[\w\.]+)(?=[\s\)\"'\?!,\.$])")  # this regex may capture only "@" + "<username>" mentions
+REGEX_MENION_TILDE = re.compile(r"(^\[~[\w\.]+\])|((?<=[\s\(\"'])\[~[\w\.]+\])(?=[\s\)\"'\?!,\.$])")  # this regex may capture only "[~" + "<username>" + "]" mentions
 REGEX_LINK = re.compile(r"\[([^\]]+)\]\(([^\)]+)\)")
 
 
@@ -262,7 +263,7 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: d
     # convert @ mentions
     mentions = re.findall(REGEX_MENTION_ATMARK, text)
     if mentions:
-        mentions = set(mentions)
+        mentions = set(filter(lambda x: x != '', itertools.chain.from_iterable(mentions)))
         for m in mentions:
             jira_id = m[1:]
             disp_name = jira_users.get(jira_id)
@@ -274,7 +275,7 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: d
     # convert ~ mentions
     mentions = re.findall(REGEX_MENION_TILDE, text)
     if mentions:
-        mentions = set(mentions)
+        mentions = set(filter(lambda x: x != '', itertools.chain.from_iterable(mentions)))
         for m in mentions:
             jira_id = m[2:-1]
             disp_name = jira_users.get(jira_id)
