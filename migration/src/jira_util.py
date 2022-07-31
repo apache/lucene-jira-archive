@@ -61,7 +61,7 @@ def extract_priority(o: dict) -> Optional[str]:
     return None
 
 
-def extract_vote_count(o: dict) -> Optional[str]:
+def extract_vote_count(o: dict) -> Optional[int]:
     votes = o.get("fields").get("votes")
     if votes:
         vote_count = votes.get("votes")
@@ -84,7 +84,7 @@ def extract_assignee(o: dict) -> tuple[str, str]:
     return (name, disp_name)
 
 
-def extract_parent_key(o: dict) -> str:
+def extract_parent_key(o: dict) -> Optional[str]:
     parent = o["fields"].get("parent")
     if parent:
         key = parent["key"]
@@ -163,7 +163,7 @@ def extract_subtasks(o: dict) -> list[str]:
     return [x.get("key", "") for x in o.get("fields").get("subtasks", [])]
 
 
-def extract_comments(o: dict) -> list[str, str, str, str, str]:
+def extract_comments(o: dict) -> list[tuple[str, str, str, str, str, str]]:
     comments = o.get("fields").get("comment", {}).get("comments", [])
     if not comments:
         return []
