@@ -38,11 +38,18 @@ class TweakedBlockQuote(AbstractMarkup):
 class TweakedQuote(AbstractMarkup):
     is_inline_element = False
 
+    def action(self, tokens: ParseResults) -> str:
+        # escape HTML tag
+        token = tokens[0].replace("<", "&lt;")
+        token = token.replace(">", "&gt;")
+        return token
+
     @property
     def expr(self) -> ParserElement:
         return ("\n" | StringStart()) + Combine(
             Literal("bq. ").setParseAction(replaceWith("> "))
-            + SkipTo(LineEnd()) + LineEnd().setParseAction(replaceWith("\n\n")) # needs additional line feed at the end of quotation to preserve indentation
+            + SkipTo(LineEnd()).setParseAction(self.action)
+            + LineEnd().setParseAction(replaceWith("\n\n")) # needs additional line feed at the end of quotation to preserve indentation
         )
 
 
