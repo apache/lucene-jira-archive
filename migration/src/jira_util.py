@@ -299,7 +299,7 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: d
     return text
 
 
-def embed_gh_issue_link(text: str, issue_id_map: dict[str, str], gh_number_self: int = None) -> str:
+def embed_gh_issue_link(text: str, issue_id_map: dict[str, int], gh_number_self: int) -> str:
     """Embed GitHub issue number
     """
     def repl_simple(m: re.Match):

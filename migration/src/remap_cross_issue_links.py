@@ -21,7 +21,7 @@ logger = logging_setup(log_dir, "remap_cross_issue_links")
 
 
 @retry_upto(3, 1.0, logger)
-def remap_issue_link_in_issue_body(issue_number: int, issue_id_map: dict[str, str], data_dir: Path, token: str, repo: str):
+def remap_issue_link_in_issue_body(issue_number: int, issue_id_map: dict[str, int], data_dir: Path, token: str, repo: str):
     body = get_issue_body(token, repo, issue_number, logger)
     if body:
         updated_body = embed_gh_issue_link(body, issue_id_map, issue_number)
@@ -36,7 +36,7 @@ def remap_issue_link_in_issue_body(issue_number: int, issue_id_map: dict[str, st
 
 
 @retry_upto(3, 1.0, logger)
-def remap_issue_link_in_comments(issue_number: int, issue_id_map: dict[str, str], data_dir: Path, token: str, repo: str):
+def remap_issue_link_in_comments(issue_number: int, issue_id_map: dict[str, int], data_dir: Path, token: str, repo: str):
     comments = get_issue_comments(token, repo, issue_number, logger)
     if not comments:
         return
