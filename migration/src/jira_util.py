@@ -231,6 +231,7 @@ REGEX_JIRA_KEY = re.compile(r"[^/]LUCENE-\d+")
 REGEX_MENTION_ATMARK = re.compile(r"(^@[\w\.@_-]+?)|((?<=[\s\(\"'])@[\w\.@_-]+?)(?=[\s\)\"'\?!,;:\.$])")  # this regex may capture only "@" + "<username>" mentions
 REGEX_MENION_TILDE = re.compile(r"(^\[~[\w\.@_-]+?\])|((?<=[\s\(\"'])\[~[\w\.@_-]+?\])(?=[\s\)\"'\?!,;:\.$])")  # this regex may capture only "[~" + "<username>" + "]" mentions
 REGEX_LINK = re.compile(r"\[([^\]]+)\]\(([^\)]+)\)")
+REGEX_GITHUB_ISSUE_LINK = re.compile(r"(\s)(#\d+)(\s)")
 
 
 def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: dict[str, str] = {}, jira_users: dict[str, str] = {}) -> str:
@@ -241,6 +242,11 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: d
         for src, repl in att_replace_map.items():
             if m.group(2) == src:
                 res = f"[{m.group(1)}]({repl})"
+        return res
+
+    def escape_gh_issue_link(m: re.Match):
+        # escape #NN by backticks to prevent creating an unintentional issue link
+        res = f"{m.group(1)}`{m.group(2)}`{m.group(3)}"
         return res
 
     text = re.sub(REGEX_CRLF, "\n", text)  # jira2markup does not support carriage return (?)
@@ -284,7 +290,11 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: d
             mention = lambda: f"@{gh_m}" if gh_m else disp_name if disp_name else f"`~{jira_id}`"
             text = text.replace(m, mention())
     
+    # convert links to attachments
     text = re.sub(REGEX_LINK, repl_att, text)
+
+    # escape github style cross-issue link (#NN)
+    text = re.sub(REGEX_GITHUB_ISSUE_LINK, escape_gh_issue_link, text)
 
     return text
 
