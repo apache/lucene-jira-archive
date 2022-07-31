@@ -289,34 +289,34 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: d
     return text
 
 
-def embed_gh_issue_link(text: str, issue_id_map: dict[str, str]) -> str:
+def embed_gh_issue_link(text: str, issue_id_map: dict[str, str], gh_number_self: int = None) -> str:
     """Embed GitHub issue number
     """
     def repl_simple(m: re.Match):
         res = m.group(0)
         gh_number = issue_id_map.get(m.group(2))
-        if gh_number:
+        if gh_number and gh_number != gh_number_self:
             res = f"{m.group(1)}#{gh_number}{m.group(3)}"
         return res
     
     def repl_paren(m: re.Match):
         res = m.group(0)
         gh_number = issue_id_map.get(m.group(2))
-        if gh_number:
+        if gh_number and gh_number != gh_number_self:
             res = f"{m.group(1)}#{gh_number}{m.group(3)}"
         return res
 
     def repl_bracket(m: re.Match):
         res = m.group(0)
         gh_number = issue_id_map.get(m.group(2))
-        if gh_number:
+        if gh_number and gh_number != gh_number_self:
             res = f"#{gh_number}"
         return res
     
     def repl_md_link(m: re.Match):
         res = m.group(0)
         gh_number = issue_id_map.get(m.group(1))
-        if gh_number:
+        if gh_number and gh_number != gh_number_self:
             res = f"{m.group(0)} (#{gh_number})"
             # print(res)
         return res
