@@ -142,8 +142,12 @@ def read_account_map(account_mapping_file: Path) -> dict[str, str]:
     with open(account_mapping_file) as fp:
         fp.readline()  # skip header
         for line in fp:
+            line = line.strip()
+            if line.startswith('#'):
+                continue
             cols = line.strip().split(",")
             if len(cols) < 2:
+                logger.warning(f"Skipping malformed entry {line} (< 2 columns) in {account_mapping_file}")
                 continue
             id_map[cols[0]] = cols[1]  # jira name -> github account
     return id_map
