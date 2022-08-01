@@ -232,7 +232,7 @@ REGEX_MENTION_ATMARK = re.compile(r"(^@[\w\.@_-]+?)|((?<=[\s\(\"'])@[\w\.@_-]+?)
 REGEX_MENION_TILDE = re.compile(r"(^\[~[\w\.@_-]+?\])|((?<=[\s\(\"'])\[~[\w\.@_-]+?\])(?=[\s\)\"'\?!,;:\.$])")  # this regex may capture only "[~" + "<username>" + "]" mentions
 REGEX_LINK = re.compile(r"\[([^\]]+)\]\(([^\)]+)\)")
 REGEX_GITHUB_ISSUE_LINK = re.compile(r"(\s)(#\d+)(\s)")
-
+REGEX_EXCESS_QUOTING = re.compile(r"(^\s*>.*?)\n([^\s])", re.MULTILINE)
 
 def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: dict[str, str] = {}, jira_users: dict[str, str] = {}) -> str:
     """Convert Jira markup to Markdown
@@ -250,6 +250,9 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: d
         return res
 
     text = re.sub(REGEX_CRLF, "\n", text)  # jira2markup does not support carriage return (?)
+
+    # #93: best effort to prevent over-quoting when > markdown appears in Jira issues
+    text = REGEX_EXCESS_QUOTING.sub(r"\1\n\n\2", text)
 
     # convert Jira special emojis into corresponding or similar Unicode characters
     for emoji, unicode in JIRA_EMOJI_TO_UNICODE.items():
