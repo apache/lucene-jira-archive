@@ -287,7 +287,7 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: d
             disp_name = jira_users.get(jira_id)
             gh_m = account_map.get(jira_id)
             # replace Jira name with GitHub account or Jira display name if it is available, othewise show Jira name with ``
-            mention = lambda: f"@{gh_m}" if gh_m else disp_name if disp_name else f"`~{jira_id}`"
+            mention = lambda: f"@{gh_m}" if gh_m else disp_name if disp_name else f"`@{jira_id}`"
             text = text.replace(m, mention())
     
     # convert links to attachments
@@ -295,6 +295,9 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: d
 
     # escape github style cross-issue link (#NN)
     text = re.sub(REGEX_GITHUB_ISSUE_LINK, escape_gh_issue_link, text)
+
+    # escape tilde (https://github.com/apache/lucene-jira-archive/issues/89)
+    text = text.replace("~", "\~")
 
     return text
 
