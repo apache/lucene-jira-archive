@@ -297,6 +297,7 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: d
     text = re.sub(REGEX_GITHUB_ISSUE_LINK, escape_gh_issue_link, text)
 
     # escape tilde (https://github.com/apache/lucene-jira-archive/issues/89)
+    # note: this should be done at the end of text conversoin
     text = text.replace("~", "\~")
 
     return text
