@@ -255,17 +255,6 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: d
     for emoji, unicode in JIRA_EMOJI_TO_UNICODE.items():
         text = re.sub(emoji, unicode, text)
 
-    # convert Jira markup into Markdown with customization
-    elements = MarkupElements()
-    elements.replace(UnorderedList, UnorderedTweakedList)
-    elements.replace(OrderedList, OrderedTweakedList)
-    elements.replace(BlockQuote, TweakedBlockQuote)
-    elements.replace(Quote, TweakedQuote)
-    elements.replace(Monospaced, TweakedMonospaced)
-    elements.insert_after(Ruler, LongRuler)
-    elements.append(EscapeHtmlTag)
-    text = jira2markdown.convert(text, elements=elements)
-
     # convert @ mentions
     mentions = re.findall(REGEX_MENTION_ATMARK, text)
     if mentions:
@@ -287,9 +276,23 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: d
             disp_name = jira_users.get(jira_id)
             gh_m = account_map.get(jira_id)
             # replace Jira name with GitHub account or Jira display name if it is available, othewise show Jira name with ``
-            mention = lambda: f"@{gh_m}" if gh_m else disp_name if disp_name else f"`~{jira_id}`"
+            mention = lambda: f"@{gh_m}" if gh_m else disp_name if disp_name else f"`@{jira_id}`"
             text = text.replace(m, mention())
     
+    # escape tilde to avoid unintentional strike-throughs in Markdown
+    text = text.replace("~", "\~")
+
+    # convert Jira markup into Markdown with customization
+    elements = MarkupElements()
+    elements.replace(UnorderedList, UnorderedTweakedList)
+    elements.replace(OrderedList, OrderedTweakedList)
+    elements.replace(BlockQuote, TweakedBlockQuote)
+    elements.replace(Quote, TweakedQuote)
+    elements.replace(Monospaced, TweakedMonospaced)
+    elements.insert_after(Ruler, LongRuler)
+    elements.append(EscapeHtmlTag)
+    text = jira2markdown.convert(text, elements=elements)
+
     # convert links to attachments
     text = re.sub(REGEX_LINK, repl_att, text)
 
