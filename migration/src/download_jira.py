@@ -79,7 +79,7 @@ def download_attachments(num: int, dump_dir: Path, att_data_dir: Path):
                 files[filename] = Attachment(filename=filename, created=created, content=content, mime_type=mime_type)
 
     for (_, a) in files.items():
-        logger.info(f"Downloading attachment {a.filename}")
+        logger.debug(f"Downloading attachment {a.filename}")
         res = requests.get(a.content, headers={"Accept": a.mime_type})
         if res.status_code != 200:
             logger.error(f"Failed to download attachment {a.filename} in issue {jira_issue_id(num)}")
