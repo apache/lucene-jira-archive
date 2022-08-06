@@ -228,8 +228,8 @@ JIRA_EMOJI_TO_UNICODE = {
 
 REGEX_CRLF = re.compile(r"\r\n")
 REGEX_JIRA_KEY = re.compile(r"[^/]LUCENE-\d+")
-REGEX_MENTION_ATMARK = re.compile(r"(^@[\w\.@_-]+?)|((?<=[\s\(\"'，．])@[\w\.@_-]+?)(?=[\s\)\"'\?!,，;:\.．$])")  # this regex may capture only "@" + "<username>" mentions
-REGEX_MENION_TILDE = re.compile(r"(^\[~[\w\.@_-]+?\])|((?<=[\s\(\"'，．])\[~[\w\.@_-]+?\])(?=[\s\)\"'\?!,，;:\.．$])")  # this regex may capture only "[~" + "<username>" + "]" mentions
+REGEX_MENTION_ATMARK = re.compile(r"(^@[\w\s\.@_-]+?)|((?<=[\s\(\"'，．])@[\w\s\.@_-]+?)(?=[\s\)\"'\?!,，;:\.．$])")  # this regex may capture only "@" + "<username>" mentions
+REGEX_MENION_TILDE = re.compile(r"(^\[~[\w\s\.@_-]+?\])|((?<=[\s\(\"'，．])\[~[\w\s\.@_-]+?\])(?=[\s\)\"'\?!,，;:\.．$])")  # this regex may capture only "[~" + "<username>" + "]" mentions
 REGEX_LINK = re.compile(r"\[([^\]]+)\]\(([^\)]+)\)")
 REGEX_GITHUB_ISSUE_LINK = re.compile(r"(\s)(#\d+)(\s)")
 
