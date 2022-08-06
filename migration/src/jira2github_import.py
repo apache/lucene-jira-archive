@@ -102,9 +102,7 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         body += f"""
 
 ---
-### Legacy Jira
-
-[{jira_id}]({jira_issue_url(jira_id)}) by {reporter} on {created_datetime.strftime('%b %d %Y')}"""
+Migrated from [{jira_id}]({jira_issue_url(jira_id)}) by {reporter} on {created_datetime.strftime('%b %d %Y')}"""
 
         if vote_count:
             body += f", {vote_count} vote"
