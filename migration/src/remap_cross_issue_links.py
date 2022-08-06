@@ -13,7 +13,7 @@ import json
 
 from common import LOG_DIRNAME, MAPPINGS_DATA_DIRNAME, ISSUE_MAPPING_FILENAME, GITHUB_REMAPPED_DATA_DIRNAME, MaxRetryLimitExceedException, logging_setup, read_issue_id_map, retry_upto, github_remapped_issue_data_file, github_remapped_comment_data_file
 from github_issues_util import *
-from jira_util import embed_gh_issue_link
+from jira_util import create_issue_links_outside_projects, embed_gh_issue_link
 
 
 log_dir = Path(__file__).resolve().parent.parent.joinpath(LOG_DIRNAME)
@@ -25,6 +25,7 @@ def remap_issue_link_in_issue_body(issue_number: int, issue_id_map: dict[str, in
     body = get_issue_body(token, repo, issue_number, logger)
     if body:
         updated_body = embed_gh_issue_link(body, issue_id_map, issue_number)
+        updated_body = create_issue_links_outside_projects(body)
         if updated_body == body:
             logger.debug(f"Issue {issue_number} does not contain any cross-issue links; nothing to do.")
             return
@@ -45,6 +46,7 @@ def remap_issue_link_in_comments(issue_number: int, issue_id_map: dict[str, int]
         id = comment.id
         body = comment.body
         updated_body = embed_gh_issue_link(body, issue_id_map, issue_number)
+        updated_body = create_issue_links_outside_projects(body)
         if updated_body == body:
             logger.debug(f"Comment {id} does not contain any cross-issue links; nothing to do.")
             continue
