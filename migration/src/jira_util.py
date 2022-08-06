@@ -354,7 +354,6 @@ def create_issue_links_outside_projects(text: str) -> str:
         if prj not in ALL_JIRA_PROJECTS:
             return m.group(0)
         jira_link = ASF_JIRA_BASE + m.group(2)
-        print(jira_link)
         return f"{m.group(1)}[{m.group(2)}]({jira_link}){m.group(3)}"
 
     def repl_paren(m: re.Match):
@@ -362,7 +361,6 @@ def create_issue_links_outside_projects(text: str) -> str:
         if prj not in ALL_JIRA_PROJECTS:
             return m.group(0)
         jira_link = ASF_JIRA_BASE + m.group(2)
-        print(jira_link)
         return f"{m.group(1)}[{m.group(2)}]({jira_link}){m.group(3)}"
 
     def repl_bracket(m: re.Match):
