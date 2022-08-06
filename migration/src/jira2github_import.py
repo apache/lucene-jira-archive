@@ -102,9 +102,7 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         body += f"""
 
 ---
-### Legacy Jira
-
-[{jira_id}]({jira_issue_url(jira_id)}) by {reporter} on {created_datetime.strftime('%b %d %Y')}"""
+Migrated from [{jira_id}]({jira_issue_url(jira_id)}) by {reporter}"""
 
         if vote_count:
             body += f", {vote_count} vote"
@@ -175,7 +173,7 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
 
             jira_comment_link = f'https://issues.apache.org/jira/browse/{jira_id}?focusedCommentId={comment_id}&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-{comment_id}'
                 
-            comment_data = f'[Legacy Jira: by {comment_author(comment_author_name, comment_author_dispname)} on [{comment_time}]({jira_comment_link})]\n\n{comment_body}'
+            comment_data = f'{comment_author(comment_author_name, comment_author_dispname)} ([migrated from JIRA]({jira_comment_link}))\n\n{comment_body}'
             data = {
                 "body": comment_data
             }
