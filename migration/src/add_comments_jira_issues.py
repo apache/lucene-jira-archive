@@ -41,7 +41,8 @@ def __add_comment(token: str, issue_id: str, comment: str, logger: Logger) -> bo
 
 @retry_upto(3, 1.0, logger)
 def add_moved_to_comment(token: str, issue_id: str, github_url: str) -> bool:
-    comment = f"""[TEST] This was moved to GitHub issue: {github_url}."""
+    gh_issue_number = github_url.rsplit("/", 1)[1]
+    comment = f"""[TEST] This was moved to GitHub issue: [#{gh_issue_number}|{github_url}]."""
     res = __add_comment(token, issue_id, comment, logger)
     if res:
         logger.debug(f"Added a comment to {issue_id}")
