@@ -205,6 +205,8 @@ def extract_pull_requests(o: dict) -> list[str]:
     return res
 
 
+REGEX_EMBEDDED_IMAGE = r"!([^!\n]+)!"
+
 # space character + Jira emoji + space character
 JIRA_EMOJI_TO_UNICODE = {
     "(?<=\s)\(y\)((?=$)|(?=\s))": "\U0001F44D",
@@ -232,6 +234,23 @@ REGEX_MENTION_ATMARK = re.compile(r"(^@[\w\s\.@_-]+?)|((?<=[\s\({\[\"'，．])@[
 REGEX_MENION_TILDE = re.compile(r"(^\[~[\w\s\.@_-]+?\])|((?<=[\s\({\[\"'，．])\[~[\w\s\.@_-]+?\])($|(?=[\s\)|\]\"'\?!,，;:\.．]))")  # this regex may capture only "[~" + "<username>" + "]" mentions
 REGEX_LINK = re.compile(r"\[([^\]]+)\]\(([^\)]+)\)")
 REGEX_GITHUB_ISSUE_LINK = re.compile(r"(\s)(#\d+)(\s)")
+
+
+def extract_embedded_image_files(text: str, image_files: list[str]) -> set[str]:
+    """Extract embedded image files in the given text.
+    https://jira.atlassian.com/secure/WikiRendererHelpAction.jspa?section=images
+    """
+    # capture candidates for embedded images
+    candidates = re.findall(REGEX_EMBEDDED_IMAGE, text)
+    embedded_image_files = set([])
+    for x in candidates:
+        if x in image_files:
+            # !xyz.png!
+            embedded_image_files.add(x)
+        elif any(map(lambda s: x.startswith(s + "|"), image_files)):
+            # !xyz.png|styles!
+            embedded_image_files.add(x.split("|", 1)[0])
+    return embedded_image_files
 
 
 def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: dict[str, str] = {}, jira_users: dict[str, str] = {}) -> str:

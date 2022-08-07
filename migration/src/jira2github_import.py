@@ -61,6 +61,7 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         priority = extract_priority(o)
         vote_count = extract_vote_count(o)
         parent_issue_key = extract_parent_key(o)
+        comments = extract_comments(o)
 
         reporter_gh = account_map.get(reporter_name)
         reporter = f"{reporter_dispname} (@{reporter_gh})" if reporter_gh else f"{reporter_dispname}"
@@ -73,6 +74,14 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         for (filename, cnt) in attachments:
             attachment_list_items.append(f"[{filename}]({attachment_url(num, filename, att_repo, att_branch)})" + (f" (versions: {cnt})" if cnt > 1 else ""))
             att_replace_map[filename] = attachment_url(num, filename, att_repo, att_branch)
+
+        # detect unmentioned image files
+        # https://github.com/apache/lucene-jira-archive/issues/126
+        image_files = [x[0] for x in attachments if re.match(r"^.+\.(png|jpg|jpeg|gif|svg|bmp|ico|tif|tiff)$", x[0], flags=re.IGNORECASE)]
+        embedded_image_files = extract_embedded_image_files(description, image_files)
+        for (_, _, comment_body, _, _, _) in comments:
+            embedded_image_files.update(extract_embedded_image_files(comment_body, image_files))
+        unmentioned_images = [x for x in image_files if x not in embedded_image_files]
 
         # embed github issue number next to linked issue keys
         linked_issues_list_items = []
@@ -93,6 +102,10 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
 
         try:
             body = f'{convert_text(description, att_replace_map, account_map, jira_users)}\n\n'
+            for image_file in unmentioned_images:
+                # show orphaned (unmentioned) image files in the issue description
+                att_url = att_replace_map.get(image_file)
+                body += f'![{image_file}]({att_url})\n\n'
         except Exception as e:
             logger.error(traceback.format_exc(limit=100))
             logger.error(f"Failed to convert opening issue description on {jira_issue_id(num)} due to above exception, ({str(e)}); falling back to original Jira description as code block.")
@@ -149,7 +162,6 @@ Migrated from [{jira_id}]({jira_issue_url(jira_id)}) by {reporter}"""
                     lines.append(line)
             return "\n".join(lines)
 
-        comments = extract_comments(o)
         comments_data = []
         for (comment_author_name, comment_author_dispname, comment_body, comment_created, comment_updated, comment_id) in comments:
             # TODO: since we now have accurate created_at reflected in the github comment, mabye we remove these
