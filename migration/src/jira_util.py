@@ -330,7 +330,7 @@ def embed_gh_issue_link(text: str, issue_id_map: dict[str, int], gh_number_self:
         res = m.group(0)
         gh_number = issue_id_map.get(m.group(1))
         if gh_number and gh_number != gh_number_self:
-            res = f"#{gh_number} ({m.group(0)})"
+            res = f"#{gh_number}"
             # print(res)
         return res
 
