@@ -311,6 +311,7 @@ if __name__ == "__main__":
     def task(num):
         logger = logging.getLogger(name)
         try:
+            # if you have attachment files in $JIRA_ATTACHMENTS_DIRPATH, text attachments'data may be embedded in issue comments.
             att_dir = Path(JIRA_ATTACHMENTS_DIRPATH).joinpath(jira_issue_id(num)) if JIRA_ATTACHMENTS_DIRPATH else None
             convert_issue(num, dump_dir, output_dir, account_map, jira_users, github_att_repo, github_att_branch, att_dir, logger)
         except Exception as e:
