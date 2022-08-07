@@ -355,6 +355,8 @@ def embed_gh_issue_link(text: str, issue_id_map: dict[str, int], gh_number_self:
 
     text = re.sub(r"(\s)(LUCENE-\d+)([\s,;:\?\!\.])", repl_simple, text)
     text = re.sub(r"(^)(LUCENE-\d+)([\s,;:\?\!\.])", repl_simple, text)
+    text = re.sub(r"(\s)https?://issues\.apache\.org/.+/(LUCENE-\d+)([\s,;:\?\!\.])", repl_simple, text)
+    text = re.sub(r"(^)https?://issues\.apache\.org/.+/(LUCENE-\d+)([\s,;:\?\!\.])", repl_simple, text)
     text = re.sub(r"(\()(LUCENE-\d+)(\))", repl_paren, text)
     text = re.sub(r"(\[)(LUCENE-\d+)(\])(?!\()", repl_bracket, text)
     text = re.sub(r"\[(LUCENE-\d+)\]\(https?[^\)]+LUCENE-\d+\)", repl_md_link, text)
