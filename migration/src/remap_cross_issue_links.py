@@ -25,7 +25,7 @@ def remap_issue_link_in_issue_body(issue_number: int, issue_id_map: dict[str, in
     body = get_issue_body(token, repo, issue_number, logger)
     if body:
         updated_body = embed_gh_issue_link(body, issue_id_map, issue_number)
-        updated_body = create_issue_links_outside_projects(body)
+        updated_body = create_issue_links_outside_projects(updated_body)
         if updated_body == body:
             logger.debug(f"Issue {issue_number} does not contain any cross-issue links; nothing to do.")
             return
@@ -46,7 +46,7 @@ def remap_issue_link_in_comments(issue_number: int, issue_id_map: dict[str, int]
         id = comment.id
         body = comment.body
         updated_body = embed_gh_issue_link(body, issue_id_map, issue_number)
-        updated_body = create_issue_links_outside_projects(body)
+        updated_body = create_issue_links_outside_projects(updated_body)
         if updated_body == body:
             logger.debug(f"Comment {id} does not contain any cross-issue links; nothing to do.")
             continue
