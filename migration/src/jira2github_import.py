@@ -77,7 +77,7 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
 
         # detect unmentioned image files
         # https://github.com/apache/lucene-jira-archive/issues/126
-        image_files = [x[0] for x in attachments if re.match(r"^.+\.(png|jpg|jpeg|gif|svg)$", x[0], flags=re.IGNORECASE)]
+        image_files = [x[0] for x in attachments if re.match(r"^.+\.(png|jpg|jpeg|gif|svg|bmp|ico|tif|tiff)$", x[0], flags=re.IGNORECASE)]
         embedded_image_files = extract_embedded_image_files(description, image_files)
         for (_, _, comment_body, _, _, _) in comments:
             embedded_image_files.update(extract_embedded_image_files(comment_body, image_files))
