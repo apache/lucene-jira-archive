@@ -6,7 +6,6 @@ from pyparsing import (
     Literal,
     MatchFirst,
     OneOrMore,
-    ZeroOrMore,
     Optional,
     ParserElement,
     ParseResults,
@@ -18,7 +17,28 @@ from pyparsing import (
 from jira2markdown.markup.advanced import Panel
 from jira2markdown.markup.base import AbstractMarkup
 from jira2markdown.markup.text_effects import BlockQuote, Color
-from jira2markdown.markup.lists import ListIndentState, ListIndent
+from jira2markdown.markup.lists import ListIndentState
+
+
+class ListIndentTabSupport(ParserElement):
+    def __init__(self, indent_state: ListIndentState, tokens: str, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.name = "ListIndent"
+        self.indent_state = indent_state
+        self.tokens = tokens
+
+    def parseImpl(self, instring, loc, doActions=True):
+        exprs = []
+        for token in self.tokens:
+            for indent in range(self.indent_state.indent + 1, max(0, self.indent_state.indent - 2), -1):
+                # occasionally, the separator can be a tab (commitbot's comment)
+                # https://github.com/apache/lucene-jira-archive/issues/112
+                exprs.append(Literal(token * indent + " ") | Literal(token * indent + "\t"))
+
+        loc, result = MatchFirst(exprs).parseImpl(instring, loc, doActions)
+        self.indent_state.indent = len(result[0]) - 1
+        return loc, result
 
 
 class TweakedList(AbstractMarkup):
@@ -45,7 +65,16 @@ class TweakedList(AbstractMarkup):
                 if len(result) == 0:
                     result.append("")
                 continue
-            bullets, text = line.split(" ", maxsplit=1)
+            cols = line.split(" ", maxsplit=1)
+            if len(cols) > 1:
+                bullets, text = cols[0], cols[1]
+            else:
+                # occasionally, the separator can be a tab (commitbot's comment)
+                cols = line.split("\t", maxsplit=1)
+                if len(cols) > 1:
+                    bullets, text = cols[0], cols[1]
+                else:
+                    continue
 
             nested_indent = 0
             while bullets[0] == self.nested_token:
@@ -74,7 +103,7 @@ class TweakedList(AbstractMarkup):
         ROW = (LineStart() ^ LineEnd()) + Combine(
             Optional(NL)
             + Optional(self.nested_token, default="")
-            + ListIndent(self.indent_state, self.tokens)
+            + ListIndentTabSupport(self.indent_state, self.tokens)
             + SkipTo(NL + Optional(White(" \t")) + Char(self.nested_token + self.tokens) | LIST_BREAK, ignore=IGNORE)
         )
 
