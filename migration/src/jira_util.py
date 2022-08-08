@@ -1,3 +1,4 @@
+from pathlib import Path
 import re
 import itertools
 from dataclasses import dataclass
@@ -236,6 +237,32 @@ REGEX_LINK = re.compile(r"\[([^\]]+)\]\(([^\)]+)\)")
 REGEX_GITHUB_ISSUE_LINK = re.compile(r"(\s)(#\d+)(\s)")
 
 
+# common file extensions in Lucene Jira attachments
+# these extensions appear at least three times in Lucene Jira.
+FILE_EXT_TO_LANG = {
+    ".patch": "diff",
+    ".PATCH": "diff",
+    ".pat": "diff",
+    ".diff": "diff",
+    ".java": "java",
+    ".jj": "java",
+    ".jflex": "java",  # text?
+    ".txt": "text",
+    ".log": "text",
+    ".out": "text",
+    ".alg": "text",
+    ".perf": "text",
+    ".benchmark": "text",
+    ".test": "text",
+    ".py": "python",
+    ".html": "html",
+    ".xml": "xml",
+    ".sh": "sh",
+    ".json": "json",
+    ".jsp": "jsp",
+    ".properties": "ini"
+}
+
 def extract_embedded_image_files(text: str, image_files: list[str]) -> set[str]:
     """Extract embedded image files in the given text.
     https://jira.atlassian.com/secure/WikiRendererHelpAction.jspa?section=images
@@ -253,7 +280,7 @@ def extract_embedded_image_files(text: str, image_files: list[str]) -> set[str]:
     return embedded_image_files
 
 
-def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: dict[str, str] = {}, jira_users: dict[str, str] = {}) -> str:
+def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: dict[str, str] = {}, jira_users: dict[str, str] = {}, att_dir: Optional[Path] = None) -> str:
     """Convert Jira markup to Markdown
     """
     def repl_att(m: re.Match):
@@ -318,6 +345,28 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: d
     # escape github style cross-issue link (#NN)
     text = re.sub(REGEX_GITHUB_ISSUE_LINK, escape_gh_issue_link, text)
 
+    # embed attachments (patches, etc.) if possible
+    links = re.findall(REGEX_LINK, text)
+    if links and att_dir:
+        paths = list(filter(lambda p: p.exists(), (att_dir.joinpath(x[0]) for x in links)))
+        if paths:
+            path = paths[0]
+            # skip unknown file extensions; skip too large files.
+            if path.suffix in FILE_EXT_TO_LANG and path.stat().st_size < 50000:
+                text += __textdata_as_details(path, FILE_EXT_TO_LANG[path.suffix])
+
+    return text
+
+
+def __textdata_as_details(path: Path, lang: str) -> str:
+    assert path.exists()
+    name = path.name
+    att_open = "open" if path.stat().st_size < 5000 else ""
+    with open(path) as fp:
+        data = fp.read()
+        # use <details> markup to collapse long texts as default
+        # https://gist.github.com/pierrejoubert73/902cc94d79424356a8d20be2b382e1ab
+        text = f"\n<details {att_open}>\n<summary>{name}</summary>\n\n```{lang}\n{data}\n```\n\n</details>\n\n"
     return text
 
 
