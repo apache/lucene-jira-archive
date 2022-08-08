@@ -7,10 +7,12 @@ from typing import Optional
 
 import jira2markdown
 from jira2markdown.elements import MarkupElements
+from jira2markdown.markup.advanced import Code
 from jira2markdown.markup.lists import UnorderedList, OrderedList
 from jira2markdown.markup.text_effects import BlockQuote, Quote, Monospaced
 from jira2markdown.markup.text_breaks import Ruler
 
+from markup.advanced import TweakedCode
 from markup.lists import UnorderedTweakedList, OrderedTweakedList
 from markup.text_effects import EscapeHtmlTag, TweakedBlockQuote, TweakedQuote, TweakedMonospaced
 from markup.text_breaks import LongRuler
@@ -330,6 +332,7 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: d
 
     # convert Jira markup into Markdown with customization
     elements = MarkupElements()
+    elements.replace(Code, TweakedCode)
     elements.replace(UnorderedList, UnorderedTweakedList)
     elements.replace(OrderedList, OrderedTweakedList)
     elements.replace(BlockQuote, TweakedBlockQuote)
