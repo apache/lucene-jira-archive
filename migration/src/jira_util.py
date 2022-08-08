@@ -361,11 +361,12 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: d
 def __textdata_as_details(path: Path, lang: str) -> str:
     assert path.exists()
     name = path.name
+    att_open = "open" if path.stat().st_size < 5000 else ""
     with open(path) as fp:
         data = fp.read()
         # use <details> markup to collapse long texts as default
         # https://gist.github.com/pierrejoubert73/902cc94d79424356a8d20be2b382e1ab
-        text = f"\n<details>\n<summary>{name}</summary>\n\n```{lang}\n{data}\n```\n\n</details>\n\n"
+        text = f"\n<details {att_open}>\n<summary>{name}</summary>\n\n```{lang}\n{data}\n```\n\n</details>\n\n"
     return text
 
 
