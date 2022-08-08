@@ -238,6 +238,7 @@ REGEX_GITHUB_ISSUE_LINK = re.compile(r"(\s)(#\d+)(\s)")
 
 
 # common file extensions in Lucene Jira attachments
+# these extensions appear at least three times in Lucene Jira.
 FILE_EXT_TO_LANG = {
     ".patch": "diff",
     ".PATCH": "diff",
