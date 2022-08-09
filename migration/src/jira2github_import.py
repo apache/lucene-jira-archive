@@ -20,8 +20,8 @@ from common import *
 from jira_util import *
 
 
-def attachment_url(issue_num: int, filename: str, att_repo: str, att_branch: str) -> str:
-    return f"https://raw.githubusercontent.com/{att_repo}/{att_branch}/attachments/{jira_issue_id(issue_num)}/{quote(filename)}"
+def attachment_url(issue_num: int, filename: str, att_base_url: str) -> str:
+    return f"{att_base_url}/{jira_issue_id(issue_num)}/{quote(filename)}"
 
 
 def jira_timestamp_to_github_timestamp(ts: str) -> str:
@@ -30,7 +30,7 @@ def jira_timestamp_to_github_timestamp(ts: str) -> str:
     return ts[:-9] + "Z"
 
 
-def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[str, str], jira_users: dict[str, str], att_repo: str, att_branch: str, att_dir: Optional[Path], logger: Logger) -> bool:
+def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[str, str], jira_users: dict[str, str], att_base_url: str, att_dir: Optional[Path], logger: Logger) -> bool:
     jira_id = jira_issue_id(num)
     dump_file = jira_dump_file(dump_dir, num)
     if not dump_file.exists():
@@ -72,8 +72,8 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
         attachment_list_items = []
         att_replace_map = {}
         for (filename, cnt) in attachments:
-            attachment_list_items.append(f"[{filename}]({attachment_url(num, filename, att_repo, att_branch)})" + (f" (versions: {cnt})" if cnt > 1 else ""))
-            att_replace_map[filename] = attachment_url(num, filename, att_repo, att_branch)
+            attachment_list_items.append(f"[{filename}]({attachment_url(num, filename, att_base_url)})" + (f" (versions: {cnt})" if cnt > 1 else ""))
+            att_replace_map[filename] = attachment_url(num, filename, att_base_url)
 
         # detect unmentioned image files
         # https://github.com/apache/lucene-jira-archive/issues/126
@@ -256,14 +256,10 @@ Migrated from [{jira_id}]({jira_issue_url(jira_id)}) by {reporter}"""
 
 
 if __name__ == "__main__":
-    github_att_repo = os.getenv("GITHUB_ATT_REPO")
-    if not github_att_repo:
-        print("Please set your GitHub attachment repo to GITHUB_ATT_REPO environment variable.")
-        sys.exit(1)
-    github_att_branch = os.getenv("GITHUB_ATT_BRANCH")
-    if not github_att_repo:
-        print("Please set your GitHub attachment branch to GITHUB_ATT_BRANCH environment variable.")
-        sys.exit(1)
+    att_base_url = os.getenv("ATTACHMENTS_BASE_URL")
+    if not att_base_url:
+        print("Please set attachments base url to ATTACHMENTS_BASE_URL environment variable.")
+        sys.exit()
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--issues', type=int, required=False, nargs='*', help='Jira issue number list to be downloaded')
@@ -313,7 +309,7 @@ if __name__ == "__main__":
         try:
             # if you have attachment files in $JIRA_ATTACHMENTS_DIRPATH, text attachments'data may be embedded in issue comments.
             att_dir = Path(JIRA_ATTACHMENTS_DIRPATH).joinpath(jira_issue_id(num)) if JIRA_ATTACHMENTS_DIRPATH else None
-            convert_issue(num, dump_dir, output_dir, account_map, jira_users, github_att_repo, github_att_branch, att_dir, logger)
+            convert_issue(num, dump_dir, output_dir, account_map, jira_users, att_base_url, att_dir, logger)
         except Exception as e:
             logger.error(traceback.format_exc(limit=100))
             logger.error(f"Failed to convert Jira issue. An error '{str(e)}' occurred; skipped {jira_issue_id(num)}.")
