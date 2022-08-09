@@ -195,7 +195,8 @@ ISSUE_TYPE_TO_LABEL_MAP = {
     "Improvement": "type:enhancement",
     "Test": "type:test",
     "Wish": "type:enhancement",
-    "Task": "type:task"
+    "Task": "type:task",
+    "Sub-task": "type:task"
 }
 
 
