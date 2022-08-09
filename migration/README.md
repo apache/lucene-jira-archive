@@ -1,4 +1,4 @@
-# [WIP] Migration tools (Jira issue -> GitHub issue)
+# Migration tools (Jira issue -> GitHub issue)
 
 ## Setup
 
