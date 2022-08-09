@@ -57,7 +57,7 @@ LUCENE-10502
 ...
 ```
 
-Downloaded attachments should be separately committed to a dedicated branch named `attachments` (or matching the `GITHUB_ATT_BRANCH` env variable) for them.
+Downloaded attachments should be uploaded to a web server or static content hosting service (i.e. GitHub Pages). You also need to set `ATTACHMENTS_BASE_URL` environment variable to correctly point to the attachment files from migrated GitHub isseus.
 
 ### 2. (Optional) Generate Jira -> GitHub account mapping
 
