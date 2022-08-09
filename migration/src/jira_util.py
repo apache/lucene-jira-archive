@@ -351,7 +351,14 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: d
     # embed attachments (patches, etc.) if possible
     links = re.findall(REGEX_LINK, text)
     if links and att_dir:
-        paths = list(filter(lambda p: p.exists(), (att_dir.joinpath(x[0]) for x in links)))
+        paths = []
+        for link in links:
+            try:
+                path = att_dir.joinpath(link[0])
+                if path.exists():
+                    paths.append(path)
+            except OSError:
+                continue
         if paths:
             path = paths[0]
             # skip unknown file extensions; skip too large files.
