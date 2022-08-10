@@ -102,6 +102,9 @@ def convert_issue(num: int, dump_dir: Path, output_dir: Path, account_map: dict[
 
         try:
             body = f'{convert_text(description, att_replace_map, account_map, jira_users, att_dir)}\n\n'
+            if len(body) > 65000:
+                logger.warning(f"Issue description on {jira_id} is too long: {body[:100]}")
+                body = "FIXME"
             for image_file in unmentioned_images:
                 # show orphaned (unmentioned) image files in the issue description
                 att_url = att_replace_map.get(image_file)
@@ -173,6 +176,9 @@ Migrated from [{jira_id}]({jira_issue_url(jira_id)}) by {reporter}"""
                 comment_time += f' [updated: {comment_updated_datetime.strftime("%b %d %Y")}]'
             try:
                 comment_body = f'{convert_text(comment_body, att_replace_map, account_map, jira_users, att_dir)}\n\n'
+                if len(comment_body) > 65000:
+                    logger.warning(f"Comment on {jira_id} is too long: {comment_body[:100]}")
+                    comment_body = "FIXME"
                 # apply a special conversion for jira-bot's comments.
                 # see https://github.com/apache/lucene-jira-archive/issues/54
                 if comment_author_name == "jira-bot":
