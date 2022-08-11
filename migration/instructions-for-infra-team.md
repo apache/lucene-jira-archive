@@ -13,6 +13,7 @@ These commands should work by copy-pasting.
 
 # download and unarchive the GitHub importable data (i will upload the tgz)
 migration $ wget https://home.apache.org/~tomoko/github-import-data.tgz
+migration $ tar xzf github-import-data.tgz
 migration $ tree -L 1
 .
 ├── README.md
@@ -22,8 +23,7 @@ migration $ tree -L 1
 ├── requirements.txt
 └── src
 
-migration $ tar xzf github-import-data.tgz
-(.venv) migration $ ls -1 github-import-data | head
+migration $ ls -1 github-import-data | head
 GH-LUCENE-1.json
 GH-LUCENE-2.json
 GH-LUCENE-3.json
@@ -32,9 +32,10 @@ GH-LUCENE-3.json
 # set the PAT token to an env variable
 migration $ cp .env.example .env
 migration $ vi .env
-export GITHUB_PAT=<set the personal access token here>
-# you don't need to touch other lines
+export GITHUB_PAT=<the personal access token here>
+# other lines don't need to be touched
 
+# set env variables from .env
 migration $ source .env
 
 # setup python virtual env
