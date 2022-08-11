@@ -47,7 +47,7 @@ def import_issue_with_comments(num: int, data_dir: Path, token: str, repo: str) 
         else:
             logger.error(f"Import GitHub issue {data_file} was failed. status={status}, errors={errors}")
         
-        return None
+        raise RuntimeError("Importing issue failed")
 
 
 if __name__ == "__main__":
