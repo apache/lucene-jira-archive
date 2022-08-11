@@ -23,7 +23,7 @@ migration $ tree -L 1
 ├── requirements.txt
 └── src
 
-migration $ ls -1 github-import-data | head
+migration $ ls -1 github-import-data
 GH-LUCENE-1.json
 GH-LUCENE-2.json
 GH-LUCENE-3.json
@@ -32,15 +32,16 @@ GH-LUCENE-3.json
 # set the PAT token to an env variable
 migration $ cp .env.example .env
 migration $ vi .env
-export GITHUB_PAT=<the personal access token here>
+export GITHUB_PAT=<set the personal access token here>
 # other lines don't need to be touched
 
 # set env variables from .env
 migration $ source .env
 
 # setup python virtual env
+# not that the script was tested with python 3.9
 migration $ python -V
-Python 3.9.13  # the script was tested with python 3.9
+Python 3.9.13
 migration $ python -m venv .venv
 migration $ . .venv/bin/activate
 (.venv) migration $ pip install -r requirements.txt 
