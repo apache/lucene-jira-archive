@@ -4,4 +4,4 @@ This repository serves for:
 
 https://issues.apache.org/jira/browse/LUCENE-10557
 
-This branch keeps all [Archived Jira attachments](./attachments).
+This branch keeps all Archived Jira attachments.
