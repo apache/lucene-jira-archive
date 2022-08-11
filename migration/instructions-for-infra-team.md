@@ -57,7 +57,30 @@ six==1.16.0
 urllib3==1.26.9
 ```
 
+## Test the import script
+
+To make sure everything is correctly set up, you can import one issue for a trial. This command imports only LUCENE-1 to GitHub `apache/lucene` repo.
+
+```
+(.venv) migration $ python src/import_github_issues.py --min 1
+```
+
+If the command is successfully done, you'll see an issue id mapping file `mapping-data/issue-map.csv`. This will look like this.
+
+```
+(.venv) migration $ cat mappings-data/issue-map.csv
+JiraKey,GitHubUrl,GitHubNumber
+LUCENE-1,https://github.com/apache/lucene/issues/1080,1080
+```
+
+### Clean up the test data
+
+Once the test is done, please delete `mapping-data/issue-map.csv` file and the imported issue (only admin accounts can delete an issue) before the actual migration.
+
 ## Run the import script
+
+Please specify the `min` option to 1 and `max` option to the maximum number of the Lucene Jira issue, that will be known by then.
+
 ```
 (.venv) migration $ nohup python src/import_github_issues.py --min 1 --max <will be known> &
 # would take 24 hours
