@@ -11,7 +11,7 @@ These commands should work by copy-pasting.
 # move to the tool's directory
 ~ $ cd lucene-jira-archive/migration/
 
-# download and unarchive the GitHub importable data (we will upload the tgz)
+# wait for us to upload this tgz, then download and unarchive the GitHub importable data
 migration $ wget https://home.apache.org/~tomoko/github-import-data.tgz
 migration $ tar xzf github-import-data.tgz
 
@@ -35,7 +35,7 @@ GH-LUCENE-10677.json
 # set the GitHub PAT token to an env variable
 migration $ cp .env.example .env
 migration $ vi .env
-export GITHUB_PAT=<set the personal access token to be used for importing here>
+export GITHUB_PAT=<set the `asfgit` personal access token to be used for importing here>
 # other lines don't need to be touched
 
 # set env variables from .env
@@ -77,17 +77,19 @@ JiraKey,GitHubUrl,GitHubNumber
 LUCENE-1,https://github.com/apache/lucene/issues/1080,1080
 ```
 
+Peek at the issue through GitHub and confirm it was imported and looks reasonable.
+
 ### Clean up the test data
 
-Once the test is done, please delete `mapping-data/issue-map.csv` file and the imported issue (only admin accounts can delete an issue) before the actual migration.
+Once the test is done, please delete `mapping-data/issue-map.csv` local file and the imported issue through GitHub (only admin accounts can delete an issue) before the actual migration.
 
 ## Run the import script
 
-Please specify the `min` option to 1 and `max` option to the maximum number of the Lucene Jira issue, that will be known by then.
+Please specify the `min` option to 1 and `max` option to the maximum number of the Lucene Jira issue, that will be known by then (how?  based on the un-tgz'd GitHub import data?  or maybe you/we will communicate this number to them?  if so, let's say that above?)
 
 ```
 (.venv) migration $ nohup python src/import_github_issues.py --min 1 --max <will be known> &
-# would take 24 hours
+# should take ~24 hours
 ```
 
 Progress will be written in the log file. E.g.:
@@ -105,7 +107,7 @@ migration $ cat log/import_github_issues_2022-08-10T13\:57\:56.log
 
 ## Output files
 
-The import script outputs two files. Both are important for succeeding steps, please send them back to us via any channels (e.g., attach them to the Jira issue).
+The import script outputs two files. Both are important for subsequent steps. Please send them back to us via any channels (e.g., attach them to the Jira issue).
 
 ```
 migration $ ls log/import_github_issues_yyyy-mm-ddTHH:MM:SS.log  # log file
