@@ -85,10 +85,10 @@ Once the test is done, please delete `mapping-data/issue-map.csv` local file and
 
 ## Run the import script
 
-Please specify the `min` option to 1 and `max` option to the maximum number of the Lucene Jira issue, that will be known by then (how?  based on the un-tgz'd GitHub import data?  or maybe you/we will communicate this number to them?  if so, let's say that above?)
+Please specify the `min` option to 1 and `max` option to the maximum number of the Lucene Jira issue (we will update these instructions with the actual `MAX_ID` during migration).
 
 ```
-(.venv) migration $ nohup python src/import_github_issues.py --min 1 --max <will be known> &
+(.venv) migration $ nohup python src/import_github_issues.py --min 1 --max MAX_ID &
 # should take ~24 hours
 ```
 
