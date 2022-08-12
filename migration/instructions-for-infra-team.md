@@ -11,9 +11,10 @@ These commands should work by copy-pasting.
 # move to the tool's directory
 ~ $ cd lucene-jira-archive/migration/
 
-# download and unarchive the GitHub importable data (i will upload the tgz)
+# download and unarchive the GitHub importable data (we will upload the tgz)
 migration $ wget https://home.apache.org/~tomoko/github-import-data.tgz
 migration $ tar xzf github-import-data.tgz
+
 migration $ tree -L 1
 .
 ├── README.md
@@ -28,20 +29,23 @@ GH-LUCENE-1.json
 GH-LUCENE-2.json
 GH-LUCENE-3.json
 ...
+GH-LUCENE-10676.json
+GH-LUCENE-10677.json
 
-# set the PAT token to an env variable
+# set the GitHub PAT token to an env variable
 migration $ cp .env.example .env
 migration $ vi .env
-export GITHUB_PAT=<set the personal access token here>
+export GITHUB_PAT=<set the personal access token to be used for importing here>
 # other lines don't need to be touched
 
 # set env variables from .env
 migration $ source .env
 
 # setup python virtual env
-# not that the script was tested with python 3.9
+# note that the script was tested with python 3.9
 migration $ python -V
 Python 3.9.13
+
 migration $ python -m venv .venv
 migration $ . .venv/bin/activate
 (.venv) migration $ pip install -r requirements.txt 
@@ -88,11 +92,11 @@ Please specify the `min` option to 1 and `max` option to the maximum number of t
 
 ## Output files
 
-The import script outputs two files. Both are important for succeeding steps, please send me back them via any channels (e.g., attach them to the Jira issue).
+The import script outputs two files. Both are important for succeeding steps, please send them back to us via any channels (e.g., attach them to the Jira issue).
 
 ```
-migration $ ls log/import_github_issues_yyyy-mm-ddTHH:MM:SS.log
-migration $ ls mappings-data/issue-map.csv
+migration $ ls log/import_github_issues_yyyy-mm-ddTHH:MM:SS.log  # log file
+migration $ ls mappings-data/issue-map.csv                       # Jira - GitHub issue id mapping file
 ```
 
 Thank you!
