@@ -33,6 +33,8 @@ def update_issue(data_file: Path, token: str, repo: str):
         body = o["body"]
         if update_issue_body(token, repo, issue_number, body, logger):
             logger.debug(f"Issue {issue_number} was successfully updated.")
+        else:
+            raise RuntimeError("Failed to update issue")
 
 
 def update_comment_by_id(comment_id: int, data_dir: Path, token: str, repo: str):
@@ -48,6 +50,8 @@ def update_comment(data_file: Path, token: str, repo: str):
         body = o["body"]
         if update_comment_body(token, repo, comment_id, body, logger):
             logger.debug(f"Comment {comment_id} was successfully updated.")
+        else:
+            raise RuntimeError("Failed to update comment")
 
 
 if __name__ == "__main__":
