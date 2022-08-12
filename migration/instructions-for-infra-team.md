@@ -90,6 +90,19 @@ Please specify the `min` option to 1 and `max` option to the maximum number of t
 # would take 24 hours
 ```
 
+Progress will be written in the log file. E.g.:
+```
+migration $ cat log/import_github_issues_2022-08-10T13\:57\:56.log 
+[2022-08-10 13:57:56,423] INFO:import_github_issues: Importing GitHub issues
+[2022-08-10 13:58:00,983] DEBUG:import_github_issues: Import GitHub issue https://github.com/mocobeta/forks-migration-test-3/issues/11 was successfully completed.
+[2022-08-10 13:58:05,563] DEBUG:import_github_issues: Import GitHub issue https://github.com/mocobeta/forks-migration-test-3/issues/12 was successfully completed.
+[2022-08-10 13:58:10,096] DEBUG:import_github_issues: Import GitHub issue https://github.com/mocobeta/forks-migration-test-3/issues/13 was successfully completed.
+...
+[2022-08-11 11:56:06,159] DEBUG:import_github_issues: Import GitHub issue https://github.com/mocobeta/forks-migration-test-3/issues/10634 was successfully completed.
+[2022-08-11 11:56:13,986] DEBUG:import_github_issues: Import GitHub issue https://github.com/mocobeta/forks-migration-test-3/issues/10635 was successfully completed.
+[2022-08-11 11:56:13,986] INFO:import_github_issues: Done.
+```
+
 ## Output files
 
 The import script outputs two files. Both are important for succeeding steps, please send them back to us via any channels (e.g., attach them to the Jira issue).
