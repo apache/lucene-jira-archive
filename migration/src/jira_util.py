@@ -14,7 +14,7 @@ from jira2markdown.markup.text_breaks import Ruler
 
 from markup.advanced import TweakedCode
 from markup.lists import UnorderedTweakedList, OrderedTweakedList
-from markup.text_effects import EscapeHtmlTag, TweakedBlockQuote, TweakedQuote, TweakedMonospaced
+from markup.text_effects import EscapeHtmlTag, EscapeQuoteMD, TweakedBlockQuote, TweakedQuote, TweakedMonospaced
 from markup.text_breaks import LongRuler
 
 
@@ -340,6 +340,7 @@ def convert_text(text: str, att_replace_map: dict[str, str] = {}, account_map: d
     elements.replace(Monospaced, TweakedMonospaced)
     elements.insert_after(Ruler, LongRuler)
     elements.append(EscapeHtmlTag)
+    elements.append(EscapeQuoteMD)
     text = jira2markdown.convert(text, elements=elements)
 
     # convert links to attachments

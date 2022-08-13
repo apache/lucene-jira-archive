@@ -7,6 +7,7 @@ from pyparsing import (
     StringStart,
     SkipTo,
     Literal,
+    LineStart,
     LineEnd,
     Combine,
     Literal,
@@ -74,3 +75,14 @@ class EscapeHtmlTag(AbstractMarkup):
     @property
     def expr(self) -> ParserElement:
         return Literal("<").setParseAction(replaceWith("&lt;")) + SkipTo(Literal(">")) + Literal(">").setParseAction(replaceWith("&gt;"))
+
+
+class EscapeQuoteMD(AbstractMarkup):
+    """
+    Escapes '>' at the start of the line that are not a part of any expression grammar
+    """
+
+    @property
+    def expr(self) -> ParserElement:
+        return LineStart() + Literal(">").setParseAction(replaceWith("&gt;"))
+
